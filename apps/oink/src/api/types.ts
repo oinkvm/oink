@@ -203,6 +203,10 @@ export interface InputSettings {
   /** Windows capture-local opt-in; false keeps other apps' injected input local. */
   forward_injected_input: boolean;
   take_foreground_on_leave: boolean;
+  /** Windows device-local Quicker compatibility mode (remote mouse buttons injected untagged). */
+  quicker_compat?: boolean;
+  /** Device-local: unlock group devices with automatic unlock when this one is unlocked. */
+  sync_unlock_others?: boolean;
   emergency_hold_ms: number;
   device_gain: number;
   scroll: ScrollSettings;
@@ -225,7 +229,7 @@ export interface CacheDevice { device: DeviceKey; usage: CacheUsage }
 export interface CacheDeviceClear { device: DeviceKey; result: { removed_bytes: number; kept_bytes: number; usage: CacheUsage } }
 
 export interface ClipboardSettings {
-  receive?: boolean; send?: boolean; remove_ds_store?: boolean;
+  receive?: boolean; send?: boolean; remove_ds_store?: boolean; dedupe?: boolean;
   // Retained settings IPC fields; every format class is always enabled.
   text: true; rich_text: true; images: true; files: true; custom: true;
 }

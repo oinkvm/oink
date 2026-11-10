@@ -9,6 +9,8 @@
 //!   符号：`dy > 0`（视图向上）→ 正的 WHEEL；`dx > 0`（视图向左）→ 负的 HWHEEL。注入的滚轮不经过鼠标驱动，
 //!   不受 `FlipFlopWheel` 影响，也不受触摸板方向设置影响。
 //! - 按键：扫描码注入（`KEYEVENTF_SCANCODE`，E0 扩展键加 `KEYEVENTF_EXTENDEDKEY`）；Pause 与媒体键用虚拟键。
+//! - Quicker 兼容模式（[`crate::quicker_compat`]）：远端输入注入时，鼠标按键（含拖拽的定位按下 / 松开）与
+//!   改为 `dwExtraInfo = 0`（[`untag_for_quicker`]）；移动、滚轮与键盘仍带 [`INJECT_TAG`]。
 
 use oink_foundation::input::{KeyCode, MouseButton};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
@@ -187,6 +189,35 @@ pub(crate) fn button(b: MouseButton, pressed: bool) -> Option<INPUT> {
         (MouseButton::Other(_), _) => return None,
     };
     Some(mouse(0, 0, data, flags))
+}
+
+const BUTTON_FLAGS: MOUSE_EVENT_FLAGS = MOUSE_EVENT_FLAGS(
+    MOUSEEVENTF_LEFTDOWN.0
+        | MOUSEEVENTF_LEFTUP.0
+        | MOUSEEVENTF_RIGHTDOWN.0
+        | MOUSEEVENTF_RIGHTUP.0
+        | MOUSEEVENTF_MIDDLEDOWN.0
+        | MOUSEEVENTF_MIDDLEUP.0
+        | MOUSEEVENTF_XDOWN.0
+        | MOUSEEVENTF_XUP.0,
+);
+
+/// OS workaround (Quicker 1.45.5, undocumented): Quicker ignores mouse button
+/// events whose dwExtraInfo is non-zero; it checks neither LLMHF_INJECTED nor
+/// the integrity level (Win10 22H2 VM, evidence oink-issue37-quicker). Clear the
+/// tag on every button transition (a combined positioned drag Down/Up too; it
+/// must stay one INPUT). Pure motion and wheel keep the tag: edge and placement
+/// accounting depend on recognising them. Keyboard keeps the tag: Quicker's key
+/// triggers do not test dwExtraInfo against zero (static analysis, same dir).
+pub(crate) fn untag_for_quicker(input: &mut INPUT) -> bool {
+    // SAFETY: `r#type` selects the initialized union member of our own builders.
+    unsafe {
+        if input.r#type == INPUT_MOUSE && input.Anonymous.mi.dwFlags.0 & BUTTON_FLAGS.0 != 0 {
+            input.Anonymous.mi.dwExtraInfo = 0;
+            return true;
+        }
+    }
+    false
 }
 
 /// 菜单遮罩键（`KeyCode::MENU_MASK`）注入的虚拟键：0xE8 未分配，不产生字符、没有系统含义，
@@ -517,6 +548,62 @@ mod tests {
             assert_eq!(caps.dwExtraInfo, INJECT_TAG);
         }
         assert!(key(KeyCode::keyboard(0x01), true).is_none());
+    }
+
+    #[test]
+    fn quicker_mode_clears_the_tag_on_mouse_buttons_only() {
+        let extra = |mut input: INPUT| {
+            let untagged = untag_for_quicker(&mut input);
+            // SAFETY: read the member selected by the builder's type.
+            let extra = unsafe {
+                if input.r#type == INPUT_KEYBOARD {
+                    input.Anonymous.ki.dwExtraInfo
+                } else {
+                    input.Anonymous.mi.dwExtraInfo
+                }
+            };
+            assert_eq!(untagged, extra == 0);
+            extra
+        };
+        for b in [
+            MouseButton::Left,
+            MouseButton::Right,
+            MouseButton::Middle,
+            MouseButton::Back,
+            MouseButton::Forward,
+        ] {
+            for pressed in [true, false] {
+                assert_eq!(extra(button(b, pressed).unwrap()), 0, "{b:?} {pressed}");
+                // Without the mode the builders keep the tag.
+                // SAFETY: button builds INPUT_MOUSE.
+                let tagged = unsafe { button(b, pressed).unwrap().Anonymous.mi.dwExtraInfo };
+                assert_eq!(tagged, INJECT_TAG);
+            }
+        }
+        assert_eq!(extra(drag_press(1, 2)), 0);
+        assert_eq!(
+            extra(drag_release_at(oink_foundation::Point::new(1., 2.), (0, 0), (10, 10))),
+            0
+        );
+        for code in [
+            KeyCode::keyboard(0x04),
+            KeyCode::LEFT_CTRL,
+            KeyCode::MENU_MASK,
+            KeyCode::CAPS_LOCK,
+        ] {
+            for pressed in [true, false] {
+                assert_eq!(extra(key(code, pressed).unwrap()), INJECT_TAG);
+            }
+        }
+        for motion in [
+            move_abs(1, 2),
+            move_relative(3, -4),
+            wheel(120, false),
+            wheel(-120, true),
+            mouse(0, 0, 0, MOUSEEVENTF_MOVE),
+        ] {
+            assert_eq!(extra(motion), INJECT_TAG);
+        }
     }
 
     #[test]

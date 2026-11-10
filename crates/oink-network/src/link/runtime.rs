@@ -71,6 +71,7 @@ struct AddressProbe {
 }
 struct Dialing {
     peer: DeviceId,
+    origin: DialOrigin,
     identity_mismatch: bool,
     addresses: VecDeque<SocketAddr>,
     attempts: Vec<Handshake>,
@@ -702,7 +703,11 @@ impl Network {
                     });
                     self.module_all(|| ModuleEvent::LinkLost { link, peer, reason });
                 }
-                Effect::Dial { peer, addresses } => {
+                Effect::Dial {
+                    peer,
+                    addresses,
+                    origin,
+                } => {
                     self.shared.track_dial(peer);
                     let mut unique = VecDeque::new();
                     for address in addresses {
@@ -719,6 +724,7 @@ impl Network {
                         self.dials.push(Dialing {
                             identity_mismatch: false,
                             peer,
+                            origin,
                             addresses: unique,
                             attempts: Vec::new(),
                         });
@@ -984,8 +990,8 @@ impl Network {
                     self.endpoint.open_connections(),
                 ));
             }
-            Command::Dial(peer, addresses, mode) => {
-                if let Err(reason) = self.core.dial(peer, addresses, mode, Instant::now()) {
+            Command::Dial(peer, addresses, mode, origin) => {
+                if let Err(reason) = self.core.dial(peer, addresses, mode, origin, Instant::now()) {
                     self.shared.release_dial(peer);
                     if reason != DialRefused::AlreadyLinked {
                         let _ = self.events.send(ConfigEvent::DialFailed {
@@ -2162,7 +2168,12 @@ impl Network {
                         initiator_boot: self.core.boot,
                         random: rand::random(),
                     };
-                    let mut trace = diagnostics::CandidateDial::start(dial.peer, address, diagnostics::hex(&id.random));
+                    let mut trace = diagnostics::CandidateDial::start(
+                        dial.peer,
+                        address,
+                        diagnostics::hex(&id.random),
+                        dial.origin,
+                    );
                     match self.endpoint.connect(address, crate::tls::SERVER_NAME) {
                         Ok(connecting) => {
                             dial.attempts.push(Handshake {

@@ -331,7 +331,7 @@ pub(super) mod tests {
         unsafe {
             read.read(&mut received).unwrap();
         }
-        assert_eq!(read.wait(10).unwrap_err().kind(), io::ErrorKind::TimedOut);
+        assert_eq!(read.wait(0).unwrap_err().kind(), io::ErrorKind::TimedOut);
         assert_eq!(received, [0; 24]);
         // SAFETY: cancelled operation is complete; buffer may be reused now.
         unsafe {

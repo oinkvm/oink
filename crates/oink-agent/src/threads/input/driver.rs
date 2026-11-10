@@ -95,8 +95,11 @@ pub(super) struct Driver {
     local_emergency_sequence: u64,
     session_locked: Option<bool>,
     auto_unlock: crate::auto_unlock::EntryGate,
+    sync_unlock: crate::auto_unlock::sync::SyncGate,
     recent_remote_input: Option<(DeviceId, Instant)>,
-    local_unlock_admission: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// Admission bit of the queued local password transaction; `Some(source)`
+    /// for a sync transaction, which only its own source's loss revokes.
+    local_unlock_admission: Option<(Arc<std::sync::atomic::AtomicBool>, Option<DeviceId>)>,
     capture_initialized: bool,
     controllable: bool,
     permission_controllable: bool,
@@ -208,6 +211,7 @@ impl Driver {
         router.set_volume_notifications_probe(Arc::new(oink_audio::device_notifications::recent_windows_notifications));
         router.set_settings((*settings).clone());
         let native = inject.backend();
+        native.set_quicker_compat(settings.quicker_compat);
         let modifier_backend = native.clone();
         router.set_modifier_release_probe(Arc::new(move |mask| modifier_backend.reconcile_passed_modifiers(mask)));
         router.set_local_feel(native.feel_profile());
@@ -267,6 +271,7 @@ impl Driver {
             local_emergency_sequence: 0,
             session_locked: None,
             auto_unlock: Default::default(),
+            sync_unlock: Default::default(),
             recent_remote_input: None,
             local_unlock_admission: None,
             capture_initialized: false,
@@ -330,6 +335,11 @@ impl Driver {
                 if self.budget.frequency() != settings.event_frequency {
                     self.flush_motion_for(crate::diagnostics::handoff::FlushReason::FrequencyChanged, None);
                     self.budget.reset(settings.event_frequency, self.now);
+                }
+                if settings.quicker_compat != self.settings.quicker_compat {
+                    // An atomic at the injection boundary. A press and its release may
+                    // differ in tagging across a toggle without leaving a hold.
+                    self.inject.backend().set_quicker_compat(settings.quicker_compat);
                 }
                 if settings.cursor_trail_duration_ms != self.settings.cursor_trail_duration_ms {
                     self.trail.duration(settings.cursor_trail_duration_ms);
@@ -598,7 +608,10 @@ impl Driver {
     }
     fn detach(&mut self, peer: DeviceId) {
         self.auto_unlock.cancel();
-        if let Some(allowed) = &self.local_unlock_admission {
+        self.sync_unlock.disconnected(peer);
+        if let Some((allowed, source)) = &self.local_unlock_admission
+            && source.is_none_or(|source| source == peer)
+        {
             allowed.store(false, Ordering::Release);
         }
         // Relayed origins share an upstream stream. Reset just that stream's
@@ -884,6 +897,9 @@ impl Driver {
                     self.inject.suspend();
                 }
                 if paused {
+                    // A local pause cancels a pending sync challenge before its
+                    // sessions close: that is the user's choice, not a lost source.
+                    self.sync_unlock.cancel();
                     self.declarations.clear();
                     self.trail.pause();
                     for peer in self.pairs.keys().copied().collect::<Vec<_>>() {
@@ -1289,19 +1305,33 @@ impl Driver {
                     self.adapter.inbound(peer, message);
                 }
             }
-            InputCommand::LocalUnlock { epoch, job } => {
+            InputCommand::LocalUnlock { admission, job } => {
                 let focus = self.adapter.router().focus();
-                if !self.paused
-                    && self.update_hold.is_none()
-                    && self.session_locked == Some(true)
-                    && focus.holder == self.local
-                    && focus.epoch == epoch
-                {
-                    self.local_unlock_admission = Some(job.admission());
+                let (admitted, source) = match admission {
+                    super::LocalUnlockAdmission::Focus(epoch) => {
+                        (focus.holder == self.local && focus.epoch == epoch, None)
+                    }
+                    // Focus-independent: the source confirmed it is unlocked on
+                    // this session and must still be attached.
+                    super::LocalUnlockAdmission::Sync(source) => (self.adapter.attached(source), Some(source)),
+                };
+                if !self.paused && self.update_hold.is_none() && self.session_locked == Some(true) && admitted {
+                    self.local_unlock_admission = Some((job.admission(), source));
                     self.inject
                         .push_in_epoch(self.input_safety, InjectItem::LocalUnlock(job));
                 } else {
                     job.reject();
+                }
+            }
+            InputCommand::SyncUnlockBroadcast { epoch } => self.broadcast_sync_unlock(epoch),
+            InputCommand::SyncUnlockQuery { source, reply } => {
+                if self.paused || self.update_hold.is_some() {
+                    let _ = reply.try_send(crate::auto_unlock::sync::SourceAnswer::Cancelled);
+                } else if !self.adapter.attached(source) {
+                    let _ = reply.try_send(crate::auto_unlock::sync::SourceAnswer::Disconnected);
+                } else {
+                    let epoch = self.sync_unlock.begin(source, reply, Instant::now());
+                    self.send_from(source, Message::Control(ControlMsg::UnlockQuery { epoch }), None);
                 }
             }
             InputCommand::UnlockReplyReady {
@@ -1730,6 +1760,29 @@ impl Driver {
                     }
                     return;
                 }
+                Message::Control(ControlMsg::SyncUnlock { epoch }) => {
+                    let boot = self.pairs[&peer].admission.as_ref().map(|a| a.boot);
+                    if let Some(boot) = boot
+                        && self.sync_unlock.admit(peer, boot, *epoch)
+                    {
+                        let _ = self.main.send(MainCommand::SyncUnlock {
+                            source: peer,
+                            epoch: *epoch,
+                        });
+                    }
+                    return;
+                }
+                Message::Control(ControlMsg::UnlockReply { epoch, unlocked })
+                    if self.sync_unlock.confirm(
+                        peer,
+                        *epoch,
+                        *unlocked,
+                        self.session_locked == Some(true),
+                        Instant::now(),
+                    ) =>
+                {
+                    return;
+                }
                 Message::Control(ControlMsg::UnlockReply { epoch, unlocked }) => {
                     crate::auto_unlock::record_flow_diagnostic(6, *epoch, u64::from(*unlocked));
                     let focus = self.adapter.router().focus();
@@ -1806,7 +1859,7 @@ impl Driver {
     }
     fn outputs_at(&mut self, from: Option<DeviceId>, dispatch: ModeDispatch) {
         if (self.paused || self.update_hold.is_some() || self.session_locked != Some(true))
-            && let Some(allowed) = &self.local_unlock_admission
+            && let Some((allowed, _)) = &self.local_unlock_admission
         {
             allowed.store(false, Ordering::Release);
         }
@@ -1814,6 +1867,7 @@ impl Driver {
             .observe(self.session_locked, self.adapter.router().focus().holder, self.local);
         if self.paused || self.update_hold.is_some() {
             self.auto_unlock.cancel();
+            self.sync_unlock.cancel();
         }
         self.cursor_scope();
         if dispatch == ModeDispatch::Callback {
@@ -2102,6 +2156,32 @@ impl Driver {
     #[cfg(test)]
     fn send(&mut self, peer: DeviceId, message: Message) {
         self.send_from(peer, message, None);
+    }
+    /// Sync unlock initiator: one hint to every attached peer that negotiated
+    /// the capability, whether its logical path is direct or relayed. Nothing
+    /// is sent while this device is paused (its I0 streams are closed anyway).
+    fn broadcast_sync_unlock(&mut self, epoch: u64) {
+        if self.paused || self.update_hold.is_some() {
+            crate::auto_unlock::sync::record_diagnostic(2, epoch, 0);
+            return;
+        }
+        let message = Message::Control(ControlMsg::SyncUnlock { epoch });
+        let peers: Vec<_> = self
+            .pairs
+            .iter()
+            .filter(|(_, pair)| {
+                pair.attached
+                    && pair
+                        .admission
+                        .as_ref()
+                        .is_some_and(|admission| wire::supported(&message, admission))
+            })
+            .map(|(peer, _)| *peer)
+            .collect();
+        for peer in &peers {
+            self.send_from(*peer, message.clone(), None);
+        }
+        crate::auto_unlock::sync::record_diagnostic(2, epoch, peers.len() as u64);
     }
     fn send_from(&mut self, peer: DeviceId, message: Message, origin: Option<DeviceId>) {
         // Router outputs can include local modifier snapshots/releases triggered

@@ -265,6 +265,94 @@ pub fn projected(provider: Arc<dyn Provider>, inventory: Inventory) -> io::Resul
     }))
 }
 
+/// Serve an already announced offer from a newer, equivalent clipboard.
+///
+/// A synchronizer that writes our own announced content back replaces the
+/// native slot the announced readers were bound to. That write is a duplicate
+/// (`crate::dedupe`) and is not announced again, so peers keep reading the
+/// original offer. Each announced representation is served by the newer
+/// clipboard's representation with the same native format at the same item
+/// position; a representation without such a counterpart (formats the
+/// synchronizer dropped) becomes unavailable. File offers are not rebound:
+/// their namespace belongs to the original copy.
+pub fn rebound(advertised: Inventory, actual: Arc<dyn Provider>) -> io::Result<Arc<dyn Provider>> {
+    let current = actual.inventory();
+    if current.platform != advertised.platform
+        || !advertised.roots.is_empty()
+        || !current.roots.is_empty()
+        || advertised.items.iter().any(|item| item.file.is_some())
+    {
+        return Err(unavailable(Unavailable::Unsupported));
+    }
+    let mut inventory = advertised;
+    let mut map = HashMap::new();
+    for (index, item) in inventory.items.iter_mut().enumerate() {
+        for rep in &mut item.representations {
+            let counterpart = current.items.get(index).and_then(|candidate| {
+                candidate.representations.iter().find(|other| {
+                    other.format == rep.format
+                        && !matches!(
+                            other.data,
+                            RepresentationData::Unavailable(_)
+                                | RepresentationData::File(_)
+                                | RepresentationData::Promise(..)
+                        )
+                        // A peer verifies an announced size against the bytes it reads.
+                        && match (rep.data.size(), other.data.size()) {
+                            (Some(ContentSize::Known(a)), Some(ContentSize::Known(b))) => a == b,
+                            (Some(ContentSize::Known(_)), _) => false,
+                            _ => true,
+                        }
+                })
+            });
+            match counterpart {
+                Some(other) if !matches!(rep.data, RepresentationData::Promise(..) | RepresentationData::File(_)) => {
+                    map.insert(rep.id, other.id);
+                }
+                _ => rep.data = RepresentationData::Unavailable(Unavailable::Superseded),
+            }
+        }
+    }
+    if map.is_empty() {
+        return Err(unavailable(Unavailable::Superseded));
+    }
+    inventory.validate().map_err(unavailable)?;
+    Ok(Arc::new(Rebound { inventory, map, actual }))
+}
+struct Rebound {
+    inventory: Inventory,
+    map: HashMap<RepresentationId, RepresentationId>,
+    actual: Arc<dyn Provider>,
+}
+impl Rebound {
+    fn mapped(&self, id: RepresentationId) -> io::Result<RepresentationId> {
+        self.map
+            .get(&id)
+            .copied()
+            .ok_or_else(|| unavailable(Unavailable::Superseded))
+    }
+}
+impl Provider for Rebound {
+    fn inventory(&self) -> Inventory {
+        self.inventory.clone()
+    }
+    fn open(&self, id: RepresentationId) -> io::Result<FileReader> {
+        self.actual.open(self.mapped(id)?)
+    }
+    fn open_hover(&self, id: RepresentationId) -> io::Result<FileReader> {
+        self.actual.open_hover(self.mapped(id)?)
+    }
+    fn translator(&self) -> Arc<dyn Translator> {
+        self.actual.translator()
+    }
+    fn reader_guard(&self, id: RepresentationId) -> io::Result<ReaderGuard> {
+        self.actual.reader_guard(self.mapped(id)?)
+    }
+    fn cancel(&self) {
+        self.actual.cancel();
+    }
+}
+
 #[derive(Debug)]
 struct ContentError(Unavailable);
 impl std::fmt::Display for ContentError {

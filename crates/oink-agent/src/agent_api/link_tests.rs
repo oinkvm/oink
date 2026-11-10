@@ -1,7 +1,7 @@
 //! Real Node/QUIC/Low tasks; fake OS devices, no desktop validation claim.
 use super::*;
 use crate::snapshot_tests::{Displays, pair, start_with_clip, until};
-use oink_network::link::DialMode;
+use oink_network::link::{DialMode, DialOrigin};
 use oink_protocol::v1::dto::FactPath;
 use std::io::Read;
 
@@ -166,11 +166,21 @@ async fn simultaneous_dial_keeps_pairing_metadata_link_view_and_diagnostics_scen
     let b = start_with_clip(&configs[1], &Displays::new("b"), None).await;
     a.links()
         .unwrap()
-        .dial(b.id(), vec![b.links().unwrap().local_addr()], DialMode::DirectOnly)
+        .dial(
+            b.id(),
+            vec![b.links().unwrap().local_addr()],
+            DialMode::DirectOnly,
+            DialOrigin::Initial,
+        )
         .unwrap();
     b.links()
         .unwrap()
-        .dial(a.id(), vec![a.links().unwrap().local_addr()], DialMode::DirectOnly)
+        .dial(
+            a.id(),
+            vec![a.links().unwrap().local_addr()],
+            DialMode::DirectOnly,
+            DialOrigin::Initial,
+        )
         .unwrap();
     pair(&a, &b).await;
     inspect_link(&a, &b, None).await;

@@ -74,7 +74,12 @@
                  Text="Click Finish to close Setup." />
         <Control Id="LaunchChoice" Type="CheckBox" X="135" Y="135" Width="220" Height="18" Hidden="yes"
                  Property="OinkLaunch" CheckBoxValue="1" Text="Launch Oink"
-                 ShowCondition="UILevel = 5 AND NOT Installed AND NOT REMOVE" />
+                 ShowCondition="UILevel = 5 AND NOT Installed AND NOT REMOVE AND NOT WIX_UPGRADE_DETECTED" />
+        <!-- Upgrade/repair: notification only. The new OinkInput already reopens
+             Oink where it was running; nothing here needs a click. -->
+        <Control Id="RestartNote" Type="Text" X="135" Y="115" Width="220" Height="30" Hidden="yes" Transparent="yes"
+                 Text="If Oink was running before Setup, it starts again automatically."
+                 ShowCondition="UILevel = 5 AND NOT REMOVE AND (Installed OR WIX_UPGRADE_DETECTED)" />
         <Control Id="BottomLine" Type="Line" X="0" Y="234" Width="370" Height="0" />
         <Control Id="Finish" Type="PushButton" X="236" Y="243" Width="56" Height="17" Default="yes" Cancel="yes" Text="Finish">
           <Publish Event="EndDialog" Value="Return" Order="999" />

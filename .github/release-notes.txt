@@ -1,38 +1,26 @@
-Oink 0.3.4 adds automatic unlock, Paste as File and layout shortcuts, and fixes several pointer, shortcut and audio issues.
+Oink 0.3.5 adds sync unlock and a Quicker compatibility mode, and fixes several bugs and usability issues.
 
 ## New
 
-- Automatic unlock: move the pointer from an unlocked computer onto a locked Mac or Windows computer, and Oink unlocks it with the saved password. The password is verified when you save it and is stored encrypted on that computer.
-- Paste as File: turn it on under Tools in Settings to save text or images on the clipboard as a file from the context menu in Finder or File Explorer.
-- Saved layouts can have shortcuts, so you can switch layouts with one key combination.
-- The middle and side mouse buttons can be used as shortcuts.
-- Hiding a screen in the layout now applies on every device in the group, and offline devices can be hidden or moved as a whole.
-- On Windows, after turning on "Disable hidden displays in the system" in Settings, screens hidden in the layout are also disabled in Windows, so the pointer can't stray onto them.
-- Moving devices with several screens in the layout works better.
-- On Windows, keyboard and mouse input simulated by other apps is now forwarded to other devices by default. You can turn this off in Settings.
-- When audio forwarding ends, media that is playing is paused before local sound is restored.
-- Oink is now available for Intel Macs.
+- Sync unlock: after you unlock one computer by hand, the other locked computers in the group unlock too. Turn on "Unlock other devices too" under General in Settings; it is off by default.
+- Clipboard deduplication: copying the same content several times in a row syncs it only once, so Oink doesn't interfere with other clipboard sync tools. You can turn it off under Clipboard in Settings.
+- New "Quicker compatibility mode" on Windows: when it is on, Quicker works normally while this computer is being controlled. Turn it on under Input in Settings.
+- On Windows, you can upgrade by double-clicking the MSI while Oink is running, and Oink restarts automatically when the installation finishes.
 
 ## Fixes
 
-- Fixed the pointer not being able to return to the computer's other screens after entering a screen hidden in the layout.
-- Fixed a still cursor being left at the top of the screen after opening Mission Control on a Mac.
-- Fixed shortcuts held down while the computer locks no longer working.
-- Fixed external input also not working on a Mac whose local input is disabled.
-- Fixed images copied on one Windows computer showing no preview in clipboard history (Win+V) on another Windows computer.
-- Fixed default pointer shortcuts for a device sometimes duplicating existing shortcuts.
-- Fixed pairing occasionally failing.
-- Fixed the audio warning still being shown after audio output recovers.
-- Fixed the pitch of forwarded audio jumping after quiet passages.
-- Fixed Num Lock not taking effect on the remote device.
-- Fixed some UI issues.
+- Resolutions in the display arrangement now show the screens' actual pixels.
+- Fixed not being able to choose an audio output when a device in the group is offline.
+- Fixed automatic unlock not skipping a Windows computer after "Only allow Windows Hello sign-in" is turned on.
+- Fixed a clipboard-related crash on Mac.
+- Fixed an occasional crash on Windows.
 
 ## Compatibility
 
-- 0.3.4 works with 0.3.0 and later.
+- 0.3.5 works with 0.3.0 and later.
 
 ## Downloads
 
 - **Mac (Apple silicon):** the `.dmg` file — macOS 14.2 or later.
 - **Mac (Intel):** the `.dmg` file marked `x64` — macOS 14.2 or later.
-- **Windows:** the `.msi` file — x64, Windows 10 version 1809 (build 17763) or later (versions before 22H2 are untested), or Windows 11. Windows 10 LTSC needs the WebView2 Runtime: https://developer.microsoft.com/microsoft-edge/webview2/
+- **Windows:** the `.msi` file — x64, Windows 10 version 1809 (build 17763) or later, or Windows 11. Windows 10 versions before 22H2 are untested.

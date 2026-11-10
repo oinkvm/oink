@@ -414,6 +414,7 @@ fn application_profile() -> oink_network::negotiation::OfferProfile {
                 "oink.pointer.move-hidden/1",
                 "oink.focus.local-click/1",
                 "oink.auto-unlock/1",
+                "oink.auto-unlock.sync/1",
                 "oink.pointer.lock-escape/1",
                 "oink.pointer.entry-protection/1",
                 "oink.input.edge-trigger/1",

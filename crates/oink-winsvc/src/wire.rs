@@ -22,9 +22,11 @@ pub enum Command {
         x: i32,
         y: i32,
     },
+    /// `untagged`: Quicker compatibility mode, send with dwExtraInfo 0 instead of the OINK tag.
     Button {
         button: u16,
         down: bool,
+        untagged: bool,
     },
     Wheel {
         amount: i32,
@@ -40,6 +42,7 @@ pub enum Command {
     DragPress {
         x: i32,
         y: i32,
+        untagged: bool,
     },
     /// Lease only: the pipe owner handles it without desktop/query work or a reply.
     Heartbeat,
@@ -47,21 +50,22 @@ pub enum Command {
     DragRelease {
         x: i32,
         y: i32,
+        untagged: bool,
     },
 }
 impl Command {
     pub fn encode(self) -> [u8; FRAME_SIZE] {
         let (kind, a, b, c) = match self {
             Self::MoveRelative { dx, dy } => (7, dx, dy, 0),
-            Self::DragPress { x, y } => (8, x, y, 0),
-            Self::DragRelease { x, y } => (10, x, y, 0),
+            Self::DragPress { x, y, untagged } => (8, x, y, i32::from(untagged)),
+            Self::DragRelease { x, y, untagged } => (10, x, y, i32::from(untagged)),
             Self::Heartbeat => (9, 0, 0, 0),
             Self::Ping => (0, 0, 0, 0),
             Self::PowerSnapshot => (11, 0, 0, 0),
             Self::Release => (1, 0, 0, 0),
             Self::Position => (2, 0, 0, 0),
             Self::Move { x, y } => (3, x, y, 0),
-            Self::Button { button, down } => (4, i32::from(button), i32::from(down), 0),
+            Self::Button { button, down, untagged } => (4, i32::from(button), i32::from(down), i32::from(untagged)),
             Self::Wheel { amount, horizontal } => (5, amount, i32::from(horizontal), 0),
             Self::Key {
                 code,
@@ -103,17 +107,20 @@ impl Command {
                 x: a as i32,
                 y: b as i32,
             },
-            8 if a <= 65535 && b <= 65535 && c == 0 => Self::DragPress {
+            8 if a <= 65535 && b <= 65535 && c <= 1 => Self::DragPress {
                 x: a as i32,
                 y: b as i32,
+                untagged: c == 1,
             },
-            10 if a <= 65535 && b <= 65535 && c == 0 => Self::DragRelease {
+            10 if a <= 65535 && b <= 65535 && c <= 1 => Self::DragRelease {
                 x: a as i32,
                 y: b as i32,
+                untagged: c == 1,
             },
-            4 if a < 5 && b <= 1 && c == 0 => Self::Button {
+            4 if a < 5 && b <= 1 && c <= 1 => Self::Button {
                 button: a as u16,
                 down: b == 1,
+                untagged: c == 1,
             },
             5 if (a as i32).unsigned_abs() <= 120000 && b <= 1 && c == 0 => Self::Wheel {
                 amount: a as i32,
@@ -220,7 +227,11 @@ mod tests {
         let input = Request {
             id: 7,
             ordinary: false,
-            command: Command::DragPress { x: 12, y: 34 },
+            command: Command::DragPress {
+                x: 12,
+                y: 34,
+                untagged: false,
+            },
         };
         assert_eq!(Request::decode(&input.encode()), Some(input));
         assert!(
@@ -257,18 +268,70 @@ mod tests {
     }
     #[test]
     fn positioned_drag_press_is_one_bounded_command() {
-        for cmd in [
-            Command::DragPress { x: 0, y: 65535 },
-            Command::DragPress { x: 123, y: 456 },
-            Command::DragRelease { x: 123, y: 456 },
-            Command::DragRelease { x: 0, y: 65535 },
-        ] {
-            assert_eq!(Command::decode(&cmd.encode()), Some(cmd));
+        for untagged in [false, true] {
+            for cmd in [
+                Command::DragPress {
+                    x: 0,
+                    y: 65535,
+                    untagged,
+                },
+                Command::DragPress {
+                    x: 123,
+                    y: 456,
+                    untagged,
+                },
+                Command::DragRelease {
+                    x: 123,
+                    y: 456,
+                    untagged,
+                },
+                Command::DragRelease {
+                    x: 0,
+                    y: 65535,
+                    untagged,
+                },
+            ] {
+                assert_eq!(Command::decode(&cmd.encode()), Some(cmd));
+            }
+            for cmd in [
+                Command::DragRelease { x: -1, y: 0, untagged },
+                Command::DragRelease {
+                    x: 0,
+                    y: 65536,
+                    untagged,
+                },
+                Command::DragPress { x: -1, y: 0, untagged },
+                Command::DragPress {
+                    x: 0,
+                    y: 65536,
+                    untagged,
+                },
+            ] {
+                assert_eq!(Command::decode(&cmd.encode()), None);
+            }
         }
-        assert_eq!(Command::decode(&Command::DragRelease { x: -1, y: 0 }.encode()), None);
-        assert_eq!(Command::decode(&Command::DragRelease { x: 0, y: 65536 }.encode()), None);
-        assert_eq!(Command::decode(&Command::DragPress { x: -1, y: 0 }.encode()), None);
-        assert_eq!(Command::decode(&Command::DragPress { x: 0, y: 65536 }.encode()), None);
+    }
+    #[test]
+    fn quicker_untagged_flag_round_trips_and_is_bounded() {
+        for button in 0..5 {
+            for down in [false, true] {
+                for untagged in [false, true] {
+                    let cmd = Command::Button { button, down, untagged };
+                    assert_eq!(Command::decode(&cmd.encode()), Some(cmd));
+                }
+            }
+        }
+        for kind in [4u32, 8, 10] {
+            let mut frame = Command::Button {
+                button: 0,
+                down: true,
+                untagged: true,
+            }
+            .encode();
+            frame[4..8].copy_from_slice(&kind.to_le_bytes());
+            frame[16..20].copy_from_slice(&2u32.to_le_bytes());
+            assert!(Command::decode(&frame).is_none(), "kind {kind}");
+        }
     }
     #[test]
     fn relative_motion_is_distinct_bounded_and_preserves_signed_counts() {
@@ -290,7 +353,11 @@ mod tests {
         assert!(Command::decode(&valid[..23]).is_none());
         for cmd in [
             Command::Move { x: -1, y: 0 },
-            Command::Button { button: 5, down: true },
+            Command::Button {
+                button: 5,
+                down: true,
+                untagged: false,
+            },
             Command::Wheel {
                 amount: i32::MIN,
                 horizontal: false,

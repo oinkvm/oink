@@ -26,16 +26,14 @@ fn cpu_seconds(pid: u32) -> Option<f64> {
 }
 
 #[test]
-#[ignore = "CPU timing qualification requires an otherwise idle dedicated machine"]
+#[ignore = "slow: CPU timing qualification requires an otherwise idle dedicated machine"]
 fn idle_service_does_not_spin() {
     let _scenario = test_watchdog::Scenario::new(module_path!(), "idle_service_does_not_spin");
-    let dir = std::env::temp_dir().join(format!("oink-idle-cpu-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    let log = dir.join("stderr.log");
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("stderr.log");
     let mut child = Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", "idle_fake_service_child", "--nocapture"])
-        .env("OINK_IDLE_CHILD", &dir)
+        .args(["--exact", "idle_fake_service_child", "--ignored", "--nocapture"])
+        .env("OINK_IDLE_CHILD", dir.path())
         .stdout(Stdio::null())
         .stderr(std::fs::File::create(&log).unwrap())
         .spawn()
@@ -48,7 +46,6 @@ fn idle_service_does_not_spin() {
     let t1 = cpu_seconds(pid);
     let status = child.wait().expect("wait oink-agent");
     let err = std::fs::read_to_string(&log).unwrap_or_default();
-    let _ = std::fs::remove_dir_all(&dir);
 
     let (Some(t0), Some(t1)) = (t0, t1) else {
         panic!("服务进程提前退出（{status}）：{err}");
@@ -60,11 +57,11 @@ fn idle_service_does_not_spin() {
 
 /// This child exercises the production owners without installing native input hooks.
 #[test]
+#[ignore = "slow: child entry for the idle CPU qualification harness"]
 fn idle_fake_service_child() {
     let _scenario = test_watchdog::Scenario::new(module_path!(), "idle_fake_service_child");
-    let Some(directory) = std::env::var_os("OINK_IDLE_CHILD") else {
-        return;
-    };
+    let directory = std::env::var_os("OINK_IDLE_CHILD")
+        .expect("idle_fake_service_child must be launched by idle_service_does_not_spin");
     let host = oink_agent::host::AgentHost::start_with_fake_platform(
         oink_agent::node::NodeOptions {
             net: oink_test_support::network_config(directory.into(), "idle", 0),

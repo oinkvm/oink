@@ -40,6 +40,11 @@ pub enum MainCommand {
         source: oink_foundation::DeviceId,
         age_ms: u32,
     },
+    /// An admitted sync unlock request from an attached source.
+    SyncUnlock {
+        source: oink_foundation::DeviceId,
+        epoch: u64,
+    },
     InputStatusChanged,
     /// Ordinary shutdown nudge; trace queues use the shared park notification.
     Wake,

@@ -55,7 +55,8 @@ pub(super) fn attach(
                 if cancelled.load(Ordering::Acquire) {
                     return Err(content::unavailable(Unavailable::Cancelled));
                 }
-                let pb = board(name.as_deref());
+                let turn = gate::enter();
+                let pb = board(&turn, name.as_deref());
                 if pb.changeCount() as u64 != count {
                     return Err(content::clipboard::changed());
                 }
@@ -97,9 +98,11 @@ pub(super) fn attach(
     });
     let key = Arc::new(move || {
         autoreleasepool(|_| {
-            if board(key_name.as_deref()).changeCount() as u64 != count {
+            let turn = gate::enter();
+            if board(&turn, key_name.as_deref()).changeCount() as u64 != count {
                 return Ok(None);
             }
+            drop(turn);
             crate::macos::clipboard_key::current(key_name.as_deref()).map(Some)
         })
     });

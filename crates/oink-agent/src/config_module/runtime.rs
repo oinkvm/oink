@@ -10,7 +10,7 @@ use oink_network::{
     admission,
     discovery::{Advert, Discovery, DiscoveryConfig, Sighting},
     group_state::State,
-    link::{ConfigEvent, DialFailure, DialMode, Direction, Disconnect, LinkId, LinkPath, PostError},
+    link::{ConfigEvent, DialFailure, DialMode, DialOrigin, Direction, Disconnect, LinkId, LinkPath, PostError},
     pair_journal::Journal,
     pair_merge::Transactions,
     pairing::{self, Sessions},
@@ -148,6 +148,8 @@ struct Dial {
     active: bool,
     last_relayed: bool,
     started: bool,
+    // A manual address makes the next attempt a request, not a background retry.
+    requested: bool,
     // Keep readiness through close(), which removes the session before Lost.
     ready_link: Option<LinkId>,
 }
@@ -186,6 +188,15 @@ impl Dial {
         // The larger-ID delay only applies to the initial round, never to an
         // explicit recovery signal such as Lost, interface change or wake.
         self.started = true;
+    }
+    /// Failures are reset by success, a lost ready link, wake, a network change and
+    /// a changed discovery beacon; only the timed retry after a failure is background.
+    fn origin(&self) -> DialOrigin {
+        if self.failures > 0 && !self.requested {
+            DialOrigin::BackgroundRetry
+        } else {
+            DialOrigin::Initial
+        }
     }
     fn due(&mut self, local: DeviceId, peer: DeviceId, now: Instant) -> bool {
         if self.active {
@@ -1833,10 +1844,11 @@ impl Owner {
                 } else {
                     DialMode::PreferDirect
                 };
-                match self.links.dial(peer, addresses, mode) {
+                match self.links.dial(peer, addresses, mode, dial.origin()) {
                     Ok(()) => {
                         dial.active = true;
                         dial.after = None;
+                        dial.requested = false;
                     }
                     Err(_) => dial.after = Some(now + REDIAL_INTERVAL),
                 }

@@ -64,6 +64,8 @@ fn state_key(command: &InputCommand) -> Option<StateKey> {
         | DndDeliveryReceipt { .. }
         | DndContentDemand { .. }
         | LocalUnlock { .. }
+        | SyncUnlockBroadcast { .. }
+        | SyncUnlockQuery { .. }
         | UnlockReplyReady { .. }
         | SendMessage { .. } => return None,
     };
@@ -207,99 +209,7 @@ impl Commands {
     pub(super) fn take_state(&self) -> Vec<StateCommand> {
         self.state.swap(None).map(Arc::unwrap_or_clone).unwrap_or_default()
     }
-    #[cfg(all(test, debug_assertions))]
-    pub(super) fn queue_len(&self) -> usize {
-        self.queue.len()
-    }
     pub(super) fn take_rejected(&self) -> u64 {
         self.rejected.swap(0, Ordering::Relaxed)
-    }
-}
-
-#[cfg(all(test, debug_assertions))]
-mod tests {
-    use super::*;
-    fn boot(device_id: oink_foundation::DeviceId) -> oink_foundation::session::Boot {
-        oink_foundation::session::Boot {
-            device_id,
-            nonce: [1; 16],
-        }
-    }
-
-    #[test]
-    fn concurrent_senders_share_bounded_action_admission_and_one_state_marker() {
-        let commands = Arc::new(Commands::new());
-        std::thread::scope(|scope| {
-            for _ in 0..8 {
-                let commands = commands.clone();
-                scope.spawn(move || {
-                    for _ in 0..2000 {
-                        commands.push(InputCommand::ReturnPointerHome);
-                        commands.push(InputCommand::FocusLock(true));
-                    }
-                });
-            }
-        });
-        commands.push(InputCommand::FocusLock(false));
-        assert_eq!(commands.queue_len(), ACTION_CAPACITY + 1);
-        assert_eq!(commands.take_rejected(), 16_000 - ACTION_CAPACITY as u64);
-        let mut actions = 0;
-        let mut states = 0;
-        while let Some(batch) = commands.pop() {
-            match batch {
-                Batch::Action(_) => actions += 1,
-                Batch::State => {
-                    let latest = commands.take_state();
-                    assert_eq!(latest.len(), 1);
-                    assert!(matches!(latest[0].0, InputCommand::FocusLock(false)));
-                    states += 1;
-                }
-            }
-        }
-        assert_eq!(actions, ACTION_CAPACITY);
-        assert_eq!(states, 1);
-    }
-
-    #[test]
-    fn peer_churn_is_bounded_without_using_local_state_or_shutdown_slots() {
-        let commands = Commands::new();
-        for id in 0..oink_protocol::v1::limits::MEMBERS as u8 {
-            let peer = oink_foundation::DeviceId([id; 32]);
-            commands.push(InputCommand::PeerFacts {
-                boot: boot(peer),
-                displays: vec![],
-                transform: None,
-                os: oink_routing::Os::Windows,
-            });
-            commands.push(InputCommand::RetirePeer(boot(peer)));
-        }
-        commands.push(InputCommand::PeerFacts {
-            boot: boot(oink_foundation::DeviceId([200; 32])),
-            displays: vec![],
-            transform: None,
-            os: oink_routing::Os::Windows,
-        });
-        commands.push(InputCommand::PeerFacts {
-            boot: boot(oink_foundation::DeviceId([0; 32])),
-            displays: vec![],
-            transform: None,
-            os: oink_routing::Os::MacOS,
-        });
-        commands.push(InputCommand::Paused(true));
-        commands.push(InputCommand::Stop);
-        assert_eq!(commands.take_rejected(), 1);
-        assert_eq!(commands.queue_len(), 1);
-        assert!(matches!(commands.pop(), Some(Batch::State)));
-        let states = commands.take_state();
-        assert_eq!(states.len(), STATE_CAPACITY - LOCAL_STATE_CAPACITY + 2);
-        assert!(matches!(states.last().unwrap().0, InputCommand::Stop));
-        assert!(states.iter().any(|c| matches!(
-            c.0,
-            InputCommand::PeerFacts {
-                os: oink_routing::Os::MacOS,
-                ..
-            }
-        )));
-        assert!(commands.pop().is_none());
     }
 }

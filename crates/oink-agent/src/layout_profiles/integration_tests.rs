@@ -1937,43 +1937,44 @@ async fn pairing_visibility_matrix(source_count: usize, target_count: usize) {
     }
 }
 
-fn pairing_visibility_gate() -> &'static tokio::sync::Mutex<()> {
-    static GATE: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
-    GATE.get_or_init(|| tokio::sync::Mutex::new(()))
-}
-
-async fn serialized_pairing_visibility_matrix(source_count: usize, target_count: usize) {
-    let _gate = pairing_visibility_gate().lock().await;
-    pairing_visibility_matrix(source_count, target_count).await;
+fn pairing_visibility_gate() -> &'static Mutex<()> {
+    static GATE: std::sync::OnceLock<Mutex<()>> = std::sync::OnceLock::new();
+    GATE.get_or_init(|| Mutex::new(()))
 }
 
 #[test]
 fn pairing_visibility_singleton_singleton_defaults_and_custom_profiles() {
+    // Queue before the scenario watchdog: another matrix owns its own budget.
+    let _gate = pairing_visibility_gate().lock().unwrap();
     crate::test_watchdog::run(
         module_path!(),
         "singleton visibility matrix",
         Some(4),
-        serialized_pairing_visibility_matrix(1, 1),
+        pairing_visibility_matrix(1, 1),
     );
 }
 
 #[test]
 fn pairing_visibility_group_singleton_defaults_and_custom_profiles() {
+    // Queue before the scenario watchdog: another matrix owns its own budget.
+    let _gate = pairing_visibility_gate().lock().unwrap();
     crate::test_watchdog::run(
         module_path!(),
         "group singleton visibility matrix",
         Some(8),
-        serialized_pairing_visibility_matrix(1, 3),
+        pairing_visibility_matrix(1, 3),
     );
 }
 
 #[test]
 fn pairing_visibility_group_group_defaults_and_custom_profiles() {
+    // Queue before the scenario watchdog: another matrix owns its own budget.
+    let _gate = pairing_visibility_gate().lock().unwrap();
     crate::test_watchdog::run(
         module_path!(),
         "group group visibility matrix",
         Some(8),
-        serialized_pairing_visibility_matrix(2, 2),
+        pairing_visibility_matrix(2, 2),
     );
 }
 

@@ -52,20 +52,10 @@ impl Node {
                 .entry(screen.id.device.into())
                 .or_insert(!screen.device_hidden);
         }
-        // A current local option revision does not prove that the owner can
-        // order a selection above every member. Use the same durable baseline
-        // coverage as the audio command, including records retained while peers
-        // are offline; unknown historical resolution alone must not block it.
-        let local_exit_selection_ready = {
-            let store = lock(&self.inner.config);
-            let owner = store.owner();
-            let claims = owner.claims(state.group);
-            owner.active_group() == Some(state.group)
-                && state
-                    .members
-                    .iter()
-                    .all(|member| claims.records.iter().any(|record| record.owner == *member))
-        };
+        // The audio command orders a selection above everything this owner has
+        // seen; other members' records are not prerequisites (oinkvm/oink#32).
+        // It needs only the owner's own record for the applied group.
+        let local_exit_selection_ready = lock(&self.inner.config).owner().active_group() == Some(state.group);
         let links = self.links().ok().map(|links| links.links());
         let members = config
             .members()

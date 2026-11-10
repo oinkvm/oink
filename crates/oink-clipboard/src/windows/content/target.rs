@@ -555,7 +555,14 @@ pub(crate) fn set_clipboard_guarded(
     let file_spec = vfile::Spec {
         cloud,
         descriptors: super::super::files::descriptors(&spec.files),
-        fixed: Vec::new(),
+        // The Oink clip marker: this clip's identity only, never content
+        // (crate::dedupe), served as an ordinary HGLOBAL format.
+        fixed: crate::dedupe::marker(spec.inventory.id)
+            .zip(super::format_id(&NativeFormat::WindowsRegistered(
+                crate::dedupe::MARKER_WINDOWS.into(),
+            )))
+            .map(|(marker, cf)| vec![(u32::from(cf), marker)])
+            .unwrap_or_default(),
         contents: spec.file_contents.clone().unwrap_or_else(|| Arc::new(NoFiles)),
         cf_descriptor: formats.file_descriptor,
         cf_contents: formats.file_contents,

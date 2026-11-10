@@ -161,7 +161,7 @@ it('does not overwrite the child preference when disabling contacts',async()=>{
   expect(result.current.prefs.macScrollFeel).toBe(true);
 });
 
-it.each([['clipReceive','receive'],['clipSend','send'],['removeDsStore','remove_ds_store']] as const)('persists the independent %s clipboard master',async(key,field)=>{
+it.each([['clipReceive','receive'],['clipSend','send'],['clipDedupe','dedupe'],['removeDsStore','remove_ds_store']] as const)('persists the independent %s clipboard master',async(key,field)=>{
   const {result}=renderHook(usePreferences);
   expect(result.current.prefs[key]).toBe(true);
   await act(async()=>result.current.set(key,false));
@@ -236,6 +236,27 @@ it('reloads the DS_Store preference from the device clipboard settings without a
   expect(unavailable.result.current.canEdit('removeDsStore')).toBe(false);
 });
 
+it('defaults Quicker compatibility off and saves only that local field',async()=>{
+  mocks.input.mockImplementation(async patch=>{
+    mocks.state={...mocks.state,input:{...(mocks.state.input as object),...patch}};
+    mocks.listeners.forEach(listener=>listener());
+  });
+  const mounted=renderHook(usePreferences);
+  expect(mounted.result.current.prefs.quickerCompat).toBe(false);
+  expect(mounted.result.current.canEdit('quickerCompat')).toBe(true);
+  mounted.unmount();
+  for(const enabled of [true,false]) {
+    const editing=renderHook(usePreferences);
+    mocks.input.mockClear();
+    await act(async()=>editing.result.current.set('quickerCompat',enabled));
+    expect(mocks.input).toHaveBeenCalledExactlyOnceWith({quicker_compat:enabled});
+    editing.unmount();
+    const reloaded=renderHook(usePreferences);
+    expect(reloaded.result.current.prefs.quickerCompat).toBe(enabled);
+    reloaded.unmount();
+  }
+});
+
 it('defaults foreground capture off for old settings and saves only the local edited field',async()=>{
   mocks.input.mockImplementation(async patch=>{
     mocks.state={...mocks.state,input:{...(mocks.state.input as object),...patch}};
@@ -259,6 +280,27 @@ it('defaults foreground capture off for old settings and saves only the local ed
   expect(mocks.transform).not.toHaveBeenCalled();
   expect(mocks.call).not.toHaveBeenCalled();
   expect(localStorage.getItem('oink:prefs')).toBeNull();
+});
+
+it('defaults sync unlock off and saves only that local input field',async()=>{
+  mocks.input.mockImplementation(async patch=>{
+    mocks.state={...mocks.state,input:{...(mocks.state.input as object),...patch}};
+    mocks.listeners.forEach(listener=>listener());
+  });
+  const mounted=renderHook(usePreferences);
+  expect(mounted.result.current.prefs.syncUnlock).toBe(false);
+  expect(mounted.result.current.canEdit('syncUnlock')).toBe(true);
+  mounted.unmount();
+  for(const enabled of [true,false]) {
+    const editing=renderHook(usePreferences);
+    mocks.input.mockClear();
+    await act(async()=>editing.result.current.set('syncUnlock',enabled));
+    expect(mocks.input).toHaveBeenCalledExactlyOnceWith({sync_unlock_others:enabled});
+    editing.unmount();
+    const reloaded=renderHook(usePreferences);
+    expect(reloaded.result.current.prefs.syncUnlock).toBe(enabled);
+    reloaded.unmount();
+  }
 });
 
 it.each(['macos','windows'])('defaults source wheel lines on and persists only its local patch on %s', async platform => {

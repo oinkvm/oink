@@ -189,6 +189,7 @@ pub fn recover(root: &Path, consent: ReportConsent, manifest: &Manifest) -> Vec<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::BufRead;
     fn test_lease() -> Lease {
         Lease {
             generation: 1,
@@ -208,29 +209,46 @@ mod tests {
     #[test]
     fn killed_collector_owner_leaves_no_raw_dump() {
         const KEY: &str = "OINK_KILLED_DUMP_OWNER";
+        // The readiness signal travels alone on the child's stderr. libtest owns
+        // stdout (a leading blank line, "running 1 test", and a "test ... "
+        // prefix without a newline when single-threaded), so no line of the
+        // child's stdout is reliably ours.
+        const READY: &str = "OINK_KILLED_DUMP_OWNER_READY";
         if let Some(root) = std::env::var_os(KEY) {
             let root = PathBuf::from(root);
             let mut writer = Writer::reserve(&root, test_lease()).unwrap();
             writer.write_at(0, b"private stack bytes").unwrap();
-            std::fs::write(root.join("ready"), b"1").unwrap();
+            eprintln!("{READY}");
             loop {
                 std::thread::park();
             }
         }
         let root = tempfile::tempdir().unwrap();
         let mut child = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "staging::tests::killed_collector_owner_leaves_no_raw_dump"])
+            .args([
+                "--exact",
+                "staging::tests::killed_collector_owner_leaves_no_raw_dump",
+                "--nocapture",
+            ])
             .env(KEY, root.path())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
             .spawn()
             .unwrap();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while !root.path().join("ready").exists() && std::time::Instant::now() < deadline {
-            std::thread::sleep(std::time::Duration::from_millis(10));
+        let stderr = std::io::BufReader::new(child.stderr.take().unwrap());
+        let mut other = Vec::new();
+        let mut ready = false;
+        for line in stderr.lines() {
+            let line = line.unwrap();
+            if line.trim_end() == READY {
+                ready = true;
+                break;
+            }
+            other.push(line);
         }
-        let ready = root.path().join("ready").exists();
         child.kill().unwrap();
         child.wait().unwrap();
-        assert!(ready);
+        assert!(ready, "owner exited before reserving its slot; stderr: {other:?}");
         assert!(
             !root.path().join("0.dmp").exists(),
             "OS must delete raw memory on process death"

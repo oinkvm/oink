@@ -125,7 +125,31 @@ impl Drop for WinInput {
     }
 }
 
+/// Remote-input injection. With Quicker compatibility on, mouse button
+/// transitions go out untagged and every mouse injection re-arms the hook's
+/// window both before (the hook may run before SendInput or the helper reply
+/// returns) and after delivery.
 fn send(inputs: &[INPUT]) -> Result<(), InputError> {
+    if !crate::quicker_compat::enabled() {
+        return deliver(inputs);
+    }
+    let mut inputs = inputs.to_vec();
+    let mut mouse = false;
+    for input in &mut inputs {
+        inject::untag_for_quicker(input);
+        mouse |= input.r#type == windows::Win32::UI::Input::KeyboardAndMouse::INPUT_MOUSE;
+    }
+    if mouse {
+        crate::quicker_compat::MOUSE.arm(std::time::Instant::now());
+    }
+    let result = deliver(&inputs);
+    if mouse {
+        crate::quicker_compat::MOUSE.arm(std::time::Instant::now());
+    }
+    result
+}
+
+fn deliver(inputs: &[INPUT]) -> Result<(), InputError> {
     if service::send(inputs)? {
         return Ok(());
     }
@@ -158,6 +182,10 @@ fn cursor_dpi() -> u32 {
 impl InputBackend for WinInput {
     fn reconcile_passed_modifiers(&self, candidates: u8) -> u8 {
         hook::reconcile_passed_modifiers(candidates)
+    }
+
+    fn set_quicker_compat(&self, enabled: bool) {
+        crate::quicker_compat::set_enabled(enabled);
     }
 
     fn set_source_foreground(&self, enabled: bool) {
@@ -246,7 +274,8 @@ impl InputBackend for WinInput {
         self.declare_user_activity()?;
         // Use the same protected-install OinkInput service path as routed input.
         // Tagged zero displacement; idle/lock behavior awaits Windows hardware verification.
-        send(&[inject::mouse(0, 0, 0, MOUSEEVENTF_MOVE)]).map(|()| true)
+        // Not remote input: never arms the Quicker compatibility window.
+        deliver(&[inject::mouse(0, 0, 0, MOUSEEVENTF_MOVE)]).map(|()| true)
     }
 
     fn start(&self, handler: EventHandler) -> Result<(), InputError> {

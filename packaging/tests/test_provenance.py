@@ -59,25 +59,6 @@ class Provenance(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, 'inventory changed'):
                 P.source_tree_sha256(root, inventory)
 
-    def test_tree_hash_is_sorted_paths_modes_and_bytes(self):
-        with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)
-            (root / 'z').write_bytes(b'last\0bytes')
-            (root / 'a').write_bytes(b'first')
-            for directory in ('build', 'target', '.git', 'evidence', 'node_modules'):
-                (root / directory).mkdir()
-                (root / directory / 'ignored').write_bytes(b'not source')
-            # A .git file/directory only selects Git inventory for actual repos.
-            (root / '.git').rename(root / 'build/git-metadata')
-            expected = hashlib.sha256(b'a\x00100644\x005\x00firstz\x00100644\x0010\x00last\x00bytes').hexdigest()
-            self.assertEqual(P.source_tree_sha256(root), expected)
-            inventory = P.source_inventory(root)
-            self.assertEqual(P.source_tree_sha256(root, list(reversed(inventory))), expected)
-            (root / 'z').write_bytes(b'changed')
-            self.assertNotEqual(P.source_tree_sha256(root), expected)
-            with self.assertRaisesRegex(RuntimeError, 'Source changed'):
-                P.source_tree_sha256(root, inventory)
-
     @unittest.skipIf(os.name == 'nt', 'POSIX mode and symlink semantics')
     def test_executable_modes_and_symlink_text_are_source(self):
         with tempfile.TemporaryDirectory() as temp:

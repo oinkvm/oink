@@ -3,9 +3,9 @@ on:
   workflow_dispatch:
     inputs:
       build:
-        description: Reserved product build shared by public and in-house packages (0.3.4 uses 108)
+        description: Reserved product build shared by public and in-house packages (0.3.5 uses 112)
         required: true
-        default: '108'
+        default: '112'
         type: string
 permissions:
   contents: read
@@ -91,7 +91,7 @@ jobs:
           $dev = Join-Path $vs 'Common7/Tools/VsDevCmd.bat'
           $out = Join-Path $env:RUNNER_TEMP 'installer-policy'
           New-Item -ItemType Directory -Force $out | Out-Null
-          foreach ($name in @('AuthorizationTests','QuiescenceTests','MaintenanceCleanupTests','CloudFilesCleanupTests','FinishInstallTests','GracefulStopTests')) {
+          foreach ($name in @('AuthorizationTests','QuiescenceTests','MaintenanceCleanupTests','CloudFilesCleanupTests','FinishInstallTests','GracefulStopTests','RelaunchTests')) {
             $src = Join-Path $env:GITHUB_WORKSPACE "packaging/windows/$name.cpp"
             cmd /d /c "`"$dev`" -arch=x64 >nul && cl.exe /nologo /EHsc /std:c++17 /W4 /WX /MT `"$src`" /Fo`"$out/$name.obj`" /Fe`"$out/$name.exe`" advapi32.lib user32.lib && `"$out/$name.exe`""
             if ($LASTEXITCODE) { exit $LASTEXITCODE }

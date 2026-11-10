@@ -64,6 +64,8 @@ pub struct Settings {
     pub confirm_quit: bool,
     pub paste_as_file: bool,
     pub emergency_hold_ms: EmergencyHoldMs,
+    /// 同步解锁其它设备: device-local, never replicated; default off.
+    pub sync_unlock_others: bool,
     #[serde(skip)]
     pub clipboard_enabled: bool,
     #[serde(skip)]
@@ -112,6 +114,7 @@ impl Default for Settings {
             confirm_quit: true,
             paste_as_file: true,
             emergency_hold_ms: EmergencyHoldMs::default(),
+            sync_unlock_others: false,
             clipboard_enabled: true,
             screen_shared: true,
             screen_preferences: ScreenPreferences::default(),
@@ -912,6 +915,31 @@ mod tests {
             assert_eq!(raw["local"]["routing"]["take_foreground_on_leave"], enabled);
             raw.as_object_mut().unwrap().remove("local");
             assert!(!raw.to_string().contains("take_foreground_on_leave"));
+        }
+    }
+
+    #[test]
+    fn quicker_compat_defaults_off_and_stays_device_local() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = AgentConfig::load_from(dir.path()).unwrap();
+        config.save().unwrap();
+        assert!(!config.settings.routing.quicker_compat);
+        for enabled in [true, false] {
+            config
+                .update_local(&serde_json::json!({"routing":{"quicker_compat":enabled}}), |s| {
+                    s.routing.quicker_compat = enabled
+                })
+                .unwrap();
+            let reloaded = AgentConfig::load_from(dir.path()).unwrap();
+            assert_eq!(reloaded.settings.routing.quicker_compat, enabled);
+            assert!(
+                reloaded.settings.routing.forward_injected_input,
+                "do not pin sibling defaults"
+            );
+            let mut raw = stored(dir.path());
+            assert_eq!(raw["local"]["routing"]["quicker_compat"], enabled);
+            raw.as_object_mut().unwrap().remove("local");
+            assert!(!raw.to_string().contains("quicker_compat"));
         }
     }
 

@@ -909,3 +909,6 @@ fn validate_local_click(raw: &RawMap) -> Result<()> {
 // Source answers about its own current console; no credential or credential status.
 wire_map!(ControlUnlockQuery,no_validation,{1=>epoch:u64=required;});
 wire_map!(ControlUnlockReply,no_validation,{1=>epoch:u64=required;2=>unlocked:bool=required;});
+// An unlocked source's per-edge hint. The target never trusts it: it challenges
+// the source with ControlUnlockQuery on the same session before acting.
+wire_map!(ControlSyncUnlock,no_validation,{1=>epoch:u64=required;});

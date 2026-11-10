@@ -40,6 +40,18 @@ pub enum DialMode {
     All,
 }
 
+/// What started a dial. Only performance reporting reads it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DialOrigin {
+    /// A request or recovery signal: pairing, a new member, a manual address, startup,
+    /// wake, a network change, a lost ready link. Every outcome is a setup sample.
+    Initial,
+    /// A timed retry after this peer's previous attempt failed (or a timed direct
+    /// upgrade of a relayed link). Only a success is a setup sample: an unreachable
+    /// member would otherwise fill `link_setup` with dial-budget timeouts.
+    BackgroundRetry,
+}
+
 /// Why `LinkLayer::dial` did not start an attempt.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum DialRefused {

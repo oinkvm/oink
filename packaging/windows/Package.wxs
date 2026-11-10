@@ -13,6 +13,10 @@
     <Property Id="ARPPRODUCTICON" Value="OinkIcon.ico" />
     <!-- Private UI properties never cross to the elevated execute sequence. -->
     <Property Id="OinkLaunch" Value="1" />
+    <!-- Launch Oink is a fresh-install choice. An upgrade restores the previous
+         state instead: RelaunchUserSessions reopens Oink only where it was running. -->
+    <SetProperty Id="OinkLaunch" Action="NoUpgradeLaunch" Value="0" After="FindRelatedProducts" Sequence="ui"
+                 Condition="WIX_UPGRADE_DETECTED" />
     <Property Id="OINK_DESKTOP_SHORTCUT" Secure="yes" />
     <!-- Launch at login: chosen on the welcome page, before the elevated
          transaction, because it also enables the machine-level pre-login
@@ -188,6 +192,13 @@
     <CustomAction Id="EnablePrelogin" BinaryRef="InstallerCA" DllEntry="EnablePrelogin" Execute="deferred" Impersonate="no" Return="ignore" />
     <SetProperty Id="EnablePrelogin" Value="[UserSID]" Before="EnablePrelogin" Sequence="execute"
                  Condition="OINK_START_AT_LOGIN = &quot;1&quot; AND NOT REMOVE" />
+    <!-- Any standalone install/upgrade/repair (double-click, msiexec at any UI
+         level) reopens Oink in each session where PrepareUserSessions found it
+         running before asking it to quit (issue #36). Restart Manager is not
+         used: it restarts only applications it shut down itself, and Oink
+         quits through its own ordered Quit before InstallValidate. Commit-only
+         SYSTEM action; OinkInput creates the UI with the session's own token. -->
+    <CustomAction Id="RelaunchUserSessions" BinaryRef="InstallerCA" DllEntry="RelaunchUserSessions" Execute="commit" Impersonate="no" Return="ignore" />
     <!-- Called only by the successful full-UI Finish button, in the client. -->
     <CustomAction Id="FinishInstall" BinaryRef="InstallerCA" DllEntry="FinishInstall" Execute="immediate" Return="check" />
     <!-- Execute sequence only: full UI must return from its final Install/
@@ -230,6 +241,7 @@
       <Custom Action="CleanupMaintenance" Before="InstallFinalize" Condition="REMOVE~=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />
       <Custom Action="RemoveLoginEntry" Before="RemoveRegistryValues" Condition="REMOVE~=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />
       <Custom Action="EnablePrelogin" After="StartServices" Condition="OINK_START_AT_LOGIN = &quot;1&quot; AND NOT REMOVE" />
+      <Custom Action="RelaunchUserSessions" After="EnablePrelogin" Condition="NOT REMOVE" />
     </InstallExecuteSequence>
     <Feature Id="Product" Title="$(var.ProductName)" Level="1">
       <ComponentRef Id="InstallRoot" />

@@ -66,6 +66,11 @@ async fn step(nodes: &mut [Running]) {
     tokio::select! { _ = a.step() => {}, _ = b.step() => {}, _ = c.step() => {} }
 }
 async fn start() -> Vec<Running> {
+    start_with(false, true).await
+}
+/// Node 0 relays between nodes 1 and 2, whose direct path is blocked.
+/// `old_relay` makes node 0 a peer that does not offer sync unlock.
+async fn start_with(old_relay: bool, hold_headers: bool) -> Vec<Running> {
     let identities: Vec<_> = (1..=3).map(|seed| Arc::new(Identity::from_seed([seed; 32]))).collect();
     let states = crate::config_module::runtime_tests::same_group(3);
     let mut pending = Vec::new();
@@ -73,8 +78,12 @@ async fn start() -> Vec<Running> {
         let directory = tempfile::tempdir().unwrap();
         group_store::save(&directory.path().join(group_store::STATE_FILE), &state).unwrap();
         let network = oink_test_support::network_config(directory.path().into(), "synthetic", 0);
+        let mut profile = crate::node::Node::offer_profile();
+        if old_relay && n == 0 {
+            profile.capabilities.retain(|c| c != "oink.auto-unlock.sync/1");
+        }
         let (links, port) = oink_network::link::LinkLayer::start(LinkConfig {
-            profile: crate::node::Node::offer_profile(),
+            profile,
             identity: identity.clone(),
             boot: Boot {
                 device_id: identity.id(),
@@ -88,7 +97,9 @@ async fn start() -> Vec<Running> {
         if n > 0 {
             let peer = identities[3 - n].id();
             testing::set_direct_blocked(&links, peer, true);
-            testing::hold_input_header(&links, Some(peer));
+            if hold_headers {
+                testing::hold_input_header(&links, Some(peer));
+            }
         }
         let input_port = links.register(KINDS);
         pending.push((directory, identity.clone(), network, links, port, input_port));
@@ -275,6 +286,168 @@ fn pause(config: &ConfigModule, paused: bool) {
     config
         .publish_local_owner(facts.preferences().unwrap().unwrap().0, state)
         .unwrap();
+}
+
+/// Sync unlock is independent of the network path (user decision Q8): the
+/// hint, the source challenge and its answer all travel on the one relayed
+/// logical session, the source identity is the session peer (not the relay),
+/// and the relay itself does not need the new capability.
+#[test]
+fn sync_unlock_round_trips_over_a_relay_that_lacks_the_capability() {
+    crate::test_watchdog::run(
+        module_path!(),
+        "sync_unlock_round_trips_over_a_relay_that_lacks_the_capability",
+        Some(6),
+        sync_round_trip(false, false),
+    );
+}
+/// The relay's own pause only closes its own input sessions; it keeps carrying
+/// the B↔C session (user decision Q10 applies to the two endpoints).
+#[test]
+fn sync_unlock_round_trips_while_the_relay_itself_is_paused() {
+    crate::test_watchdog::run(
+        module_path!(),
+        "sync_unlock_round_trips_while_the_relay_itself_is_paused",
+        Some(6),
+        sync_round_trip(false, true),
+    );
+}
+/// A relay to direct migration keeps the logical session: a challenge sent on
+/// the relayed path is answered on the direct one, never as a lost source.
+#[test]
+fn sync_unlock_challenge_survives_relay_to_direct_migration() {
+    crate::test_watchdog::run(
+        module_path!(),
+        "sync_unlock_challenge_survives_relay_to_direct_migration",
+        Some(6),
+        sync_round_trip(true, false),
+    );
+}
+async fn sync_round_trip(migrate: bool, relay_paused: bool) {
+    use crate::auto_unlock::sync::SourceAnswer;
+    use crate::threads::{MainCommand, input::InputCommand};
+    let mut nodes = start_with(true, false).await;
+    let relay = nodes[0].owner.links.id();
+    let b = nodes[1].owner.links.clone();
+    let c = nodes[2].owner.links.clone();
+    crate::test_watchdog::phase("relayed input attachment");
+    while !nodes[1].attached(c.id())
+        || !nodes[2].attached(b.id())
+        || !nodes[1].attached(relay)
+        || !nodes[2].attached(relay)
+    {
+        step(&mut nodes).await;
+    }
+    assert!(matches!(
+        b.links().by_peer(c.id()).unwrap().path,
+        oink_network::link::LinkPath::Relayed { .. }
+    ));
+    if relay_paused {
+        crate::test_watchdog::phase("relay pauses its own sharing");
+        pause(&nodes[0].owner.config, true);
+        while !nodes[0].owner.paused || nodes[1].attached(relay) || nodes[2].attached(relay) {
+            step(&mut nodes).await;
+        }
+        assert!(nodes[1].attached(c.id()) && nodes[2].attached(b.id()));
+    }
+    for node in &nodes {
+        while node._main.try_recv().is_ok() {}
+    }
+    // Drives the three owners until `found` matches a main command of
+    // node `index`; the input threads run on their own threads.
+    async fn until<T>(nodes: &mut [Running], index: usize, mut found: impl FnMut(MainCommand) -> Option<T>) -> T {
+        loop {
+            while let Ok(command) = nodes[index]._main.try_recv() {
+                if let Some(value) = found(command) {
+                    return value;
+                }
+            }
+            let _ = tokio::time::timeout(Duration::from_millis(10), step(nodes)).await;
+        }
+    }
+    crate::test_watchdog::phase("hint from B reaches C through the relay");
+    nodes[1]
+        .owner
+        .input
+        .send(InputCommand::SyncUnlockBroadcast { epoch: 41 });
+    let (source, epoch) = until(&mut nodes, 2, |command| match command {
+        MainCommand::SyncUnlock { source, epoch } => Some((source, epoch)),
+        _ => None,
+    })
+    .await;
+    assert_eq!(
+        (source, epoch),
+        (b.id(), 41),
+        "source is the session peer, not the relay"
+    );
+    crate::test_watchdog::phase("C challenges B on the same relayed session");
+    nodes[2].owner.input.send(InputCommand::SessionLocked(Some(true)));
+    let (reply, answer) = std::sync::mpsc::sync_channel(1);
+    let asked = Instant::now();
+    nodes[2]
+        .owner
+        .input
+        .send(InputCommand::SyncUnlockQuery { source, reply });
+    let (peer, stream, query) = until(&mut nodes, 1, |command| match command {
+        MainCommand::UnlockQuery { peer, stream, epoch } => Some((peer, stream, epoch)),
+        _ => None,
+    })
+    .await;
+    assert_eq!(peer, c.id());
+    if migrate {
+        crate::test_watchdog::phase("relay to direct migration during the challenge");
+        testing::set_direct_blocked(&b, c.id(), false);
+        testing::set_direct_blocked(&c, b.id(), false);
+        b.update_addresses(c.id(), vec![c.local_addr()]);
+        tokio::join!(testing::cutover_finished(&b), testing::cutover_finished(&c));
+        assert!(!matches!(
+            b.links().by_peer(c.id()).unwrap().path,
+            oink_network::link::LinkPath::Relayed { .. }
+        ));
+    }
+    // B's main thread answers for its own (here: unlocked) session.
+    nodes[1].owner.input.send(InputCommand::UnlockReplyReady {
+        peer,
+        stream,
+        epoch: query,
+        unlocked: true,
+    });
+    let started = Instant::now();
+    let answer = loop {
+        if let Ok(answer) = answer.try_recv() {
+            break answer;
+        }
+        let _ = tokio::time::timeout(Duration::from_millis(10), step(&mut nodes)).await;
+    };
+    // The reply crosses the migrated session at once. Migration never
+    // cancels the challenge or reports a lost source; only the source's
+    // own two-second window decides (this harness' cutover is slower).
+    let expected = if asked.elapsed() <= crate::auto_unlock::sync::SOURCE_REPLY {
+        SourceAnswer::Unlocked
+    } else {
+        SourceAnswer::Locked
+    };
+    assert!(migrate || expected == SourceAnswer::Unlocked);
+    assert_eq!(
+        answer,
+        expected,
+        "answered {:?} after the challenge, {:?} after the reply",
+        asked.elapsed(),
+        started.elapsed()
+    );
+    assert!(started.elapsed() < crate::auto_unlock::sync::SOURCE_REPLY);
+    // The relay negotiated no sync capability with either endpoint and
+    // never received the hint itself.
+    assert!(
+        !std::iter::from_fn(|| nodes[0]._main.try_recv().ok())
+            .any(|command| matches!(command, MainCommand::SyncUnlock { .. }))
+    );
+    crate::test_watchdog::phase("input and network shutdown");
+    for node in &nodes {
+        node.owner.input.stop();
+        node.owner.config.stop().await;
+        node.owner.links.stop().await;
+    }
 }
 
 #[test]

@@ -586,6 +586,7 @@ fn spawn_update_target(id: u32, user: &[u8], target: crate::launch_recipe::Targe
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
     use std::os::windows::io::AsRawHandle;
 
     fn track(child: &std::process::Child) -> StartedProcess {
@@ -631,17 +632,21 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "slow: held-process wait-handle fixture"]
     fn held_process_fixture() {
         if std::env::var_os("OINK_HELD_PROCESS_FIXTURE").is_some() {
-            std::thread::sleep(Duration::from_secs(15));
+            let mut input = std::io::stdin().lock();
+            let mut release = [0; 1];
+            std::io::Read::read_exact(&mut input, &mut release).unwrap();
         }
     }
 
     #[test]
     fn wait_handle_detects_a_later_exit_without_granting_process_mutation() {
         let mut child = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "platform::backend::tests::held_process_fixture"])
+            .args(["--exact", "platform::backend::tests::held_process_fixture", "--ignored"])
             .env("OINK_HELD_PROCESS_FIXTURE", "1")
+            .stdin(std::process::Stdio::piped())
             .spawn()
             .unwrap();
         let tracked = track(&child);
@@ -649,7 +654,7 @@ mod tests {
         // SAFETY: query/wait handle intentionally lacks PROCESS_TERMINATE.
         assert_eq!(unsafe { TerminateProcess(tracked.process.0, 42) }, 0);
         assert_eq!(io::Error::last_os_error().raw_os_error(), Some(5));
-        child.kill().unwrap();
+        child.stdin.take().unwrap().write_all(&[1]).unwrap();
         child.wait().unwrap();
         assert!(tracked.exit_code().unwrap().is_some());
     }

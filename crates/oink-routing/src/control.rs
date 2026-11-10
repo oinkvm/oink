@@ -77,6 +77,11 @@ pub enum ControlMsg {
         epoch: u64,
         unlocked: bool,
     },
+    /// The sender's user just unlocked it. Only a hint: the receiver challenges
+    /// the sender with UnlockQuery on the same session before acting.
+    SyncUnlock {
+        epoch: u64,
+    },
     FocusEnter {
         epoch: u64,
         display: String,

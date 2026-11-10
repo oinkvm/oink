@@ -56,9 +56,12 @@ describe('arrangement computer names',()=>{
     const checkNames=()=>{
       rerender(<Arrangement {...props} screens={presentScreens(result.current.value,devices)}/>);
       expect(Array.from(container.querySelectorAll('.scr__name'),el=>el.textContent)).toEqual([renamed,renamed,'Remote computer']);
-      expect(Array.from(container.querySelectorAll('.scr__res'),el=>el.textContent)).toEqual(['1920 × 1080','1920 × 1080','1920 × 1080']);
+      // bounds are 1920 × 1080 points over a 3840 × 2160 backing store: label the pixels.
+      expect(Array.from(container.querySelectorAll('.scr__res'),el=>el.textContent)).toEqual(['3840 × 2160','3840 × 2160','3840 × 2160']);
       const label=container.querySelector('.scr')!.getAttribute('aria-label')!;
       expect(label.startsWith(renamed)).toBe(true);
+      // The accessible name reads the badge's figure, not render-canvas units.
+      expect(label).toMatch(/[，,] ?3840 × 2160[，,]/);
       expect(label).toContain(language==='en'?'position':'位置');
       expect(label).not.toMatch(/Display|Monitor model/);
     };

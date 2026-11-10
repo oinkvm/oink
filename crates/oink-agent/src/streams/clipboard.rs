@@ -67,11 +67,6 @@ pub struct ClipboardStreams {
 }
 
 impl ClipboardStreams {
-    #[cfg(test)]
-    pub(super) fn attachment_count(&self) -> u64 {
-        self.next_attachment
-    }
-
     pub fn new(links: LinkLayer, config: ConfigModule) -> Self {
         let paused = config.applied().paused;
         let files = files::FileLinks::new(links.clone(), StreamKind::Clipboard);

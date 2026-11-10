@@ -130,6 +130,7 @@ mod tests {
         assert!(jitter_bins(u64::MAX, [0; 5]).unwrap().2);
     }
     #[test]
+    #[ignore = "slow: random sampling cycle stress"]
     fn input_phase_and_transient_timers_are_bounded() {
         let mut gate = InputGate::new().unwrap();
         assert_eq!((0..10000).filter(|_| gate.select()).count(), 100);

@@ -113,7 +113,7 @@ mod tests {
         assert_eq!(
             serde_json::to_value(applied).unwrap(),
             json!({
-                "receive":false,"send":true,"remove_ds_store":false,
+                "receive":false,"send":true,"remove_ds_store":false,"dedupe":true,
                 "text":true,"rich_text":true,"images":true,"files":true,"custom":true
             })
         );

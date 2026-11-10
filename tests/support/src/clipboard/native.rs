@@ -197,6 +197,30 @@ pub(super) fn capture(fake: &FakeClipboard, _data: &Path) -> Result<oink_clipboa
     };
     let mut bytes = HashMap::new();
     let mut roots = vec![];
+    if let Some(marker) = fake.marker() {
+        // Like the native writers: one private format next to the content.
+        let id = RepresentationId(u32::MAX);
+        bytes.insert(id, marker.clone());
+        inventory.items.push(ContentItem {
+            virtual_files: false,
+            id: ItemId(u32::MAX),
+            file: None,
+            representations: vec![Representation {
+                id,
+                format: format(match platform() {
+                    ClipPlatform::Mac => oink_clipboard::dedupe::MARKER_MAC,
+                    _ => oink_clipboard::dedupe::MARKER_WINDOWS,
+                }),
+                medium: Medium::Bytes,
+                aspect: 1,
+                index: -1,
+                standard: None,
+                data: RepresentationData::Reader {
+                    size: ContentSize::Known(marker.len() as u64),
+                },
+            }],
+        });
+    }
     for (index, data) in data.iter().enumerate() {
         let id = RepresentationId((index + 1) as u32);
         let (format, standard, payload) = match data {
@@ -310,8 +334,11 @@ pub(super) fn write_guarded(
 ) -> Result<u64, ClipboardError> {
     if fake.lock().deferred_native {
         guard().map_err(|_| ClipboardError::Busy)?;
+        let marker = oink_clipboard::dedupe::marker(spec.inventory.id);
         let count = fake.set(content::items(&spec.inventory), spec.sensitivity);
-        fake.lock().native = Some(spec);
+        let mut inner = fake.lock();
+        inner.native = Some(spec);
+        inner.marker = marker;
         return Ok(count);
     }
     if !spec.files.is_empty() && spec.file_contents.is_some() && !fake.lock().virtual_files {
@@ -335,7 +362,9 @@ pub(super) fn write_guarded(
     }
     guard().map_err(|_| ClipboardError::Busy)?;
     let count = fake.set(items, spec.sensitivity);
-    fake.lock().contents = spec.file_contents;
+    let mut inner = fake.lock();
+    inner.contents = spec.file_contents;
+    inner.marker = oink_clipboard::dedupe::marker(spec.inventory.id);
     Ok(count)
 }
 

@@ -945,3 +945,35 @@ fn keyboard_and_mouse_disabled_modes_enable_to_shared_without_restoring_local() 
     assert!(r.keyboard_local());
     assert!(r.mouse_local());
 }
+
+#[test]
+fn unrecorded_injected_button_up_passes_locally_without_forwarding_or_claiming() {
+    // Windows Quicker compatibility mode: Oink's own untagged button DOWN is
+    // passed before routing, but every UP is routed. Such an UP has no recorded
+    // press here, so it must reach the local OS and nothing else.
+    for remote in [false, true] {
+        let mut r = router(remote);
+        let claim = r.focus_claim();
+        for button in [
+            MouseButton::Left,
+            MouseButton::Right,
+            MouseButton::Middle,
+            MouseButton::Back,
+            MouseButton::Forward,
+        ] {
+            let d = r.on_local_event(
+                &CapturedEvent {
+                    event: InputEvent::Button { button, pressed: false },
+                    source: SourceKind::Unknown,
+                    physical: false,
+                    time_us: 100,
+                    cursor: (!remote).then(|| Point::new(123., 234.)),
+                },
+                100,
+            );
+            assert_eq!(d, Disposition::Pass, "remote={remote} {button:?}");
+        }
+        assert!(inputs(&r).is_empty(), "remote={remote}");
+        assert_eq!(r.focus_claim(), claim);
+    }
+}

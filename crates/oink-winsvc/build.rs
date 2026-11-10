@@ -12,6 +12,10 @@ fn main() {
             .file("native/unlock.cpp")
             .include("../oink-credential-provider")
             .flag_if_supported("/EHsc")
+            // /W4 /WX: an unknown escape in a registry path (C4129) once
+            // shipped as a mere build-script warning.
+            .warnings(true)
+            .warnings_into_errors(true)
             .compile("oink_auto_unlock");
         for lib in [
             "advapi32", "wtsapi32", "crypt32", "user32", "shell32", "ole32", "userenv",

@@ -174,15 +174,17 @@ pub(super) struct CandidateDial {
     pub peer: DeviceId,
     pub address: std::net::SocketAddr,
     pub operation: String,
+    origin: super::DialOrigin,
     started: Instant,
     done: bool,
 }
 impl CandidateDial {
-    pub fn start(peer: DeviceId, address: std::net::SocketAddr, operation: String) -> Self {
+    pub fn start(peer: DeviceId, address: std::net::SocketAddr, operation: String, origin: super::DialOrigin) -> Self {
         let trace = Self {
             peer,
             address,
             operation,
+            origin,
             started: Instant::now(),
             done: false,
         };
@@ -207,11 +209,15 @@ impl CandidateDial {
     }
     pub fn end(&mut self, result: &'static str, reason: &'static str, error: &str) {
         if !self.done {
-            super::timing::record(
-                super::timing::Measurement::Stage(super::timing::Stage::Dial),
-                self.started,
-                Instant::now(),
-            );
+            // A background retry's failed candidate is an unreachable member's
+            // dial budget running out, not setup latency anyone waits for.
+            if result == "completed" || self.origin == super::DialOrigin::Initial {
+                super::timing::record(
+                    super::timing::Measurement::Stage(super::timing::Stage::Dial),
+                    self.started,
+                    Instant::now(),
+                );
+            }
             self.emit(result, reason, error);
             self.done = true;
         }
@@ -285,6 +291,7 @@ pub(super) mod tests {
             DeviceId([1; 32]),
             "127.0.0.1:47470".parse().unwrap(),
             hex(&[3; 16]),
+            crate::link::DialOrigin::Initial,
         ));
         let rows = rows.lock().unwrap();
         let failed: Vec<_> = rows
@@ -333,5 +340,30 @@ mod scheduling_tests {
             available,
             "ordinary log formatting held metadata used by the network owner"
         );
+    }
+}
+
+#[cfg(test)]
+mod timing_tests {
+    use super::*;
+    use crate::link::{
+        DialOrigin,
+        timing::{Measurement, Stage, tests::capture},
+    };
+    #[test]
+    fn background_retry_candidates_report_only_successful_dials() {
+        let address = "127.0.0.1:9".parse().unwrap();
+        let peer = DeviceId([7; 32]);
+        let events = capture(|| {
+            let retry =
+                |operation: &str| CandidateDial::start(peer, address, operation.into(), DialOrigin::BackgroundRetry);
+            retry("01").end("failed", "timeout", "QUIC dial deadline");
+            drop(retry("02"));
+            retry("03").end("completed", "authenticated", "");
+            CandidateDial::start(peer, address, "04".into(), DialOrigin::Initial).end("failed", "timeout", "");
+            drop(CandidateDial::start(peer, address, "05".into(), DialOrigin::Initial));
+        });
+        // Retry: only the completed candidate. Initial: the timeout and the cancellation.
+        assert_eq!(events, vec![Measurement::Stage(Stage::Dial); 3]);
     }
 }

@@ -551,7 +551,6 @@ mod tests {
         use std::io::Write;
         let (receiver, mut helper) = UnixStream::pair().unwrap();
         let sender = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(20));
             helper.write_all(&[1]).unwrap();
         });
         assert_eq!(read_ready(receiver, Instant::now() + Duration::from_secs(1)), Ok(()));
@@ -567,6 +566,7 @@ mod tests {
         }
     }
     #[test]
+    #[ignore = "slow: requires an injected preparation clock"]
     fn readiness_obeys_the_preparation_deadline_with_a_silent_live_helper() {
         let (receiver, _helper) = UnixStream::pair().unwrap();
         let started = Instant::now();
@@ -665,7 +665,7 @@ mod tests {
         );
     }
     #[test]
-    #[ignore = "requires genuine baseline/candidate bundles; isolated swap with a validation-only launcher, no desktop UI"]
+    #[ignore = "device: requires genuine baseline/candidate bundles and a validation-only launcher"]
     fn external_isolated_handoff_and_bundle_replacement() {
         let baseline = PathBuf::from(std::env::var("OINK_LOCAL_UPDATE_TEST_BASELINE").expect("explicit baseline"));
         let candidate = PathBuf::from(std::env::var("OINK_LOCAL_UPDATE_TEST_APP").expect("explicit candidate"));
@@ -747,7 +747,7 @@ mod tests {
         assert_eq!(helper.join().unwrap(), Ok(()));
     }
     #[test]
-    #[ignore = "requires explicit genuine reference app; replaces isolated copies and runs desktop-disabled launch smoke only"]
+    #[ignore = "device: requires an explicit reference app and desktop-disabled launch smoke"]
     fn external_isolated_replace_and_backend_relaunch() {
         let reference = PathBuf::from(std::env::var("OINK_LOCAL_UPDATE_TEST_APP").expect("explicit reference app"));
         let evidence = PathBuf::from(std::env::var("OINK_LOCAL_UPDATE_TEST_EVIDENCE").expect("external evidence"));

@@ -560,6 +560,81 @@ impl From<ExceptionName> for String {
         name.0
     }
 }
+/// The compile-time source file of a Rust panic location, reduced to the
+/// crate directory that owns it: `tao-0.37.1/src/platform_impl/windows/event_loop.rs`,
+/// `oink-agent/src/clip.rs`, `core/src/option.rs`. It names shipped code, never
+/// a user file: the build machine's registry, checkout or sysroot prefix is
+/// dropped before anything is stored. Line and column alone cannot tell which
+/// workspace or dependency file panicked (Sentry RUST-1, 2026-11-09).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct SourcePath(String);
+impl SourcePath {
+    /// Fixed capacity of the allocation-free panic-hook buffer.
+    pub const CAPACITY: usize = 119;
+    /// Reduce `std::panic::Location::file()` into `out` without allocating
+    /// (the panic hook must not depend on the allocator). Keeps the component
+    /// before the last `src` component; a relative path without `src` stays
+    /// whole. Returns the length written, or 0 when the path cannot be
+    /// represented (absolute without `src`, too long, or other characters).
+    pub fn reduce(file: &str, out: &mut [u8; Self::CAPACITY]) -> usize {
+        let bytes = file.as_bytes();
+        let separator = |b: u8| b == b'/' || b == b'\\';
+        let (mut start, mut previous, mut current) = (None, 0, 0);
+        for end in 0..=bytes.len() {
+            if end == bytes.len() || separator(bytes[end]) {
+                // `previous + 1 < current`: the owning component is not empty.
+                if &bytes[current..end] == b"src" && current > 0 && previous + 1 < current {
+                    start = Some(previous);
+                }
+                previous = current;
+                current = end + 1;
+            }
+        }
+        let relative = bytes.first().is_some_and(|b| !separator(*b)) && !bytes.contains(&b':');
+        let Some(start) = start.or(relative.then_some(0)) else {
+            return 0;
+        };
+        let reduced = &bytes[start..];
+        if reduced.len() > Self::CAPACITY {
+            return 0;
+        }
+        for (slot, byte) in out.iter_mut().zip(reduced) {
+            *slot = if separator(*byte) { b'/' } else { *byte };
+        }
+        if Self::valid(&out[..reduced.len()]) {
+            reduced.len()
+        } else {
+            0
+        }
+    }
+    pub fn from_reduced(bytes: &[u8]) -> Option<Self> {
+        Self::valid(bytes).then(|| Self(String::from_utf8_lossy(bytes).into_owned()))
+    }
+    fn valid(bytes: &[u8]) -> bool {
+        !bytes.is_empty()
+            && bytes.len() <= Self::CAPACITY
+            && bytes.ends_with(b".rs")
+            && bytes
+                .iter()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b'+' | b'/'))
+            && !bytes.split(|b| *b == b'/').any(|part| part.is_empty() || part == b"..")
+    }
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+impl TryFrom<String> for SourcePath {
+    type Error = &'static str;
+    fn try_from(path: String) -> std::result::Result<Self, Self::Error> {
+        Self::from_reduced(path.as_bytes()).ok_or("invalid source path")
+    }
+}
+impl From<SourcePath> for String {
+    fn from(path: SourcePath) -> Self {
+        path.0
+    }
+}
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ObjcException {
@@ -586,6 +661,9 @@ pub struct SafeCrash {
     pub callsite: Option<u32>,
     pub line: Option<u32>,
     pub column: Option<u32>,
+    /// Source file of `line`/`column`; Rust panics only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<SourcePath>,
 }
 impl SafeCrash {
     pub fn empty(
@@ -605,6 +683,7 @@ impl SafeCrash {
             callsite: None,
             line: None,
             column: None,
+            source: None,
         }
     }
     pub fn frames(&self) -> impl Iterator<Item = &Frame> {
@@ -666,6 +745,9 @@ impl Report {
     pub fn validate(&self) -> Result<()> {
         match self {
             Self::SafeCrash(c) => {
+                if c.source.is_some() && (c.crash_kind != CrashKind::RustPanic || c.line.is_none()) {
+                    return Err(Error::Invalid);
+                }
                 if let Some(throw) = &c.objc_exception
                     && (c.crash_kind != CrashKind::NativeException
                         || c.exception_class != ExceptionClass::Abort

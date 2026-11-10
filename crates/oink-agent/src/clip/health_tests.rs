@@ -172,7 +172,7 @@ fn content_and_superseded_capture_errors_leave_clipboard_usable() {
             ] {
                 handle
                     .tx
-                    .send(Input::Captured(source.change_count(), Err(error), None))
+                    .send(Input::Captured(source.change_count(), Err(error), None, None))
                     .unwrap();
                 handle.settle().await;
                 assert!(
@@ -187,6 +187,7 @@ fn content_and_superseded_capture_errors_leave_clipboard_usable() {
                 .send(Input::Captured(
                     source.change_count() - 1,
                     Err(ClipboardError::Platform("superseded capture".into())),
+                    None,
                     None,
                 ))
                 .unwrap();

@@ -909,7 +909,9 @@ impl Owner {
             .remember(device, address)
             .map_err(|_| ApiError::PersistenceFailed)?;
         self.links.update_addresses(device, self.member_candidates(device));
-        self.dials.entry(device).or_default().after = None;
+        let dial = self.dials.entry(device).or_default();
+        dial.after = None;
+        dial.requested = true;
         self.tick();
         Ok(())
     }

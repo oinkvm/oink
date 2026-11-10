@@ -841,8 +841,8 @@ impl<'a> OwnerContext<'a> {
         let observed = self.resources().and_then(|r| r.speaker().ok().flatten());
         let enabled = self.boolean(4);
         let receiver = input.selected_exit == Some(self.member.device);
-        // Missing historical owner records can leave the group route unknown
-        // after reinstall. A current owner's null/withdrawn claim still proves
+        // The group route is unknown until the audio owner publishes its
+        // resolution. A current owner's null/withdrawn claim still proves
         // it is not the exit, so its forwarding preference remains presentable
         // and editable. A missing or true claim cannot establish that role.
         let mode_known = input.exit_baseline
@@ -1527,7 +1527,7 @@ mod tests {
         assert!(next.cards[0].pause.is_none());
     }
     #[test]
-    fn historical_exit_unknown_preserves_authenticated_non_exit_modes() {
+    fn unpublished_exit_resolution_preserves_authenticated_non_exit_modes() {
         use oink_audio::claims::{Claims, Record, Resolution, Stamp};
         use std::collections::BTreeSet;
 
@@ -1578,7 +1578,7 @@ mod tests {
                 member.facts = Some(Arc::new(dto::DeviceFacts::from_raw(raw).unwrap()));
             }
             // A reinstall has all current owners, but only a relayed witness
-            // for the old identity. It must not guess a route or hide known modes.
+            // for the old identity.
             claims
                 .observe_watermark(
                     dto::AudioExitClaim::from_raw(BTreeMap::from([
@@ -1597,7 +1597,23 @@ mod tests {
                 )
                 .unwrap();
             let ids: BTreeSet<_> = members.iter().map(|m| m.device.0).collect();
-            assert_eq!(claims.resolve(&ids, &ids), Resolution::Unknown);
+            // The witness names the old identity's last selection: an
+            // unavailable exit, or none. It never guesses an available route.
+            let stamp = Stamp {
+                counter: 56,
+                owner: oink_foundation::DeviceId([9; 32]),
+            };
+            let witnessed = if historical_claimed {
+                Resolution::Exit {
+                    stamp,
+                    available: false,
+                }
+            } else {
+                Resolution::None { barrier: Some(stamp) }
+            };
+            assert_eq!(claims.resolve(&ids, &ids), witnessed);
+            // Until the audio owner publishes that resolution, the cards have no
+            // exit baseline; current owners' null/false claims still show modes.
             let input = inputs(members);
             let mut projector = Projector::new().unwrap();
             let view = projector.update(&input, 1).unwrap();
@@ -1629,7 +1645,7 @@ mod tests {
                     TokenOperation::Option { edit: CardOptionEdit::ForwardingEnabled(value) } if value == card.is_self));
                 assert!(matches!(speaker.make_exit_action, CardAction::Invoke { .. }));
             }
-            assert_eq!(claims.resolve(&ids, &ids), Resolution::Unknown);
+            assert_eq!(claims.resolve(&ids, &ids), witnessed);
         }
     }
     #[test]
@@ -1692,7 +1708,7 @@ mod tests {
         }
     }
     #[test]
-    fn local_exit_selection_waits_for_baselines_but_not_historical_resolution() {
+    fn local_exit_selection_waits_for_the_active_group_not_historical_resolution() {
         let mut me = row(1, "self", true);
         let mut peer = row(2, "peer", true);
         for member in [&mut me, &mut peer] {
@@ -1711,19 +1727,19 @@ mod tests {
             before.cards[0].status.as_ref().unwrap().speaker.make_exit_action,
             CardAction::unavailable(CardActionUnavailable::StateUnknown)
         );
-        // Our retained baselines do not establish the remote owner's readiness.
+        // Our local readiness does not establish the remote owner's readiness.
         assert!(matches!(
             before.cards[1].status.as_ref().unwrap().speaker.make_exit_action,
             CardAction::Invoke { .. }
         ));
         // No local owner revision or historical resolution needs to change.
-        // Completing coverage alone must publish a new card and usable token.
+        // Readiness alone must publish a new card and usable token.
         input.local_exit_selection_ready = true;
         let after = projector.update(&input, 2).unwrap();
         assert_eq!(after.revision.0, before.revision.0 + 1);
         assert!(!input.exit_baseline);
         let CardAction::Invoke { token, .. } = &after.cards[0].status.as_ref().unwrap().speaker.make_exit_action else {
-            panic!("complete current baselines permit an explicit takeover")
+            panic!("the active group permits an explicit takeover")
         };
         let binding = projector.tokens().read(token).unwrap();
         assert_eq!(binding.owner.revision, 5);

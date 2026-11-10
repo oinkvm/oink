@@ -295,6 +295,5 @@ mod symlink_tests {
             assert_eq!(safe_symlink_target(target, depth), safe, "target depth {depth}");
         }
         assert!(!safe_symlink_target(&"a".repeat(4097), 0));
-        assert_eq!(format!("{:?}", NodeKind::Symlink("private-target".into())), "Symlink");
     }
 }

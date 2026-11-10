@@ -108,6 +108,9 @@ pub struct RoutingSettings {
     pub forward_injected_input: bool,
     /// Windows source-local foreground capture; never published to peers.
     pub take_foreground_on_leave: bool,
+    /// Windows device-local Quicker compatibility mode (default off): remote
+    /// mouse button injection carries dwExtraInfo 0. Never published to peers.
+    pub quicker_compat: bool,
     /// Runtime projection of this device owner's persistent game preference.
     #[serde(skip)]
     pub game_mode_preference: crate::GameMode,
@@ -157,6 +160,7 @@ impl Default for RoutingSettings {
             native_multifinger: true,
             forward_injected_input: true,
             take_foreground_on_leave: false,
+            quicker_compat: false,
             game_mode_preference: crate::GameMode::Auto,
             return_pointer_on_display_sleep: true,
             wake_displays_on_input: true,
@@ -222,5 +226,14 @@ mod tests {
         assert!(absent.forward_injected_input);
         let explicit: RoutingSettings = serde_json::from_str(r#"{"forward_injected_input":false}"#).unwrap();
         assert!(!explicit.forward_injected_input);
+    }
+
+    #[test]
+    fn quicker_compat_defaults_off_and_explicit_true_is_preserved() {
+        assert!(!RoutingSettings::default().quicker_compat);
+        let absent: RoutingSettings = serde_json::from_str("{}").unwrap();
+        assert!(!absent.quicker_compat);
+        let explicit: RoutingSettings = serde_json::from_str(r#"{"quicker_compat":true}"#).unwrap();
+        assert!(explicit.quicker_compat);
     }
 }

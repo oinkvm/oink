@@ -832,10 +832,7 @@ fn remote_api_calls_subscribes_and_sees_stop() {
             })
         })
     };
-    assert_eq!(
-        conn_rx.recv_timeout(Duration::from_secs(5)).unwrap().pid,
-        std::process::id()
-    );
+    assert_eq!(conn_rx.recv().unwrap().pid, std::process::id());
     // Recorder recovery is asynchronous even for an empty isolated directory.
     // The export API explicitly rejects requests until that startup phase completes.
     wait("diagnostics startup recovery", || {
@@ -923,11 +920,7 @@ fn remote_api_calls_subscribes_and_sees_stop() {
     // 按请求退出：订阅方收到「正在退出」。
     let d = dir.clone();
     Client::connect(&d).unwrap().stop().unwrap();
-    rt.block_on(async {
-        tokio::time::timeout(Duration::from_secs(2), node.wait_for_stop())
-            .await
-            .unwrap()
-    });
+    rt.block_on(async { node.wait_for_stop().await });
     assert_eq!(follower.join().unwrap(), EventsEnd::Stopping);
     rt.block_on(server.close());
     rt.block_on(node.shutdown());
@@ -965,7 +958,7 @@ fn remote_api_reconnects_to_new_endpoint_and_sees_crash() {
         let remote = remote.clone();
         std::thread::spawn(move || remote.follow_events(|_| conn_tx.send(()).unwrap()))
     };
-    conn_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    conn_rx.recv().unwrap();
     // 模拟崩溃：运行时连同所有连接一起消失，不发 closing（ipc.json 留下）。
     drop(server);
     rt.shutdown_timeout(Duration::from_millis(200));
@@ -977,7 +970,6 @@ fn remote_api_reconnects_to_new_endpoint_and_sees_crash() {
     // 打断跟随（界面退出）。
     let remote2 = remote.clone();
     let t = std::thread::spawn(move || remote2.follow_events(|_| {}));
-    std::thread::sleep(Duration::from_millis(50));
     remote.stop_following();
     // 服务已不在：要么连不上（Lost），要么被打断（Cancelled）。
     assert!(matches!(t.join().unwrap(), EventsEnd::Lost(_) | EventsEnd::Cancelled));
@@ -1138,7 +1130,7 @@ fn generic_cli_process_calls_api_and_streams_json_events() {
         }
     });
     // The initial snapshot proves the subscription exists before the CLI edit.
-    received.recv_timeout(Duration::from_secs(5)).unwrap();
+    received.recv().unwrap();
     let pause = invoke(&[
         "call",
         "set_local_paused",
@@ -1146,7 +1138,7 @@ fn generic_cli_process_calls_api_and_streams_json_events() {
     ]);
     assert_eq!(pause["type"], "device_control_accepted");
     loop {
-        if let ApiEvent::Pause(pause) = received.recv_timeout(Duration::from_secs(5)).unwrap()
+        if let ApiEvent::Pause(pause) = received.recv().unwrap()
             && pause.paused
         {
             break;

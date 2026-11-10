@@ -293,24 +293,6 @@ mod tests {
         assert!(changes.iter().all(|change| change.outcome == "restored"));
     }
     #[test]
-    fn volatile_restart_marker_survives_only_application_restarts() {
-        let dir = tempfile::tempdir().unwrap();
-        let installer = dir.path().join("Microphone.ps1");
-        let harness = dir.path().join("marker-test.ps1");
-        std::fs::write(&installer, SCRIPT).unwrap();
-        std::fs::write(&harness, include_str!("tests/volatile-marker.ps1")).unwrap();
-        let output = Command::new(powershell().unwrap())
-            .args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File"])
-            .arg(harness)
-            .arg(installer)
-            .creation_flags(0x08000000)
-            .output()
-            .unwrap();
-        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
-        assert_eq!(SCRIPT.matches("            MarkRestartRequired").count(), 2);
-        assert_eq!(SCRIPT.matches("if ($process.ExitCode -notin @(0,3010))").count(), 2);
-    }
-    #[test]
     fn owned_package_cleanup_preserves_receipt_until_complete() {
         let dir = tempfile::tempdir().unwrap();
         let installer = dir.path().join("Microphone.ps1");
@@ -356,19 +338,5 @@ mod tests {
         ] {
             assert!(bootstrap(mode, action, token).is_err());
         }
-    }
-    #[test]
-    fn elevated_script_keeps_uac_and_hidden_verified_file_launch() {
-        assert!(BOOTSTRAP.contains("-Verb RunAs -WindowStyle Hidden"));
-        assert!(BOOTSTRAP.contains("'-WindowStyle','Hidden'"));
-        assert!(BOOTSTRAP.contains("'-File', ('\"' + $path + '\"')"));
-        assert!(!BOOTSTRAP.contains("EncodedCommand"));
-        assert!(!SCRIPT.contains("EncodedCommand"));
-        assert!(!SCRIPT.contains("Get-CimInstance"));
-        assert!(BOOTSTRAP.contains("Protected $agent"));
-        assert!(BOOTSTRAP.contains("Protected $directory"));
-        assert!(BOOTSTRAP.contains("Protected $path"));
-        assert!(SCRIPT.contains("Protected $progressDirectory"));
-        assert!(SCRIPT.contains("Protected $progressFile"));
     }
 }

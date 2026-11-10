@@ -6,7 +6,11 @@
 //! 可产生 LL 回调的鼠标 Raw Input 在动而鼠标钩子超过 1 s 没被调用 → 重装鼠标钩子（[`hook_lost`]）。
 //! 看门狗先核对鼠标/触摸板 Raw Input 注册没被本进程的其他代码改走（见 [`super::rawinput`]）。
 //! 后台不注册键盘 Raw Input，以免触发 Windows 的未公开 LL 链绕过行为，因此没有键盘看门狗，
-//! 键盘钩子被系统静默摘除后不自动重装（原因与系统实现证据见 [`super::rawinput::register`]）。
+//! 键盘钩子被系统静默摘除后看门狗不会发现（原因与系统实现证据见 [`super::rawinput::register`]），
+//! 只在下一次进入 `Remote` 时随下面的重新挂接换成新钩子。
+//!
+//! **钩子链顺序**：低级钩子后装的先收到事件。每次从 `Local` 进入 `Remote`，鼠标和键盘钩子都先装新的、
+//! 再卸旧的，让 Oink 排到比它后启动的手势/热键软件（如 Quicker）前面（[`State::move_hook_to_front`]）。
 //!
 //! 状态都在本线程的 thread_local 里，钩子回调不加锁。其他线程通过 `PostThreadMessage` + 通道发命令；
 //! 在回调里（本线程）调用 `set_mode` 时直接生效，不经过消息。
@@ -306,6 +310,7 @@ struct State {
     handler: EventHandler,
     mode: CaptureMode,
     park: POINT,
+    hooks: HookApi,
     mouse_hook: Option<HHOOK>,
     kbd_hook: Option<HHOOK>,
     hider: Hider,
@@ -368,6 +373,44 @@ thread_local! {
 enum HookKind {
     Mouse,
     Keyboard,
+}
+
+/// Win32 entry points for registering and removing our LL hooks; tests
+/// substitute recording fakes to check the order of
+/// [`State::move_hook_to_front`].
+#[derive(Clone, Copy)]
+struct HookApi {
+    install: fn(HookKind) -> Result<HHOOK, String>,
+    /// Whether UnhookWindowsHookEx succeeded.
+    remove: fn(HHOOK) -> bool,
+}
+
+const NATIVE_HOOKS: HookApi = HookApi {
+    install: native_install_hook,
+    remove: native_remove_hook,
+};
+
+fn native_install_hook(kind: HookKind) -> Result<HHOOK, String> {
+    // WH_KEYBOARD_LL is desktop-scoped (Microsoft's Desktops/SetWindowsHookEx
+    // contract). UIAccess lifts UIPI on Default, not Winlogon's desktop ACL.
+    // This thread never switches desktops; the SYSTEM helper injects only and
+    // installs no hook. Secure credential keys therefore cannot reach this hook.
+
+    // SAFETY: 全局低级钩子：hmod 为本模块，线程 id 为 0；回调是本模块里的 extern "system" 函数。
+    unsafe {
+        let hinstance = GetModuleHandleW(None).map_err(|e| e.to_string())?;
+        match kind {
+            HookKind::Mouse => SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_proc), Some(hinstance.into()), 0)
+                .map_err(|e| format!("SetWindowsHookExW(WH_MOUSE_LL): {e}")),
+            HookKind::Keyboard => SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_proc), Some(hinstance.into()), 0)
+                .map_err(|e| format!("SetWindowsHookExW(WH_KEYBOARD_LL): {e}")),
+        }
+    }
+}
+
+fn native_remove_hook(h: HHOOK) -> bool {
+    // SAFETY: 句柄由 native_install_hook 取得，只卸载一次（系统已经静默卸载时这里返回失败，无害）。
+    unsafe { UnhookWindowsHookEx(h) }.is_ok()
 }
 
 /// 鼠标钩子是否已被系统卸载：Raw Input 最近（[`WATCHDOG_MS`] 的两倍以内）收到了输入，而钩子在那之前
@@ -769,6 +812,7 @@ fn run(
                 handler,
                 mode: CaptureMode::Local,
                 park: cur,
+                hooks: NATIVE_HOOKS,
                 mouse_hook: None,
                 kbd_hook: None,
                 hider,
@@ -1223,30 +1267,15 @@ impl State {
     }
 
     fn install_hook(&mut self, kind: HookKind) -> Result<(), String> {
-        // WH_KEYBOARD_LL is desktop-scoped (Microsoft's Desktops/SetWindowsHookEx
-        // contract). UIAccess lifts UIPI on Default, not Winlogon's desktop ACL.
-        // This thread never switches desktops; the SYSTEM helper injects only and
-        // installs no hook. Secure credential keys therefore cannot reach this hook.
-
-        // SAFETY: 全局低级钩子：hmod 为本模块，线程 id 为 0；回调是本模块里的 extern "system" 函数。
-        unsafe {
-            let hinstance = GetModuleHandleW(None).map_err(|e| e.to_string())?;
-            match kind {
-                HookKind::Mouse => {
-                    let h = SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_proc), Some(hinstance.into()), 0)
-                        .map_err(|e| format!("SetWindowsHookExW(WH_MOUSE_LL): {e}"))?;
-                    self.mouse_hook = Some(h);
-                    CAPTURE_HOOKS.fetch_add(1, Ordering::AcqRel);
-                    self.last_mouse_hook = Instant::now();
-                }
-                HookKind::Keyboard => {
-                    let h = SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_proc), Some(hinstance.into()), 0)
-                        .map_err(|e| format!("SetWindowsHookExW(WH_KEYBOARD_LL): {e}"))?;
-                    self.kbd_hook = Some(h);
-                    CAPTURE_HOOKS.fetch_add(1, Ordering::AcqRel);
-                }
+        let h = (self.hooks.install)(kind)?;
+        match kind {
+            HookKind::Mouse => {
+                self.mouse_hook = Some(h);
+                self.last_mouse_hook = Instant::now();
             }
+            HookKind::Keyboard => self.kbd_hook = Some(h),
         }
+        CAPTURE_HOOKS.fetch_add(1, Ordering::AcqRel);
         if matches!(kind, HookKind::Keyboard) {
             keyboard_trace::boundary(
                 keyboard_trace::Stage::Installed,
@@ -1271,23 +1300,115 @@ impl State {
         };
         if let Some(h) = h {
             CAPTURE_HOOKS.fetch_sub(1, Ordering::AcqRel);
-            // SAFETY: 句柄由 install_hook 取得，只卸载一次（系统已经静默卸载时这里返回失败，无害）。
-            let result = unsafe { UnhookWindowsHookEx(h) };
-            if matches!(kind, HookKind::Keyboard) {
-                keyboard_trace::boundary(
-                    keyboard_trace::Stage::Removed,
-                    0,
-                    Some(keyboard_trace::held(self)),
-                    Some(result.is_ok()),
-                );
-            }
-            super::trace::action(
-                crate::native_lifecycle::Kind::HookRemove,
-                None,
-                kind as u32,
-                Some(result.is_ok()),
+            let removed = (self.hooks.remove)(h);
+            self.trace_hook_removed(kind, removed);
+        }
+    }
+
+    fn trace_hook_removed(&self, kind: HookKind, removed: bool) {
+        if matches!(kind, HookKind::Keyboard) {
+            keyboard_trace::boundary(
+                keyboard_trace::Stage::Removed,
+                0,
+                Some(keyboard_trace::held(self)),
+                Some(removed),
             );
         }
+        super::trace::action(
+            crate::native_lifecycle::Kind::HookRemove,
+            None,
+            kind as u32,
+            Some(removed),
+        );
+    }
+
+    /// Re-registers our installed LL hook of `kind` at the head of its chain.
+    ///
+    /// Why: Windows calls WH_MOUSE_LL / WH_KEYBOARD_LL hooks newest first, and
+    /// only the order of SetWindowsHookEx calls decides that order. A gesture or
+    /// hotkey tool started after Oink (Quicker: right button held back for gesture
+    /// recognition, its hotkeys swallowed) then sees remote-bound input first and
+    /// acts on this computer. Such tools never re-register; Quicker documents that
+    /// the user's start order decides. So on every Local -> Remote entry we
+    /// register a fresh hook, which puts Oink first for the remote session.
+    ///
+    /// Why this shape: the new hook is installed BEFORE the old one is removed and
+    /// nothing is pumped in between, so neither LL chain is ever without an Oink
+    /// hook (no event slips to a later hook uncaptured) and both Oink hooks never
+    /// see the same event: an event already being dispatched continues from the
+    /// old hook's successor, and the next one starts at the new head. Removing
+    /// first would open a window with no Oink hook; deferring to a posted message
+    /// would let the events queued right after the crossing reach the other tool
+    /// first. This runs inside our own mouse callback when the crossing move
+    /// switches the mode; Windows keeps the hook that is executing alive until its
+    /// callback returns, and CallNextHookEx ignores the handle we pass.
+    /// If the new hook cannot be installed, the old one stays (capture keeps
+    /// working in the old chain position). Removing an old hook that Windows has
+    /// already dropped after LowLevelHooksTimeout fails harmlessly; for the
+    /// keyboard, which has no watchdog, this also restores a silently removed hook.
+    /// Back in Local mode nothing is re-registered: Oink then passes input on,
+    /// so the other tool keeps working behind it.
+    /// Measured on Windows 10 22H2 (VM, Hyper-V synthetic mouse/keyboard) with a
+    /// later-started probe hook; see docs/design/routing.md ("Windows：低级钩子链顺序").
+    fn move_hook_to_front(&mut self, kind: HookKind) {
+        let Some(old) = (match kind {
+            HookKind::Mouse => self.mouse_hook,
+            HookKind::Keyboard => self.kbd_hook,
+        }) else {
+            return;
+        };
+        let started = Instant::now();
+        let new = match (self.hooks.install)(kind) {
+            Ok(new) => new,
+            Err(e) => {
+                super::trace::action(
+                    crate::native_lifecycle::Kind::HookReinstall,
+                    None,
+                    kind as u32,
+                    Some(false),
+                );
+                tracing::warn!(
+                    ?kind,
+                    "re-registering the low-level hook at the chain head failed; keeping the old hook: {e}"
+                );
+                return;
+            }
+        };
+        let removed = (self.hooks.remove)(old);
+        let elapsed = started.elapsed();
+        match kind {
+            HookKind::Mouse => {
+                self.mouse_hook = Some(new);
+                self.last_mouse_hook = Instant::now();
+            }
+            HookKind::Keyboard => self.kbd_hook = Some(new),
+        }
+        if matches!(kind, HookKind::Keyboard) {
+            keyboard_trace::boundary(
+                keyboard_trace::Stage::Installed,
+                0,
+                Some(keyboard_trace::held(self)),
+                Some(true),
+            );
+        }
+        self.trace_hook_removed(kind, removed);
+        if crate::native_lifecycle::lifecycle_enabled() {
+            crate::native_lifecycle::emit(
+                crate::native_lifecycle::Kind::HookReinstall,
+                crate::native_lifecycle::Data {
+                    reason: kind as u32,
+                    success: Some(true),
+                    steps: Some(elapsed.as_micros().min(u128::from(u32::MAX)) as u32),
+                    ..crate::native_lifecycle::Data::default()
+                },
+            );
+        }
+        tracing::debug!(
+            ?kind,
+            old_removed = removed,
+            elapsed_us = elapsed.as_micros() as u64,
+            "low-level hook re-registered at the chain head for remote control"
+        );
     }
 
     fn uninstall_hooks(&mut self) {
@@ -1450,6 +1571,12 @@ impl State {
         };
         match t {
             Transition::Remote(p) => {
+                if self.mode == CaptureMode::Local {
+                    // Pointer leaves this computer: put Oink ahead of hooks
+                    // registered after it (see move_hook_to_front).
+                    self.move_hook_to_front(HookKind::Mouse);
+                    self.move_hook_to_front(HookKind::Keyboard);
+                }
                 self.cancel_restore();
                 let from = cursor_pos();
                 self.raw_capture.update(false, self.park);
@@ -2504,6 +2631,11 @@ fn mouse_proc_with_next(code: i32, wparam: WPARAM, lparam: LPARAM, next: impl Fn
     if code >= 0 {
         // SAFETY: HC_ACTION 时 lparam 指向系统提供的 MSLLHOOKSTRUCT，回调期间有效。
         let info = unsafe { &*(lparam.0 as *const MSLLHOOKSTRUCT) };
+        if quicker_window_skips(wparam.0 as u32, info, Instant::now()) {
+            // Possibly Oink's own untagged button injection: never route, record
+            // or classify it. Pass it like opted-out external input.
+            return external::pass_mouse(wparam.0 as u32, info, next);
+        }
         let origin_kind = external::mouse_origin(info);
         if origin_kind == crate::windows_external_input::Origin::External
             && external::mouse_local(wparam.0 as u32, info)
@@ -2660,6 +2792,19 @@ fn mouse_proc_with_next(code: i32, wparam: WPARAM, lparam: LPARAM, next: impl Fn
         }
     }
     result
+}
+
+/// Quicker compatibility mode (see crate::quicker_compat): within one second
+/// of an Oink mouse injection, flagged-injected mouse input without Oink's tag
+/// may be Oink's own untagged button event. Physical input, Oink-tagged events,
+/// transition markers and every button release keep their ordinary path.
+fn quicker_window_skips(msg: u32, info: &MSLLHOOKSTRUCT, now: Instant) -> bool {
+    crate::quicker_compat::skip(
+        crate::quicker_compat::MOUSE.active(now),
+        info.flags & LLMHF_INJECTED != 0,
+        inject::own_mouse_tag(info.dwExtraInfo) || is_marker(info.dwExtraInfo),
+        matches!(msg, WM_LBUTTONUP | WM_RBUTTONUP | WM_MBUTTONUP | WM_XBUTTONUP),
+    )
 }
 
 fn account_own_mouse(msg: u32, info: &MSLLHOOKSTRUCT) {
@@ -3314,6 +3459,7 @@ mod tests {
                 park: to_point(p(1920, 1080)),
             },
             park: p(1920, 1080),
+            hooks: NATIVE_HOOKS,
             mouse_hook: None,
             kbd_hook: None,
             hider: Hider::new(Strategy::None),
@@ -3523,6 +3669,157 @@ mod tests {
                 "accepted native target updates the exact displacement base before readback"
             );
         }
+    }
+
+    #[derive(Debug, PartialEq)]
+    enum HookOp {
+        Install(HookKind, usize),
+        Remove(usize),
+    }
+
+    thread_local! {
+        static HOOK_OPS: RefCell<Vec<HookOp>> = const { RefCell::new(Vec::new()) };
+        static HOOK_NEXT: Cell<usize> = const { Cell::new(100) };
+        static HOOK_FAILS: Cell<Option<HookKind>> = const { Cell::new(None) };
+    }
+
+    const FAKE_HOOKS: HookApi = HookApi {
+        install: |kind| {
+            if HOOK_FAILS.get() == Some(kind) {
+                return Err("fake SetWindowsHookExW failure".into());
+            }
+            let h = HOOK_NEXT.get();
+            HOOK_NEXT.set(h + 1);
+            HOOK_OPS.with_borrow_mut(|ops| ops.push(HookOp::Install(kind, h)));
+            Ok(fake_hook(h))
+        },
+        remove: |h| {
+            HOOK_OPS.with_borrow_mut(|ops| ops.push(HookOp::Remove(h.0 as usize)));
+            true
+        },
+    };
+
+    fn fake_hook(id: usize) -> HHOOK {
+        HHOOK(std::ptr::without_provenance_mut(id))
+    }
+
+    fn hooked_local_state() -> State {
+        HOOK_OPS.with_borrow_mut(Vec::clear);
+        HOOK_NEXT.set(100);
+        HOOK_FAILS.set(None);
+        let mut st = remote_state();
+        st.mode = CaptureMode::Local;
+        st.hooks = FAKE_HOOKS;
+        st.mouse_hook = Some(fake_hook(1));
+        st.kbd_hook = Some(fake_hook(2));
+        st
+    }
+
+    fn hook_ops() -> Vec<HookOp> {
+        HOOK_OPS.with_borrow_mut(std::mem::take)
+    }
+
+    #[test]
+    fn entering_remote_moves_both_hooks_to_the_chain_head_new_before_old() {
+        use super::super::cursor::test_native as native;
+        for via in [Via::InHook, Via::Marker, Via::Timer] {
+            let _native = native::Guard::at(p(1870, 2156));
+            let mut st = hooked_local_state();
+            st.hider = native::hider();
+            st.execute(Transition::Remote(p(1920, 1080)), via);
+            assert_eq!(
+                hook_ops(),
+                [
+                    HookOp::Install(HookKind::Mouse, 100),
+                    HookOp::Remove(1),
+                    HookOp::Install(HookKind::Keyboard, 101),
+                    HookOp::Remove(2),
+                ],
+                "{via:?}: each new hook is registered before its old one is removed"
+            );
+            assert_eq!(st.mouse_hook.map(|h| h.0 as usize), Some(100));
+            assert_eq!(st.kbd_hook.map(|h| h.0 as usize), Some(101));
+
+            // Re-parking while already Remote and returning to Local keep the
+            // chain position: only the Local -> Remote edge re-registers.
+            st.execute(Transition::Remote(p(1920, 1080)), via);
+            st.execute(Transition::Local(None), via);
+            assert_eq!(hook_ops(), []);
+            st.execute(Transition::Remote(p(1920, 1080)), via);
+            assert_eq!(
+                hook_ops(),
+                [
+                    HookOp::Install(HookKind::Mouse, 102),
+                    HookOp::Remove(100),
+                    HookOp::Install(HookKind::Keyboard, 103),
+                    HookOp::Remove(101),
+                ],
+                "{via:?}: every later departure re-registers again"
+            );
+        }
+    }
+
+    #[test]
+    fn entering_remote_with_a_drag_anchor_also_moves_hooks_to_the_chain_head() {
+        use super::super::cursor::test_native as native;
+        let from = p(2178, 2156);
+        let _native = native::Guard::at(from);
+        let mut st = hooked_local_state();
+        st.hider = native::hider();
+        st.drag_anchor = Some(oink_foundation::dnd::DragAnchor {
+            generation: 1,
+            at: to_point(from),
+            surface: 1,
+        });
+        st.execute(Transition::Remote(p(1920, 1080)), Via::Marker);
+        assert_eq!(
+            hook_ops(),
+            [
+                HookOp::Install(HookKind::Mouse, 100),
+                HookOp::Remove(1),
+                HookOp::Install(HookKind::Keyboard, 101),
+                HookOp::Remove(2),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_failed_new_hook_keeps_the_old_hook_installed() {
+        use super::super::cursor::test_native as native;
+        for failing in [HookKind::Mouse, HookKind::Keyboard] {
+            let _native = native::Guard::at(p(1870, 2156));
+            let mut st = hooked_local_state();
+            st.hider = native::hider();
+            HOOK_FAILS.set(Some(failing));
+            st.execute(Transition::Remote(p(1920, 1080)), Via::InHook);
+            let expected = match failing {
+                HookKind::Mouse => vec![HookOp::Install(HookKind::Keyboard, 100), HookOp::Remove(2)],
+                HookKind::Keyboard => vec![HookOp::Install(HookKind::Mouse, 100), HookOp::Remove(1)],
+            };
+            assert_eq!(hook_ops(), expected, "{failing:?} fails: its old hook is never removed");
+            let (mouse, kbd) = match failing {
+                HookKind::Mouse => (1, 100),
+                HookKind::Keyboard => (100, 2),
+            };
+            assert_eq!(st.mouse_hook.map(|h| h.0 as usize), Some(mouse));
+            assert_eq!(st.kbd_hook.map(|h| h.0 as usize), Some(kbd));
+            assert!(
+                matches!(st.mode, CaptureMode::Remote { .. }),
+                "capture continues with the old hook"
+            );
+        }
+    }
+
+    #[test]
+    fn hooks_that_are_not_installed_are_not_registered_on_remote_entry() {
+        use super::super::cursor::test_native as native;
+        let _native = native::Guard::at(p(1870, 2156));
+        let mut st = hooked_local_state();
+        st.hider = native::hider();
+        st.mouse_hook = None;
+        st.kbd_hook = None;
+        st.execute(Transition::Remote(p(1920, 1080)), Via::InHook);
+        assert_eq!(hook_ops(), []);
     }
 
     fn native_park_applies(st: &mut State, marker: Marker) {

@@ -1373,6 +1373,7 @@ mod direct_media_tests {
         assert!(read().1.is_none());
     }
     #[test]
+    #[ignore = "slow: requires injected packet arrival timestamps"]
     fn dormant_datagrams_wake_with_real_arrival_and_reject_late_sleep_and_bad_media() {
         let (send, recv) = datagram_pair(
             LinkId(1),

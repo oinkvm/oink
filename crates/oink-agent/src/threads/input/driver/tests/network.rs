@@ -165,7 +165,8 @@ fn quic_reader_resend_reopens_only_the_writer_and_reuses_the_retained_opening() 
 async fn quic_reader_resend_reopens_only_the_writer_and_reuses_the_retained_opening_scenario() {
     let (a, mut acfg, mut aport) = node(41).await;
     let (b, mut bcfg, mut bport) = node(42).await;
-    a.dial(b.id(), vec![b.local_addr()], DialMode::DirectOnly).unwrap();
+    a.dial(b.id(), vec![b.local_addr()], DialMode::DirectOnly, DialOrigin::Initial)
+        .unwrap();
     let (ac, bc) = tokio::join!(connected(&mut acfg), connected(&mut bcfg));
     let agreement =
         oink_protocol::v1::admission::Agreement::new(crate::node::Node::offer_profile().capabilities).unwrap();

@@ -50,6 +50,16 @@ impl Ordering {
     pub fn source(&self) -> Option<DeviceId> {
         self.current.as_ref().map(|(peer, _)| *peer)
     }
+    /// A local change turned out to be a duplicate of the clipboard content it
+    /// replaced (`crate::dedupe`): the clipboard keeps its previous Oink
+    /// identity. The ordering fence was never moved by the local change.
+    pub fn restore(&mut self, current: Option<(DeviceId, dto::ClipboardOffer)>) {
+        self.pending = None;
+        self.current = current;
+    }
+    pub fn current_with_source(&self) -> Option<(DeviceId, dto::ClipboardOffer)> {
+        self.current.clone()
+    }
     pub fn local_change(&mut self, count: u64, now: Instant) -> bool {
         if count <= self.written {
             return false;

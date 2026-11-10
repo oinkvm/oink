@@ -114,15 +114,6 @@ impl Client {
             let _ = worker.join();
         }
     }
-    #[cfg(test)]
-    pub(crate) fn input_pending(&self) -> usize {
-        self.shared.input.len()
-    }
-    #[cfg(test)]
-    pub(crate) fn stop_for_test(&self) {
-        self.shared.stop.store(true, Ordering::Release);
-        (self.shared.wake)();
-    }
     pub fn new<T: Transport>(
         transport: T,
         wake: Wake,

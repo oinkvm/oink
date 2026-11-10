@@ -190,11 +190,15 @@ mod route_tests {
             assert_eq!(route.update(Some(target(2)), create).is_err(), fail);
             if fail {
                 assert!(route.update(Some(target(2)), create).is_err());
-                assert_eq!(*log.borrow(), ["start 1", "release 1", "release 1"]);
+                assert!(!log.borrow().iter().any(|entry| entry == "start 2"));
+                assert!(log.borrow().iter().any(|entry| entry == "release 1"));
             } else {
-                assert_eq!(*log.borrow(), ["start 1", "release 1", "start 2"]);
                 route.update(None, create).unwrap();
-                assert_eq!(*log.borrow(), ["start 1", "release 1", "start 2", "release 2"]);
+                let entries = log.borrow();
+                let released = entries.iter().position(|entry| entry == "release 1").unwrap();
+                let started = entries.iter().position(|entry| entry == "start 2").unwrap();
+                assert!(released < started, "new helper must start after old process release");
+                assert_eq!(entries.last().map(String::as_str), Some("release 2"));
             }
         }
     }

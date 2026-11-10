@@ -71,6 +71,32 @@ it.each(['en','ja','ko','zh-Hans'])('shows default-off foreground capture only o
   expect(mac.container.querySelector('[data-item="takeForegroundOnLeave"]')).toBeNull();
   expect(sectionsFor('mac').flatMap(section=>section.items).some(item=>item.id==='takeForegroundOnLeave')).toBe(false);
 });
+it.each(['en','ja','ko','zh-Hans'])('shows default-off Quicker compatibility only on Windows in %s', language => {
+  setLanguage(language);
+  const set=vi.fn();
+  const {container,unmount}=render(view(initial,'',vi.fn(),undefined,'win',{...prefs,set}));
+  const row=container.querySelector<HTMLElement>('[data-item="quickerCompat"]')!;
+  expect(row).not.toBeNull();
+  expect(row.previousElementSibling?.getAttribute('data-item')).toBe('forwardInjectedInput');
+  const control=within(row).getByRole('switch') as HTMLInputElement;
+  expect(control.checked).toBe(false);
+  fireEvent.click(control);
+  expect(set).toHaveBeenCalledExactlyOnceWith('quickerCompat',true);
+  const item=sectionsFor('win').flatMap(section=>section.items).find(item=>item.id==='quickerCompat')!;
+  if(language==='en') {
+    expect(item.label).toBe('Quicker compatibility mode');
+    expect(item.desc).toBe('Lets Quicker work while this computer is being controlled');
+  } else if(language==='zh-Hans') {
+    expect(item.label).toBe('Quicker 兼容模式');
+    expect(item.desc).toBe('使本机被控制时 Quicker 能正常使用');
+  } else expect(item.desc).not.toBe('使本机被控制时 Quicker 能正常使用');
+  const found=searchSections('win','Quicker').get('input');
+  expect(found==='all'||found?.has('quickerCompat')).toBe(true);
+  unmount();
+  const mac=render(view());
+  expect(mac.container.querySelector('[data-item="quickerCompat"]')).toBeNull();
+  expect(sectionsFor('mac').flatMap(section=>section.items).some(item=>item.id==='quickerCompat')).toBe(false);
+});
 const prefs = { prefs: DEFAULT_PREFS, set() {}, canEdit: () => true } as unknown as PrefsApi;
 const initial: Record<PermissionId, PermState> = { accessibility: 'not_granted', input: 'not_granted', network: 'not_required', files: 'unknown', audio: 'not_determined' };
 function view(perms = initial, query = '', onGrant = vi.fn(), onOpenPermissionSettings?: (id: PermissionId) => void, platform: Platform = 'mac', settings = prefs) {
@@ -356,13 +382,13 @@ it.each(['en','ja','ko','zh-Hans'])('removes format toggles and retains other cl
       const {container,unmount}=render(view(initial,'',vi.fn(),undefined,platform,settings));
       const section = sectionsFor(platform).find(section=>section.id==='clipboard')!;
       expect(section.items.map(item=>item.id)).toEqual([
-        'clipReceive','clipSend','receivedFiles','receivedCleanup','cache',
+        'clipReceive','clipSend','clipDedupe','receivedFiles','receivedCleanup','cache',
         ...(platform==='mac'?['removeDsStore']:[]),
       ]);
       for (const key of ['clipText','clipRich','clipImage','clipFiles','clipPrivate']) {
         expect(container.querySelector(`[data-item="${key}"]`)).toBeNull();
       }
-      for (const key of ['clipReceive','clipSend',...(platform==='mac'?['removeDsStore']:[])]) {
+      for (const key of ['clipReceive','clipSend','clipDedupe',...(platform==='mac'?['removeDsStore']:[])]) {
         const row=container.querySelector<HTMLElement>(`[data-item="${key}"]`)!;
         expect((within(row).getByRole('switch') as HTMLInputElement).disabled).toBe(false);
       }

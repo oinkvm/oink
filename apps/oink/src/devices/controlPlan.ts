@@ -1,6 +1,14 @@
-import type { DeviceCardsView, DeviceCard, CardAction } from '../api/cards';
+import type { DeviceCardsView, DeviceCard, CardAction, DeviceControlFailure } from '../api/cards';
 import type { ControlAction, ControlObservation } from './controlActions';
 import { resourceAction } from './project';
+
+/** The refusal for a card action that cannot be invoked. A card's own
+ * unavailable reason is shown for every resource (oinkvm/oink#32: an exit
+ * selection refused for a real reason must not read "unsupported"). */
+export function refusalFor(command:CardAction|null|undefined,action:ControlAction):DeviceControlFailure {
+  const reason=command?.kind==='unavailable'?command.reason:action.kind==='microphone'?'state_unknown':'unsupported';
+  return reason==='state_unknown'||reason==='state_stale'?'state_conflict':reason==='remote_fault'?'resource_fault':reason;
+}
 
 export function controlCommand(card:DeviceCard,action:ControlAction):CardAction|null|undefined {
   if(action.kind==='card')return resourceAction(card,action.resource,action.desired);

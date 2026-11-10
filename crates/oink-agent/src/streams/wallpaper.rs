@@ -279,7 +279,6 @@ mod lifecycle {
     use super::*;
     use crate::streams::{diagnostics::DiagnosticsStreams, lifecycle_tests::Fixture};
     use oink_network::link::{ModuleEvent, ModulePort};
-    use std::time::Duration;
 
     async fn receive(port: &mut ModulePort) -> InboundLow {
         tokio::time::timeout(Duration::from_secs(4), async {
@@ -493,18 +492,12 @@ mod cutover_regression {
     use super::*;
     use crate::streams::{diagnostics::DiagnosticsStreams, lifecycle_tests::Fixture};
     use oink_network::link::{LinkPath, ModuleEvent, ModulePort};
-    use std::time::Duration;
-
     async fn wallpaper(port: &mut ModulePort) -> InboundLow {
-        tokio::time::timeout(Duration::from_secs(6), async {
-            loop {
-                if let Some(ModuleEvent::InboundLow(operation)) = port.next().await {
-                    return *operation;
-                }
+        loop {
+            if let Some(ModuleEvent::InboundLow(operation)) = port.next().await {
+                return *operation;
             }
-        })
-        .await
-        .expect("wallpaper must recover after path cutover without another link-ready event")
+        }
     }
 
     #[test]
@@ -560,21 +553,17 @@ mod cutover_regression {
                         .set_member_address(peers[index], contexts[1 - index].0.local_addr().to_string())
                         .unwrap();
                 }
-                tokio::time::timeout(Duration::from_secs(10), async {
-                    loop {
-                        if contexts.iter().enumerate().all(|(index, (network, _))| {
-                            network.links().by_peer(peers[index]).is_some_and(|entry| {
-                                assert_eq!(entry.link, links[index], "migration preserves the logical link");
-                                entry.path == LinkPath::Direct
-                            })
-                        }) {
-                            break;
-                        }
-                        tokio::time::sleep(Duration::from_millis(10)).await;
+                loop {
+                    if contexts.iter().enumerate().all(|(index, (network, _))| {
+                        network.links().by_peer(peers[index]).is_some_and(|entry| {
+                            assert_eq!(entry.link, links[index], "migration preserves the logical link");
+                            entry.path == LinkPath::Direct
+                        })
+                    }) {
+                        break;
                     }
-                })
-                .await
-                .expect("real relay links cut over to direct");
+                    tokio::task::yield_now().await;
+                }
                 for operation in pending {
                     assert!(
                         !(operation.stream.effect_validity())(),

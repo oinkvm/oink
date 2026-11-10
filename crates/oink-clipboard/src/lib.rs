@@ -17,6 +17,7 @@ pub mod cache;
 #[cfg(any(windows, test))]
 mod cloud_files;
 pub mod content;
+pub mod dedupe;
 pub mod model;
 pub mod negotiation;
 pub mod paste_file;
@@ -346,6 +347,13 @@ pub trait FileContents: Send + Sync {
     }
     /// 系统放弃读取（例如用户取消粘贴），可以停止后台下载。默认什么也不做。
     fn cancel(&self) {}
+}
+
+/// macOS backend bound to a private named pasteboard instead of the general
+/// one (probes running beside an installed Oink, native tests).
+#[cfg(target_os = "macos")]
+pub fn named_pasteboard_backend(name: &str) -> Result<Box<dyn ClipboardBackend>, ClipboardError> {
+    macos::named_backend(name)
 }
 
 /// 创建本机平台的实现。

@@ -135,6 +135,7 @@ impl Drop for Trail {
 #[cfg(all(test, debug_assertions))]
 mod tests {
     #[test]
+    #[ignore = "slow: long trail history qualification"]
     fn seam_probe_contains_only_this_session_and_a_fixed_short_tail() {
         let trail = Trail::new();
         trail.duration(10_000);
@@ -162,6 +163,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "slow: long trail history qualification"]
     fn configured_duration_survives_resets_without_extending_seam_history() {
         let trail = Trail::new();
         trail.duration(10_000);

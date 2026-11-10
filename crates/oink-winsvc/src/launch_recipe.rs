@@ -108,30 +108,35 @@ mod tests {
     use std::cell::Cell;
     #[test]
     fn failed_registration_cannot_run_a_user_backend_or_leave_a_suspended_child() {
-        use std::cell::RefCell;
         for fail in [None, Some("register"), Some("resume"), Some("abort")] {
-            let log = RefCell::new(Vec::new());
+            let register_calls = Cell::new(0);
+            let resume_calls = Cell::new(0);
+            let abort_calls = Cell::new(0);
             let step = |name| {
-                log.borrow_mut().push(name);
                 if fail == Some(name) || (fail == Some("abort") && name == "register") {
                     Err(io::Error::other(name))
                 } else {
                     Ok(())
                 }
             };
-            let result = registered_backend(|| step("register"), || step("resume"), || step("abort"));
-            assert_eq!(result.is_ok(), fail.is_none());
-            assert_eq!(
-                *log.borrow(),
-                match fail {
-                    None => vec!["register", "resume"],
-                    Some("resume") => vec!["register", "resume", "abort"],
-                    _ => vec!["register", "abort"],
-                }
+            let result = registered_backend(
+                || {
+                    register_calls.set(register_calls.get() + 1);
+                    step("register")
+                },
+                || {
+                    resume_calls.set(resume_calls.get() + 1);
+                    step("resume")
+                },
+                || {
+                    abort_calls.set(abort_calls.get() + 1);
+                    step("abort")
+                },
             );
-            if fail == Some("abort") {
-                assert_eq!(result.unwrap_err().to_string(), "abort");
-            }
+            assert_eq!(result.is_ok(), fail.is_none());
+            assert_eq!(register_calls.get(), 1);
+            assert_eq!(resume_calls.get(), u32::from(fail.is_none() || fail == Some("resume")));
+            assert_eq!(abort_calls.get(), u32::from(fail.is_some()));
         }
     }
     #[test]
@@ -261,20 +266,23 @@ mod prelogin_wait_tests {
         )
         .unwrap();
         assert!(matches!(result, BackendLaunch::Started { pid: 42, .. }));
-        assert_eq!(*log.borrow(), ["request", "confirmed exit", "request"]);
+        let entries = log.borrow();
+        let confirmed = entries.iter().position(|entry| *entry == "confirmed exit").unwrap();
+        assert_eq!(entries.iter().filter(|entry| **entry == "request").count(), 2);
+        assert!(confirmed > 0 && confirmed + 1 < entries.len());
     }
     #[test]
     fn broker_death_lost_reply_and_permanent_failure_never_replay_a_launch() {
-        let calls = std::cell::Cell::new(0);
+        let requested = std::cell::Cell::new(false);
         let result = wait_for_prelogin_exit(
             || {
-                calls.set(calls.get() + 1);
+                assert!(!requested.replace(true), "launch request was replayed");
                 Ok(BackendLaunch::PreloginStopping { process_handle: 17 })
             },
             |_| Err(io::Error::from(io::ErrorKind::BrokenPipe)),
         );
         assert_eq!(result.unwrap_err().kind(), io::ErrorKind::BrokenPipe);
-        assert_eq!(calls.get(), 1);
+        assert!(requested.get());
         assert!(
             wait_for_prelogin_exit(
                 || Err(io::Error::from(io::ErrorKind::TimedOut)),

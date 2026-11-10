@@ -1,10 +1,12 @@
 #![cfg(windows)]
 use oink_telemetry::{capture::Manifest, *};
 #[test]
+#[ignore = "device: Windows native crash collector and dump cleanup"]
 fn native_child_is_extracted_locally_and_raw_dump_deleted() {
     run_crash(false);
 }
 #[test]
+#[ignore = "device: Windows native crash collector without report consent"]
 fn native_child_local_diagnostics_does_not_require_report_consent() {
     run_crash(true);
 }

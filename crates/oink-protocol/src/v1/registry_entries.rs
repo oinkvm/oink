@@ -187,4 +187,5 @@ message_registry! {
     0x1302 => ControlLocalClick(ControlLocalClick), [Route {kind:3, transport:Transport::Reliable, extra_capabilities:&[]}], ["oink.input/1", "oink.focus.local-click/1"], Suspend;
     0x1303 => ControlUnlockQuery(ControlUnlockQuery), [Route {kind:3, transport:Transport::Reliable, extra_capabilities:&[]}], ["oink.input/1", "oink.auto-unlock/1"], Suspend;
     0x1304 => ControlUnlockReply(ControlUnlockReply), [Route {kind:3, transport:Transport::Reliable, extra_capabilities:&[]}], ["oink.input/1", "oink.auto-unlock/1"], Suspend;
+    0x1305 => ControlSyncUnlock(ControlSyncUnlock), [Route {kind:3, transport:Transport::Reliable, extra_capabilities:&[]}], ["oink.input/1", "oink.auto-unlock/1", "oink.auto-unlock.sync/1"], Suspend;
 }

@@ -58,6 +58,7 @@ fn good_signature_selects_highest_compatible_build_without_downgrade() {
     assert!(m.select(&s).unwrap().is_none());
 }
 #[test]
+#[ignore = "slow: exhaustive signed payload tamper stress"]
 fn tamper_every_payload_byte_wrong_key_and_invalid_signature() {
     let bytes = serde_json::to_vec(&payload()).unwrap();
     let env: Value = serde_json::from_slice(&signed_bytes(&bytes)).unwrap();

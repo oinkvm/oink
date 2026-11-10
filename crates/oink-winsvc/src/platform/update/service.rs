@@ -737,6 +737,9 @@ fn engine(state: Arc<Mutex<State>>, wake: Arc<super::super::wake::Event>) {
     while !super::super::broker::STOP.load(Ordering::Acquire) {
         state.lock().unwrap().expire_verification(Instant::now());
         let is_pending = pending();
+        // Name changes in the maintenance directory wake this loop, including
+        // an installer's relaunch request published by rename.
+        super::relaunch::consume();
         let input = (is_pending, super::input_allowed());
         if observed_input != Some(input) {
             observed_input = Some(input);

@@ -214,7 +214,8 @@ async fn crossing_timing_scenario() {
     let (a, mut ac, _) = node().await;
     let (b, mut bc, _) = node().await;
     let mut port = b.register(&[StreamKind::Input]);
-    a.dial(b.id(), vec![b.local_addr()], DialMode::DirectOnly).unwrap();
+    a.dial(b.id(), vec![b.local_addr()], DialMode::DirectOnly, DialOrigin::Initial)
+        .unwrap();
     let (al, bl) = tokio::join!(connected(&mut ac), connected(&mut bc));
     a.set_ready(al.link);
     b.set_ready(bl.link);
@@ -340,7 +341,8 @@ async fn parallel_reachable_candidates_scenario() {
             }
         }));
     }
-    a.dial(b.id(), addresses, DialMode::DirectOnly).unwrap();
+    a.dial(b.id(), addresses, DialMode::DirectOnly, DialOrigin::Initial)
+        .unwrap();
     watchdog::phase("both reachable candidates attempted");
     for first in first_packets {
         first.await.unwrap();
@@ -378,6 +380,7 @@ async fn candidate_slots_are_shared_between_peer_dials() {
             peer,
             sockets.iter().map(|s| s.local_addr().unwrap()).collect(),
             DialMode::DirectOnly,
+            DialOrigin::Initial,
         )
         .unwrap();
     }
@@ -416,7 +419,8 @@ async fn candidate_slots_are_shared_between_peer_dials() {
 async fn failed_n1_cancels_old_low_and_reopens_without_losing_c0() {
     let (a, mut a_config, _a_module) = node().await;
     let (b, mut b_config, mut b_module) = node().await;
-    a.dial(b.id(), vec![b.local_addr()], DialMode::DirectOnly).unwrap();
+    a.dial(b.id(), vec![b.local_addr()], DialMode::DirectOnly, DialOrigin::Initial)
+        .unwrap();
     let (ac, mut bc) = tokio::join!(connected(&mut a_config), connected(&mut b_config));
     a.set_ready(ac.link);
     b.set_ready(bc.link);
@@ -483,7 +487,13 @@ async fn exact_identity_dial_reports_certificate_replacement_without_pairing() {
     let (a, mut events, _) = node().await;
     let (b, _, _) = node().await;
     let expected = DeviceId([87; 32]);
-    a.dial(expected, vec![b.local_addr()], DialMode::DirectOnly).unwrap();
+    a.dial(
+        expected,
+        vec![b.local_addr()],
+        DialMode::DirectOnly,
+        DialOrigin::Initial,
+    )
+    .unwrap();
     let event = timeout(Duration::from_secs(4), events.next()).await.unwrap().unwrap();
     assert!(matches!(event,ConfigEvent::DialFailed {peer,reason:DialFailure::IdentityChanged} if peer==expected));
     assert!(a.links().links.is_empty());
@@ -495,10 +505,12 @@ async fn protocol_violation_budget_is_per_logical_link_and_reports_suppressed_co
     let (a, mut ac, mut diagnostics) = node().await;
     let (b, mut bc, _) = node().await;
     let (c, mut cc, _) = node().await;
-    a.dial(b.id(), vec![b.local_addr()], DialMode::DirectOnly).unwrap();
+    a.dial(b.id(), vec![b.local_addr()], DialMode::DirectOnly, DialOrigin::Initial)
+        .unwrap();
     let ab = connected(&mut ac).await;
     let _ba = connected(&mut bc).await;
-    a.dial(c.id(), vec![c.local_addr()], DialMode::DirectOnly).unwrap();
+    a.dial(c.id(), vec![c.local_addr()], DialMode::DirectOnly, DialOrigin::Initial)
+        .unwrap();
     let ac_link = connected(&mut ac).await;
     let _ca = connected(&mut cc).await;
     let violation = v1::admission::Violation {
@@ -576,7 +588,8 @@ fn address_probe_failures_keep_local_network_causes() {
 async fn a_new_address_connects_during_a_pending_relay_search() {
     let (a, mut ac, _) = node().await;
     let (b, mut bc, _) = node().await;
-    a.dial(b.id(), vec![], DialMode::PreferDirect).unwrap();
+    a.dial(b.id(), vec![], DialMode::PreferDirect, DialOrigin::Initial)
+        .unwrap();
     // FIFO commands guarantee the address arrives after the empty search starts.
     a.update_addresses(b.id(), vec![b.local_addr()]);
     let (al, bl) = tokio::join!(connected(&mut ac), connected(&mut bc));
@@ -597,7 +610,8 @@ async fn fourth_heartbeat_writes_n0_i0_m0_in_one_poll_turn_and_repeats_after_two
     let (b, mut bc, _) = node_profile(profile).await;
     let mut input = b.register(&[StreamKind::Input]);
     let mut audio = b.register(&[StreamKind::Audio]);
-    a.dial(b.id(), vec![b.local_addr()], DialMode::DirectOnly).unwrap();
+    a.dial(b.id(), vec![b.local_addr()], DialMode::DirectOnly, DialOrigin::Initial)
+        .unwrap();
     let (al, bl) = tokio::join!(connected(&mut ac), connected(&mut bc));
     a.set_ready(al.link);
     b.set_ready(bl.link);

@@ -63,53 +63,7 @@ fn request_optional<T>(
 
 pub(crate) fn send(inputs: &[INPUT]) -> Result<bool, InputError> {
     for (index, i) in inputs.iter().enumerate() {
-        // SAFETY: INPUT comes only from our fully initialized key/mouse builders; type selects union field.
-        let cmd = unsafe {
-            if i.r#type == INPUT_KEYBOARD {
-                let k = i.Anonymous.ki;
-                let scan = k.dwFlags.contains(KEYEVENTF_SCANCODE);
-                Command::Key {
-                    code: if scan { k.wScan } else { k.wVk.0 },
-                    scan,
-                    extended: k.dwFlags.contains(KEYEVENTF_EXTENDEDKEY),
-                    down: !k.dwFlags.contains(KEYEVENTF_KEYUP),
-                }
-            } else if i.r#type == INPUT_MOUSE {
-                let m = i.Anonymous.mi;
-                let f = m.dwFlags;
-                if f.contains(MOUSEEVENTF_MOVE) {
-                    if f.contains(MOUSEEVENTF_ABSOLUTE) && f.contains(MOUSEEVENTF_LEFTDOWN) {
-                        Command::DragPress { x: m.dx, y: m.dy }
-                    } else if f.contains(MOUSEEVENTF_ABSOLUTE) && f.contains(MOUSEEVENTF_LEFTUP) {
-                        Command::DragRelease { x: m.dx, y: m.dy }
-                    } else if f.contains(MOUSEEVENTF_ABSOLUTE) {
-                        Command::Move { x: m.dx, y: m.dy }
-                    } else {
-                        Command::MoveRelative { dx: m.dx, dy: m.dy }
-                    }
-                } else if f.contains(MOUSEEVENTF_WHEEL) || f.contains(MOUSEEVENTF_HWHEEL) {
-                    Command::Wheel {
-                        amount: m.mouseData as i32,
-                        horizontal: f.contains(MOUSEEVENTF_HWHEEL),
-                    }
-                } else {
-                    let (button, down) = match f {
-                        MOUSEEVENTF_LEFTDOWN => (0, true),
-                        MOUSEEVENTF_LEFTUP => (0, false),
-                        MOUSEEVENTF_RIGHTDOWN => (1, true),
-                        MOUSEEVENTF_RIGHTUP => (1, false),
-                        MOUSEEVENTF_MIDDLEDOWN => (2, true),
-                        MOUSEEVENTF_MIDDLEUP => (2, false),
-                        MOUSEEVENTF_XDOWN => ((m.mouseData + 2) as u16, true),
-                        MOUSEEVENTF_XUP => ((m.mouseData + 2) as u16, false),
-                        _ => return Err(InputError::Unsupported),
-                    };
-                    Command::Button { button, down }
-                }
-            } else {
-                return Err(InputError::Unsupported);
-            }
-        };
+        let cmd = command(i)?;
         if optional(cmd)?.is_none() {
             // No bytes were sent; only this branch may safely use the ordinary backend.
             if index == 0 {
@@ -121,9 +75,117 @@ pub(crate) fn send(inputs: &[INPUT]) -> Result<bool, InputError> {
     Ok(true)
 }
 
+/// The helper receives a bounded command, never a raw dwExtraInfo. Only our
+/// builders (OINK tag) and Quicker compatibility mode (0, button events only)
+/// produce these INPUTs, so a zero tag selects the helper's untagged form.
+fn command(i: &INPUT) -> Result<Command, InputError> {
+    // SAFETY: INPUT comes only from our fully initialized key/mouse builders; type selects union field.
+    unsafe {
+        if i.r#type == INPUT_KEYBOARD {
+            let k = i.Anonymous.ki;
+            let scan = k.dwFlags.contains(KEYEVENTF_SCANCODE);
+            Ok(Command::Key {
+                code: if scan { k.wScan } else { k.wVk.0 },
+                scan,
+                extended: k.dwFlags.contains(KEYEVENTF_EXTENDEDKEY),
+                down: !k.dwFlags.contains(KEYEVENTF_KEYUP),
+            })
+        } else if i.r#type == INPUT_MOUSE {
+            let m = i.Anonymous.mi;
+            let f = m.dwFlags;
+            let untagged = m.dwExtraInfo == 0;
+            Ok(if f.contains(MOUSEEVENTF_MOVE) {
+                if f.contains(MOUSEEVENTF_ABSOLUTE) && f.contains(MOUSEEVENTF_LEFTDOWN) {
+                    Command::DragPress {
+                        x: m.dx,
+                        y: m.dy,
+                        untagged,
+                    }
+                } else if f.contains(MOUSEEVENTF_ABSOLUTE) && f.contains(MOUSEEVENTF_LEFTUP) {
+                    Command::DragRelease {
+                        x: m.dx,
+                        y: m.dy,
+                        untagged,
+                    }
+                } else if f.contains(MOUSEEVENTF_ABSOLUTE) {
+                    Command::Move { x: m.dx, y: m.dy }
+                } else {
+                    Command::MoveRelative { dx: m.dx, dy: m.dy }
+                }
+            } else if f.contains(MOUSEEVENTF_WHEEL) || f.contains(MOUSEEVENTF_HWHEEL) {
+                Command::Wheel {
+                    amount: m.mouseData as i32,
+                    horizontal: f.contains(MOUSEEVENTF_HWHEEL),
+                }
+            } else {
+                let (button, down) = match f {
+                    MOUSEEVENTF_LEFTDOWN => (0, true),
+                    MOUSEEVENTF_LEFTUP => (0, false),
+                    MOUSEEVENTF_RIGHTDOWN => (1, true),
+                    MOUSEEVENTF_RIGHTUP => (1, false),
+                    MOUSEEVENTF_MIDDLEDOWN => (2, true),
+                    MOUSEEVENTF_MIDDLEUP => (2, false),
+                    MOUSEEVENTF_XDOWN => ((m.mouseData + 2) as u16, true),
+                    MOUSEEVENTF_XUP => ((m.mouseData + 2) as u16, false),
+                    _ => return Err(InputError::Unsupported),
+                };
+                Command::Button { button, down, untagged }
+            })
+        } else {
+            Err(InputError::Unsupported)
+        }
+    }
+}
+
 #[cfg(all(test, debug_assertions))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn helper_commands_carry_the_quicker_untagged_form_for_buttons_only() {
+        use super::super::inject;
+        use oink_foundation::input::MouseButton;
+        for quicker in [false, true] {
+            let prepare = |mut input: INPUT| {
+                if quicker {
+                    inject::untag_for_quicker(&mut input);
+                }
+                command(&input).unwrap()
+            };
+            for (b, id) in [
+                (MouseButton::Left, 0),
+                (MouseButton::Right, 1),
+                (MouseButton::Middle, 2),
+                (MouseButton::Back, 3),
+                (MouseButton::Forward, 4),
+            ] {
+                for down in [true, false] {
+                    assert_eq!(
+                        prepare(inject::button(b, down).unwrap()),
+                        Command::Button {
+                            button: id,
+                            down,
+                            untagged: quicker
+                        }
+                    );
+                }
+            }
+            assert_eq!(
+                prepare(inject::drag_press(5, 6)),
+                Command::DragPress {
+                    x: 5,
+                    y: 6,
+                    untagged: quicker
+                }
+            );
+            assert!(matches!(
+                prepare(inject::drag_release_at(Point::new(1., 2.), (0, 0), (10, 10))),
+                Command::DragRelease { untagged, .. } if untagged == quicker
+            ));
+            assert_eq!(prepare(inject::move_abs(1, 2)), Command::Move { x: 1, y: 2 });
+            assert!(matches!(prepare(inject::wheel(120, false)), Command::Wheel { .. }));
+        }
+    }
 
     #[test]
     fn ordinary_installation_never_opens_installed_service() {

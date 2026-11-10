@@ -174,6 +174,12 @@ impl Node {
                     });
                 }
             }
+            MainCommand::SyncUnlock { source, epoch } => {
+                let node = self.clone();
+                self.inner.rt.spawn_blocking(move || {
+                    crate::auto_unlock::sync_attempt(&node, source, epoch);
+                });
+            }
             MainCommand::UnlockRemoteInput { source, age_ms } => {
                 self.inner.rt.spawn_blocking(move || {
                     crate::auto_unlock::remote_input(source, age_ms);

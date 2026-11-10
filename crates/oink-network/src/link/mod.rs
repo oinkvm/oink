@@ -181,12 +181,18 @@ impl LinkLayer {
         receive.await.map_err(|_| AddressProbeError::Stopped)?
     }
 
-    pub fn dial(&self, peer: DeviceId, candidates: Vec<SocketAddr>, mode: DialMode) -> Result<(), DialRefused> {
+    pub fn dial(
+        &self,
+        peer: DeviceId,
+        candidates: Vec<SocketAddr>,
+        mode: DialMode,
+        origin: DialOrigin,
+    ) -> Result<(), DialRefused> {
         if candidates.iter().any(|addr| !addr.is_ipv4()) {
             return Err(DialRefused::InvalidAddress);
         }
         self.reserve_dial(peer)?;
-        self.0.send(handle::Command::Dial(peer, candidates, mode));
+        self.0.send(handle::Command::Dial(peer, candidates, mode, origin));
         Ok(())
     }
 

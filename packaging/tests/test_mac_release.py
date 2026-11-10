@@ -119,7 +119,8 @@ class MacReleaseTests(unittest.TestCase):
                 self.assertEqual(M.sign(Path('sign_update'),path,PUBLIC),signature)
                 self.assertEqual(run.call_args.kwargs,dict(input=SEED.encode()))
                 self.assertNotIn(SEED, str(run.call_args.args))
-                verify.assert_called_once_with(b'archive',signature,PUBLIC)
+                self.assertEqual(verify.call_count, 1)
+                self.assertEqual(verify.call_args.args, (b'archive', signature, PUBLIC))
 
     @unittest.skipUnless(os.environ.get('SPARKLE_TEST_SIGN_UPDATE'),'pinned official native signer optional')
     def test_official_archive_and_feed_signatures_with_public_test_seed(self):

@@ -75,7 +75,7 @@ fn input(cmd: Command) -> Option<INPUT> {
             },
             KEYBDINPUT::default(),
         ),
-        command @ (Command::Move { x, y } | Command::DragPress { x, y } | Command::DragRelease { x, y }) => (
+        command @ (Command::Move { x, y } | Command::DragPress { x, y, .. } | Command::DragRelease { x, y, .. }) => (
             INPUT_MOUSE,
             MOUSEINPUT {
                 dx: x,
@@ -92,7 +92,10 @@ fn input(cmd: Command) -> Option<INPUT> {
                         0
                     },
                 time: 0,
-                dwExtraInfo: TAG,
+                dwExtraInfo: match command {
+                    Command::DragPress { untagged: true, .. } | Command::DragRelease { untagged: true, .. } => 0,
+                    _ => TAG,
+                },
             },
             KEYBDINPUT::default(),
         ),
@@ -110,7 +113,7 @@ fn input(cmd: Command) -> Option<INPUT> {
             },
             KEYBDINPUT::default(),
         ),
-        Command::Button { button, down } => {
+        Command::Button { button, down, untagged } => {
             let flags = match (button, down) {
                 (0, true) => MOUSEEVENTF_LEFTDOWN,
                 (0, false) => MOUSEEVENTF_LEFTUP,
@@ -126,7 +129,8 @@ fn input(cmd: Command) -> Option<INPUT> {
                 MOUSEINPUT {
                     mouseData: if button >= 3 { u32::from(button) - 2 } else { 0 },
                     dwFlags: flags,
-                    dwExtraInfo: TAG,
+                    // Quicker compatibility mode (see oink-input inject::untag_for_quicker).
+                    dwExtraInfo: if untagged { 0 } else { TAG },
                     ..Default::default()
                 },
                 KEYBDINPUT::default(),
@@ -162,7 +166,7 @@ fn input(cmd: Command) -> Option<INPUT> {
     })
 }
 fn send(cmd: Command) -> io::Result<()> {
-    if let Command::DragRelease { x, y } = cmd {
+    if let Command::DragRelease { x, y, .. } = cmd {
         let mut clip = RECT::default();
         // Validate on the actual injection desktop too, not only in the client.
         // SAFETY: read-only desktop metrics and valid output rectangle.
@@ -253,12 +257,25 @@ impl Injector {
         self.attach()?;
         *stage = ErrorStage::Inject;
         send(cmd)?;
+        self.record(cmd);
+        Ok(())
+    }
+    /// Ledger of the Ups that close presses this helper injected.
+    fn record(&mut self, cmd: Command) {
         match cmd {
             Command::DragRelease { .. } => {
                 self.held.remove(&(0, 0));
             }
-            Command::DragPress { .. } => {
-                self.held.insert((0, 0), Command::Button { button: 0, down: false });
+            Command::DragPress { untagged, .. } => {
+                // Cleanup keeps the press's tagging so Quicker sees a paired Up.
+                self.held.insert(
+                    (0, 0),
+                    Command::Button {
+                        button: 0,
+                        down: false,
+                        untagged,
+                    },
+                );
             }
             Command::Key {
                 code,
@@ -281,16 +298,22 @@ impl Injector {
                     self.held.remove(&key);
                 }
             }
-            Command::Button { button, down } => {
+            Command::Button { button, down, untagged } => {
                 if down {
-                    self.held.insert((0, button), Command::Button { button, down: false });
+                    self.held.insert(
+                        (0, button),
+                        Command::Button {
+                            button,
+                            down: false,
+                            untagged,
+                        },
+                    );
                 } else {
                     self.held.remove(&(0, button));
                 }
             }
             _ => {}
         }
-        Ok(())
     }
 }
 pub(super) fn run(parent_pid: u32, route: Option<crate::prelogin_route::Source>) -> io::Result<()> {
@@ -873,7 +896,11 @@ mod isolated_pipe_tests {
         assert!(!injector.needs_maintenance());
         injector.pending.insert("inactive".into(), BTreeMap::new());
         assert!(!injector.needs_maintenance());
-        let up = Command::Button { button: 0, down: false };
+        let up = Command::Button {
+            button: 0,
+            down: false,
+            untagged: false,
+        };
         injector.pending.get_mut("inactive").unwrap().insert((0, 0), up);
         assert!(injector.needs_maintenance());
         injector.pending.clear();
@@ -1006,7 +1033,14 @@ mod isolated_pipe_tests {
                 // The connection scope has ended, so its timer must be disarmed.
                 done.send(()).unwrap();
             });
-            send(&client, Command::Button { button: 0, down: true });
+            send(
+                &client,
+                Command::Button {
+                    button: 0,
+                    down: true,
+                    untagged: false,
+                },
+            );
             assert_eq!(os.lock().unwrap().held.len(), 1);
             if expire {
                 milliseconds.store(400, Ordering::Release);
@@ -1025,12 +1059,11 @@ mod isolated_pipe_tests {
                 .expect("cleanup after disconnect/lease expiry");
             task.join().unwrap();
             assert!(os.lock().unwrap().held.is_empty());
-            assert!(
-                os.lock()
-                    .unwrap()
-                    .events
-                    .contains(&Command::Button { button: 0, down: false })
-            );
+            assert!(os.lock().unwrap().events.contains(&Command::Button {
+                button: 0,
+                down: false,
+                untagged: false
+            }));
         }
     }
 
@@ -1106,7 +1139,15 @@ mod isolated_pipe_tests {
         });
         let client = super::super::client::private_pipe_client(client_pipe).unwrap();
         let down = client
-            .request(Command::Button { button: 0, down: true }, false, false)
+            .request(
+                Command::Button {
+                    button: 0,
+                    down: true,
+                    untagged: false,
+                },
+                false,
+                false,
+            )
             .unwrap()
             .unwrap();
         assert_eq!(&down.0[..4], &[0; 4]);
@@ -1198,7 +1239,15 @@ mod isolated_pipe_tests {
             let at = Instant::now();
             let pending = timing.pending(at);
             timing.native_begin(CallClass::Button, at);
-            let result = input.request(Command::Button { button: 0, down: true }, false, false);
+            let result = input.request(
+                Command::Button {
+                    button: 0,
+                    down: true,
+                    untagged: false,
+                },
+                false,
+                false,
+            );
             timing.native_end(CallClass::Button, at.elapsed().as_micros() as u64);
             drop(pending);
             eprintln!("PRIVATE_PIPE_INPUT_TIMING {:?}", timing.take(Instant::now()));
@@ -1244,6 +1293,72 @@ mod relative_input_tests {
 mod drag_press_tests {
     use super::*;
     #[test]
+    fn quicker_mode_clears_only_button_tags_and_cleanup_keeps_the_press_tagging() {
+        for untagged in [false, true] {
+            let expected = if untagged { 0 } else { TAG };
+            let mut commands = vec![
+                Command::DragPress { x: 1, y: 2, untagged },
+                Command::DragRelease { x: 1, y: 2, untagged },
+            ];
+            for button in 0..5 {
+                for down in [false, true] {
+                    commands.push(Command::Button { button, down, untagged });
+                }
+            }
+            for command in commands {
+                // SAFETY: these commands construct INPUT_MOUSE without sending it.
+                assert_eq!(unsafe { input(command).unwrap().Anonymous.mi.dwExtraInfo }, expected);
+            }
+        }
+        for command in [
+            Command::Move { x: 1, y: 2 },
+            Command::MoveRelative { dx: 1, dy: 2 },
+            Command::Wheel {
+                amount: 120,
+                horizontal: false,
+            },
+        ] {
+            // SAFETY: motion and wheel construct INPUT_MOUSE without sending it.
+            assert_eq!(unsafe { input(command).unwrap().Anonymous.mi.dwExtraInfo }, TAG);
+        }
+        let key = input(Command::Key {
+            code: 0x1e,
+            scan: true,
+            extended: false,
+            down: true,
+        })
+        .unwrap();
+        // SAFETY: Key constructs INPUT_KEYBOARD without sending it.
+        assert_eq!(unsafe { key.Anonymous.ki.dwExtraInfo }, TAG);
+        // The ledger stores an Up with the press's tagging, so a desktop-switch
+        // or lease cleanup closes an untagged press with an untagged Up.
+        for untagged in [false, true] {
+            let mut injector = Injector::default();
+            for (press, key) in [
+                (
+                    Command::Button {
+                        button: 1,
+                        down: true,
+                        untagged,
+                    },
+                    (0, 1),
+                ),
+                (Command::DragPress { x: 1, y: 2, untagged }, (0, 0)),
+            ] {
+                // Record only: apply() would attach to a desktop and inject.
+                injector.record(press);
+                assert_eq!(
+                    injector.held.get(&key),
+                    Some(&Command::Button {
+                        button: key.1,
+                        down: false,
+                        untagged
+                    })
+                );
+            }
+        }
+    }
+    #[test]
     fn transport_failure_ack_keeps_request_identity_and_fixed_error_stage() {
         for stage in [ErrorStage::Peer, ErrorStage::Liveness, ErrorStage::Decode] {
             let reply = error_reply(denied(), stage, 7, 11);
@@ -1258,7 +1373,12 @@ mod drag_press_tests {
     }
     #[test]
     fn helper_preserves_position_and_up_in_one_input() {
-        let event = input(Command::DragRelease { x: 123, y: 456 }).unwrap();
+        let event = input(Command::DragRelease {
+            x: 123,
+            y: 456,
+            untagged: false,
+        })
+        .unwrap();
         // SAFETY: DragRelease initializes INPUT_MOUSE's mi member.
         let mouse = unsafe { event.Anonymous.mi };
         assert_eq!((mouse.dx, mouse.dy), (123, 456));
@@ -1270,7 +1390,12 @@ mod drag_press_tests {
     }
     #[test]
     fn helper_preserves_position_and_down_in_one_input() {
-        let event = input(Command::DragPress { x: 123, y: 456 }).unwrap();
+        let event = input(Command::DragPress {
+            x: 123,
+            y: 456,
+            untagged: false,
+        })
+        .unwrap();
         // SAFETY: DragPress constructs INPUT_MOUSE and initializes its mi member.
         let mouse = unsafe { event.Anonymous.mi };
         assert_eq!((mouse.dx, mouse.dy), (123, 456));

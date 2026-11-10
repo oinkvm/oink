@@ -470,3 +470,41 @@ it('shows an incorrect-password refusal and keeps auto unlock disabled', async (
   expect(await within(dialog).findByText('密码不正确')).toBeTruthy();
   expect(within(row).getByRole('button',{name:'启用'})).toBeTruthy();
 });
+
+it.each(['mac', 'win'] as const)('places the sync unlock switch right after automatic unlock, off by default, on %s', platform => {
+  setLanguage('zh-Hans');
+  const { container } = render(view(platform));
+  const rows = [...container.querySelectorAll<HTMLElement>('[data-item]')].map(row => row.dataset.item);
+  expect(rows.indexOf('syncUnlock')).toBe(rows.indexOf('autoUnlock') + 1);
+  const row = container.querySelector<HTMLElement>('[data-item="syncUnlock"]')!;
+  expect((within(row).getByRole('switch', { name: '同步解锁其它设备' }) as HTMLInputElement).checked).toBe(false);
+  expect(row.querySelector('.ok-row__desc')?.textContent).toBe('本机解锁后，同时解锁已开启“自动解锁本机”的其它设备。Windows 设备需要锁屏画面已收起。');
+  const found = [...searchSections(platform, '一起解锁').values()];
+  expect(found.some(hit => hit === 'all' || hit.has('syncUnlock'))).toBe(true);
+});
+
+it.each([
+  ['zh-Hans', 'lock_screen', '上次同步解锁未执行：锁屏画面未收起'],
+  ['en', 'display_wake', 'Last sync unlock skipped: the display couldn’t be woken'],
+  ['en', 'source_locked', 'Last sync unlock skipped: the requesting device was locked again'],
+  ['ja', 'local_typing', '前回の一緒にロック解除はスキップされました：このデバイスで入力中でした'],
+  ['ko', 'source_disconnected', '마지막 함께 잠금 해제를 건너뜀: 요청한 기기와 연결이 끊어졌습니다'],
+  ['zh-Hans', 'password_field', '上次同步解锁未执行：锁屏密码框未就绪'],
+] as const)('shows a skipped %s sync unlock (%s) as secondary text without the alert icon', async (language, kind, copy) => {
+  setLanguage(language);
+  vi.spyOn(backend, 'autoUnlockStatus').mockResolvedValue({ enabled: true, failure: null, windows_hello_only: false, sync_last: { kind, at_ms: 1 } });
+  const { container } = render(view('mac'));
+  const row = container.querySelector<HTMLElement>('[data-item="autoUnlock"]')!;
+  await waitFor(() => expect(row.querySelector('.ok-row__desc')?.textContent).toBe(copy));
+  expect(row.querySelector('.setp__unlock-failed')).toBeNull();
+  expect(row.querySelector('.setp__unlock-on')).not.toBeNull();
+});
+
+it('keeps a real failure in red over a sync skip', async () => {
+  setLanguage('zh-Hans');
+  vi.spyOn(backend, 'autoUnlockStatus').mockResolvedValue({ enabled: true, failure: 'password_incorrect', windows_hello_only: false, sync_last: { kind: 'lock_screen', at_ms: 1 } });
+  const { container } = render(view('win'));
+  const row = container.querySelector<HTMLElement>('[data-item="autoUnlock"]')!;
+  await waitFor(() => expect(row.querySelector('.ok-row__desc')?.textContent).toBe('上次解锁失败：密码错误，请修改密码'));
+  expect(row.querySelector('.setp__unlock-failed')).not.toBeNull();
+});

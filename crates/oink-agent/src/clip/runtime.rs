@@ -109,6 +109,9 @@ pub(crate) fn start_link_runtime(
         fetch_requested: None,
         native_write: None,
         queued_write: None,
+        identity: None,
+        echo_base: None,
+        recent: VecDeque::new(),
         on_transfer: Arc::new(move |value| {
             if let Some(inner) = weak.upgrade() {
                 Node { inner }.emit(crate::api::ApiEvent::FileTransfer(value));
@@ -220,11 +223,11 @@ impl Task {
                     Some(ModuleEvent::PathChanged{..})=>{},None=>break,
                 },
                 command=commands.recv()=>match command {
-                    Some(Input::Captured(before,result,key))=>{
+                    Some(Input::Captured(before,result,key,identity))=>{
                         oink_clipboard::copy_diagnostics::capture_handoff(
                             oink_clipboard::copy_diagnostics::Stage::CapturedReceived, before, 0, 0,
                         );
-                        self.captured(before,result,key);
+                        self.captured(before,result,key,identity);
                     },
                     Some(Input::Applied{id,ticket,publication})=>self.applied(id,ticket,publication),
                     Some(Input::LocalChange(count))=>if self.active(){self.observe(count);},

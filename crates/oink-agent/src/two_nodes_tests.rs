@@ -172,6 +172,7 @@ fn input_transform_is_owned_locally_and_persists_without_a_layout_edit() {
 }
 
 mod audio;
+mod echo;
 
 /// Compare the exact retained layout register, including its owner version.
 fn assert_layout_files_equal(a: &Node, b: &Node) {
@@ -1264,7 +1265,7 @@ async fn focus_lock_api_and_overview_events_name_the_remote_target_on_both_membe
 }
 
 #[test]
-#[ignore = "requires a dedicated quiet timing run; process-global idle statistics qualification"]
+#[ignore = "slow: requires a dedicated quiet timing run and process-global idle statistics qualification"]
 fn idle_two_nodes_emit_only_requested_link_statistics() {
     const CHILD: &str = "OINK_IDLE_EVENT_CHILD";
     if std::env::var_os(CHILD).is_none() {

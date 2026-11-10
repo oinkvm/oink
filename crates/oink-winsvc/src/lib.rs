@@ -34,6 +34,7 @@ mod lease;
 
 mod auto_unlock;
 pub use auto_unlock::{
-    AutoUnlockFailure, AutoUnlockResult, AutoUnlockStatus, auto_unlock_attempt, auto_unlock_disable,
-    auto_unlock_remote_input, auto_unlock_save, auto_unlock_status,
+    AUTO_UNLOCK_SYNC_WINDOW, AutoUnlockFailure, AutoUnlockResult, AutoUnlockStatus, AutoUnlockSync,
+    auto_unlock_attempt, auto_unlock_disable, auto_unlock_remote_input, auto_unlock_save, auto_unlock_status,
+    auto_unlock_sync_attempt,
 };

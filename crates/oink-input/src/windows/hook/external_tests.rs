@@ -35,11 +35,13 @@ static PHYSICAL_SNAPSHOT: Mutex<()> = Mutex::new(());
 // These tests drive the real LL callback and source router together; no native
 // hook is installed and no SendInput, desktop switch or real lock is performed.
 mod key_tail_tests;
+mod quicker_tests;
 impl Fixture {
     fn new() -> Self {
         let physical_snapshot = PHYSICAL_SNAPSHOT.lock().unwrap();
         external::gap();
         key_releases::clear();
+        crate::quicker_compat::MOUSE.clear();
         let cursor = tests::TestCursor::at(POINT { x: 1920, y: 1080 });
         let events = Arc::new(Mutex::new(Vec::<CapturedEvent>::new()));
         let output = events.clone();
@@ -382,4 +384,91 @@ fn default_local_path_covers_lower_il_unknown_keys_all_buttons_and_both_wheels()
     }
     assert!(f.events.lock().unwrap().is_empty());
     assert_eq!(with_state(|s| s.keys.len()), Some(0));
+}
+
+/// RUST-6 (0.3.3 build 100, Windows 11): the router, inside the capture owner,
+/// placed the cursor with SendInput from this hook thread. Windows delivered a
+/// physical mouse callback synchronously into the hook while the owner was
+/// still borrowed, and its mouse guard read panicked in a nounwind callback.
+/// The nested callback here runs at the same point: inside the owner's poll,
+/// with and without the hook State also in use (RUST-6 had both busy).
+#[test]
+fn physical_mouse_nested_in_the_busy_owner_keeps_the_guard_without_borrowing_it() {
+    struct Nesting {
+        disabled: bool,
+        state_busy: bool,
+        routed: Arc<AtomicUsize>,
+        nested: Arc<Mutex<Option<isize>>>,
+    }
+    impl crate::capture_loop::CaptureLoop for Nesting {
+        fn set_wake(&mut self, _: crate::capture_loop::Wake) {}
+        fn event(&mut self, _: &CapturedEvent) -> Disposition {
+            self.routed.fetch_add(1, Ordering::Relaxed);
+            Disposition::Pass
+        }
+        fn poll(&mut self, _: Instant) -> Option<Instant> {
+            let info = MSLLHOOKSTRUCT {
+                pt: POINT { x: 1921, y: 1080 },
+                ..Default::default()
+            };
+            let deliver = || {
+                mouse_proc_with_next(
+                    0,
+                    WPARAM(WM_MOUSEMOVE as usize),
+                    LPARAM((&info as *const MSLLHOOKSTRUCT) as isize),
+                    || LRESULT(0),
+                )
+                .0
+            };
+            let result = if self.state_busy {
+                STATE.with(|slot| {
+                    let _borrow = slot.borrow_mut();
+                    deliver()
+                })
+            } else {
+                deliver()
+            };
+            *self.nested.lock().unwrap() = Some(result);
+            None
+        }
+        fn stopped(&self) -> bool {
+            false
+        }
+        fn mouse_disabled(&self) -> bool {
+            self.disabled
+        }
+    }
+    for disabled in [false, true] {
+        for state_busy in [false, true] {
+            let f = Fixture::new();
+            // Production routes hook events through the capture owner.
+            with_state(|s| {
+                s.handler = Arc::new(crate::capture_loop::event);
+                s.mode = CaptureMode::Local;
+            });
+            let routed = Arc::new(AtomicUsize::new(0));
+            let nested = Arc::new(Mutex::new(None));
+            crate::capture_loop::install(
+                Box::new(Nesting {
+                    disabled,
+                    state_busy,
+                    routed: routed.clone(),
+                    nested: nested.clone(),
+                }),
+                Arc::new(|| {}),
+            );
+            // An ordinary physical move consults the owner's guard first.
+            let top = f.mouse(WM_MOUSEMOVE, 0);
+            if disabled {
+                assert_eq!(top, 1);
+            }
+            let before = routed.load(Ordering::Relaxed);
+            crate::capture_loop::poll(Instant::now());
+            let label = format!("disabled={disabled} state_busy={state_busy}");
+            // The guard keeps the owner's last answer; an enabled mouse passes
+            // the nested move unrouted, as every reentrant hook callback does.
+            assert_eq!(*nested.lock().unwrap(), Some(isize::from(disabled)), "{label}");
+            assert_eq!(routed.load(Ordering::Relaxed), before, "{label}");
+        }
+    }
 }

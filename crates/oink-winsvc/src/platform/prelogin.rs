@@ -26,7 +26,6 @@ use std::{
     time::{Duration, Instant},
 };
 use windows_sys::Win32::{
-    Security::Authorization::*,
     Storage::FileSystem::*,
     System::{Diagnostics::ToolHelp::*, Registry::*, RemoteDesktop::*},
     UI::Shell::*,
@@ -379,25 +378,10 @@ impl Store for Protected {
     }
 }
 
-fn sid_string(sid: &[u8]) -> io::Result<String> {
-    let mut raw = ptr::null_mut();
-    // SAFETY: SID from a validated token; the LocalAlloc string is freed after copying.
-    unsafe {
-        check(ConvertSidToStringSidW(sid.as_ptr().cast_mut().cast(), &mut raw))?;
-        let mut n = 0;
-        while *raw.add(n) != 0 {
-            n += 1;
-        }
-        let text = String::from_utf16_lossy(std::slice::from_raw_parts(raw, n));
-        LocalFree(raw.cast());
-        Ok(text)
-    }
-}
-
 /// Service side: one authenticated request from the console session's user.
 /// `process` is the kernel-authenticated, PID-pinned client process.
 pub(super) fn handle(request: &BackendLaunch, id: u32, process: &Handle) -> io::Result<BackendLaunch> {
-    let sid = sid_string(&security::user_sid(id)?)?;
+    let sid = security::sid_string(&security::user_sid(id)?)?;
     let elevated = super::update::elevated(process);
     let reply = store_access().handle(
         &mut Protected,
@@ -538,7 +522,7 @@ pub(super) fn backend_processes(owned_pid: Option<u32>, include_user: bool) -> i
 /// Only read the loaded user's registry; never load a hive or touch a user path
 /// as SYSTEM. A missing/disabled Run entry means no replacement is expected.
 fn owner_autostart(id: u32, owner: &str) -> bool {
-    let Ok(sid) = security::user_sid(id).and_then(|s| sid_string(&s)) else {
+    let Ok(sid) = security::user_sid(id).and_then(|s| security::sid_string(&s)) else {
         return false;
     };
     if !owner.eq_ignore_ascii_case(&sid) {

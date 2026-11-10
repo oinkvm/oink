@@ -19,6 +19,14 @@ use oink_protocol::frame::StreamCode;
 use oink_routing::{DndEvent, GameMode, Os, RoutingSettings};
 use std::sync::Arc;
 
+/// What admits a local password transaction into the injection FIFO.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LocalUnlockAdmission {
+    /// Pointer entry: still the focus holder of this FocusEnter epoch.
+    Focus(u64),
+    /// Sync unlock: focus-independent; the confirmed source must stay attached.
+    Sync(DeviceId),
+}
 /// Ordinary thread (the input module's task) → input thread. Small and of fixed size;
 /// the queue is bounded and `InputThread::send` never blocks.
 #[derive(Debug)]
@@ -77,8 +85,17 @@ pub enum InputCommand {
     RetirePeer(oink_foundation::session::Boot),
     SessionLocked(Option<bool>),
     LocalUnlock {
-        epoch: u64,
+        admission: LocalUnlockAdmission,
         job: crate::auto_unlock::typing::Job,
+    },
+    /// Sync unlock initiator: this device's user just unlocked it.
+    SyncUnlockBroadcast {
+        epoch: u64,
+    },
+    /// Sync unlock target: challenge `source` on its current I0 session.
+    SyncUnlockQuery {
+        source: DeviceId,
+        reply: std::sync::mpsc::SyncSender<crate::auto_unlock::sync::SourceAnswer>,
     },
     UnlockReplyReady {
         peer: DeviceId,

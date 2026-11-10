@@ -12,7 +12,7 @@ import { PauseGlyph } from './devices/icons';
 import { SideContextMenu, type SideContextMenuProps } from './devices/DeviceMenu';
 import type { DeviceControlFailure, DeviceControlReply } from './api/cards';
 import { ControlActions, type ControlAction } from './devices/controlActions';
-import { controlCommand, controlObservation, volumeFacts } from './devices/controlPlan';
+import { controlCommand, controlObservation, refusalFor, volumeFacts } from './devices/controlPlan';
 import { canDisableInput, toggleShare } from './devices/data';
 import type { ShareKind, ShareValue } from './devices/data';
 import type { SpeakerAction, MicrophoneAction } from './devices/VolumeRow';
@@ -98,11 +98,7 @@ export function App() {
                     :api.setForwardingControls(requestId,facts.token,action.volume,action.muted,action.deferPersistence===true);
             }
             const command=controlCommand(card,action);
-            if(command?.kind!=='invoke') {
-                if(action.kind!=='microphone')return refused('unsupported');
-                const reason=command?.kind==='unavailable'?command.reason:'state_unknown';
-                return refused(reason==='state_unknown'||reason==='state_stale'?'state_conflict':reason==='remote_fault'?'resource_fault':reason);
-            }
+            if(command?.kind!=='invoke')return refused(refusalFor(command,action));
             return api.invokeCard(requestId,command.token);
         },
         refresh:()=>agent.query('cards',api.deviceCards),show:setControlTargets,fail:(reason,action)=>{

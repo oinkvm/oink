@@ -129,6 +129,7 @@ pub const CAPABILITIES: &[&str] = &[
     "oink.power/1",
     "oink.cloud-file-links/1",
     "oink.input.lock-remote-windows/1",
+    "oink.auto-unlock.sync/1",
 ];
 #[derive(Clone, Copy, Debug, Serialize)]
 pub struct Stream {

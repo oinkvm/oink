@@ -244,7 +244,7 @@ pub(in crate::platform) fn elevated(process: &Handle) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{sync::mpsc, time::Duration};
+    use std::sync::mpsc;
     use windows_sys::Win32::System::Threading::WaitForSingleObject;
 
     #[test]
@@ -281,7 +281,6 @@ mod tests {
             assert_eq!(unsafe { WaitForSingleObject(operation.event(), 1000) }, WAIT_OBJECT_0);
             operation.cancel();
             drop(operation);
-            std::thread::sleep(Duration::from_millis(30));
             // SAFETY: private pipe; force the ordinary disconnect/reconnect boundary.
             check(unsafe { DisconnectNamedPipe(pipe.0) }).unwrap();
             let mut operation = pipe_io::Operation::new(&pipe).unwrap();

@@ -681,7 +681,7 @@ fn encode_selected(
 mod tests {
     use super::*;
     #[tokio::test]
-    #[ignore = "isolated resource benchmark; run with --ignored --nocapture"]
+    #[ignore = "slow: isolated resource benchmark; run with --ignored --nocapture"]
     async fn resource_projection_idle_benchmark() {
         let control = Control::default();
         let started = Instant::now();

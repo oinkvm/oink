@@ -134,6 +134,9 @@ pub(super) fn encode(value: &ControlMsg) -> v1::Result<Message> {
         ControlMsg::UnlockQuery { epoch } => {
             Message::ControlUnlockQuery(w::ControlUnlockQuery::from_raw(map([(1, epoch.write())]))?)
         }
+        ControlMsg::SyncUnlock { epoch } => {
+            Message::ControlSyncUnlock(w::ControlSyncUnlock::from_raw(map([(1, epoch.write())]))?)
+        }
         ControlMsg::UnlockReply { epoch, unlocked } => {
             Message::ControlUnlockReply(w::ControlUnlockReply::from_raw(map([
                 (1, epoch.write()),
@@ -285,6 +288,7 @@ pub(super) fn encode(value: &ControlMsg) -> v1::Result<Message> {
 pub(super) fn decode(value: Message) -> v1::Result<ControlMsg> {
     Ok(match value {
         Message::ControlUnlockQuery(v) => ControlMsg::UnlockQuery { epoch: v.epoch()? },
+        Message::ControlSyncUnlock(v) => ControlMsg::SyncUnlock { epoch: v.epoch()? },
         Message::ControlUnlockReply(v) => ControlMsg::UnlockReply {
             epoch: v.epoch()?,
             unlocked: v.unlocked()?,

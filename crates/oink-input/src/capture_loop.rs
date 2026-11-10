@@ -117,12 +117,23 @@ pub(crate) fn clear() {
 }
 pub(crate) fn event(event: &CapturedEvent) -> Disposition {
     OWNER.with(|slot| {
-        slot.borrow_mut()
-            .as_mut()
-            .expect("capture owner installed")
-            .event(event)
+        // Windows: SendInput issued from this hook thread while event()/poll()
+        // owns the router (cursor placement, mode restore) runs the LL hooks
+        // synchronously on the same thread before SendInput returns, and they
+        // may carry other pending physical input (Sentry RUST-6). The router
+        // is mid-operation: the nested event passes unrouted, like every
+        // other reentrant hook callback.
+        let Ok(mut owner) = slot.try_borrow_mut() else {
+            let n = REENTERED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            if n.is_power_of_two() {
+                tracing::info!(n, "capture event nested in its busy owner passed unrouted");
+            }
+            return Disposition::Pass;
+        };
+        owner.as_mut().expect("capture owner installed").event(event)
     })
 }
+static REENTERED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub(crate) fn poll(now: Instant) -> (Option<Instant>, bool) {
     OWNER.with(|slot| {
         let mut slot = slot.borrow_mut();
@@ -173,8 +184,20 @@ pub(crate) fn injected_disable_release(code: crate::KeyCode, pressed: bool) {
         }
     });
 }
+thread_local! { static MOUSE_DISABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+/// The hook reads the guard for every physical mouse event, so the value kept
+/// here is the owner's answer for the previous event on this thread. A
+/// callback nested in the busy owner (see `event`) uses it: the guard is a
+/// user setting, unchanged by the routing work that caused the nesting.
 pub(crate) fn mouse_disabled() -> bool {
-    OWNER.with(|slot| slot.borrow().as_ref().is_some_and(|owner| owner.mouse_disabled()))
+    OWNER.with(|slot| match slot.try_borrow() {
+        Ok(owner) => {
+            let disabled = owner.as_ref().is_some_and(|owner| owner.mouse_disabled());
+            MOUSE_DISABLED.set(disabled);
+            disabled
+        }
+        Err(_) => MOUSE_DISABLED.get(),
+    })
 }
 pub(crate) fn keyboard_disabled() -> bool {
     OWNER.with(|slot| slot.borrow().as_ref().is_some_and(|owner| owner.keyboard_disabled()))
@@ -259,4 +282,74 @@ pub(crate) fn release_local_key(event: &CapturedEvent) -> bool {
             .and_then(|mut slot| slot.as_mut().map(|owner| owner.release_local_key(event)))
             .unwrap_or(false)
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{CapturedEvent, InputEvent, SourceKind};
+    use std::{
+        cell::Cell,
+        sync::atomic::{AtomicUsize, Ordering},
+    };
+
+    thread_local! { static NESTED: Cell<Option<(bool, Disposition)>> = const { Cell::new(None) }; }
+
+    /// Mirrors RUST-6: work done while event()/poll() owns the router (on
+    /// Windows, SendInput from the hook thread) synchronously delivers another
+    /// native callback, which asks the owner for its mouse guard and routes the
+    /// nested event on the same thread.
+    struct Busy {
+        disabled: bool,
+        events: Arc<AtomicUsize>,
+    }
+    impl CaptureLoop for Busy {
+        fn set_wake(&mut self, _: Wake) {}
+        fn event(&mut self, _: &CapturedEvent) -> Disposition {
+            self.events.fetch_add(1, Ordering::Relaxed);
+            Disposition::Swallow
+        }
+        fn poll(&mut self, _: Instant) -> Option<Instant> {
+            let event = CapturedEvent {
+                event: InputEvent::PointerDelta { dx: 1.0, dy: 0.0 },
+                physical: true,
+                source: SourceKind::Mouse,
+                time_us: 0,
+                cursor: None,
+            };
+            NESTED.set(Some((super::mouse_disabled(), super::event(&event))));
+            None
+        }
+        fn stopped(&self) -> bool {
+            false
+        }
+        fn mouse_disabled(&self) -> bool {
+            self.disabled
+        }
+    }
+
+    #[test]
+    fn a_callback_nested_in_the_owner_reads_the_guard_and_is_not_routed_twice() {
+        for disabled in [false, true] {
+            let events = Arc::new(AtomicUsize::new(0));
+            install(
+                Box::new(Busy {
+                    disabled,
+                    events: events.clone(),
+                }),
+                Arc::new(|| {}),
+            );
+            // The hook reads the guard for every physical event before routing.
+            assert_eq!(mouse_disabled(), disabled);
+            NESTED.set(None);
+            poll(Instant::now());
+            assert_eq!(NESTED.get(), Some((disabled, Disposition::Pass)), "disabled={disabled}");
+            assert_eq!(
+                events.load(Ordering::Relaxed),
+                0,
+                "the busy router never sees the nested event"
+            );
+            clear();
+        }
+    }
 }

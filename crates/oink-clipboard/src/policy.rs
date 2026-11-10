@@ -26,6 +26,10 @@ pub struct Settings {
     /// Local source preference; never part of the group configuration.
     #[serde(default = "enabled_by_default")]
     pub remove_ds_store: bool,
+    /// "Clipboard deduplication": do not announce a local change that is a
+    /// format subset of the previous clipboard content (crate::dedupe). Local.
+    #[serde(default = "enabled_by_default")]
+    pub dedupe: bool,
 }
 fn enabled_by_default() -> bool {
     true
@@ -36,6 +40,7 @@ impl Default for Settings {
             receive: true,
             send: true,
             remove_ds_store: true,
+            dedupe: true,
         }
     }
 }

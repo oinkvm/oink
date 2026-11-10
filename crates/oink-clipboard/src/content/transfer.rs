@@ -366,6 +366,34 @@ impl Registry {
         Ok(lease)
     }
 
+    /// Replace the provider of an announced clipboard offer with a rebound
+    /// provider for the same offer identity (see `content::rebound`). The old
+    /// source no longer matches the native clipboard; readers still holding it
+    /// fail as they would have without the replacement.
+    pub fn replace_clipboard(
+        &self,
+        old: SourceLease,
+        provider: Arc<dyn Provider>,
+        key: Option<[u8; 32]>,
+    ) -> io::Result<SourceLease> {
+        let offer = old.0.offer;
+        if provider.inventory().id != offer {
+            return Err(unavailable(Unavailable::InvalidData));
+        }
+        {
+            let mut sources = self.0.lock().unwrap();
+            if sources
+                .get(&offer)
+                .and_then(Weak::upgrade)
+                .is_some_and(|source| Arc::ptr_eq(&source, &old.0))
+            {
+                sources.remove(&offer);
+            }
+        }
+        drop(old);
+        self.register_clipboard_identified(provider, key, None)
+    }
+
     pub fn check_clipboard(&self, backend: &dyn crate::ClipboardBackend) -> io::Result<()> {
         if let Some(grants) = &self.4 {
             // Do not acquire registry -> grants in the opposite order from

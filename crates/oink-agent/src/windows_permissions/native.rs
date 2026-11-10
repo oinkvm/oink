@@ -190,7 +190,7 @@ mod tests {
     /// Explicit acceptance probe: reads OS configuration, never launches the
     /// installed program or changes firewall/service state.
     #[test]
-    #[ignore = "requires an installed MSI and OINK_TEST_INSTALLED_EXE"]
+    #[ignore = "device: requires an installed MSI and OINK_TEST_INSTALLED_EXE"]
     fn installed_access_read_only_probe() {
         let exe =
             std::path::PathBuf::from(std::env::var_os("OINK_TEST_INSTALLED_EXE").expect("installed executable path"));

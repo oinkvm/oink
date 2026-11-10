@@ -1038,9 +1038,16 @@ pub struct InputSettings {
     /// Windows source-local preference, default off for settings without this key.
     #[serde(default)]
     pub take_foreground_on_leave: bool,
+    /// Windows device-local Quicker compatibility mode, default off. Never replicated.
+    #[serde(default)]
+    pub quicker_compat: bool,
     /// Physical source preference, persisted only by this device.
     #[serde(default = "default_true")]
     pub forward_wheel_by_lines: bool,
+    /// Unlock other devices when this one is unlocked by its user. Local
+    /// preference, never replicated to peers; default off.
+    #[serde(default)]
+    pub sync_unlock_others: bool,
     /// Read-only live native injector availability; absent means unavailable.
     #[serde(default)]
     pub contacts_injection_available: bool,
@@ -1108,6 +1115,7 @@ pub struct ClipboardSettings {
     pub receive: bool,
     pub send: bool,
     pub remove_ds_store: bool,
+    pub dedupe: bool,
 }
 impl Default for ClipboardSettings {
     fn default() -> Self {
@@ -1120,6 +1128,7 @@ impl From<oink_clipboard::policy::Settings> for ClipboardSettings {
             receive: settings.receive,
             send: settings.send,
             remove_ds_store: settings.remove_ds_store,
+            dedupe: settings.dedupe,
         }
     }
 }
@@ -1129,13 +1138,14 @@ impl From<ClipboardSettings> for oink_clipboard::policy::Settings {
             receive: settings.receive,
             send: settings.send,
             remove_ds_store: settings.remove_ds_store,
+            dedupe: settings.dedupe,
         }
     }
 }
 impl Serialize for ClipboardSettings {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
-        let mut fields = serializer.serialize_struct("ClipboardSettings", 8)?;
+        let mut fields = serializer.serialize_struct("ClipboardSettings", 9)?;
         fields.serialize_field("receive", &self.receive)?;
         fields.serialize_field("send", &self.send)?;
         fields.serialize_field("text", &true)?;
@@ -1144,6 +1154,7 @@ impl Serialize for ClipboardSettings {
         fields.serialize_field("files", &true)?;
         fields.serialize_field("custom", &true)?;
         fields.serialize_field("remove_ds_store", &self.remove_ds_store)?;
+        fields.serialize_field("dedupe", &self.dedupe)?;
         fields.end()
     }
 }
@@ -3160,7 +3171,9 @@ fn test_input_settings() -> InputSettings {
         mac_scroll_feel: true,
         forward_injected_input: true,
         take_foreground_on_leave: false,
+        quicker_compat: false,
         forward_wheel_by_lines: true,
+        sync_unlock_others: false,
         emergency_hold_ms: 5000,
         device_gain: 1.,
         scroll: ScrollSettings { speed: 1. },

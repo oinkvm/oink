@@ -1314,7 +1314,7 @@ mod tests {
                 atomic::{AtomicU8, AtomicU64, Ordering},
                 mpsc,
             },
-            time::{Duration, Instant},
+            time::Instant,
         };
         let backend = Arc::new(oink_test_support::input::FakeInput::new());
         backend.start(Arc::new(|_| oink_input::Disposition::Pass)).unwrap();
@@ -1335,13 +1335,13 @@ mod tests {
                 let mut typing = crate::auto_unlock::typing::Typing::new(Instant::now());
                 typing.before_character(Instant::now(), true, Some(true))?;
                 ready.send(()).unwrap();
-                wait.recv_timeout(Duration::from_secs(1)).unwrap();
+                wait.recv().unwrap();
                 // Pause revokes the local transaction after its first character too.
                 typing.before_character(Instant::now(), false, Some(true))
             }),
             reply,
         )));
-        started.recv_timeout(Duration::from_secs(1)).unwrap();
+        started.recv().unwrap();
         backend.take_injected();
         for pressed in [true, false] {
             handle.push(InjectItem::Inject {
@@ -1354,15 +1354,14 @@ mod tests {
         }
         backend.set_input_paused(true);
         release.send(()).unwrap();
-        assert!(done.recv_timeout(Duration::from_secs(1)).unwrap().is_err());
+        assert!(done.recv().unwrap().is_err());
         let ack = Arc::new(AtomicU8::new(0));
         handle.push(InjectItem::OwnerFence {
             state: ack.clone(),
             failures: Arc::new(AtomicU64::new(0)),
             expect_released: true,
         });
-        let until = Instant::now() + Duration::from_secs(1);
-        while ack.load(Ordering::Acquire) == 0 && Instant::now() < until {
+        while ack.load(Ordering::Acquire) == 0 {
             std::thread::yield_now();
         }
         assert_eq!(ack.load(Ordering::Acquire), 1);
@@ -1384,10 +1383,7 @@ mod tests {
     fn local_unlock_buffers_all_sources_key_pairs_in_fifo_on_finish_or_abort() {
         use super::*;
         use oink_foundation::input::KeyCode;
-        use std::{
-            sync::{Arc, mpsc},
-            time::Duration,
-        };
+        use std::sync::{Arc, mpsc};
         for abort in [false, true] {
             let backend = Arc::new(oink_test_support::input::FakeInput::new());
             let handle = start_with_backend(backend.clone(), Box::new(|_| {})).unwrap();
@@ -1397,12 +1393,12 @@ mod tests {
             handle.push(InjectItem::LocalUnlock(crate::auto_unlock::typing::Job::new(
                 Box::new(move |_| {
                     started.send(()).unwrap();
-                    wait.recv_timeout(Duration::from_secs(1)).unwrap();
+                    wait.recv().unwrap();
                     if abort { Err("synthetic abort") } else { Ok(()) }
                 }),
                 reply,
             )));
-            ready.recv_timeout(Duration::from_secs(1)).unwrap();
+            ready.recv().unwrap();
             let events = vec![
                 (DeviceId([1; 32]), 4, true),
                 (DeviceId([2; 32]), 5, true),
@@ -1420,10 +1416,10 @@ mod tests {
             }
             assert!(backend.take_injected().is_empty());
             finish.send(()).unwrap();
-            assert_eq!(result.recv_timeout(Duration::from_secs(1)).unwrap().is_err(), abort);
+            assert_eq!(result.recv().unwrap().is_err(), abort);
             let (done, ack) = mpsc::sync_channel(1);
             handle.push(InjectItem::CursorRead { scope: 0, reply: done });
-            ack.recv_timeout(Duration::from_secs(1)).unwrap();
+            ack.recv().unwrap();
             assert_eq!(
                 backend.take_injected(),
                 events
@@ -1446,7 +1442,6 @@ mod tests {
             control::{ControlMsg, FocusScope, WindowsLockRequest},
         };
         use std::sync::Arc;
-        use std::time::{Duration, Instant};
         for revoked in [false, true] {
             let target = Boot {
                 device_id: DeviceId([1; 32]),
@@ -1527,9 +1522,8 @@ mod tests {
                 },
                 from: None,
             });
-            let deadline = Instant::now() + Duration::from_secs(2);
-            while backend.injected().len() < 7 && Instant::now() < deadline {
-                std::thread::sleep(Duration::from_millis(2));
+            while backend.injected().len() < 7 {
+                std::thread::yield_now();
             }
             assert_eq!(backend.injected().len(), 7);
             assert_eq!(backend.workstation_locks(), if revoked { vec![] } else { vec![6] });
@@ -1541,7 +1535,6 @@ mod tests {
         use super::*;
         use oink_input::InputBackend;
         use std::sync::{Arc, mpsc};
-        use std::time::{Duration, Instant};
         let backend = Arc::new(oink_test_support::input::FakeInput::new());
         let (entered, waiting) = mpsc::channel();
         let (resume, resumed) = mpsc::channel();
@@ -1570,7 +1563,7 @@ mod tests {
             from: Some(peer),
         });
         handle.push(InjectItem::ReleaseAll { peer });
-        waiting.recv_timeout(Duration::from_secs(3)).unwrap();
+        waiting.recv().unwrap();
         handle.push(InjectItem::Inject {
             event: InjectEvent::MoveTo {
                 pos: Point::new(800., 400.),
@@ -1581,9 +1574,7 @@ mod tests {
         handle.suspend();
         assert!(!handle.detached(), "in-flight cleanup must remain visible");
         resume.send(()).unwrap();
-        let until = Instant::now() + Duration::from_secs(3);
         while !handle.detached() {
-            assert!(Instant::now() < until);
             std::thread::yield_now();
         }
         assert!(!backend.injection_active());
@@ -1604,7 +1595,7 @@ mod tests {
             from: Some(peer),
         });
         handle.push(InjectItem::ReleaseAll { peer });
-        waiting.recv_timeout(Duration::from_secs(3)).unwrap();
+        waiting.recv().unwrap();
         assert_eq!(backend.injection_sessions(), 2);
         assert_eq!(backend.take_injected(), vec![fresh]);
     }
@@ -1614,7 +1605,6 @@ mod tests {
         use super::*;
         use oink_input::InputBackend;
         use std::sync::{Arc, mpsc};
-        use std::time::Duration;
         for down in [
             InjectEvent::Key {
                 code: oink_input::KeyCode::LEFT_SHIFT,
@@ -1647,7 +1637,7 @@ mod tests {
                 from: Some(peer),
             });
             handle.push(InjectItem::ReleaseAll { peer });
-            waiting.recv_timeout(Duration::from_secs(3)).unwrap();
+            waiting.recv().unwrap();
             for item in [
                 InjectItem::Inject {
                     event: InjectEvent::MoveTo {
@@ -1692,7 +1682,7 @@ mod tests {
             });
             handle.push(InjectItem::ReleaseAll { peer });
             resume.send(()).unwrap();
-            waiting.recv_timeout(Duration::from_secs(3)).unwrap();
+            waiting.recv().unwrap();
             let up = match down.clone() {
                 InjectEvent::Key { code, .. } => InjectEvent::Key { code, pressed: false },
                 InjectEvent::Button { button, .. } => InjectEvent::Button { button, pressed: false },
@@ -1709,7 +1699,6 @@ mod tests {
         use super::*;
         use oink_input::InputBackend;
         use std::sync::{Arc, mpsc};
-        use std::time::{Duration, Instant};
         let backend = Arc::new(oink_test_support::input::FakeInput::new());
         let (done, received) = mpsc::channel();
         let handle = start_with_backend(
@@ -1728,10 +1717,9 @@ mod tests {
             },
         });
         handle.push(InjectItem::ReleaseAll { peer });
-        received.recv_timeout(Duration::from_secs(3)).unwrap();
+        received.recv().unwrap();
         backend.set_input_paused(true);
-        let end = Instant::now() + Duration::from_secs(2);
-        while backend.injected().len() < 2 && Instant::now() < end {
+        while backend.injected().len() < 2 {
             std::thread::yield_now();
         }
         assert_eq!(
@@ -1828,15 +1816,13 @@ mod tests {
             },
             main,
         });
-        let begin = commands.recv_timeout(std::time::Duration::from_secs(3)).unwrap();
+        let begin = commands.recv().unwrap();
         let initial = Point::new(40., 50.);
         handle.push(InjectItem::Inject {
             event: InjectEvent::MoveTo { pos: initial },
             from: None,
         });
-        let limit = std::time::Instant::now() + std::time::Duration::from_secs(3);
         while backend.cursor_position().unwrap() != initial {
-            assert!(std::time::Instant::now() < limit);
             std::thread::yield_now();
         }
         backend.take_injected();
@@ -1850,7 +1836,7 @@ mod tests {
             })
             .unwrap()
         });
-        at_window.recv_timeout(std::time::Duration::from_secs(3)).unwrap();
+        at_window.recv().unwrap();
         for event in [
             InjectEvent::MoveTo {
                 pos: Point::new(200., 200.),
@@ -1896,7 +1882,6 @@ mod tests {
             from: None,
         });
         while backend.cursor_position().unwrap() != next {
-            assert!(std::time::Instant::now() < limit);
             std::thread::yield_now();
         }
         assert_eq!(
@@ -1966,7 +1951,7 @@ mod tests {
         }
         handle.push(InjectItem::ReleaseAll { peer });
         // Retain the actual ordinary-worker completion, without a timed fake Begin.
-        let begin = commands.recv_timeout(std::time::Duration::from_secs(3)).unwrap();
+        let begin = commands.recv().unwrap();
         assert!(matches!(
             begin,
             super::super::MainCommand::Dnd {
@@ -1974,15 +1959,14 @@ mod tests {
                 ..
             }
         ));
-        let watchdog = std::time::Instant::now() + std::time::Duration::from_secs(3);
-        while backend.injected().len() < 2 && std::time::Instant::now() < watchdog {
-            std::thread::sleep(std::time::Duration::from_millis(1));
+        while backend.injected().len() < 2 {
+            std::thread::yield_now();
         }
         let during_begin = backend.injected();
         let read_during_begin = read_before_motion.try_recv();
         // Release before asserting so a broken motion filter cannot strand teardown.
         drop(begin);
-        finish.recv_timeout(std::time::Duration::from_secs(3)).unwrap();
+        finish.recv().unwrap();
         assert!(
             read_during_begin.is_ok(),
             "readback may not block motion behind a Begin fence"
@@ -2026,7 +2010,7 @@ mod tests {
         handle.push(InjectItem::ReleaseAll {
             peer: DeviceId([1; 32]),
         });
-        completed.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+        completed.recv().unwrap();
         assert_eq!(backend.mode(), Some(parked));
     }
 
@@ -2080,7 +2064,7 @@ mod tests {
             },
         });
         handle.push(InjectItem::ReleaseAll { peer: a });
-        assert_eq!(rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap(), a);
+        assert_eq!(rx.recv().unwrap(), a);
         let events = backend.take_injected();
         assert_eq!(events.len(), 3);
         assert_eq!(

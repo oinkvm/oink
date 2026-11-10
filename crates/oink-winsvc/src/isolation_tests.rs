@@ -32,9 +32,27 @@ impl helper::Native for Native {
             return reply;
         }
         match command {
-            Command::Button { button, down: true } => os.held.push(Command::Button { button, down: false }),
-            Command::DragPress { .. } => os.held.push(Command::Button { button: 0, down: false }),
-            Command::DragRelease { .. } => os.held.retain(|up| *up != (Command::Button { button: 0, down: false })),
+            Command::Button {
+                button,
+                down: true,
+                untagged,
+            } => os.held.push(Command::Button {
+                button,
+                down: false,
+                untagged,
+            }),
+            Command::DragPress { untagged, .. } => os.held.push(Command::Button {
+                button: 0,
+                down: false,
+                untagged,
+            }),
+            Command::DragRelease { untagged, .. } => os.held.retain(|up| {
+                *up != (Command::Button {
+                    button: 0,
+                    down: false,
+                    untagged,
+                })
+            }),
             Command::Key {
                 code,
                 scan,
@@ -140,6 +158,7 @@ struct Fixture {
     release: mpsc::Sender<()>,
     clock: Arc<AtomicU64>,
     wake: owner::Wake,
+    wake_events: mpsc::Receiver<()>,
     submitted: mpsc::Receiver<Command>,
     waiting: mpsc::Receiver<()>,
 }
@@ -157,7 +176,9 @@ fn fixture_native<N: helper::Native>(
     let (release, gate) = mpsc::channel();
     let thread: Arc<OnceLock<thread::Thread>> = Arc::default();
     let wake_thread = thread.clone();
+    let (wake_events, wake_observed) = mpsc::channel();
     let wake: owner::Wake = Arc::new(move || {
+        let _ = wake_events.send(());
         if let Some(thread) = wake_thread.get() {
             thread.unpark();
         }
@@ -193,6 +214,7 @@ fn fixture_native<N: helper::Native>(
         release,
         clock: clock_us,
         wake,
+        wake_events: wake_observed,
         submitted: submissions,
         waiting: waits,
     }
@@ -206,8 +228,16 @@ fn blocked_ordinary_round_trip_must_not_delay_input_ack() {
     let input = fixture.client.clone();
     let (done, completed) = mpsc::channel();
     let injection = thread::spawn(move || {
-        done.send(input.request(Command::Button { button: 0, down: true }, false, false))
-            .unwrap();
+        done.send(input.request(
+            Command::Button {
+                button: 0,
+                down: true,
+                untagged: false,
+            },
+            false,
+            false,
+        ))
+        .unwrap();
     });
     let result = completed.recv_timeout(Duration::from_secs(3));
     // Always release the fake IPC before asserting, including a regressed owner.
@@ -372,7 +402,7 @@ fn reconnect_during_disconnected_generation_cleanup_cannot_discard_new_input() {
     if !applied {
         // Release the stranded ACK waiter on the old code before failing the
         // deterministic assertion; this is test teardown, never a timeout fix.
-        fixture.client.stop_for_test();
+        fixture.client.shutdown();
     }
     let result = request.join().unwrap();
     assert!(
@@ -402,19 +432,38 @@ fn native_fifo_preserves_drag_press_up_and_release_barriers() {
         Some(Instant::now()),
     );
     let commands = [
-        Command::DragPress { x: 123, y: 456 },
+        Command::DragPress {
+            x: 123,
+            y: 456,
+            untagged: false,
+        },
         Command::Move { x: 1, y: 2 },
-        Command::Button { button: 0, down: false },
+        Command::Button {
+            button: 0,
+            down: false,
+            untagged: false,
+        },
         Command::Release,
     ];
     let first = fixture.client.clone();
     let down = thread::spawn(move || first.request(commands[0], false, false));
     ready.recv_timeout(Duration::from_secs(3)).unwrap();
+    assert_eq!(fixture.submitted.recv().unwrap(), commands[0]);
+    fixture.wake_events.recv().unwrap();
     let mut callers = Vec::new();
-    for (i, command) in commands[1..].iter().copied().enumerate() {
+    let mut starts = Vec::new();
+    for command in commands[1..].iter().copied() {
         let client = fixture.client.clone();
-        callers.push(thread::spawn(move || client.request(command, false, false)));
-        until(|| fixture.client.input_pending() == i + 1);
+        let (go, started) = mpsc::channel();
+        starts.push(go);
+        callers.push(thread::spawn(move || {
+            started.recv().unwrap();
+            client.request(command, false, false)
+        }));
+    }
+    for _ in commands[1..].iter() {
+        starts.remove(0).send(()).unwrap();
+        fixture.wake_events.recv().unwrap();
     }
     // The down is already applied but its ACK is explicitly blocked. No later
     // input has left the client lane, regardless of how long the gate is held.
@@ -524,7 +573,11 @@ fn empty_helper_ledger_sleeps_but_held_and_disconnected_cleanup_still_run() {
                 request: Request {
                     id,
                     ordinary: false,
-                    command: Command::Button { button: 0, down },
+                    command: Command::Button {
+                        button: 0,
+                        down,
+                        untagged: false,
+                    },
                 },
             })
             .unwrap();
@@ -650,7 +703,11 @@ fn controlled_stop_releases_keys_without_waiting_for_blocked_ordinary_query() {
             request: Request {
                 id: 1,
                 ordinary: false,
-                command: Command::Button { button: 0, down: true },
+                command: Command::Button {
+                    button: 0,
+                    down: true,
+                    untagged: false,
+                },
             },
         })
         .unwrap();
@@ -879,8 +936,16 @@ fn native_ack_can_precede_local_write_notification_without_replay_or_disconnect(
     )
     .unwrap();
     for command in [
-        Command::Button { button: 0, down: true },
-        Command::Button { button: 0, down: false },
+        Command::Button {
+            button: 0,
+            down: true,
+            untagged: false,
+        },
+        Command::Button {
+            button: 0,
+            down: false,
+            untagged: false,
+        },
     ] {
         client.request(command, false, false).unwrap();
     }

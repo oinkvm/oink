@@ -58,7 +58,8 @@
     "oink.pointer.entry-protection/1",
     "oink.power/1",
     "oink.cloud-file-links/1",
-    "oink.input.lock-remote-windows/1"
+    "oink.input.lock-remote-windows/1",
+    "oink.auto-unlock.sync/1"
   ],
   "diagnostic_events": [
     "protocol-violation/1",
@@ -12755,6 +12756,34 @@
         ],
         "name": "ControlUnlockReply"
       }
+    },
+    {
+      "capabilities": [
+        "oink.input/1",
+        "oink.auto-unlock/1",
+        "oink.auto-unlock.sync/1"
+      ],
+      "id": 4869,
+      "name": "ControlSyncUnlock",
+      "pause": "Suspend",
+      "routes": [
+        {
+          "extra_capabilities": [],
+          "kind": 3,
+          "transport": "Reliable"
+        }
+      ],
+      "schema": {
+        "fields": [
+          {
+            "absence": "required",
+            "key": 1,
+            "name": "epoch",
+            "shape": "u64"
+          }
+        ],
+        "name": "ControlSyncUnlock"
+      }
     }
   ],
   "open_enums": [
@@ -13790,6 +13819,17 @@
         }
       ],
       "name": "ControlUnlockReply"
+    },
+    {
+      "fields": [
+        {
+          "absence": "required",
+          "key": 1,
+          "name": "epoch",
+          "shape": "u64"
+        }
+      ],
+      "name": "ControlSyncUnlock"
     },
     {
       "fields": [

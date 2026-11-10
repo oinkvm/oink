@@ -93,7 +93,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "isolated resource benchmark; run with --ignored --nocapture"]
+    #[ignore = "slow: resource identity formatting benchmark"]
     fn resource_identity_format_benchmark() {
         let id = std::hint::black_box(DeviceId([0xab; 32]));
         let started = std::time::Instant::now();

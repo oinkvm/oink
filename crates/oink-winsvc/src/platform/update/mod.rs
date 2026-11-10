@@ -6,6 +6,7 @@ pub use local::{elevate as elevate_local, inspect as inspect_local, spool as spo
 mod pipe;
 pub(in crate::platform) use pipe::elevated;
 pub(super) mod protected;
+mod relaunch;
 mod service;
 mod signature;
 mod task;

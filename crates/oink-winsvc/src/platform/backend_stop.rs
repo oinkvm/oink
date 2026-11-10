@@ -128,10 +128,9 @@ mod tests {
         assert!(stop.load(Ordering::Acquire));
     }
     #[test]
+    #[ignore = "device: installed Windows SCM notification cancellation"]
     fn scm_notification_can_be_cancelled_without_stopping_service() {
-        if std::env::var_os("OINK_SCM_STOP_NATIVE_TEST").is_none() {
-            return;
-        }
+        std::env::var_os("OINK_SCM_STOP_NATIVE_TEST").expect("set OINK_SCM_STOP_NATIVE_TEST=1 for SCM smoke");
         let called = std::sync::Arc::new(AtomicBool::new(false));
         let copy = called.clone();
         let watch = watch(move || {
@@ -142,10 +141,9 @@ mod tests {
         assert!(!called.load(Ordering::Acquire));
     }
     #[test]
+    #[ignore = "device: installed Windows SCM APC notification"]
     fn scm_running_notification_delivers_a_real_apc_without_changing_service() {
-        if std::env::var_os("OINK_SCM_STOP_NATIVE_TEST").is_none() {
-            return;
-        }
+        std::env::var_os("OINK_SCM_STOP_NATIVE_TEST").expect("set OINK_SCM_STOP_NATIVE_TEST=1 for SCM smoke");
         let (send, receive) = std::sync::mpsc::channel();
         // SCM immediately reports an already-running service through the same APC
         // path as STOP_PENDING. No service start/stop or installed app is involved.

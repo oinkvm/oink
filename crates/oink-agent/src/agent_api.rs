@@ -759,7 +759,9 @@ pub(crate) fn input_settings(node: &Node) -> InputSettings {
         mac_scroll_feel: s.routing.mac_scroll_feel,
         forward_injected_input: s.routing.forward_injected_input,
         take_foreground_on_leave: s.routing.take_foreground_on_leave,
+        quicker_compat: s.routing.quicker_compat,
         forward_wheel_by_lines: s.routing.forward_wheel_by_lines,
+        sync_unlock_others: s.sync_unlock_others,
         emergency_hold_ms: s.emergency_hold_ms.get(),
         device_gain: s.screen_preferences.device_gain,
         scroll: ScrollSettings {
@@ -1425,6 +1427,7 @@ impl AgentApi for Node {
             "forward_injected_input",
             "forward_wheel_by_lines",
             "take_foreground_on_leave",
+            "quicker_compat",
         ] {
             if let Some(value) = local_patch.as_object_mut().and_then(|p| p.remove(key)) {
                 let routing = local_patch
@@ -1454,6 +1457,7 @@ impl AgentApi for Node {
             }
             routing.forward_injected_input = s.forward_injected_input;
             routing.take_foreground_on_leave = s.take_foreground_on_leave;
+            routing.quicker_compat = s.quicker_compat;
             routing.forward_wheel_by_lines = s.forward_wheel_by_lines;
             routing.remote_scroll_speed = s.scroll.speed;
             routing.fixed_reference_display = match s.pointer.reference {
@@ -1472,6 +1476,7 @@ impl AgentApi for Node {
             candidate.cursor_trail_duration_ms = s.cursor_trail_duration_ms;
             candidate.event_frequency = s.event_frequency;
             candidate.emergency_hold_ms = emergency_hold;
+            candidate.sync_unlock_others = s.sync_unlock_others;
             candidate.screen_preferences.device_gain = s.device_gain;
             candidate.speed_mode = match s.pointer.scaling {
                 PointerScaling::Physical => SpeedMode::Physical,

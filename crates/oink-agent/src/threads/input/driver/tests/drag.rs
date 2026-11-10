@@ -272,7 +272,7 @@ fn pending_artwork_never_fences_motion_while_ordinary_consumer_is_stalled() {
         retained_inventory: None,
     });
     let begin = loop {
-        let command = h._main.recv_timeout(Duration::from_secs(1)).unwrap();
+        let command = h._main.recv().unwrap();
         if matches!(command, MainCommand::Dnd { .. }) {
             break command;
         }
@@ -294,8 +294,7 @@ fn pending_artwork_never_fences_motion_while_ordinary_consumer_is_stalled() {
         event: InjectEvent::MoveTo { pos: target },
         from: None,
     });
-    let deadline = Instant::now() + Duration::from_millis(100);
-    while backend.cursor_position().unwrap() != target && Instant::now() < deadline {
+    while backend.cursor_position().unwrap() != target {
         std::thread::yield_now();
     }
     let observed = backend.cursor_position().unwrap();

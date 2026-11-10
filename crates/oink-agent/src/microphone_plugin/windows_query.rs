@@ -224,32 +224,4 @@ mod tests {
         assert!(!check(&[driver(), driver()], Some(ARCHIVE.into()), "oem42.inf"));
         assert!(!check(&[], Some(ARCHIVE.into()), "oem42.inf"));
     }
-    #[test]
-    #[ignore = "read-only real-machine timing probe"]
-    fn native_query_timing() {
-        for _ in 0..5 {
-            let start = std::time::Instant::now();
-            let result = query();
-            println!(
-                "native_query_ms={} result={result:?}",
-                start.elapsed().as_secs_f64() * 1000.
-            );
-            assert!(result.is_ok());
-        }
-        crate::microphone_plugin::start();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
-        while crate::microphone_plugin::status().refreshing {
-            assert!(std::time::Instant::now() < deadline, "startup query did not finish");
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        println!("cached_status={:?}", crate::microphone_plugin::status());
-        let start = std::time::Instant::now();
-        for _ in 0..10_000 {
-            std::hint::black_box(crate::microphone_plugin::status());
-        }
-        println!(
-            "cached_status_mean_us={} over=10000",
-            start.elapsed().as_secs_f64() * 1_000_000. / 10_000.
-        );
-    }
 }

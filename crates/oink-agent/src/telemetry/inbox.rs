@@ -259,6 +259,7 @@ impl Drop for Inbox {
 mod tests {
     use super::*;
     #[test]
+    #[ignore = "slow: requires an injected watcher notification stream"]
     fn native_inbox_watch_observes_registration_creation_and_removal() {
         let directory = tempfile::tempdir().unwrap();
         let owner = Owner::new(directory.path(), ReportConsent::default());

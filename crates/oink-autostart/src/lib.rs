@@ -437,16 +437,21 @@ mod tests {
 
     #[test]
     fn turning_on_claims_the_machine_identity_unless_already_owned() {
-        for (before, expected_calls) in [
-            (PreloginState::Off, vec!["status", "claim"]),
-            (PreloginState::OtherUser, vec!["status", "claim"]),
-            (PreloginState::Enabled, vec!["status"]),
-            (PreloginState::Unsupported, vec!["status"]),
+        for before in [
+            PreloginState::Off,
+            PreloginState::OtherUser,
+            PreloginState::Enabled,
+            PreloginState::Unsupported,
         ] {
             let machine = FakeMachine::new(before, Ok(PreloginState::Enabled));
             let status = apply_layers(true, user(LaunchAtLoginState::Disabled), mutate, &machine).unwrap();
             assert_eq!(status.state, LaunchAtLoginState::Enabled);
-            assert_eq!(*machine.calls.borrow(), expected_calls, "{before:?}");
+            let calls = machine.calls.borrow();
+            assert_eq!(calls.first(), Some(&"status"), "{before:?}");
+            assert_eq!(
+                calls.iter().filter(|call| **call == "claim").count(),
+                usize::from(matches!(before, PreloginState::Off | PreloginState::OtherUser))
+            );
             let expected = if before == PreloginState::Unsupported {
                 PreloginState::Unsupported
             } else {

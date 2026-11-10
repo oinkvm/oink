@@ -35,6 +35,7 @@ pub(super) enum Effect {
     Dial {
         peer: DeviceId,
         addresses: Vec<SocketAddr>,
+        origin: DialOrigin,
     },
     DialFailed(DeviceId, DialFailure),
     DialFinished(DeviceId),
@@ -106,6 +107,8 @@ pub(super) struct Link {
     pub installed: bool,
     installation_deadline: Instant,
     report_setup_started: Instant,
+    /// False for a path of a background retry: only reaching Ready is a sample.
+    report_setup_failure: bool,
     report_config_started: Option<Instant>,
     heartbeat: Heartbeat,
     last_peer_data: Option<Instant>,
@@ -135,6 +138,7 @@ impl Link {
 #[derive(Debug)]
 struct Dial {
     mode: DialMode,
+    origin: DialOrigin,
     addresses: Vec<SocketAddr>,
     direct: bool,
     deadline: Instant,
@@ -270,6 +274,7 @@ impl Core {
         peer: DeviceId,
         addresses: Vec<SocketAddr>,
         mode: DialMode,
+        origin: DialOrigin,
         now: Instant,
     ) -> Result<(), DialRefused> {
         let installing = self.peer_link(peer);
@@ -285,6 +290,7 @@ impl Core {
             peer,
             Dial {
                 mode,
+                origin,
                 addresses: addresses.clone(),
                 direct,
                 deadline: now + DIAL_BUDGET,
@@ -304,7 +310,11 @@ impl Core {
             return Ok(());
         }
         if direct {
-            self.effects.push_back(Effect::Dial { peer, addresses });
+            self.effects.push_back(Effect::Dial {
+                peer,
+                addresses,
+                origin,
+            });
         }
         if mode == DialMode::All || !direct && mode == DialMode::PreferDirect {
             self.request_relay(peer, now);
@@ -325,11 +335,13 @@ impl Core {
             return;
         }
         if let Some(dial) = self.dials.remove(&peer) {
-            super::timing::record(
-                super::timing::Measurement::Setup(super::timing::Result::Failed),
-                dial.deadline - DIAL_BUDGET,
-                Instant::now(),
-            );
+            if dial.origin == DialOrigin::Initial {
+                super::timing::record(
+                    super::timing::Measurement::Setup(super::timing::Result::Failed),
+                    dial.deadline - DIAL_BUDGET,
+                    Instant::now(),
+                );
+            }
             path_trace(peer, "offline", None, "local", "dial_failed");
             self.effects.push_back(Effect::DialFailed(peer, reason));
         }
@@ -614,6 +626,10 @@ impl Core {
                     .dials
                     .get(&peer.device_id)
                     .map_or(now, |dial| dial.deadline - DIAL_BUDGET),
+                report_setup_failure: self
+                    .dials
+                    .get(&peer.device_id)
+                    .is_none_or(|dial| dial.origin == DialOrigin::Initial),
                 report_config_started: None,
                 heartbeat: Heartbeat::new(now),
                 last_peer_data: None,
@@ -770,19 +786,21 @@ impl Core {
             pong_age_ms = link.heartbeat.rtt.map(|_| observed.saturating_duration_since(link.heartbeat.progress).as_secs_f64() * 1000.),
             "Logical link lost");
         if !link.installed || link.state != LinkState::Ready {
-            let result = match reason {
-                LinkLost::Stopped
-                | LinkLost::Local(Disconnect::Stopping | Disconnect::LeavingGroup | Disconnect::Sleeping) => {
-                    super::timing::Result::Cancelled
-                }
-                LinkLost::Local(Disconnect::HandshakeTimeout) => super::timing::Result::Timeout,
-                _ => super::timing::Result::Failed,
-            };
-            super::timing::record(
-                super::timing::Measurement::Setup(result),
-                link.report_setup_started,
-                Instant::now(),
-            );
+            if link.report_setup_failure {
+                let result = match reason {
+                    LinkLost::Stopped
+                    | LinkLost::Local(Disconnect::Stopping | Disconnect::LeavingGroup | Disconnect::Sleeping) => {
+                        super::timing::Result::Cancelled
+                    }
+                    LinkLost::Local(Disconnect::HandshakeTimeout) => super::timing::Result::Timeout,
+                    _ => super::timing::Result::Failed,
+                };
+                super::timing::record(
+                    super::timing::Measurement::Setup(result),
+                    link.report_setup_started,
+                    Instant::now(),
+                );
+            }
             tracing::info!(target: "oink_link_diagnostics", kind = "connection_step", peer_id = link.peer.device_id.to_hex().as_str(), operation = diagnostics::hex(&link.hop.connection_id.random).as_str(), stage = if link.installed { "config_ready" } else { "path_install" }, result = "failed", reason = reason_label, "Connection establishment failed");
         }
         if let Some(m) = &link.cutover {
@@ -909,7 +927,11 @@ impl Core {
             }
             if !fresh.is_empty() {
                 dial.direct = true;
-                self.effects.push_back(Effect::Dial { peer, addresses: fresh });
+                self.effects.push_back(Effect::Dial {
+                    peer,
+                    addresses: fresh,
+                    origin: dial.origin,
+                });
             }
         }
         if let Some(id) = self.peer_link(peer) {
@@ -944,13 +966,18 @@ impl Core {
                 peer,
                 Dial {
                     mode: DialMode::DirectOnly,
+                    origin: DialOrigin::BackgroundRetry,
                     addresses: addresses.clone(),
                     direct: true,
                     deadline: now + DIAL_BUDGET,
                     request: None,
                 },
             );
-            self.effects.push_back(Effect::Dial { peer, addresses });
+            self.effects.push_back(Effect::Dial {
+                peer,
+                addresses,
+                origin: DialOrigin::BackgroundRetry,
+            });
         }
     }
     pub fn route(&self, connection: ConnectionId, tag: u64) -> Option<LinkId> {

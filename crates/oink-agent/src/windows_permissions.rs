@@ -123,7 +123,7 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    #[ignore = "requires OINK_FIREWALL_CHANGE_PROBE and an external disposable-rule edit"]
+    #[ignore = "device: requires OINK_FIREWALL_CHANGE_PROBE and an external disposable-rule edit"]
     fn native_policy_notification_requeries_once() {
         // This acceptance probe never mutates policy. The external controller
         // changes one disposable rule only after this observer is registered.

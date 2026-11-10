@@ -99,6 +99,9 @@ pub fn encode(report: &AdmittedReport) -> Result<Vec<u8>> {
             exceptions.push(exception);
             event["exception"] = json!({"values":exceptions});
             event["contexts"] = json!({"oink_crash":{"type":"oink_crash","exception_code":c.exception_code,"stack_available":!frames.is_empty(),"callsite":c.callsite,"line":c.line,"column":c.column}});
+            if let Some(source) = &c.source {
+                event["contexts"]["oink_crash"]["file"] = json!(source.as_str());
+            }
             "event"
         }
         Report::MeasuredInterval(_) | Report::PerformanceDistribution(_) => {
@@ -796,5 +799,86 @@ mod objc_privacy_tests {
             column: 1,
         });
         assert!(Report::SafeCrash(report).validate().is_err());
+    }
+}
+
+#[cfg(test)]
+mod panic_source_tests {
+    use super::*;
+    fn reduce(file: &str) -> Option<String> {
+        let mut out = [0; SourcePath::CAPACITY];
+        let len = SourcePath::reduce(file, &mut out);
+        (len != 0).then(|| String::from_utf8(out[..len].to_vec()).unwrap())
+    }
+    #[test]
+    fn panic_files_keep_only_the_owning_crate_path() {
+        for (file, expected) in [
+            // RUST-1's candidate as rustc records it in a Windows build
+            // (registry path under the build account's home directory).
+            (
+                r"C:\Users\runneradmin\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\tao-0.37.1\src\platform_impl\windows\event_loop.rs",
+                Some("tao-0.37.1/src/platform_impl/windows/event_loop.rs"),
+            ),
+            (
+                "/Users/someone/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tauri-2.12.4/src/app.rs",
+                Some("tauri-2.12.4/src/app.rs"),
+            ),
+            ("crates/oink-agent/src/clip.rs", Some("oink-agent/src/clip.rs")),
+            ("apps/oink/src-tauri/src/app.rs", Some("src-tauri/src/app.rs")),
+            ("/rustc/0123abcd/library/core/src/option.rs", Some("core/src/option.rs")),
+            ("src/main.rs", Some("src/main.rs")),
+            ("build.rs", Some("build.rs")),
+            // Absolute without a crate `src`: generated or unknown code.
+            ("/Users/someone/target/release/build/x-1/out/bindings.rs", None),
+            (r"C:\private\name.rs", None),
+            ("/src/x.rs", None),
+            ("crates/oink agent/src/x.rs", None),
+            ("crates/oink-agent/src/私.rs", None),
+            ("crates/oink-agent/src/x.txt", None),
+            ("", None),
+        ] {
+            assert_eq!(reduce(file).as_deref(), expected, "{file}");
+        }
+        assert_eq!(reduce(&format!("a/{}.rs", "x".repeat(SourcePath::CAPACITY))), None);
+    }
+    #[test]
+    fn a_rust_panic_reports_its_source_file_beside_line_and_column() {
+        let mut crash = SafeCrash::empty(
+            BuildContext {
+                app_version: AppVersion {
+                    major: 0,
+                    minor: 3,
+                    patch: 5,
+                    build: 1,
+                },
+                os_version_class: OsVersionClass::Windows10,
+            },
+            Component::UiRust,
+            CrashKind::RustPanic,
+            ExceptionClass::Panic,
+        );
+        crash.line = Some(2295);
+        crash.column = Some(11);
+        crash.source = SourcePath::from_reduced(b"tao-0.37.1/src/platform_impl/windows/event_loop.rs");
+        let report = AdmittedReport::new(Report::SafeCrash(crash.clone()), 3600).unwrap();
+        let bytes = encode(&report).unwrap();
+        let event: Value = serde_json::from_slice(bytes.split(|b| *b == b'\n').nth(2).unwrap()).unwrap();
+        let context = &event["contexts"]["oink_crash"];
+        assert_eq!(context["file"], "tao-0.37.1/src/platform_impl/windows/event_loop.rs");
+        assert_eq!(context["line"], 2295);
+        assert_eq!(context["column"], 11);
+        // The persisted queue round-trips it and rejects a free-form path.
+        let clean = serde_json::to_value(&report).unwrap();
+        assert!(encode_persisted(&serde_json::to_vec(&clean).unwrap()).is_ok());
+        let mut poisoned = clean;
+        poisoned["report"]["data"]["source"] = json!("/Users/private/notes.rs");
+        assert!(encode_persisted(&serde_json::to_vec(&poisoned).unwrap()).is_err());
+        // Only a located Rust panic may carry a source file.
+        let mut native = crash.clone();
+        native.crash_kind = CrashKind::NativeException;
+        assert!(Report::SafeCrash(native).validate().is_err());
+        let mut unlocated = crash;
+        unlocated.line = None;
+        assert!(Report::SafeCrash(unlocated).validate().is_err());
     }
 }

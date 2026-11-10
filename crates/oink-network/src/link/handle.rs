@@ -13,7 +13,7 @@ use std::{
 use tokio::sync::{Notify, mpsc, oneshot};
 
 pub(super) enum Command {
-    Dial(DeviceId, Vec<SocketAddr>, DialMode),
+    Dial(DeviceId, Vec<SocketAddr>, DialMode, DialOrigin),
     Disconnect(LinkId, Disconnect),
     HalfOpen(LinkId),
     Ready(LinkId),

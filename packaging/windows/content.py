@@ -60,8 +60,8 @@ def verify_install_ui(tables):
     row = controls.get(('OinkExitDlg', 'LaunchChoice'))
     if not row or row[2] != 'CheckBox' or row[8:10] != ['OinkLaunch', 'Launch Oink'] or properties.get('OinkLaunch') != '1':
         raise RuntimeError('MSI launch choice must default checked')
-    if ['OinkExitDlg', 'LaunchChoice', 'Show', 'UILevel = 5 AND NOT Installed AND NOT REMOVE'] not in tables.get('ControlCondition', []):
-        raise RuntimeError('MSI launch choice must only appear after successful full-UI install/upgrade')
+    if ['OinkExitDlg', 'LaunchChoice', 'Show', 'UILevel = 5 AND NOT Installed AND NOT REMOVE AND NOT WIX_UPGRADE_DETECTED'] not in tables.get('ControlCondition', []):
+        raise RuntimeError('MSI launch choice must only appear after a successful full-UI fresh install')
     if ('OinkExitDlg', 'LoginChoice') in controls:
         raise RuntimeError('MSI login choice must precede the elevated transaction')
     desktop_control = controls.get(('OinkWelcomeDlg', 'DesktopChoice'))
@@ -124,6 +124,25 @@ def verify_install_ui(tables):
         raise RuntimeError('MSI desktop default must be full-UI fresh-install only')
 
     verify_user_session_ui(tables)
+    verify_relaunch(tables)
+
+
+def verify_relaunch(tables):
+    # Issue #36: a standalone MSI reopens Oink where it ran before Setup, with no
+    # Finish click. The commit-only SYSTEM action hands sessions to OinkInput.
+    actions = {row[0]: row for row in tables.get('CustomAction', [])}
+    execute = {row[0]: row for row in tables.get('InstallExecuteSequence', [])}
+    ui = {row[0]: row for row in tables.get('InstallUISequence', [])}
+    if (actions.get('RelaunchUserSessions', [])[1:4] != ['3649', 'InstallerCA', 'RelaunchUserSessions'] or
+            execute.get('RelaunchUserSessions', ['', ''])[1] != 'NOT REMOVE' or 'RelaunchUserSessions' in ui or
+            not int(execute['StartServices'][2]) < int(execute['RelaunchUserSessions'][2]) < int(execute['InstallFinalize'][2])):
+        raise RuntimeError('MSI relaunch must be a non-fatal SYSTEM commit action after the new service starts')
+    if (actions.get('NoUpgradeLaunch', [])[1:4] != ['51', 'OinkLaunch', '0'] or
+            ui.get('NoUpgradeLaunch', ['', ''])[1] != 'WIX_UPGRADE_DETECTED' or 'NoUpgradeLaunch' in execute or
+            not int(ui['FindRelatedProducts'][2]) < int(ui['NoUpgradeLaunch'][2]) < int(ui['ExecuteAction'][2])):
+        raise RuntimeError('MSI upgrade must not offer or perform a second Finish launch')
+    if ['OinkExitDlg', 'RestartNote', 'Show', 'UILevel = 5 AND NOT REMOVE AND (Installed OR WIX_UPGRADE_DETECTED)'] not in tables.get('ControlCondition', []):
+        raise RuntimeError('MSI upgrade completion must only notify about the automatic restart')
 
 
 def verify_user_session_ui(tables):

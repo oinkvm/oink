@@ -4,6 +4,8 @@
 //! across their producers and consumers.
 
 pub mod clipboard;
+pub mod clipboard_dedupe;
+pub mod clipboard_marker;
 pub mod contacts;
 pub mod content;
 pub mod display;

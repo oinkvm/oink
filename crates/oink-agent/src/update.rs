@@ -938,13 +938,8 @@ mod tests {
         node.input_thread()
             .unwrap()
             .send(crate::threads::input::InputCommand::SessionLocked(Some(false)));
-        let ready = Instant::now() + Duration::from_secs(1);
         while node.input_status().unwrap().update_locked {
-            assert!(
-                Instant::now() < ready,
-                "fake input did not publish its unlocked session"
-            );
-            std::thread::sleep(Duration::from_millis(1));
+            std::thread::yield_now();
         }
         let _ui = crate::instance::acquire_ui(directory.path()).unwrap();
         let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();

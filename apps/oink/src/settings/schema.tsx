@@ -65,8 +65,11 @@ export const SECTIONS: SectionMeta[] = [
                     return tr('在其他设备上操作时，本机不会因为闲置而熄屏、锁屏');
                 }, get keywords() { return tr('休眠 熄屏 锁屏 唤醒 其它设备活动时，本机保持屏幕点亮 其他设备活动时，保持屏幕常亮'); } },
             { id: 'autoUnlock', get label() { return tr('自动解锁本机'); },
-              get desc() { return tr('本机锁定时，从其它设备移入指针自动解锁。需要输入登录密码，密码加密储存在本地。'); },
+              get desc() { return tr('本机锁定时，从其它设备移入指针，或其它设备开启“同步解锁其它设备”后被解锁时，自动解锁本机。需要输入登录密码，密码加密储存在本地。'); },
               get keywords() { return tr('解锁 锁屏 密码 登录 自动登录 自动解锁'); } },
+            { id: 'syncUnlock', get label() { return tr('同步解锁其它设备'); },
+              get desc() { return tr('本机解锁后，同时解锁已开启“自动解锁本机”的其它设备。Windows 设备需要锁屏画面已收起。'); },
+              get keywords() { return tr('解锁 同步解锁 锁屏 一起解锁 全部解锁'); } },
             { id: 'confirmQuit', get label() {
                     return tr('退出前确认');
                 }, get desc() {
@@ -155,6 +158,7 @@ export const SECTIONS: SectionMeta[] = [
             },
             { id: 'takeForegroundOnLeave', only: 'win', get label() { return tr('指针离开时接管前台'); }, get desc() { return tr('指针离开本机时，接管前台应用，避免本机运行读取物理按键的应用时，按键同时在两边生效。若部分应用在指针离开后行为异常，可关闭此开关。'); }, get keywords() { return tr('前台 窗口 游戏 捕获 点击 按键 全屏'); } },
             { id: 'forwardInjectedInput', only: 'win', get label() { return tr('转发程序注入的输入'); }, get desc() { return tr('关闭时，用本机控制其它设备时，本机其它程序注入的输入不转发至被控设备'); }, get keywords() { return tr('程序 注入 输入 转发 模拟 自动化 宏 辅助功能 SendInput computer use'); } },
+            { id: 'quickerCompat', only: 'win', get label() { return tr('Quicker 兼容模式'); }, get desc() { return tr('使本机被控制时 Quicker 能正常使用'); }, get keywords() { return tr('Quicker 轮盘 手势 兼容'); } },
             { id: 'pollLimit', get label() {
                     return tr('指针事件频率上限');
                 }, get desc() {
@@ -189,6 +193,7 @@ export const SECTIONS: SectionMeta[] = [
         items: [
             { id: 'clipReceive', get label() { return tr('接收其它设备复制的内容'); }, get desc() { return tr('在其它设备上复制的内容，可以在本机粘贴'); } },
             { id: 'clipSend', get label() { return tr('同步复制的内容给其它设备'); }, get desc() { return tr('本机复制的内容，可以在其它设备上粘贴'); } },
+            { id: 'clipDedupe', get label() { return tr('剪贴板内容去重'); }, get desc() { return tr('连续复制相同内容时，只会同步一次，可避免与其它同步工具产生冲突'); }, get keywords() { return tr('去重 重复 同步工具 冲突 回环'); } },
             {id:'receivedFiles',get label(){return tr('收到的文件');},get desc(){return tr('从其它设备粘贴或拖拽到本机的文件');},get keywords(){return tr('收到 接收 文件 文件夹 粘贴 拖拽 管理 删除 空间 Finder Explorer');}},
             {id:'receivedCleanup',get label(){return tr('自动清理收到的文件');},get desc(){return tr('释放磁盘空间。仍在原设备上的文件可以再次下载，其他文件会被删除');},get keywords(){return tr('自动 清理 收到 文件 7天 30天 从不');}},
             { id: 'cache', get label() {

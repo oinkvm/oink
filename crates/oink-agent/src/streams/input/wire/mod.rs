@@ -122,7 +122,7 @@ pub(crate) fn decode(bytes: &[u8], peer: &PeerAdmission, datagram: bool) -> v1::
         _ if (0x0100..=0x010f).contains(&frame.header.type_id)
             || matches!(
                 frame.header.type_id,
-                0x1300 | 0x1301 | 0x1302 | 0x1303 | 0x1304 | 0x0111
+                0x1300 | 0x1301 | 0x1302 | 0x1303 | 0x1304 | 0x1305 | 0x0111
             ) =>
         {
             control::decode(message).map(|value| Decoded::Packet(Packet::Control(value)))
@@ -150,6 +150,7 @@ pub(crate) fn supported(message: &Packet, peer: &PeerAdmission) -> bool {
         Packet::Control(ControlMsg::CursorTrail { .. } | ControlMsg::CursorTrailHandoff { .. }) => "oink.input.trail/1",
         Packet::Dnd(_) => "oink.drag/1",
         Packet::Control(ControlMsg::UnlockQuery { .. } | ControlMsg::UnlockReply { .. }) => "oink.auto-unlock/1",
+        Packet::Control(ControlMsg::SyncUnlock { .. }) => "oink.auto-unlock.sync/1",
         Packet::Control(ControlMsg::LocalClick { .. }) => "oink.focus.local-click/1",
         Packet::Control(ControlMsg::MovePointer { .. }) => "oink.pointer.move/1",
         Packet::Control(ControlMsg::MovePointerEnter { .. }) => "oink.pointer.move-hidden/1",
@@ -419,6 +420,7 @@ mod dispatch_tests {
         };
         vec![
             ControlMsg::UnlockQuery { epoch: 1 },
+            ControlMsg::SyncUnlock { epoch: 1 },
             ControlMsg::UnlockReply {
                 epoch: 1,
                 unlocked: true,
@@ -554,5 +556,32 @@ mod dispatch_tests {
             .map(|m| m.id)
             .collect();
         assert_eq!(covered, registered);
+    }
+
+    #[test]
+    fn sync_unlock_is_never_sent_to_a_peer_without_the_capability() {
+        let admission = |capabilities: &[&str]| PeerAdmission {
+            boot: Boot {
+                device_id: DeviceId([1; 32]),
+                nonce: [1; 16],
+            },
+            link: oink_network::link::LinkId(1),
+            agreement: Arc::new(Agreement::new(capabilities.iter().map(|s| s.to_string())).unwrap()),
+        };
+        let base = [
+            "oink.core/1",
+            "oink.group/1",
+            "oink.input/1",
+            "oink.clipboard/1",
+            "oink.low/1",
+            "oink.auto-unlock/1",
+        ];
+        let old = admission(&base);
+        let new = admission(&[&base[..], &["oink.auto-unlock.sync/1"]].concat());
+        let sync = Packet::Control(ControlMsg::SyncUnlock { epoch: 1 });
+        assert!(!supported(&sync, &old));
+        assert!(supported(&sync, &new));
+        // The challenge pair keeps its own, older capability.
+        assert!(supported(&Packet::Control(ControlMsg::UnlockQuery { epoch: 1 }), &old));
     }
 }

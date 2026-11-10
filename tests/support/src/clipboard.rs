@@ -24,6 +24,9 @@ struct Inner {
     native: Option<oink_clipboard::NativeSpec>,
     /// 最近一次写入的虚拟文件的内容来源。
     contents: Option<Arc<dyn FileContents>>,
+    /// The Oink clip marker of the current content (oink_clipboard::dedupe),
+    /// kept apart from `items` so content assertions stay unchanged.
+    marker: Option<Vec<u8>>,
 }
 
 /// 内存里的剪贴板。`copy` 模拟用户复制；`write` 由同步逻辑调用。
@@ -53,6 +56,7 @@ impl FakeClipboard {
             let mut i = self.lock();
             i.contents = None;
             i.native = None;
+            i.marker = None;
             let items = match i.rewrite {
                 Some(f) => items.into_iter().map(f).collect(),
                 None => items,
@@ -71,6 +75,32 @@ impl FakeClipboard {
     /// 模拟用户在本机复制。返回新的变化计数。
     pub fn copy(&self, items: Vec<ClipData>, s: Sensitivity) -> u64 {
         self.set(items, s)
+    }
+
+    /// Model a synchronizer that copies the whole clipboard, private formats
+    /// included: the content and the Oink clip marker come back together.
+    pub fn copy_with_marker(&self, items: Vec<ClipData>, marker: Option<Vec<u8>>, s: Sensitivity) -> u64 {
+        // Set before the change handlers run, as a native write publishes all
+        // types in one transaction.
+        let (count, handlers) = {
+            let mut i = self.lock();
+            i.contents = None;
+            i.native = None;
+            i.marker = marker;
+            i.items = items;
+            i.sensitivity = Some(s);
+            i.count += 1;
+            (i.count, i.handlers.clone())
+        };
+        for h in handlers {
+            h();
+        }
+        count
+    }
+
+    /// The Oink clip marker currently on this clipboard.
+    pub fn marker(&self) -> Option<Vec<u8>> {
+        self.lock().marker.clone()
     }
 
     /// 当前内容。

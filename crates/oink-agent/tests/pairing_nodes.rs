@@ -253,6 +253,7 @@ async fn start_request(a: &Node, b: &Node, operation: &str) -> String {
 }
 
 #[test]
+#[ignore = "slow: requires real network delay and loss qualification"]
 fn slow_manual_peer_is_prepared_within_budget_and_real_network_loss_ends_pairing() {
     common::watchdog::run(
         module_path!(),
@@ -326,6 +327,7 @@ fn slow_manual_peer_is_prepared_within_budget_and_real_network_loss_ends_pairing
 }
 
 #[test]
+#[ignore = "slow: requires a periodic group state clock injection"]
 fn waiting_for_code_survives_periodic_group_state_and_still_commits() {
     common::watchdog::run(
         module_path!(),

@@ -488,7 +488,11 @@ mod tests {
             for command in [
                 Command::Release,
                 Command::Move { x: 1, y: 2 },
-                Command::Button { button: 0, down: false },
+                Command::Button {
+                    button: 0,
+                    down: false,
+                    untagged: false,
+                },
             ] {
                 assert!(!ordinary_query(command, role));
             }

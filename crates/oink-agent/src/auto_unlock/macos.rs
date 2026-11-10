@@ -16,9 +16,12 @@ use zeroize::{Zeroize, Zeroizing};
 type Cf = *const c_void;
 type Result<T> = std::result::Result<T, &'static str>;
 const KEYCHAIN: &str = "macOS专用钥匙串操作失败";
-const PASSWORD_INCORRECT: &str = "密码不正确";
+pub(crate) const PASSWORD_INCORRECT: &str = "密码不正确";
 const PASSWORD_VERIFY: &str = "无法验证登录密码";
-const LOCK_CHANGED: &str = "锁屏状态或登录会话已变化，自动解锁已停止";
+pub(crate) const LOCK_CHANGED: &str = "锁屏状态或登录会话已变化，自动解锁已停止";
+pub(crate) const DISPLAY_ASLEEP: &str = "无法唤醒 macOS 锁屏显示器";
+pub(crate) const NOT_READY: &str = "macOS 锁屏密码框未在规定时间内就绪";
+pub(crate) const LOCAL_TYPING: &str = "本机正在输入，已跳过同步解锁";
 const READINESS_TIMEOUT: Duration = Duration::from_secs(5);
 const READINESS_STABLE: Duration = Duration::from_millis(600);
 const READINESS_SAMPLE_INTERVAL: Duration = Duration::from_millis(20);
@@ -104,6 +107,7 @@ unsafe extern "C" {
     fn CGEventSetFlags(event: Cf, flags: u64);
     fn CGEventSetIntegerValueField(event: Cf, field: u32, value: i64);
     fn CGEventPost(tap: u32, event: Cf);
+    fn CGEventSourceSecondsSinceLastEventType(state: i32, event_type: u32) -> f64;
 }
 struct Owned(Cf);
 impl Drop for Owned {
@@ -375,11 +379,76 @@ pub fn attempt(
     if text.is_empty() {
         return Err("未保存有效的登录密码");
     }
+    type_password(backend, text, false, start)
+}
+/// Sync unlock target transaction. The display was woken at `woke` (in
+/// parallel with the source challenge); readiness keeps the same five-second
+/// window measured from that wake.
+pub fn sync_attempt(
+    backend: std::sync::Arc<dyn oink_input::InputBackend>,
+    woke: Instant,
+    start: impl FnOnce(super::typing::Job) -> Result<()>,
+) -> Result<()> {
+    if let Err(reason) = wait_ready(woke + READINESS_TIMEOUT) {
+        // SAFETY: read-only CoreGraphics query of the main display.
+        return Err(if unsafe { CGDisplayIsAsleep(CGMainDisplayID()) != 0 } {
+            DISPLAY_ASLEEP
+        } else {
+            reason
+        });
+    }
+    let text = read_secret()?;
+    if text.is_empty() {
+        return Err("未保存有效的登录密码");
+    }
+    // User decision Q5 also applies to macOS, but loginwindow's verdict after
+    // Return is not observable to Oink. An unattended sync therefore verifies
+    // the stored password with Open Directory before typing anything; a wrong
+    // one latches password_incorrect and stops further sync attempts.
+    verify_password(std::str::from_utf8(&text).map_err(|_| "macOS已存凭据格式无效")?)?;
+    type_password(backend, text, true, start)
+}
+/// The backend's own user session is locked, on console and logged in.
+pub(crate) fn console_locked() -> bool {
+    locked_session().is_ok()
+}
+/// Pre-start rejection and lock changes are not failures: the user unlocked or
+/// the transaction lost its admission before typing anything.
+pub(crate) fn stopped_by_state_change(reason: &str) -> bool {
+    matches!(
+        reason,
+        LOCK_CHANGED
+            | "本机已解锁或锁定状态未知，自动输入已停止"
+            | "输入开始前焦点或连接状态改变，已取消自动解锁"
+            | "输入开始前状态改变，自动解锁已取消"
+    )
+}
+/// Local keyboard input within the last two seconds (user decision Q9). The
+/// HID system state covers the lock screen, where the password field's Secure
+/// Input hides key events from Oink's own event tap.
+fn local_typing() -> bool {
+    const HID_SYSTEM_STATE: i32 = 1;
+    const KEY_DOWN: u32 = 10;
+    // SAFETY: read-only query of the HID event source state; no permission prompt.
+    let seconds = unsafe { CGEventSourceSecondsSinceLastEventType(HID_SYSTEM_STATE, KEY_DOWN) };
+    seconds.is_finite() && seconds >= 0.0 && seconds < super::sync::LOCAL_TYPING.as_secs_f64()
+}
+fn type_password(
+    backend: std::sync::Arc<dyn oink_input::InputBackend>,
+    text: Zeroizing<Vec<u8>>,
+    sync: bool,
+    start: impl FnOnce(super::typing::Job) -> Result<()>,
+) -> Result<()> {
     let session = locked_session()?;
     let created = std::time::Instant::now();
     let (reply, result) = std::sync::mpsc::sync_channel(1);
     let job = super::typing::Job::new(
         Box::new(move |admission| {
+            // Checked on the injection owner immediately before the first
+            // character, together with the per-character lock guard.
+            if sync && local_typing() {
+                return Err(LOCAL_TYPING);
+            }
             let mut begun = false;
             guarded_text_at(
                 text,
@@ -408,15 +477,15 @@ fn password_field_ready_for(backend: &dyn oink_input::InputBackend, timeout: Dur
     // UserActivity is the only wake mechanism used here. Secure Input is
     // intentionally not part of readiness: on the measured macOS versions it
     // can pulse or remain false while the loginwindow surface is usable.
-    backend
-        .declare_user_activity()
-        .map_err(|_| "无法唤醒 macOS 锁屏显示器")?;
-    let started = Instant::now();
+    backend.declare_user_activity().map_err(|_| DISPLAY_ASLEEP)?;
+    wait_ready(Instant::now() + timeout)
+}
+fn wait_ready(deadline: Instant) -> Result<()> {
     let mut readiness = ReadinessState::default();
     loop {
         let now = Instant::now();
-        if now.saturating_duration_since(started) >= timeout {
-            return Err("macOS 锁屏密码框未在规定时间内就绪");
+        if now >= deadline {
+            return Err(NOT_READY);
         }
         if observe_readiness(&mut readiness, now, false, readiness_sample()) {
             return Ok(());
@@ -807,6 +876,11 @@ fn post_character(
             // SAFETY: owned keyboard event, valid HID tap constant.
             unsafe { CGEventPost(0, event.0) };
             *begun = true;
+            if character.is_none() {
+                // Return submitted Oink's password: an unlock edge in the next
+                // five seconds is Oink's own and must not fan out again.
+                super::sync::mark_own_unlock();
+            }
         } else {
             // This is deliberately unconditional after a successful down. It
             // prevents a stale modifier/key state when Touch ID or another

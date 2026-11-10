@@ -155,3 +155,30 @@ it('excludes missing AX at view time and restores all geometry without changing 
     expect(restored[0]).toEqual(shown[0]);
     expect(value).toEqual(before);
 });
+
+describe('screen tile resolution', () => {
+    // A 14" MacBook Pro at its default scale: bounds are Quartz points, the
+    // backing store has twice as many pixels in each direction.
+    const retina = (pixels: { w: number; h: number }): Screen => {
+        const base = screen('a', { x: 0, y: 0, w: 1512, h: 982 });
+        return { ...base, display: { ...base.display, pixel_width: pixels.w, pixel_height: pixels.h } };
+    };
+    const labels = (screens: ReturnType<typeof renderLayout>) => screens.map(s => [s.labelWidth, s.labelHeight]);
+
+    it('labels a Retina screen with its pixels rather than its points', () => {
+        expect(labels(renderLayout(layout([retina({ w: 3024, h: 1964 })]), {}))).toEqual([[3024, 1964]]);
+    });
+
+    it('keeps the pixel label when a saved placement rescales the drawn screen', () => {
+        const value = layout([retina({ w: 3024, h: 1964 })]);
+        const live = renderLayout(value, {});
+        const saved = renderLayout(value, {}, [placement]);
+        expect(saved[0].w).not.toBeCloseTo(live[0].w);
+        expect(labels(saved)).toEqual([[3024, 1964]]);
+    });
+
+    it('falls back to bounds for a placeholder without pixel dimensions', () => {
+        expect(labels(renderLayout(layout([retina({ w: 0, h: 0 })]), {}))).toEqual([[1512, 982]]);
+        expect(labels(renderLayout(layout([retina({ w: 3024, h: 0 })]), {}))).toEqual([[1512, 982]]);
+    });
+});

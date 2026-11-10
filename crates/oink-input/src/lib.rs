@@ -44,6 +44,9 @@ mod ordinary_motion;
 mod park_commit;
 pub mod pointer_capture;
 pub mod pointer_transition;
+#[cfg(any(windows, all(test, debug_assertions)))]
+#[cfg_attr(not(windows), allow(dead_code))]
+mod quicker_compat;
 pub mod session_gate;
 #[cfg(any(windows, test))]
 mod source_foreground;
@@ -148,6 +151,10 @@ pub trait InputBackend: Send + Sync {
     /// Ordered outside capture callbacks. Windows owns a dedicated foreground
     /// window until false; other platforms retain their native focus behavior.
     fn set_source_foreground(&self, _enabled: bool) {}
+
+    /// Windows-local Quicker compatibility mode: remote button and keyboard
+    /// injection carries `dwExtraInfo = 0`. Other platforms ignore it.
+    fn set_quicker_compat(&self, _enabled: bool) {}
 
     /// Atomic only: no native permission query on capture/injection threads.
     fn input_safety(&self) -> session_gate::InputSafety {

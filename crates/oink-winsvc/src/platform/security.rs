@@ -201,6 +201,20 @@ pub(super) fn verify_self() -> io::Result<()> {
     }
     Ok(())
 }
+pub(super) fn sid_string(sid: &[u8]) -> io::Result<String> {
+    let mut raw = ptr::null_mut();
+    // SAFETY: SID from a validated token; the LocalAlloc string is freed after copying.
+    unsafe {
+        check(ConvertSidToStringSidW(sid.as_ptr().cast_mut().cast(), &mut raw))?;
+        let mut n = 0;
+        while *raw.add(n) != 0 {
+            n += 1;
+        }
+        let text = String::from_utf16_lossy(std::slice::from_raw_parts(raw, n));
+        LocalFree(raw.cast());
+        Ok(text)
+    }
+}
 pub(super) fn user_sid(id: u32) -> io::Result<Vec<u8>> {
     let mut raw = ptr::null_mut();
     // SAFETY: SYSTEM broker/helper queries only the active session, owning the returned token.

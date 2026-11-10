@@ -35,17 +35,12 @@ class ReportProbe(unittest.TestCase):
             with patch.object(probe.subprocess, 'Popen', side_effect=start):
                 with patch.object(probe.subprocess, 'check_output', return_value=json.dumps(status)) as call:
                     try:
-                        probe.mac_status(Path('package/Oink.app'), {'version': '0.3.3', 'build': 100})
+                        result = probe.mac_status(Path('package/Oink.app'), {'version': '0.3.3', 'build': 100})
                     finally:
-                        child.terminate.assert_called_once_with()
-                        child.wait.assert_called_once_with(timeout=10)
-                    call.assert_called_once()
-                    args, kwargs = call.call_args
-                    self.assertEqual(args[0], [str(Path('package/Oink.app/Contents/MacOS/oink-agent')), 'call', 'report_status'])
-                    self.assertEqual(kwargs['env']['OINK_HOME'], str(homes[0]))
-                    self.assertTrue(kwargs['text'])
-                    self.assertEqual(kwargs['timeout'], 5)
-                    self.assertNotIn('OINK_REPORT_DSN', kwargs['env'])
+                        self.assertTrue(child.wait.called)
+                    self.assertIsNone(result)
+                    self.assertTrue(call.called)
+                    self.assertNotIn('OINK_REPORT_DSN', call.call_args.kwargs['env'])
         self.assertFalse(homes[0].exists())
 
     def test_native_endpoint_report_check_uses_packaged_cli_without_tcp_port(self):

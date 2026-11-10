@@ -2479,7 +2479,10 @@ impl Router {
             m @ ControlMsg::CursorTrailHandoff { .. } => self.trail_receive(from, m, now),
             // Consumed by the input module's adapter (it becomes the peer's
             // `sharing` flag when the pair attaches); the router itself does not act on it.
-            ControlMsg::InputCapability { .. } | ControlMsg::UnlockQuery { .. } | ControlMsg::UnlockReply { .. } => {}
+            ControlMsg::InputCapability { .. }
+            | ControlMsg::UnlockQuery { .. }
+            | ControlMsg::UnlockReply { .. }
+            | ControlMsg::SyncUnlock { .. } => {}
             ControlMsg::Feel { profile } => {
                 if let Some(p) = self.peers.get_mut(&from) {
                     p.feel = profile;

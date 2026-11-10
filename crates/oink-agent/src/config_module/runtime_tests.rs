@@ -2662,3 +2662,29 @@ async fn unhide_repairs_only_restored_device_in_one_layout_publication() {
     }
     stop(&nodes).await;
 }
+
+#[test]
+fn only_timed_retries_after_a_failure_are_background_dials() {
+    let now = Instant::now();
+    // New member: first link after pairing, startup.
+    let mut dial = Dial::default();
+    assert_eq!(dial.origin(), DialOrigin::Initial);
+    dial.failed(DialFailure::Unreachable, now);
+    assert_eq!(dial.origin(), DialOrigin::BackgroundRetry);
+    // A path that fails admission before Ready is a failure too.
+    dial.lost(LinkId(1), now);
+    assert_eq!(dial.failures, 2);
+    assert_eq!(dial.origin(), DialOrigin::BackgroundRetry);
+    // The user entered an address for the member.
+    dial.requested = true;
+    assert_eq!(dial.origin(), DialOrigin::Initial);
+    dial.requested = false;
+    // Wake, network change or a changed discovery beacon.
+    dial.reset(now);
+    assert_eq!(dial.origin(), DialOrigin::Initial);
+    // A ready link was lost: the immediate reconnect is not a background retry.
+    dial.failed(DialFailure::Unreachable, now);
+    dial.ready_link = Some(LinkId(2));
+    dial.lost(LinkId(2), now);
+    assert_eq!(dial.origin(), DialOrigin::Initial);
+}

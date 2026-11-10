@@ -29,11 +29,7 @@ use std::{
     sync::Arc,
 };
 
-fn board(name: Option<&str>) -> Retained<NSPasteboard> {
-    name.map_or_else(NSPasteboard::generalPasteboard, |name| {
-        NSPasteboard::pasteboardWithName(&NSString::from_str(name))
-    })
-}
+use super::gate::{self, board};
 pub(super) fn standard(name: &str) -> Option<StandardFormat> {
     Some(match name {
         "public.utf8-plain-text"
@@ -316,8 +312,9 @@ pub(super) fn snapshot_board(pb: &NSPasteboard, data: &Path, id: OfferId) -> io:
 /// Registry serving and capture run on blocking executors, outside input/network.
 /// changeCount is checked around the native read, including Oink's own writes.
 fn read_current(name: Option<&str>, count: u64, item: usize, ty: &str) -> io::Result<crate::FileReader> {
+    let turn = gate::enter();
     autoreleasepool(|_| {
-        let pb = board(name);
+        let pb = board(&turn, name);
         if pb.changeCount() as u64 != count {
             return Err(content::clipboard::changed());
         }
@@ -337,8 +334,9 @@ fn read_current(name: Option<&str>, count: u64, item: usize, ty: &str) -> io::Re
 }
 
 pub(super) fn capture(name: Option<&str>, data: &Path) -> Result<CapturedClipboard, ClipboardError> {
+    let turn = gate::enter();
     autoreleasepool(|_| {
-        let pb = board(name);
+        let pb = board(&turn, name);
         let count = pb.changeCount() as u64;
         let id = OfferId {
             clip: ClipId {
@@ -366,8 +364,9 @@ pub(super) fn capture(name: Option<&str>, data: &Path) -> Result<CapturedClipboa
         let check_name = name.clone();
         let promise_name = name.clone();
         let check: content::clipboard::Check = Arc::new(move || {
+            let turn = gate::enter();
             autoreleasepool(|_| {
-                if board(check_name.as_deref()).changeCount() as u64 == count {
+                if board(&turn, check_name.as_deref()).changeCount() as u64 == count {
                     Ok(())
                 } else {
                     Err(content::clipboard::changed())
@@ -557,7 +556,10 @@ define_class!(
                 );
                 match urls.read(*node) {
                     Ok(url) if !callback.timed_out() => {
-                        if item.setString_forType(&NSString::from_str(&url), ty) {
+                        let turn = gate::enter();
+                        let set = item.setString_forType(&NSString::from_str(&url), ty);
+                        drop(turn);
+                        if set {
                             trace.success(url.len() as u64);
                             callback.served();
                         }
@@ -637,7 +639,10 @@ define_class!(
                 }
                 match result {
                     Ok(bytes) => {
-                        if item.setData_forType(&NSData::with_bytes(&bytes), ty) {
+                        let turn = gate::enter();
+                        let set = item.setData_forType(&NSData::with_bytes(&bytes), ty);
+                        drop(turn);
+                        if set {
                             trace.success(bytes.len() as u64);
                             callback.served();
                         }
@@ -933,7 +938,17 @@ pub(super) fn write_lazy(
     guard: &dyn Fn() -> std::io::Result<()>,
 ) -> Result<u64, ClipboardError> {
     autoreleasepool(|_| {
-        let items: Vec<_> = native_items_lazy(spec, Some(urls), lazy_urls.as_ref())?
+        let native = native_items_lazy(spec, Some(urls), lazy_urls.as_ref())?;
+        // The Oink clip marker: this clip's identity only, never content
+        // (crate::dedupe). Immediate data, so a synchronizer copying the board
+        // wholesale carries it without asking Oink for anything.
+        if let (Some((_, first)), Some(marker)) = (native.first(), crate::dedupe::marker(spec.inventory.id)) {
+            first.setData_forType(
+                &NSData::with_bytes(&marker),
+                &NSString::from_str(crate::dedupe::MARKER_MAC),
+            );
+        }
+        let items: Vec<_> = native
             .into_iter()
             .map(|(_, item)| ProtocolObject::from_retained(item))
             .collect();
@@ -945,7 +960,8 @@ pub(super) fn write_lazy(
             items
         };
         guard().map_err(|_| ClipboardError::Busy)?;
-        let pb = board(name);
+        let turn = gate::enter();
+        let pb = board(&turn, name);
         pb.clearContents();
         if !pb.writeObjects(&NSArray::from_retained_slice(&items)) {
             return Err(ClipboardError::Unsupported);

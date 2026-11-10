@@ -11,7 +11,7 @@ use std::{
 /// Opt in explicitly: asks the OS crash reporter to process an isolated child.
 /// No installed app, desktop input, application settings or OS report deletion.
 #[test]
-#[ignore = "real OS crash reporter; run explicitly on a Mac"]
+#[ignore = "device: macOS OS crash reporter and DiagnosticReports"]
 fn native_child_ips_has_matching_uuid_and_multiple_shipped_frames() {
     let dir = tempfile::tempdir().unwrap();
     let source = dir.path().join("crash.c");

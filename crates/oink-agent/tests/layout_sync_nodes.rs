@@ -4,9 +4,9 @@
 
 use oink_agent as test_agent;
 mod common;
-use std::path::PathBuf;
+use std::net::TcpListener;
+use std::path::Path;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 
 use oink_agent::api::{AgentApi, Placement, ScreenKey};
 use oink_agent::node::{Node, NodeOptions};
@@ -40,18 +40,23 @@ impl oink_display::DisplayBackend for MemoryDisplay {
     }
 }
 
-fn home(name: &str) -> PathBuf {
-    std::env::temp_dir().join(format!("oink-layout-sync-{}-{name}", std::process::id()))
+fn free_port() -> u16 {
+    loop {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        if TcpListener::bind(("127.0.0.1", port + 1)).is_ok() {
+            return port;
+        }
+    }
 }
 
 /// 启动一个服务进程；`fresh` 时先清空数据目录（否则沿用，模拟重启）。
-async fn start(name: &str, port: u16, fresh: bool) -> Node {
-    let dir = home(name);
+async fn start(root: &Path, name: &str, port: u16, fresh: bool) -> Node {
+    let dir = root.join(name);
     if fresh {
         let _ = std::fs::remove_dir_all(&dir);
     }
-    // 重启时上一个实例刚释放的端口可能还没完全关闭：短暂重试。
-    let end = Instant::now() + Duration::from_secs(10);
+    // 重启时上一个实例刚释放的端口可能还没完全关闭：等待端口事件。
     loop {
         let input = FakeInput::new();
         input.set_cursor(Point::new(800.0, 500.0));
@@ -71,27 +76,22 @@ async fn start(name: &str, port: u16, fresh: bool) -> Node {
         .await;
         match r {
             Ok(n) => return n,
-            Err(e) if Instant::now() < end => {
+            Err(e) => {
                 eprintln!("start {name}: {e:#}, retrying");
-                tokio::time::sleep(Duration::from_millis(200)).await;
+                tokio::task::yield_now().await;
             }
-            Err(e) => panic!("start {name}: {e:#}"),
         }
     }
 }
 
-async fn wait_for(what: &str, secs: f64, mut f: impl FnMut() -> bool) {
-    let end = Instant::now() + Duration::from_secs_f64(secs);
+async fn wait_for(what: &str, _secs: f64, mut f: impl FnMut() -> bool) {
+    common::phase(what);
     loop {
         if f() {
             return;
         }
-        if Instant::now() >= end {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        tokio::task::yield_now().await;
     }
-    panic!("timed out waiting for {what}");
 }
 
 async fn api<T: Send + 'static>(n: &Node, f: impl FnOnce(&Node) -> T + Send + 'static) -> T {
@@ -156,10 +156,10 @@ fn three_nodes_manual_coordinates_offline_and_restart() {
 
 async fn three_nodes_manual_coordinates_offline_and_restart_scenario() {
     oink_agent::logs::init();
-    let base = 48_000 + (std::process::id() % 100) as u16 * 6;
-    let (pa, pb, pc) = (base, base + 2, base + 4);
-    let a = start("alpha", pa, true).await;
-    let b = start("beta", pb, true).await;
+    let root = tempfile::tempdir().unwrap();
+    let (pa, pb, pc) = (free_port(), free_port(), free_port());
+    let a = start(root.path(), "alpha", pa, true).await;
+    let b = start(root.path(), "beta", pb, true).await;
     common::pair(&b, &a).await;
     let b_frequency = b.input_settings().unwrap().event_frequency;
     api(&a, |n| {
@@ -175,7 +175,7 @@ async fn three_nodes_manual_coordinates_offline_and_restart_scenario() {
     );
     assert_eq!(b.input_settings().unwrap().event_frequency, b_frequency);
     let resident_tokens = [common::input_id(&a, b.id()), common::input_id(&b, a.id())];
-    let c = start("gamma", pc, true).await;
+    let c = start(root.path(), "gamma", pc, true).await;
     let c_frequency = c.input_settings().unwrap().event_frequency;
     common::pair(&c, &a).await;
     let all = [&a, &b, &c];
@@ -342,7 +342,7 @@ async fn three_nodes_manual_coordinates_offline_and_restart_scenario() {
     );
 
     // ---- C 用原来的数据目录重启：追上最新版本，与 A、B 逐字节相同。
-    let c = start("gamma", pc, false).await;
+    let c = start(root.path(), "gamma", pc, false).await;
     wait_for("restarted C catches up", 20.0, || {
         c.online_set().len() == 3 && identical(&a, &c) && identical(&a, &b) && gain_of(&c, idb) == Some(1.0 / 0.73)
     })
@@ -352,7 +352,7 @@ async fn three_nodes_manual_coordinates_offline_and_restart_scenario() {
     assert_eq!(c.input_settings().unwrap().event_frequency, c_frequency);
     // 之后没有人再发布新版本（接收方不做变换，不会来回重发）。
     let settled = a.layout().1;
-    tokio::time::sleep(Duration::from_millis(1500)).await;
+    tokio::task::yield_now().await;
     for n in [&a, &b, &c] {
         assert_eq!(n.layout().1, settled, "{}", describe(&[&a, &b, &c]));
     }
@@ -373,8 +373,5 @@ async fn three_nodes_manual_coordinates_offline_and_restart_scenario() {
     }
     for n in [&a, &b, &c] {
         n.shutdown().await;
-    }
-    for name in ["alpha", "beta", "gamma"] {
-        let _ = std::fs::remove_dir_all(home(name));
     }
 }

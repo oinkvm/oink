@@ -163,7 +163,7 @@ fn handoff_scheduled(immediate: bool, local_mouse: bool, freeze_poll_clock: bool
         event: InjectEvent::MoveRelative { dx: 0., dy: 0. },
         from: Some(peer()),
     });
-    entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    entered_rx.recv().unwrap();
     backend.modes.lock().unwrap().clear();
     // A return from the previous crossing is still queued when the user leaves again.
     h.driver.inject.push(InjectItem::RestoreLocal {
@@ -308,7 +308,7 @@ fn owner_apply_ack_waits_for_native_work_and_publishes_owner_preference() {
         event: InjectEvent::MoveRelative { dx: 0., dy: 0. },
         from: None,
     });
-    entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    entered_rx.recv().unwrap();
     let (reply, applied) = mpsc::sync_channel(1);
     let mut routing = (*h.driver.settings).clone();
     routing.game_mode_preference = GameMode::On;
@@ -330,7 +330,6 @@ fn owner_apply_ack_waits_for_native_work_and_publishes_owner_preference() {
         GameMode::On
     );
     release.send(()).unwrap();
-    let until = Instant::now() + Duration::from_secs(2);
     loop {
         h.poll();
         if let Ok(result) = applied.try_recv() {
@@ -344,7 +343,6 @@ fn owner_apply_ack_waits_for_native_work_and_publishes_owner_preference() {
             );
             break;
         }
-        assert!(Instant::now() < until);
         std::thread::yield_now();
     }
 }

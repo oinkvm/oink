@@ -669,7 +669,11 @@ export function Arrangement({ screens, platform = 'mac', geometryScreens = scree
             } as CSSProperties;
             const hz = Math.max(14, Math.min(R * 1.2, W / 3, H / 3));
             const out = gap + 8;
-            const label = tr('{0}，{1} × {2}，位置 {3}, {4}', s.name, fmt(s.w), fmt(s.h), fmt(s.x), fmt(s.y));
+            // The accessible name reads the badge's figure: s.w/s.h are render-canvas
+            // units (plane × RENDER_SCALE), neither points nor pixels.
+            const resW = fmt(s.labelWidth ?? r.w);
+            const resH = fmt(s.labelHeight ?? r.h);
+            const label = tr('{0}，{1} × {2}，位置 {3}, {4}', s.name, resW, resH, fmt(s.x), fmt(s.y));
             return (<div key={s.id} className="scr" style={style} role="button" tabIndex={0} aria-pressed={selected} aria-label={s.offline ? tr('{0}，离线', label) : label} aria-describedby={hintId} data-selected={selected && (!multi || alone) ? '' : undefined} data-active={isActive ? active!.mode : undefined} data-corner={isActive ? active!.corner : undefined} data-overlap={isActive && active!.overlap ? '' : undefined} data-ctx={contextFor?.(s)} onContextMenu={() => { if (contextFor?.(s))
                 onSelect(s.id); }} onFocus={() => { if (!pointerFocus.current) onSelect(s.id); }} onDoubleClick={() => onSelect(s.id, 'device')} onKeyDown={(e) => onScreenKeyDown(e, s)} onPointerDown={(e) => begin(e, s, 'move')} onPointerMove={move} onPointerUp={(e) => end(e)} onPointerCancel={(e) => end(e, true)} onLostPointerCapture={(e) => end(e)}>
             {/* Write radii on the painted node: the WebKit fallback rereads its
@@ -686,7 +690,7 @@ export function Arrangement({ screens, platform = 'mac', geometryScreens = scree
               </Icon>}
               <span className="scr__label">
                 <span className="scr__name">{s.name}</span>
-                <span className="scr__res">{s.labelWidth ?? Math.round(r.w)} × {s.labelHeight ?? Math.round(r.h)}</span>
+                <span className="scr__res">{resW} × {resH}</span>
               </span>
               </span>
             </div>

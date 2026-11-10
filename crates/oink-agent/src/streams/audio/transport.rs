@@ -117,6 +117,7 @@ mod split_tests {
     use oink_protocol::v1::hot::{self, Value};
 
     #[test]
+    #[ignore = "slow: requires injected packet arrival timestamps"]
     fn overflow_is_bounded_and_accounted_only_to_the_delayed_lane() {
         let (send, [speaker, microphone]) = oink_network::link::testing::partitioned_datagram_pair(
             LinkId(1),

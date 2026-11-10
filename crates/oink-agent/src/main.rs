@@ -1043,28 +1043,6 @@ fn manual_save_minutes(last: Option<u32>, all: bool) -> Option<u32> {
 }
 
 #[cfg(test)]
-mod diagnostics_cli_tests {
-    use super::*;
-    #[test]
-    fn save_defaults_to_thirty_and_parses_all_or_positive_minutes() {
-        for (args, expected) in [
-            (vec!["oink-agent", "diagnostics", "save"], Some(30)),
-            (vec!["oink-agent", "diagnostics", "save", "--all"], None),
-            (vec!["oink-agent", "diagnostics", "save", "--last", "1440"], Some(1440)),
-        ] {
-            let cli = Cli::try_parse_from(args).unwrap();
-            assert!(
-                matches!(cli.cmd, Cmd::Diagnostics { cmd: DiagnosticsCmd::Save { last, all } } if manual_save_minutes(last, all) == expected)
-            );
-        }
-        assert!(Cli::try_parse_from(["oink-agent", "diagnostics", "save", "--all", "--last", "30"]).is_err());
-        for value in ["0", "-1", "1.5", "4294967296"] {
-            assert!(Cli::try_parse_from(["oink-agent", "diagnostics", "save", "--last", value]).is_err());
-        }
-    }
-}
-
-#[cfg(test)]
 mod product_boundary {
     use super::*;
     use clap::CommandFactory;

@@ -14,6 +14,7 @@
 #include <cstddef>
 #include "identity.h"
 #include "FinishInstall.h"
+#include "Relaunch.h"
 
 static UINT fail(MSIHANDLE install, int code) {
     MSIHANDLE record = MsiCreateRecord(0);
@@ -321,12 +322,61 @@ static bool request_user_stop(MSIHANDLE install, const std::wstring& directory) 
     return ok;
 }
 
+static void info(MSIHANDLE install, const std::wstring& text) {
+    MSIHANDLE record = MsiCreateRecord(0);
+    MsiRecordSetStringW(record, 0, text.c_str());
+    MsiProcessMessage(install, INSTALLMESSAGE_INFO, record);
+    MsiCloseHandle(record);
+}
+
+// Every live installed UI/backend image (both are ID_UI) with a readable token,
+// by its token session and user. The caller always reads its own processes;
+// SYSTEM and elevated callers read every session. The SYSTEM pre-login backend
+// is not a user session and is never recorded.
+static std::vector<relaunch::Session> running_sessions(const std::wstring& directory) {
+    std::vector<relaunch::Session> sessions;
+    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snapshot == INVALID_HANDLE_VALUE) return sessions;
+    PROCESSENTRY32W entry{sizeof(entry)};
+    for (BOOL more = Process32FirstW(snapshot, &entry); more; more = Process32NextW(snapshot, &entry)) {
+        if (_wcsicmp(entry.szExeFile, ID_UI) != 0) continue;
+        HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, FALSE, entry.th32ProcessID);
+        if (!process) continue;
+        HANDLE token = nullptr;
+        if (WaitForSingleObject(process, 0) == WAIT_TIMEOUT &&
+            _wcsicmp(maintenance::image(process).c_str(), (directory + L"\\" ID_UI).c_str()) == 0 &&
+            OpenProcessToken(process, TOKEN_QUERY, &token)) {
+            alignas(TOKEN_USER) BYTE user[sizeof(TOKEN_USER) + SECURITY_MAX_SID_SIZE]{};
+            DWORD session = 0, size = 0;
+            PWSTR text = nullptr;
+            if (GetTokenInformation(token, TokenUser, user, sizeof(user), &size) &&
+                GetTokenInformation(token, TokenSessionId, &session, sizeof(session), &size) &&
+                !finish_install::service_account(reinterpret_cast<TOKEN_USER*>(user)->User.Sid) &&
+                ConvertSidToStringSidW(reinterpret_cast<TOKEN_USER*>(user)->User.Sid, &text)) {
+                relaunch::add(sessions, session, text);
+                LocalFree(text);
+            }
+            CloseHandle(token);
+        }
+        CloseHandle(process);
+    }
+    CloseHandle(snapshot);
+    return sessions;
+}
+
 static UINT user_session_gate(MSIHANDLE install) {
     const auto directory = root();
     if (directory.empty()) return fail(install, 3);
     const bool allowed = graceful_stop::permitted(property(install, L"UILevel"),
         !property(install, L"UPGRADINGPRODUCTCODE").empty(), MsiGetMode(install, MSIRUNMODE_SCHEDULED) != FALSE,
         MsiGetMode(install, MSIRUNMODE_COMMIT) != FALSE, MsiGetMode(install, MSIRUNMODE_ROLLBACK) != FALSE);
+    if (allowed) {
+        // Record before the stop request; RelaunchUserSessions consumes this
+        // as CustomActionData only if the transaction commits (issue #36).
+        const auto data = relaunch::encode(running_sessions(directory));
+        MsiSetPropertyW(install, L"RelaunchUserSessions", data.c_str());
+        info(install, L"PrepareUserSessions: running Oink sessions before Quit: " + (data.empty() ? std::wstring(L"none") : data) + L".");
+    }
     const auto state = graceful_stop::prepare(allowed, [&] { return user_sessions(directory); },
         [&] { return request_user_stop(install, directory); }, [&] {
             MSIHANDLE progress = MsiCreateRecord(0);
@@ -364,6 +414,43 @@ extern "C" __declspec(dllexport) UINT __stdcall CheckQuiescence(MSIHANDLE instal
         return clients_quiescent(directory) ? graceful_stop::State::clear : graceful_stop::State::busy;
     }, [] { Sleep(250); return true; });
     return state == graceful_stop::State::clear ? ERROR_SUCCESS : fail(install, 8);
+}
+
+// Commit-only, as SYSTEM, after the new OinkInput started: Windows Installer runs
+// it only once the whole transaction (including nested old-product removal)
+// succeeded, so a rolled-back install never reopens anything. Publishing is by
+// rename into the protected maintenance directory, whose name-change
+// notification already wakes the service's update engine; the service, not this
+// short-lived installer process, creates the UI (WTSQueryUserToken of that
+// session, never the installer's possibly elevated or SYSTEM token).
+extern "C" __declspec(dllexport) UINT __stdcall RelaunchUserSessions(MSIHANDLE install) {
+    std::vector<relaunch::Session> sessions;
+    if (!relaunch::decode(property(install, L"CustomActionData"), sessions)) {
+        info(install, L"RelaunchUserSessions: malformed session record; Oink is not reopened.");
+        return ERROR_SUCCESS;
+    }
+    if (sessions.empty()) return ERROR_SUCCESS;
+    const auto directory = maintenance::directory();
+    // The in-app updater's worker drives its own msiexec under a pending
+    // journal and reopens its drained sessions after health; it owns that relaunch.
+    if (!maintenance::absent(directory + L"\\pending.json")) {
+        info(install, L"RelaunchUserSessions: an update transaction owns the relaunch.");
+        return ERROR_SUCCESS;
+    }
+    const auto temporary = directory + L"\\relaunch.new", target = directory + L"\\relaunch.json";
+    const auto text = relaunch::json(sessions);
+    bool ok = protected_path(directory);
+    HANDLE file = ok ? CreateFileW(temporary.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+        FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_WRITE_THROUGH, nullptr) : INVALID_HANDLE_VALUE;
+    DWORD written = 0;
+    ok = file != INVALID_HANDLE_VALUE && WriteFile(file, text.data(), static_cast<DWORD>(text.size()), &written, nullptr) &&
+        written == text.size() && FlushFileBuffers(file);
+    if (file != INVALID_HANDLE_VALUE) CloseHandle(file);
+    ok = ok && MoveFileExW(temporary.c_str(), target.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
+    const DWORD error = ok ? ERROR_SUCCESS : GetLastError();
+    info(install, L"RelaunchUserSessions: " + relaunch::encode(sessions) + (ok ? L" handed to OinkInput." :
+        L" not published; error=" + std::to_wstring(error) + L". Open Oink from the Start menu."));
+    return ERROR_SUCCESS;
 }
 
 extern "C" __declspec(dllexport) UINT __stdcall CheckProtectedState(MSIHANDLE install) {

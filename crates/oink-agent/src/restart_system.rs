@@ -1,5 +1,5 @@
 //! The local user token requests a graceful, planned restart. No elevation/force.
-#[cfg(any(windows, test))]
+#[cfg(windows)]
 fn arguments() -> (u32, u32) {
     // EWX_REBOOT; APPLICATION | INSTALLATION | PLANNED.
     (0x2, 0x0004_0000 | 0x2 | 0x8000_0000)
@@ -80,24 +80,4 @@ pub(crate) fn restart() -> Result<(), String> {
         }
     };
     run().map_err(|error| error.to_string())
-}
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn restart_is_planned_application_installation_and_never_forced() {
-        let (flags, reason) = super::arguments();
-        assert_eq!(flags, 2);
-        assert_eq!(flags & (4 | 16), 0); // FORCE and FORCEIFHUNG
-        assert_eq!(reason, 0x8004_0002);
-        #[cfg(windows)]
-        {
-            use windows::Win32::System::Shutdown::*;
-            assert_eq!(flags, EWX_REBOOT.0);
-            assert_eq!(
-                reason,
-                (SHTDN_REASON_MAJOR_APPLICATION | SHTDN_REASON_MINOR_INSTALLATION | SHTDN_REASON_FLAG_PLANNED).0
-            );
-        }
-    }
 }

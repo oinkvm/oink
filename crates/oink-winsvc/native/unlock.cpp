@@ -26,6 +26,20 @@ static std::wstring root;
 // unlocked. The service stamps receipt with GetTickCount64, so the readiness
 // decision compares one monotonic clock and never trusts wall-clock input.
 static uint64_t recentRemoteSource = 0, recentRemoteAt = 0;
+// Latest sync unlock operation, reported to the agent once its window ends.
+// Process-lifetime only: a sync operation never persists Pending, so a service
+// restart simply forgets an unconsumed one (no secret was handed out).
+enum SyncOutcome : DWORD {
+  SyncNone = 0,
+  SyncPending = 1,
+  SyncSubmitted = 2,
+  SyncSucceeded = 3,
+  SyncFailed = 4,
+  SyncExpired = 5
+};
+static uint64_t syncId = 0;
+static SyncOutcome syncOutcome = SyncNone;
+static bool syncPrepared = false;
 static constexpr wchar_t OnlySystem[] = L"O:SYG:SYD:P(A;OICI;FA;;;SY)";
 struct Descriptor {
   PSECURITY_DESCRIPTOR p = nullptr;
@@ -185,21 +199,36 @@ static bool persistFailure(const Config &c, FailureKind kind) {
   return writePrivate(file(c, L".failure"), reinterpret_cast<BYTE *>(&value),
                       sizeof(value));
 }
-static bool windowsHelloOnly() {
+// Settings > Accounts > Sign-in options > "For improved security, only allow
+// Windows Hello sign-in for Microsoft accounts on this device" (Windows 10 2004
+// "Require Windows Hello sign-in for Microsoft accounts"). Microsoft does not
+// document where the toggle is stored; the Settings app keeps it in this HKLM
+// DWORD (64-bit view): 2 when on, 0 when off (a test machine reads 0 with the
+// toggle off). Read-only here: Oink never changes it. Raw string: in a plain
+// literal "\M" etc. are unknown escapes (C4129) and the path loses its
+// separators.
+static constexpr wchar_t PasswordLessDeviceKey[] =
+    LR"(SOFTWARE\Microsoft\Windows NT\CurrentVersion\PasswordLess\Device)";
+static constexpr wchar_t PasswordLessDeviceValue[] =
+    L"DevicePasswordLessBuildVersion";
+// Reads the toggle below hive (HKEY_LOCAL_MACHINE in production). A missing
+// key or value, or a value that is not a DWORD, means the toggle was never on.
+extern "C" bool oink_unlock_hello_only_under(HKEY hive) {
   HKEY key = nullptr;
-  if (RegOpenKeyExW(
-          HKEY_LOCAL_MACHINE,
-          L"SOFTWARE\Microsoft\Windows NT\CurrentVersion\PasswordLess\Device",
-          0, KEY_READ | KEY_WOW64_64KEY, &key) != ERROR_SUCCESS)
+  if (RegOpenKeyExW(hive, PasswordLessDeviceKey, 0, KEY_READ | KEY_WOW64_64KEY,
+                    &key) != ERROR_SUCCESS)
     return false;
   DWORD type = 0, value = 0, size = sizeof(value);
-  const bool enabled = RegQueryValueExW(key, L"DevicePasswordLessBuildVersion",
-                                         nullptr, &type,
-                                         reinterpret_cast<BYTE *>(&value),
-                                         &size) == ERROR_SUCCESS &&
-                       type == REG_DWORD && size == sizeof(value) && value > 0;
+  const bool enabled =
+      RegQueryValueExW(key, PasswordLessDeviceValue, nullptr, &type,
+                       reinterpret_cast<BYTE *>(&value),
+                       &size) == ERROR_SUCCESS &&
+      type == REG_DWORD && size == sizeof(value) && value != 0;
   RegCloseKey(key);
   return enabled;
+}
+static bool windowsHelloOnly() {
+  return oink_unlock_hello_only_under(HKEY_LOCAL_MACHINE);
 }
 static FailureKind outcomeFailure(DWORD status) {
   // ReportResult supplies the NTSTATUS returned by the password package.
@@ -318,10 +347,20 @@ static void handle(Request &q, Reply &r, HANDLE pipe, DWORD id) {
     return;
   auto before = operation.state;
   operation.expire(GetTickCount64());
-  if (before != operation.state) {
+  if (before != operation.state && operation.sync_abandoned()) {
+    // LogonUI never serialized within the sync window: the LockApp curtain
+    // was still up (Q3). A skip, not a failure: no latch, no saved result.
+    if (syncId == operation.id) {
+      syncOutcome = SyncExpired;
+      syncPrepared = operation.prepared;
+    }
+    operation.reset();
+  } else if (before != operation.state) {
     persistFailure(operationTarget, FailureUnknown);
     remove(file(operationTarget, L".blocked"));
     persistResult(operationTarget, operation.state);
+    if (operation.sync && syncId == operation.id)
+      syncOutcome = SyncFailed;
   }
   Handle cpProcess(cpPeer(pipe, id));
   bool cp = cpProcess.h != nullptr;
@@ -397,6 +436,27 @@ static void handle(Request &q, Reply &r, HANDLE pipe, DWORD id) {
         }
       }
     }
+  } else if (q.op == SyncTrigger && backend && q.id) {
+    // Same preconditions as Trigger. Hello-only devices are rejected without
+    // a latch; the agent already skipped them. No Pending result is persisted:
+    // an unconsumed sync operation is forgotten, never recovered as a failure.
+    const bool retryable = saved == UnlockOperation::Idle ||
+                           saved == UnlockOperation::Succeeded ||
+                           saved == UnlockOperation::Failed ||
+                           saved == UnlockOperation::Expired;
+    if (retryable && !absent(file(c, L".dpapi")) && locked(id) &&
+        !windowsHelloOnly() &&
+        operation.begin(++sequence, id, GetTickCount64(), signed_in, q.id,
+                        true)) {
+      if (saved == UnlockOperation::Failed || saved == UnlockOperation::Expired)
+        remove(file(c, L".blocked"));
+      operationTarget = c;
+      syncId = operation.id;
+      syncOutcome = SyncPending;
+      syncPrepared = false;
+      r.id = operation.id;
+      r.error = 0;
+    }
   } else if (q.op == RemoteInput && backend && q.id) {
     const uint64_t now = GetTickCount64();
     const uint64_t age = std::min<uint64_t>(q.status, 60000);
@@ -426,11 +486,17 @@ static void handle(Request &q, Reply &r, HANDLE pipe, DWORD id) {
         remove(file(c, L".blocked"));
         persistResult(c, operation.state);
       }
+      if (operation.sync && syncId == operation.id) {
+        syncPrepared = true;
+        syncOutcome = operation.state == UnlockOperation::Submitted
+                          ? SyncSubmitted
+                          : SyncFailed;
+      }
     }
   } else if (q.op == Outcome && cp && q.id == operation.id &&
              id == operation.session &&
              operation.state == UnlockOperation::Submitted) {
-    operation.result(q.id, id, q.status == 0);
+    operation.result(q.id, id, q.status == 0, GetTickCount64());
     if (q.status == 0) {
       if (!persistFailure(operationTarget, FailureNone))
         operation.state = UnlockOperation::Failed;
@@ -443,6 +509,10 @@ static void handle(Request &q, Reply &r, HANDLE pipe, DWORD id) {
     if (operation.state == UnlockOperation::Succeeded &&
         !remove(file(operationTarget, L".blocked")))
       operation.state = UnlockOperation::Failed;
+    if (operation.sync && syncId == operation.id)
+      syncOutcome = operation.state == UnlockOperation::Succeeded
+                        ? SyncSucceeded
+                        : SyncFailed;
     r.error = 0;
   }
   r.present = !absent(file(c, L".dpapi"));
@@ -462,7 +532,11 @@ static void handle(Request &q, Reply &r, HANDLE pipe, DWORD id) {
     r.remote_input_at = operation.remote_input_at;
     r.remote_input_source = operation.remote_input_source;
     r.decision = operation.prepared ? (operation.eligible ? 1 : 2) : 0;
+    r.succeeded_at = operation.succeeded_at;
   }
+  r.now = GetTickCount64();
+  r.sync = syncOutcome | (syncPrepared ? 0x100u : 0u);
+  r.sync_id = syncId;
 }
 // Own each OVERLAPPED until completion, including cancellation. No sleeping
 // polling loop and no FlushFileBuffers waiting on an untrusted client.
@@ -601,6 +675,9 @@ extern "C" DWORD oink_unlock_start(Authenticate auth) {
   operation.reset();
   recentRemoteSource = 0;
   recentRemoteAt = 0;
+  syncId = 0;
+  syncOutcome = SyncNone;
+  syncPrepared = false;
   backendAuth = auth;
   stopping = false;
   worker = CreateThread(nullptr, 0, serve, nullptr, 0, nullptr);
@@ -655,6 +732,15 @@ extern "C" DWORD oink_unlock_client(DWORD op, uint64_t source,
   status[8] = static_cast<DWORD>(r.remote_input_source);
   status[9] = static_cast<DWORD>(r.remote_input_source >> 32);
   status[10] = r.decision;
+  status[11] = r.sync;
+  status[12] = static_cast<DWORD>(r.succeeded_at);
+  status[13] = static_cast<DWORD>(r.succeeded_at >> 32);
+  status[14] = static_cast<DWORD>(r.now);
+  status[15] = static_cast<DWORD>(r.now >> 32);
+  status[16] = static_cast<DWORD>(r.sync_id);
+  status[17] = static_cast<DWORD>(r.sync_id >> 32);
+  status[18] = static_cast<DWORD>(r.id);
+  status[19] = static_cast<DWORD>(r.id >> 32);
   SecureZeroMemory(&q, sizeof(q));
   SecureZeroMemory(&r, sizeof(r));
   return error;

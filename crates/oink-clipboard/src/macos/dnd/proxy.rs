@@ -2,6 +2,7 @@
 //! order remains intact; only process-bound fulfilment controls are reconstructed.
 use super::*;
 use crate::content::{self, namespace::Namespace};
+use crate::macos::gate;
 use crate::model::{FileNode, NativeFormat, NodeId, NodeKind, RepresentationData, Unavailable};
 use objc2_app_kit::{NSPasteboardItemDataProvider, NSPasteboardType};
 #[cfg(all(test, debug_assertions))]
@@ -244,8 +245,7 @@ define_class!(
                     // Pasteboard Manager supplies this receiver-local context
                     // only for a real promise read with a paste destination.
                     // Ordinary URL/HTML reads must never materialize the file.
-                    let destination = board
-                        .and_then(|board| board.stringForType(&NSString::from_str("com.apple.pastelocation")))
+                    let destination = paste_location(board)
                         .and_then(|value| NSURL::URLWithString(&value))
                         .and_then(|url| url.filePathURL())
                         .and_then(|url| url.path())
@@ -259,6 +259,7 @@ define_class!(
                 })();
                 match result {
                     Ok(url) => {
+                        let _turn = gate::enter();
                         item.setString_forType(&NSString::from_str(&url), ty);
                     }
                     Err(error) => tracing::warn!(
@@ -268,6 +269,7 @@ define_class!(
                     ),
                 }
             } else if let Some(value) = self.pasteboardPropertyListForType(ty) {
+                let _turn = gate::enter();
                 set_property(item, ty, &value);
             }
         }
@@ -331,6 +333,13 @@ define_class!(
         }
     }
 );
+
+/// The paste destination AppKit attaches to a promise read. Only the board
+/// call takes a pasteboard turn; receiving the promised files does not.
+fn paste_location(board: Option<&NSPasteboard>) -> Option<Retained<NSString>> {
+    let _turn = gate::enter();
+    board.and_then(|board| board.stringForType(&NSString::from_str("com.apple.pastelocation")))
+}
 
 fn set_property(item: &NSPasteboardItem, ty: &NSPasteboardType, value: &AnyObject) -> bool {
     // Match NSPasteboardWriting's bytes/string encoding. setPropertyList wraps
@@ -470,12 +479,12 @@ define_class!(
             let name = ty.to_string();
             if let Some((_, bytes)) = self.ivars().values.iter().find(|(name, _)| name == &ty.to_string()) {
                 if name == "NSFilesPromisePboardType" || name == "Apple files promise pasteboard type" {
+                    let _turn = gate::enter();
                     item.setData_forType(&NSData::with_bytes(bytes), ty);
                     return;
                 }
                 let result = (|| {
-                    let destination = board
-                        .and_then(|board| board.stringForType(&NSString::from_str("com.apple.pastelocation")))
+                    let destination = paste_location(board)
                         .and_then(|value| NSURL::URLWithString(&value))
                         .and_then(|url| url.filePathURL())
                         .and_then(|url| url.path())
@@ -489,11 +498,13 @@ define_class!(
                 })();
                 match result {
                     Ok(url) => {
+                        let _turn = gate::enter();
                         item.setString_forType(&NSString::from_str(&url), ty);
                     }
                     Err(_) => tracing::warn!("native legacy promise delivery failed"),
                 }
             } else if let Some(value) = self.ivars().extra.pasteboardPropertyListForType(ty) {
+                let _turn = gate::enter();
                 // NSData is already the native byte representation. Passing it
                 // through setPropertyList wraps it in a binary plist and changes
                 // every companion's bytes (including image encodings).

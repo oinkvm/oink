@@ -92,7 +92,7 @@ impl Rig {
         self.ready(1, 2);
         let target = self.peer(2);
         self.nodes[0]
-            .dial(target, vec![], DialMode::PreferDirect, self.now)
+            .dial(target, vec![], DialMode::PreferDirect, DialOrigin::Initial, self.now)
             .unwrap();
         self.pump();
     }
@@ -260,7 +260,7 @@ fn pending_relay_request_follows_direct_readiness_without_a_new_attempt() {
             let mut r = Rig::new(3);
             let peer = r.peer(2 - source);
             r.nodes[source]
-                .dial(peer, vec![], DialMode::PreferDirect, r.now)
+                .dial(peer, vec![], DialMode::PreferDirect, DialOrigin::Initial, r.now)
                 .unwrap();
             let request = r.nodes[source].dials[&peer].request.unwrap();
             r.pump();
@@ -300,7 +300,9 @@ fn pending_relay_request_follows_direct_readiness_without_a_new_attempt() {
 fn expired_relay_search_is_not_revived_by_a_new_neighbor() {
     let mut r = Rig::new(3);
     let peer = r.peer(2);
-    r.nodes[0].dial(peer, vec![], DialMode::PreferDirect, r.now).unwrap();
+    r.nodes[0]
+        .dial(peer, vec![], DialMode::PreferDirect, DialOrigin::Initial, r.now)
+        .unwrap();
     r.now += RELAY_TIMEOUT;
     r.nodes[0].tick(r.now);
     r.pump();
@@ -540,19 +542,21 @@ fn dial_cap_and_failed_dial_leave_no_retained_target() {
     for i in 1..=MAX_DIALS {
         let p = r.peer(i);
         r.nodes[0]
-            .dial(p, addresses.clone(), DialMode::DirectOnly, r.now)
+            .dial(p, addresses.clone(), DialMode::DirectOnly, DialOrigin::Initial, r.now)
             .unwrap();
     }
     let ninth = r.peer(MAX_DIALS + 1);
     assert_eq!(
-        r.nodes[0].dial(ninth, addresses.clone(), DialMode::All, r.now),
+        r.nodes[0].dial(ninth, addresses.clone(), DialMode::All, DialOrigin::Initial, r.now),
         Err(DialRefused::Busy)
     );
     let p = r.peer(1);
     r.nodes[0].dial_done(p, r.now);
     assert!(!r.nodes[0].dials.contains_key(&p));
     assert!(r.nodes[0].peer_link(p).is_none());
-    r.nodes[0].dial(ninth, addresses, DialMode::DirectOnly, r.now).unwrap();
+    r.nodes[0]
+        .dial(ninth, addresses, DialMode::DirectOnly, DialOrigin::Initial, r.now)
+        .unwrap();
     assert_eq!(r.nodes[0].dials.len(), MAX_DIALS);
 }
 
@@ -601,7 +605,9 @@ fn selected_direct_candidate_expires_when_pending_relay_installation_is_lost() {
     r.ready(0, 1);
     r.ready(1, 2);
     let target = r.peer(2);
-    r.nodes[0].dial(target, vec![], DialMode::PreferDirect, r.now).unwrap();
+    r.nodes[0]
+        .dial(target, vec![], DialMode::PreferDirect, DialOrigin::Initial, r.now)
+        .unwrap();
     let mut held = Vec::new();
     r.pump_holding(&mut held, |_, effect| {
         matches!(effect, Effect::Control { message, .. } if matches!(message.as_ref(), LinkMsg::PathInstall(_)))
@@ -654,7 +660,13 @@ fn executor_finishes_direct_candidates_and_loss_closes_the_selected_connection()
     let peer = r.peer(1);
     let addresses = vec!["127.0.0.1:1".parse().unwrap(), "127.0.0.1:2".parse().unwrap()];
     r.nodes[0]
-        .dial(peer, addresses.clone(), DialMode::DirectOnly, r.now)
+        .dial(
+            peer,
+            addresses.clone(),
+            DialMode::DirectOnly,
+            DialOrigin::Initial,
+            r.now,
+        )
         .unwrap();
     assert!(
         r.nodes[0]
@@ -717,7 +729,13 @@ fn all_mode_relay_arrival_keeps_direct_slot_until_its_budget_finishes() {
     r.observed.clear();
     let peer = r.peer(2);
     r.nodes[0]
-        .dial(peer, vec!["127.0.0.1:9".parse().unwrap()], DialMode::All, r.now)
+        .dial(
+            peer,
+            vec!["127.0.0.1:9".parse().unwrap()],
+            DialMode::All,
+            DialOrigin::Initial,
+            r.now,
+        )
         .unwrap();
     r.pump();
     assert_eq!(
@@ -754,7 +772,13 @@ fn direct_arrival_cancels_an_outstanding_all_mode_relay_request() {
     r.observed.clear();
     let target = r.peer(2);
     r.nodes[0]
-        .dial(target, vec!["127.0.0.1:9".parse().unwrap()], DialMode::All, r.now)
+        .dial(
+            target,
+            vec!["127.0.0.1:9".parse().unwrap()],
+            DialMode::All,
+            DialOrigin::Initial,
+            r.now,
+        )
         .unwrap();
     // Direct authentication completes while relay requests are still in flight.
     r.connect(0, 2);
@@ -897,7 +921,9 @@ fn selection_restart_after_all_old_candidates_are_gone() {
             r.ready(0, 1);
             r.ready(1, 2);
             let peer = r.peer(2);
-            r.nodes[0].dial(peer, vec![], DialMode::PreferDirect, r.now).unwrap();
+            r.nodes[0]
+                .dial(peer, vec![], DialMode::PreferDirect, DialOrigin::Initial, r.now)
+                .unwrap();
             // Leave the relay request in flight until both candidates exist.
         }
         // Both dial directions authenticate before any selection is delivered.
@@ -974,7 +1000,9 @@ fn selected_direct_candidate_waits_for_pending_relay_installation() {
     r.ready(0, 1);
     r.ready(1, 2);
     let peer = r.peer(2);
-    r.nodes[0].dial(peer, vec![], DialMode::PreferDirect, r.now).unwrap();
+    r.nodes[0]
+        .dial(peer, vec![], DialMode::PreferDirect, DialOrigin::Initial, r.now)
+        .unwrap();
     let mut held = vec![];
     r.pump_holding(&mut held, |n, effect| {
         n == 1
@@ -1019,7 +1047,9 @@ fn simultaneous_relay_discovery_obeys_the_pair_arbiter() {
     r.ready(1, 2);
     for (local, remote) in [(0, 2), (2, 0)] {
         let peer = r.peer(remote);
-        r.nodes[local].dial(peer, vec![], DialMode::All, r.now).unwrap();
+        r.nodes[local]
+            .dial(peer, vec![], DialMode::All, DialOrigin::Initial, r.now)
+            .unwrap();
     }
     r.pump();
     let a = r.link(0, 2);
@@ -1051,7 +1081,9 @@ fn retiring_direct_member_revokes_existing_transit_but_preserves_its_c0_link() {
 fn fresh_addresses_join_a_pending_relay_search_once() {
     let mut r = Rig::new(2);
     let target = r.peer(1);
-    r.nodes[0].dial(target, vec![], DialMode::PreferDirect, r.now).unwrap();
+    r.nodes[0]
+        .dial(target, vec![], DialMode::PreferDirect, DialOrigin::Initial, r.now)
+        .unwrap();
     let deadline = r.nodes[0].dials[&target].deadline;
     r.nodes[0].effects.clear();
     let first: SocketAddr = "127.0.0.1:47001".parse().unwrap();
@@ -1063,7 +1095,7 @@ fn fresh_addresses_join_a_pending_relay_search_once() {
         .effects
         .iter()
         .filter_map(|effect| match effect {
-            Effect::Dial { peer, addresses } if *peer == target => Some(addresses.clone()),
+            Effect::Dial { peer, addresses, .. } if *peer == target => Some(addresses.clone()),
             _ => None,
         })
         .collect::<Vec<_>>();
@@ -1082,7 +1114,9 @@ fn relay_search_expiry_during_path_install_still_reports_dial_failure() {
     r.ready(1, 2);
     r.observed.clear();
     let peer = r.peer(2);
-    r.nodes[0].dial(peer, vec![], DialMode::PreferDirect, r.now).unwrap();
+    r.nodes[0]
+        .dial(peer, vec![], DialMode::PreferDirect, DialOrigin::Initial, r.now)
+        .unwrap();
     let search_deadline = r.now + RELAY_TIMEOUT;
     // Installation starts after the relay search, so its acknowledgement can
     // remain in flight when the earlier search budget expires.
@@ -1119,7 +1153,9 @@ fn relay_search_expiry_during_path_install_still_reports_dial_failure() {
     // The caller can now consume DialFailed and use its normal retry schedule.
     // No stale dial/candidate reservation may prevent that next real attempt.
     r.now = install_deadline;
-    r.nodes[0].dial(peer, vec![], DialMode::PreferDirect, r.now).unwrap();
+    r.nodes[0]
+        .dial(peer, vec![], DialMode::PreferDirect, DialOrigin::Initial, r.now)
+        .unwrap();
     r.pump();
     assert!(r.nodes[0].links[&r.link(0, 2)].installed);
     assert!(r.nodes[2].links[&r.link(2, 0)].installed);
@@ -1130,7 +1166,13 @@ fn exhausted_candidates_during_path_install_still_report_dial_failure() {
     let mut r = Rig::new(2);
     let peer = r.peer(1);
     r.nodes[0]
-        .dial(peer, vec!["127.0.0.1:9".parse().unwrap()], DialMode::DirectOnly, r.now)
+        .dial(
+            peer,
+            vec!["127.0.0.1:9".parse().unwrap()],
+            DialMode::DirectOnly,
+            DialOrigin::Initial,
+            r.now,
+        )
         .unwrap();
     // A reverse incoming candidate wins selection while the outgoing
     // candidates finish. Path installation has not acknowledged success yet.
@@ -1165,7 +1207,13 @@ fn exhausted_candidates_during_path_install_can_still_connect() {
     let mut r = Rig::new(2);
     let peer = r.peer(1);
     r.nodes[0]
-        .dial(peer, vec!["127.0.0.1:9".parse().unwrap()], DialMode::DirectOnly, r.now)
+        .dial(
+            peer,
+            vec!["127.0.0.1:9".parse().unwrap()],
+            DialMode::DirectOnly,
+            DialOrigin::Initial,
+            r.now,
+        )
         .unwrap();
     r.now += Duration::from_millis(100);
     r.connect(1, 0);
@@ -1227,7 +1275,9 @@ fn dial_queued_during_inbound_path_install_receives_a_result() {
         let link = r.link(0, 1);
         assert!(!r.nodes[0].links[&link].installed);
         assert!(!r.nodes[0].dials.contains_key(&peer));
-        r.nodes[0].dial(peer, vec![], DialMode::PreferDirect, r.now).unwrap();
+        r.nodes[0]
+            .dial(peer, vec![], DialMode::PreferDirect, DialOrigin::Initial, r.now)
+            .unwrap();
         if completes {
             for (_, effect) in held {
                 let Effect::Control {
@@ -1354,4 +1404,78 @@ fn lost_decision_identifies_binding_and_distinguishes_unobserved_from_recent_dat
         assert!(logs.iter().any(|row| row.contains(&("kind".into(), "link_lost".into()))
             && row.contains(&("peer_data_known".into(), "false".into()))));
     });
+}
+
+#[test]
+fn background_retry_failures_are_not_setup_samples() {
+    use super::super::timing::{Measurement, Result as Outcome, tests::capture};
+    for (origin, sampled) in [(DialOrigin::Initial, true), (DialOrigin::BackgroundRetry, false)] {
+        // Unreachable at once: no candidate address for a direct-only dial.
+        let mut r = Rig::new(2);
+        let peer = r.peer(1);
+        let events = capture(|| {
+            r.nodes[0]
+                .dial(peer, vec![], DialMode::DirectOnly, origin, r.now)
+                .unwrap();
+        });
+        assert!(
+            r.nodes[0]
+                .effects
+                .iter()
+                .any(|e| matches!(e, Effect::DialFailed(p, _) if *p == peer))
+        );
+        assert_eq!(
+            events.contains(&Measurement::Setup(Outcome::Failed)),
+            sampled,
+            "{origin:?} dial failure"
+        );
+
+        // The peer accepts TLS but admission never completes (a sleeping peer).
+        let mut r = Rig::new(2);
+        let peer = r.peer(1);
+        r.nodes[0]
+            .dial(
+                peer,
+                vec!["127.0.0.1:9".parse().unwrap()],
+                DialMode::PreferDirect,
+                origin,
+                r.now,
+            )
+            .unwrap();
+        r.connect(0, 1);
+        r.pump();
+        let link = r.link(0, 1);
+        assert!(r.nodes[0].links[&link].installed);
+        let events = capture(|| r.nodes[0].lose(link, LinkLost::Local(Disconnect::HandshakeTimeout)));
+        assert_eq!(
+            events.contains(&Measurement::Setup(Outcome::Timeout)),
+            sampled,
+            "{origin:?} loss before Ready"
+        );
+    }
+}
+
+#[test]
+fn every_dial_that_reaches_ready_is_a_setup_sample() {
+    use super::super::timing::{Measurement, Result as Outcome, tests::capture};
+    // A member that became reachable during background retries, and an
+    // initial dial (first link after pairing, or a reconnect after a lost link).
+    for origin in [DialOrigin::Initial, DialOrigin::BackgroundRetry] {
+        let mut r = Rig::new(2);
+        let peer = r.peer(1);
+        r.nodes[0]
+            .dial(
+                peer,
+                vec!["127.0.0.1:9".parse().unwrap()],
+                DialMode::PreferDirect,
+                origin,
+                r.now,
+            )
+            .unwrap();
+        r.connect(0, 1);
+        r.pump();
+        let link = r.link(0, 1);
+        let events = capture(|| r.nodes[0].set_ready(link));
+        assert!(events.contains(&Measurement::Setup(Outcome::Ready)), "{origin:?}");
+    }
 }

@@ -806,21 +806,6 @@ mod macos {
             .unwrap();
         }
         #[test]
-        #[ignore = "read-only native timing; no device mutation or capture"]
-        fn native_device_query_timing() {
-            for _ in 0..5 {
-                let started = Instant::now();
-                let mut status = MicrophonePluginStatus::default();
-                let result = inspect_devices(&mut status);
-                eprintln!(
-                    "native_device_query_ms={} result={:?}",
-                    started.elapsed().as_secs_f64() * 1000.,
-                    result
-                );
-                assert!(result.is_ok());
-            }
-        }
-        #[test]
         fn installed_identity_migrates_legacy_and_rejects_signature_failures() {
             let temp = tempfile::tempdir().unwrap();
             let current = temp.path().join("OinkMicrophone.driver");

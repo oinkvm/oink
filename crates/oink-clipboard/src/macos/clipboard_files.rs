@@ -448,9 +448,16 @@ mod tests {
                 .unwrap();
         let item = board.pasteboardItems().unwrap().objectAtIndex(0);
         let types = item.types().iter().map(|t| t.to_string()).collect::<Vec<_>>();
+        // The Oink clip marker (crate::dedupe) rides on the first item too.
         assert_eq!(
             types,
-            ["public.file-url", "public.utf8-plain-text", "public.png", "public.tiff"]
+            [
+                "public.file-url",
+                "public.utf8-plain-text",
+                "public.png",
+                "public.tiff",
+                crate::dedupe::MARKER_MAC
+            ]
         );
         assert_eq!(
             item.stringForType(&NSString::from_str("public.utf8-plain-text"))

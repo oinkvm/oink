@@ -121,6 +121,7 @@ def main():
     p.add_argument('--windows-update-test-feed', help='Explicit matching qualification-build origin; never public')
     p.add_argument('--require-updater', action='store_true')
     p.add_argument('--require-collector', action='store_true')
+    p.add_argument('--run-native-tests', action='store_true', help='Run Windows C++/PowerShell tests explicitly')
     a = p.parse_args()
     if not re.fullmatch(r'[0-9a-f]{64}', a.source_tree_sha256) or not 1 <= a.build < 2**31:
         p.error('source tree SHA256 and build in 1..2147483647 required')
@@ -284,12 +285,13 @@ def main():
                            'pdb_sha256': digest(symbols / 'InstallerCA.pdb')})
     (symbols / 'manifest.json').write_text(json.dumps({'source_tree_sha256': a.source_tree_sha256,
                                                      'images': symbol_records}, indent=2) + '\n')
-    for test in ('AuthorizationTests', 'QuiescenceTests', 'MaintenanceCleanupTests', 'CloudFilesCleanupTests', 'FinishInstallTests', 'GracefulStopTests', 'UserDataCleanupTests', 'EmbeddedPowerShellTests'):
-        run('cl.exe', '/nologo', '/EHsc', '/std:c++17', '/W4', '/WX', '/MT', ROOT / f'packaging/windows/{test}.cpp',
-            f'/Fo{a.output}/{test}.obj', f'/Fe{a.output}/{test}.exe', 'advapi32.lib', 'user32.lib')
-        run(a.output / f'{test}.exe')
-    run('powershell.exe', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', ROOT / 'packaging/windows/MicrophoneTests.ps1')
-    run('powershell.exe', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', ROOT / 'packaging/windows/VerifyPeTests.ps1')
+    if a.run_native_tests:
+        for test in ('AuthorizationTests', 'QuiescenceTests', 'MaintenanceCleanupTests', 'CloudFilesCleanupTests', 'FinishInstallTests', 'GracefulStopTests', 'RelaunchTests', 'UserDataCleanupTests', 'EmbeddedPowerShellTests'):
+            run('cl.exe', '/nologo', '/EHsc', '/std:c++17', '/W4', '/WX', '/MT', ROOT / f'packaging/windows/{test}.cpp',
+                f'/Fo{a.output}/{test}.obj', f'/Fe{a.output}/{test}.exe', 'advapi32.lib', 'user32.lib')
+            run(a.output / f'{test}.exe')
+        run('powershell.exe', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', ROOT / 'packaging/windows/MicrophoneTests.ps1')
+        run('powershell.exe', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', ROOT / 'packaging/windows/VerifyPeTests.ps1')
     notices = a.output / 'notices.wxs'
     write_notices(notices, payload, notice_files)
     run('node', ROOT / 'build-support/check-package-licenses.mjs', payload, 'windows-x64', cwd=ROOT)

@@ -36,11 +36,11 @@ fn phase(label: &str) {
 }
 
 #[test]
+#[ignore = "slow: child entry for the network exit qualification harness"]
 fn term_child() {
     let _scenario = common::watchdog::Scenario::new(module_path!(), "term_child");
-    let Ok(case) = std::env::var("OINK_NETWORK_EXIT_CASE") else {
-        return;
-    };
+    let case = std::env::var("OINK_NETWORK_EXIT_CASE")
+        .expect("term_child must be launched by term_stays_bounded_idle_connecting_connected_and_bulk");
     phase("create tempdir");
     let dir = tempfile::tempdir().unwrap();
     let source = Arc::new(FakeClipboard::default());
@@ -89,7 +89,12 @@ fn term_child() {
             host.node()
                 .links()
                 .unwrap()
-                .dial(peer_id, vec![address], oink_network::link::DialMode::PreferDirect)
+                .dial(
+                    peer_id,
+                    vec![address],
+                    oink_network::link::DialMode::PreferDirect,
+                    oink_network::link::DialOrigin::Initial,
+                )
                 .expect("fresh blackhole dial must be accepted");
             phase("await QUIC Initial");
             tokio::time::timeout(Duration::from_secs(15), async {
@@ -163,13 +168,14 @@ fn term_child() {
 }
 
 #[test]
+#[ignore = "slow: repeated process exit qualification including bulk clipboard pressure"]
 fn term_stays_bounded_idle_connecting_connected_and_bulk() {
     let _scenario =
         common::watchdog::Scenario::new(module_path!(), "term_stays_bounded_idle_connecting_connected_and_bulk");
     for case in ["idle", "connecting", "connected", "bulk"] {
         for run in 0..5 {
             let mut child = std::process::Command::new(std::env::current_exe().unwrap())
-                .args(["term_child", "--exact", "--nocapture"])
+                .args(["term_child", "--exact", "--ignored", "--nocapture"])
                 .env("OINK_NETWORK_EXIT_CASE", case)
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped())

@@ -9,6 +9,7 @@
 //!   放在第一个条目上；返回写完后的 `changeCount`。文本里的 CRLF 转成 LF。
 //! - 远端文件：一次声明按需文件 URL；File Provider 元数据在独立线程准备，实际文件读取由系统触发内容拉取。
 //! - 监听：macOS 没有剪贴板变化通知，后台线程每 75 ms 轮询 `changeCount`。
+//! - 线程：NSPasteboard 不是线程安全的；本进程对它的每次调用都在 `gate` 的一个轮次里（见 gate.rs）。
 
 mod clipboard_files;
 mod clipboard_key;
@@ -16,6 +17,7 @@ mod content;
 pub(crate) mod dnd;
 pub mod file_provider;
 mod files;
+mod gate;
 mod pasteboard;
 pub(crate) mod small_files;
 #[cfg(all(test, debug_assertions))]
@@ -46,6 +48,20 @@ pub(crate) const POLL_INTERVAL: Duration = Duration::from_millis(75);
 pub(crate) fn backend() -> Result<Box<dyn ClipboardBackend>, ClipboardError> {
     Ok(Box::new(MacClipboard {
         name: None,
+        watcher: Mutex::new(None),
+        registration: Arc::new(Mutex::new(None)),
+        local: Arc::new(Mutex::new(None)),
+    }))
+}
+
+/// A private named pasteboard: real AppKit behavior without touching the
+/// user's general clipboard.
+pub(crate) fn named_backend(name: &str) -> Result<Box<dyn ClipboardBackend>, ClipboardError> {
+    if name.is_empty() {
+        return Err(ClipboardError::Unsupported);
+    }
+    Ok(Box::new(MacClipboard {
+        name: Some(name.to_owned()),
         watcher: Mutex::new(None),
         registration: Arc::new(Mutex::new(None)),
         local: Arc::new(Mutex::new(None)),

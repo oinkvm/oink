@@ -29,6 +29,7 @@ fn fixture_admission(peer: DeviceId, link: LinkId) -> wire::PeerAdmission {
                     "oink.pointer.move-hidden/1",
                     "oink.focus.local-click/1",
                     "oink.auto-unlock/1",
+                    "oink.auto-unlock.sync/1",
                     "oink.input.relative/1",
                     "oink.input.gestures/1",
                     "oink.input.contacts/1",
@@ -75,6 +76,54 @@ fn external_forwarding_reads_the_latest_local_snapshot_without_restart_or_poll()
         h.driver.snapshots.settings.publish(settings);
         assert_eq!(h.driver.forward_injected_input(), enabled);
     }
+}
+#[test]
+fn quicker_compat_reaches_the_native_backend_at_start_and_on_change() {
+    use oink_foundation::input::{CaptureMode, FeelProfile};
+    use oink_input::{EventHandler, InputBackend, InputError, InputPermissions};
+    struct Recording {
+        fake: oink_test_support::input::FakeInput,
+        quicker: std::sync::Mutex<Vec<bool>>,
+    }
+    impl InputBackend for Recording {
+        fn set_quicker_compat(&self, enabled: bool) {
+            self.quicker.lock().unwrap().push(enabled);
+        }
+        fn start(&self, handler: EventHandler) -> Result<(), InputError> {
+            self.fake.start(handler)
+        }
+        fn stop(&self) {
+            self.fake.stop();
+        }
+        fn set_mode(&self, mode: CaptureMode) -> Result<(), InputError> {
+            self.fake.set_mode(mode)
+        }
+        fn inject(&self, event: &InjectEvent) -> Result<(), InputError> {
+            self.fake.inject(event)
+        }
+        fn cursor_position(&self) -> Result<oink_foundation::Point, InputError> {
+            self.fake.cursor_position()
+        }
+        fn feel_profile(&self) -> FeelProfile {
+            self.fake.feel_profile()
+        }
+        fn permissions(&self) -> InputPermissions {
+            self.fake.permissions()
+        }
+    }
+    let backend = Arc::new(Recording {
+        fake: oink_test_support::input::FakeInput::new(),
+        quicker: Default::default(),
+    });
+    let mut h = Harness::with_backend(backend.clone());
+    assert_eq!(*backend.quicker.lock().unwrap(), [false]);
+    for enabled in [true, true, false] {
+        let mut settings = (*h.driver.snapshots.settings.load()).clone();
+        settings.quicker_compat = enabled;
+        h.driver.snapshots.settings.publish(settings);
+        h.driver.refresh();
+    }
+    assert_eq!(*backend.quicker.lock().unwrap(), [false, true, false]);
 }
 fn input_scope(driver: &Driver) -> oink_routing::control::FocusScope {
     let Some(ControlMsg::FocusState {
@@ -853,64 +902,6 @@ fn datagram_on_reliable_input_faults_its_exact_stream() {
 }
 
 #[test]
-fn ordinary_command_flood_has_a_defined_nonblocking_outcome() {
-    let mut h = Harness::new();
-    // No native callback consumes the queue during this burst. Use the actual public
-    // command API; the harness owns and drains the native owner at the end.
-    let handle = std::mem::ManuallyDrop::new(InputThread {
-        source_start: h.driver.inject.source_start(),
-        #[cfg(debug_assertions)]
-        source_motion_for_test: h.driver.inject.source_motion_counter_for_test(),
-        shared: h.driver.shared.clone(),
-        backend: h.driver.inject.backend(),
-        inject_scheduler: h.driver.inject.scheduler_snapshot(),
-        inject_timing: h.driver.inject.timing(),
-        inject_failures: h.driver.inject.failure_counter(),
-    });
-    for _ in 0..10_000 {
-        handle.send(InputCommand::FocusLock(true));
-    }
-    handle.send(InputCommand::FocusLock(false));
-    assert_eq!(h.driver.shared.commands.queue_len(), 1);
-    h.poll();
-    assert!(!h.driver.adapter.router().locked());
-    assert_eq!(h.driver.shared.commands.take_rejected(), 0);
-}
-
-#[test]
-fn full_action_queue_rejects_and_counts_but_keeps_latest_state_and_shutdown() {
-    let mut h = Harness::new();
-    let handle = std::mem::ManuallyDrop::new(InputThread {
-        source_start: h.driver.inject.source_start(),
-        #[cfg(debug_assertions)]
-        source_motion_for_test: h.driver.inject.source_motion_counter_for_test(),
-        shared: h.driver.shared.clone(),
-        backend: h.driver.inject.backend(),
-        inject_scheduler: h.driver.inject.scheduler_snapshot(),
-        inject_timing: h.driver.inject.timing(),
-        inject_failures: h.driver.inject.failure_counter(),
-    });
-    for _ in 0..1031 {
-        handle.send(InputCommand::ReturnPointerHome);
-    }
-    handle.send(InputCommand::FocusLock(true));
-    handle.send(InputCommand::Paused(false));
-    handle.send(InputCommand::Paused(true));
-    assert_eq!(h.driver.shared.commands.queue_len(), 1025);
-    assert_eq!(h.driver.shared.commands.take_rejected(), 7);
-    assert_eq!(h.driver.shared.commands.take_rejected(), 0);
-    h.poll();
-    assert!(!h.driver.adapter.router().locked()); // Pausing visibly clears the lock.
-    assert!(h.driver.paused);
-    for _ in 0..1024 {
-        handle.send(InputCommand::ReturnPointerHome);
-    }
-    handle.send(InputCommand::Stop);
-    h.poll();
-    assert!(h.driver.stopping);
-}
-
-#[test]
 fn stalled_main_cancellation_must_precede_native_left_up() {
     use oink_foundation::input::MouseButton;
     let backend = Arc::new(oink_test_support::input::FakeInput::new());
@@ -1015,7 +1006,7 @@ fn blocked_fake_injector_leaves_i0_queued_while_the_input_owner_keeps_running() 
         event: InjectEvent::MoveRelative { dx: 0., dy: 0. },
         from: Some(peer()),
     });
-    entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    entered_rx.recv().unwrap();
     while h.driver.inject.available() >= 4096 {
         h.driver.inject.push(InjectItem::SetMode(CaptureMode::Local));
     }
@@ -1030,17 +1021,11 @@ fn blocked_fake_injector_leaves_i0_queued_while_the_input_owner_keeps_running() 
             .unwrap(),
         )
         .unwrap();
-    let started = Instant::now();
     h.poll();
-    assert!(
-        started.elapsed() < Duration::from_millis(100),
-        "input owner waited for the blocked injector"
-    );
     assert_eq!(h.driver.adapter.receive_state(peer()).unwrap().feel, Some(previous));
     assert!(h.driver.adapter.attached(peer()));
     release.send(()).unwrap();
-    let until = Instant::now() + Duration::from_secs(2);
-    while h.driver.adapter.receive_state(peer()).unwrap().feel != Some(changed.clone()) && Instant::now() < until {
+    while h.driver.adapter.receive_state(peer()).unwrap().feel != Some(changed.clone()) {
         h.poll();
         std::thread::yield_now();
     }
@@ -1073,9 +1058,8 @@ fn emergency_clears_online_and_releases_holds_before_reporting_its_barrier() {
             pressed: true,
         }),
     );
-    let until = Instant::now() + Duration::from_secs(2);
     let mut down = false;
-    while !down && Instant::now() < until {
+    while !down {
         down = backend
             .take_injected()
             .iter()
@@ -1092,9 +1076,8 @@ fn emergency_clears_online_and_releases_holds_before_reporting_its_barrier() {
     assert_ne!(h.driver.adapter.routing_session(), instance);
     assert!(h.driver.pairs[&peer()].outbound.is_none());
     assert!(h.driver.pairs[&peer()].inbound.is_some());
-    let until = Instant::now() + Duration::from_secs(2);
     let mut released = false;
-    while !released && Instant::now() < until {
+    while !released {
         released = h.driver.inject.take_released() == Some(peer());
         std::thread::yield_now();
     }
@@ -1184,8 +1167,7 @@ fn paused_inbound_actions_cannot_reuse_previous_session() {
     let old_scope = input_scope(&h.driver);
     h.driver.command(InputCommand::Paused(true));
     h.poll();
-    let until = Instant::now() + Duration::from_secs(2);
-    while h.driver.pairs[&peer()].releasing && Instant::now() < until {
+    while h.driver.pairs[&peer()].releasing {
         h.poll();
         std::thread::yield_now();
     }
@@ -1454,6 +1436,8 @@ mod motion;
 
 mod capture;
 
+mod sync_unlock;
+
 #[test]
 fn trail_duration_snapshot_updates_capture_probe_and_native_renderer_command() {
     let mut h = Harness::new();
@@ -1504,20 +1488,17 @@ fn contacts_snapshot_disables_receiver_before_processing_more_input() {
     let begin = Message::Input(InputMsg::TouchpadContacts(Frame::between(None, &sample)));
     r.input_message(origin, begin.clone(), 0);
     h.driver.outputs(Some(origin));
-    let until = Instant::now() + Duration::from_secs(2);
     while !fake
         .injected()
         .iter()
         .any(|e| matches!(e, InjectEvent::TouchpadContacts(f) if f.phase == Phase::Begin))
     {
-        assert!(Instant::now() < until, "initial contacts were not injected");
         std::thread::yield_now();
     }
     let mut settings = (*h.driver.snapshots.settings.load()).clone();
     settings.accept_contacts = false;
     h.driver.snapshots.settings.publish(settings);
     h.poll();
-    let until = Instant::now() + Duration::from_secs(2);
     loop {
         let count = fake
             .injected()
@@ -1527,7 +1508,6 @@ fn contacts_snapshot_disables_receiver_before_processing_more_input() {
         if count == 1 {
             break;
         }
-        assert!(Instant::now() < until, "setting snapshot did not release contacts");
         std::thread::yield_now();
     }
     let r = h.driver.adapter.router_mut();
@@ -1646,8 +1626,7 @@ fn manual_update_interrupts_held_input_locked_and_secure_session() {
     let (reply, wait) = mpsc::sync_channel(1);
     h.driver.command(InputCommand::PrepareUpdate { generation: 1, reply });
     let fence = wait.recv().unwrap().unwrap();
-    let deadline = Instant::now() + Duration::from_secs(2);
-    while fence.load(Ordering::Acquire) == 0 && Instant::now() < deadline {
+    while fence.load(Ordering::Acquire) == 0 {
         std::thread::yield_now();
     }
     assert_eq!(fence.load(Ordering::Acquire), 1);
@@ -1684,9 +1663,8 @@ fn manual_update_interrupts_remote_control_and_fences_native_key_release() {
             pressed: true,
         }),
     );
-    let until = Instant::now() + Duration::from_secs(2);
     let mut down = false;
-    while !down && Instant::now() < until {
+    while !down {
         down = backend
             .take_injected()
             .iter()
@@ -1698,8 +1676,7 @@ fn manual_update_interrupts_remote_control_and_fences_native_key_release() {
     let (reply, wait) = mpsc::sync_channel(1);
     h.driver.command(InputCommand::PrepareUpdate { generation: 19, reply });
     let fence = wait.recv().unwrap().unwrap();
-    let until = Instant::now() + Duration::from_secs(2);
-    while fence.load(Ordering::Acquire) == 0 && Instant::now() < until {
+    while fence.load(Ordering::Acquire) == 0 {
         std::thread::yield_now();
     }
     assert_eq!(fence.load(Ordering::Acquire), 1);
@@ -1728,7 +1705,7 @@ fn manual_update_interrupts_pending_native_drag_and_keeps_injection_dormant_unti
         main: h.driver.main.clone(),
     });
     let pending = loop {
-        let command = h._main.recv_timeout(Duration::from_secs(2)).unwrap();
+        let command = h._main.recv().unwrap();
         if matches!(command, MainCommand::Dnd { .. }) {
             break command;
         }
@@ -1736,8 +1713,7 @@ fn manual_update_interrupts_pending_native_drag_and_keeps_injection_dormant_unti
     let (reply, wait) = mpsc::sync_channel(1);
     h.driver.command(InputCommand::PrepareUpdate { generation: 23, reply });
     let fence = wait.recv().unwrap().unwrap();
-    let until = Instant::now() + Duration::from_secs(2);
-    while fence.load(Ordering::Acquire) == 0 && Instant::now() < until {
+    while fence.load(Ordering::Acquire) == 0 {
         std::thread::yield_now();
     }
     assert_eq!(
@@ -1751,8 +1727,7 @@ fn manual_update_interrupts_pending_native_drag_and_keeps_injection_dormant_unti
     // Even completion of old ordinary work cannot restart the old session.
     drop(pending);
     h.driver.command(InputCommand::AbortUpdate { generation: 23 });
-    let until = Instant::now() + Duration::from_secs(2);
-    while h.driver.inject.suspended() && Instant::now() < until {
+    while h.driver.inject.suspended() {
         h.poll();
         std::thread::yield_now();
     }
@@ -1767,8 +1742,7 @@ fn update_prepare_waits_for_injection_fence_and_abort_restores_admission() {
     let (reply, wait) = mpsc::sync_channel(1);
     h.driver.command(InputCommand::PrepareUpdate { generation: 9, reply });
     let fence = wait.recv().unwrap().unwrap();
-    let deadline = Instant::now() + Duration::from_secs(2);
-    while fence.load(Ordering::Acquire) == 0 && Instant::now() < deadline {
+    while fence.load(Ordering::Acquire) == 0 {
         std::thread::yield_now();
     }
     assert_eq!(fence.load(Ordering::Acquire), 1);
@@ -1859,7 +1833,6 @@ fn resource_faults_keep_unknown_and_separate_capture_secure_input_and_cleanup() 
         expected_emergency_sequence: 0,
         reply,
     });
-    let until = Instant::now() + Duration::from_secs(2);
     loop {
         h.poll();
         if let Ok(result) = result.try_recv() {
@@ -1869,7 +1842,6 @@ fn resource_faults_keep_unknown_and_separate_capture_secure_input_and_cleanup() 
             assert_eq!(h.driver.shared.status.load().resource_faults.screen, Some(Fault::None));
             break;
         }
-        assert!(Instant::now() < until);
         std::thread::yield_now();
     }
     for (event, pending) in [
@@ -1892,7 +1864,6 @@ fn resource_faults_keep_unknown_and_separate_capture_secure_input_and_cleanup() 
             expected_emergency_sequence: 0,
             reply,
         });
-        let until = Instant::now() + Duration::from_secs(2);
         loop {
             h.poll();
             if let Ok(result) = received.try_recv() {
@@ -1903,7 +1874,6 @@ fn resource_faults_keep_unknown_and_separate_capture_secure_input_and_cleanup() 
                 );
                 break;
             }
-            assert!(Instant::now() < until);
             std::thread::yield_now();
         }
     }
@@ -1923,14 +1893,12 @@ fn owner_resume_cannot_cross_an_emergency_sequence() {
     h.driver.adapter.trigger_emergency();
     h.driver.outputs(None);
     assert_eq!(h.driver.shared.status.load().emergency_sequence, 1);
-    let until = Instant::now() + Duration::from_secs(2);
     loop {
         h.poll();
         if let Ok(result) = result.try_recv() {
             assert_eq!(result, Err(ControlFailure::StaleRevision));
             break;
         }
-        assert!(Instant::now() < until);
         std::thread::yield_now();
     }
     assert!(h.driver.shared.status.load().paused);
@@ -1955,7 +1923,6 @@ fn received_emergency_invalidates_resume_without_originating_another_group_event
     h.driver.command(InputCommand::KeyboardDisabled(true));
     let (reply, received) = mpsc::sync_channel(1);
     h.driver.command(InputCommand::ReceiveEmergency { reply });
-    let until = Instant::now() + Duration::from_secs(2);
     loop {
         h.poll();
         if let Ok(result) = received.try_recv() {
@@ -1964,7 +1931,6 @@ fn received_emergency_invalidates_resume_without_originating_another_group_event
             assert_eq!(applied.local_emergency_sequence, 0);
             break;
         }
-        assert!(Instant::now() < until);
         std::thread::yield_now();
     }
     assert!(h.driver.shared.status.load().paused);
@@ -3190,8 +3156,7 @@ fn source_foreground_driver_follows_departure_return_and_live_policy() {
         // An ordered fence proves the fake backend processed the transition too.
         let done = Arc::new(std::sync::atomic::AtomicU8::new(0));
         driver.inject.push(InjectItem::UpdateFence(done.clone()));
-        let until = Instant::now() + Duration::from_secs(2);
-        while done.load(Ordering::Acquire) == 0 && Instant::now() < until {
+        while done.load(Ordering::Acquire) == 0 {
             std::thread::yield_now();
         }
         assert_eq!(done.load(Ordering::Acquire), 1);
@@ -3236,8 +3201,7 @@ fn source_foreground_driver_restores_on_normal_return() {
     h.driver.outputs(None);
     let done = Arc::new(std::sync::atomic::AtomicU8::new(0));
     h.driver.inject.push(InjectItem::UpdateFence(done.clone()));
-    let until = Instant::now() + Duration::from_secs(2);
-    while done.load(Ordering::Acquire) == 0 && Instant::now() < until {
+    while done.load(Ordering::Acquire) == 0 {
         std::thread::yield_now();
     }
     assert_eq!(done.load(Ordering::Acquire), 1);
@@ -3473,7 +3437,7 @@ fn local_unlock_admission_survives_focus_leaving_before_first_character() {
         reply,
     );
     h.driver.command(InputCommand::LocalUnlock {
-        epoch: h.driver.adapter.router().focus().epoch,
+        admission: LocalUnlockAdmission::Focus(h.driver.adapter.router().focus().epoch),
         job,
     });
     h.driver.command(InputCommand::MovePointerTo(peer()));

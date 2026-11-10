@@ -671,3 +671,44 @@ fn auto_unlock_query_and_reply_require_optional_capability() {
     }
     assert!(!registry::BASELINE.contains(&"oink.auto-unlock/1"));
 }
+
+#[test]
+fn sync_unlock_requires_its_own_optional_capability_on_both_ends() {
+    for (sync_a, sync_b) in [(true, false), (false, true), (true, true)] {
+        let (mut a, mut b) = offers();
+        add_cap(&mut a, "oink.auto-unlock/1", 4);
+        add_cap(&mut b, "oink.auto-unlock/1", 4);
+        if sync_a {
+            add_cap(&mut a, "oink.auto-unlock.sync/1", 4);
+        }
+        if sync_b {
+            add_cap(&mut b, "oink.auto-unlock.sync/1", 4);
+        }
+        let negotiated = admission::negotiate(&bytes(a), &bytes(b), registry::CAPABILITIES, false).unwrap();
+        let agreement = admission::Agreement::new(negotiated.enabled().unwrap().0.into_iter().map(|v| v.0)).unwrap();
+        // Input admission does not depend on whether the logical path is direct
+        // or relayed; only pairing is restricted to direct links.
+        for direct in [true, false] {
+            let context = admission::Context {
+                kind: 3,
+                transport: registry::Transport::Reliable,
+                phase: admission::Phase::Member,
+                agreement: &agreement,
+                direct,
+                old_member_lane: false,
+            };
+            let message = Message::ControlSyncUnlock(
+                oink_protocol::v1::dto::ControlSyncUnlock::from_raw(support::sample_named("ControlSyncUnlock"))
+                    .unwrap(),
+            );
+            let encoded = frame::encode(&message, 16384).unwrap();
+            assert_eq!(
+                context
+                    .decode(frame::OpaqueFrame::parse_exact(&encoded, 16384).unwrap())
+                    .is_ok(),
+                sync_a && sync_b
+            );
+        }
+    }
+    assert!(!registry::BASELINE.contains(&"oink.auto-unlock.sync/1"));
+}

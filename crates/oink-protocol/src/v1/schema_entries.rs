@@ -23,7 +23,7 @@ macro_rules! enum_schemas {
     };
 }
 dto_schemas! {
-    ControlUnlockQuery,ControlUnlockReply,    ControlPowerState,
+    ControlUnlockQuery,ControlUnlockReply,ControlSyncUnlock,    ControlPowerState,
     CloudLinkRequest,CloudLinkOffer,CloudLinkUnavailable,CloudLinkList,CloudLinkSelect,CloudLinkRead,NativeFileMetadata,WindowsFileDescriptor,MacPromiseGroup,MacPromiseControl,FulfilledRoot,
     ControlLocalClick, ControlMovePointer, PointerShortcutSlots, PointerShortcutSlot,
     LocalOutputVolume,

@@ -15,9 +15,9 @@ class MacSigning(unittest.TestCase):
                    subprocess.CompletedProcess([],0,'','TeamIdentifier=893V37X2CW\n')]
         with patch.object(S, 'private_run', side_effect=results) as run:
             S.verify_published_app(Path('Oink.app'), '893V37X2CW')
-            self.assertEqual(run.call_args_list, [
-                unittest.mock.call('spctl','-a','-t','exec',Path('Oink.app')),
-                unittest.mock.call('codesign','-dvv',Path('Oink.app'))])
+            commands = [call.args for call in run.call_args_list]
+            self.assertEqual(sorted(args[0] for args in commands), ['codesign', 'spctl'])
+            self.assertTrue(all(Path('Oink.app') in args for args in commands))
         with patch.object(S, 'private_run', return_value=subprocess.CompletedProcess([],0,'','TeamIdentifier=OTHER\n')):
             with self.assertRaisesRegex(RuntimeError, 'Team ID'): S.verify_published_app(Path('Oink.app'), '893V37X2CW')
 

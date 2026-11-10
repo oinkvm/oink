@@ -6,7 +6,9 @@ import { createLayoutProfilesApi } from './layoutProfiles';
 export { ApiFailure } from "./transport";
 
 export type AutoUnlockFailure = 'password_incorrect' | 'windows_hello_only' | 'login_ui_not_ready' | 'unknown';
-export type AutoUnlockStatus = { enabled: boolean; failure: AutoUnlockFailure | null; windows_hello_only: boolean };
+/** Why the latest 同步解锁 request was skipped on this device; never a failure. */
+export type AutoUnlockSyncSkip = 'lock_screen' | 'display_wake' | 'password_field' | 'source_locked' | 'local_typing' | 'source_disconnected';
+export type AutoUnlockStatus = { enabled: boolean; failure: AutoUnlockFailure | null; windows_hello_only: boolean; sync_last?: { kind: AutoUnlockSyncSkip; at_ms: number } | null };
 
 export async function call<R>(method: string, params?: Record<string, unknown>): Promise<R> {
   try {

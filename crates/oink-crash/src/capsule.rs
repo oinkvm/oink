@@ -9,7 +9,13 @@ use std::{
 };
 
 const MAGIC: [u8; 8] = *b"OINKCR03";
-const SIZE: usize = 128;
+/// The record shared with the File Provider extension's C capture.
+const BASE: usize = 128;
+/// Rust capsules append the panic source file: length byte, path bytes and a
+/// checksum. An all-zero extension (no source) checks as valid.
+const SOURCE: usize = BASE + 1;
+const SOURCE_CHECK: usize = SOURCE + SourcePath::CAPACITY;
+const SIZE: usize = SOURCE_CHECK + 8;
 #[derive(Debug)]
 struct ArmedFile {
     file: File,
@@ -23,8 +29,33 @@ pub struct Capture {
     generation: AtomicU64,
     file: Mutex<Option<ArmedFile>>,
 }
+/// A panic location held without allocation until the fatal boundary.
+#[derive(Clone, Copy)]
+struct PanicAt {
+    line: u32,
+    column: u32,
+    len: u8,
+    file: [u8; SourcePath::CAPACITY],
+}
+impl PanicAt {
+    const NONE: Self = Self {
+        line: 0,
+        column: 0,
+        len: 0,
+        file: [0; SourcePath::CAPACITY],
+    };
+    fn of(location: &std::panic::Location<'_>) -> Self {
+        let mut at = Self {
+            line: location.line(),
+            column: location.column(),
+            ..Self::NONE
+        };
+        at.len = SourcePath::reduce(location.file(), &mut at.file) as u8;
+        at
+    }
+}
 thread_local! {
-    static PANIC_LOCATION: std::cell::Cell<(u32,u32)> = const { std::cell::Cell::new((0,0)) };
+    static PANIC_LOCATION: std::cell::Cell<PanicAt> = const { std::cell::Cell::new(PanicAt::NONE) };
 }
 
 /// The process entry point owns this boundary. Caught panics never write a
@@ -34,8 +65,8 @@ pub fn fatal_boundary<T>(run: impl FnOnce() -> T) -> T {
         Ok(value) => value,
         Err(_) => {
             if let Some(capture) = HOOK.get() {
-                let (line, column) = PANIC_LOCATION.try_with(std::cell::Cell::get).unwrap_or_default();
-                capture.record(CrashKind::RustPanic, 0, line, column);
+                let at = PANIC_LOCATION.try_with(std::cell::Cell::get).unwrap_or(PanicAt::NONE);
+                capture.record(CrashKind::RustPanic, 0, &at);
             }
             std::process::abort();
         }
@@ -45,19 +76,21 @@ pub fn fatal_boundary<T>(run: impl FnOnce() -> T) -> T {
 static HOOK: OnceLock<Arc<Capture>> = OnceLock::new();
 impl Capture {
     /// Compose once. The old hook's local logging behavior is unchanged; none of
-    /// its output or PanicHookInfo payload/file/thread enters the capsule.
+    /// its output, PanicHookInfo payload or thread enters the capsule. Only the
+    /// location does: line, column and the crate-relative source file
+    /// (`SourcePath`), which is shipped code, never user data.
     pub fn install() -> Arc<Self> {
         HOOK.get_or_init(|| {
             let state = Arc::new(Self::default());
             let hook = state.clone();
             let previous = std::panic::take_hook();
             std::panic::set_hook(Box::new(move |info| {
-                let (line, column) = info.location().map(|l| (l.line(), l.column())).unwrap_or_default();
-                let _ = PANIC_LOCATION.try_with(|location| location.set((line, column)));
+                let at = info.location().map(PanicAt::of).unwrap_or(PanicAt::NONE);
+                let _ = PANIC_LOCATION.try_with(|location| location.set(at));
                 // Abort-profile panics are intrinsically fatal. Unwinding
                 // profiles commit only at the application entry boundary.
                 if cfg!(panic = "abort") {
-                    hook.record(CrashKind::RustPanic, 0, line, column);
+                    hook.record(CrashKind::RustPanic, 0, &at);
                 }
                 previous(info);
             }));
@@ -121,7 +154,7 @@ impl Capture {
     }
     /// Fixed-size best effort, no allocator, formatter, panic payload, or blocking
     /// report lock. A busy slot loses coverage instead of delaying a faulting thread.
-    pub fn record(&self, kind: CrashKind, code: u32, line: u32, column: u32) {
+    fn record(&self, kind: CrashKind, code: u32, at: &PanicAt) {
         let generation = self.generation.load(Ordering::Acquire);
         if generation == 0 {
             return;
@@ -136,8 +169,7 @@ impl Capture {
             file.component,
             kind,
             code,
-            line,
-            column,
+            at,
             oink_telemetry::now(),
             file.build,
             file.capability,
@@ -157,8 +189,11 @@ impl Capture {
 #[cfg(windows)]
 pub(crate) fn native_exception(code: u32) {
     if let Some(hook) = HOOK.get() {
-        hook.record(CrashKind::NativeException, code, 0, 0);
+        hook.record(CrashKind::NativeException, code, &PanicAt::NONE);
     }
+}
+fn checksum(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0u64, |a, b| a.rotate_left(7) ^ *b as u64)
 }
 // Fixed binary layout keeps the fatal hook independent of serializers.
 #[allow(clippy::too_many_arguments)]
@@ -167,8 +202,7 @@ fn encode(
     component: Component,
     kind: CrashKind,
     code: u32,
-    line: u32,
-    column: u32,
+    location: &PanicAt,
     at: u64,
     build: BuildContext,
     capability: [u8; 32],
@@ -179,8 +213,12 @@ fn encode(
     out[16] = component as u8;
     out[17] = kind as u8;
     out[20..24].copy_from_slice(&code.to_le_bytes());
-    out[24..28].copy_from_slice(&line.to_le_bytes());
-    out[28..32].copy_from_slice(&column.to_le_bytes());
+    out[24..28].copy_from_slice(&location.line.to_le_bytes());
+    out[28..32].copy_from_slice(&location.column.to_le_bytes());
+    out[SOURCE - 1] = location.len;
+    out[SOURCE..SOURCE_CHECK].copy_from_slice(&location.file);
+    let source = checksum(&out[BASE..SOURCE_CHECK]);
+    out[SOURCE_CHECK..].copy_from_slice(&source.to_le_bytes());
     out[32..40].copy_from_slice(&at.to_le_bytes());
     out[40..72].copy_from_slice(&capability);
     out[72..74].copy_from_slice(&build.app_version.major.to_le_bytes());
@@ -193,8 +231,8 @@ fn encode(
         OsVersionClass::MacOSMajor(m) => (3, m),
         OsVersionClass::Unknown => (0, 0),
     };
-    let check = out[..120].iter().fold(0u64, |a, b| a.rotate_left(7) ^ *b as u64);
-    out[120..].copy_from_slice(&check.to_le_bytes());
+    let check = checksum(&out[..120]);
+    out[120..BASE].copy_from_slice(&check.to_le_bytes());
     out
 }
 pub fn recover(
@@ -217,16 +255,19 @@ pub fn recover_with_capability(
         return None;
     }
     let file = File::open(path).ok()?;
-    if file.metadata().ok()?.len() != SIZE as u64 {
+    // BASE: the File Provider extension's C capsule; SIZE: a Rust capsule.
+    let len = file.metadata().ok()?.len();
+    if len != BASE as u64 && len != SIZE as u64 {
         return None;
     }
     let mut bytes = [0; SIZE];
     use std::io::Read;
-    (&file).read_exact(&mut bytes).ok()?;
+    (&file).read_exact(&mut bytes[..len as usize]).ok()?;
     let u64_at = |i| u64::from_le_bytes(bytes[i..i + 8].try_into().unwrap());
     if bytes[..8] != MAGIC
         || u64_at(8) != consent.generation
-        || u64_at(120) != bytes[..120].iter().fold(0u64, |a, b| a.rotate_left(7) ^ *b as u64)
+        || u64_at(120) != checksum(&bytes[..120])
+        || u64_at(SOURCE_CHECK) != checksum(&bytes[BASE..SOURCE_CHECK])
     {
         return None;
     }
@@ -285,6 +326,10 @@ pub fn recover_with_capability(
     crash.exception_code = (u32_at(20) != 0).then_some(u32_at(20));
     crash.line = (u32_at(24) != 0).then_some(u32_at(24));
     crash.column = (u32_at(28) != 0).then_some(u32_at(28));
+    let source = &bytes[SOURCE..SOURCE + usize::from(bytes[SOURCE - 1]).min(SourcePath::CAPACITY)];
+    if kind == CrashKind::RustPanic && crash.line.is_some() {
+        crash.source = SourcePath::from_reduced(source);
+    }
     Some((crash, at))
 }
 #[cfg(test)]
@@ -301,12 +346,19 @@ mod tests {
             images: vec![],
         }
     }
+    fn located(line: u32, column: u32) -> PanicAt {
+        PanicAt {
+            line,
+            column,
+            ..PanicAt::NONE
+        }
+    }
     #[test]
     fn bounded_capsule_off_stale_corrupt_and_repeated_faults() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("capsule");
         let c = Capture::default();
-        c.record(CrashKind::RustPanic, 0, 9, 1);
+        c.record(CrashKind::RustPanic, 0, &located(9, 1));
         assert!(!path.exists());
         c.arm(
             &path,
@@ -319,9 +371,9 @@ mod tests {
         )
         .unwrap();
         for _ in 0..100 {
-            c.record(CrashKind::RustPanic, 0, 9, 1);
+            c.record(CrashKind::RustPanic, 0, &located(9, 1));
         }
-        assert_eq!(std::fs::metadata(&path).unwrap().len(), 128);
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), SIZE as u64);
         let consent = ReportConsent {
             choice: Choice::Granted,
             policy_version: 3,
@@ -344,7 +396,7 @@ mod tests {
         );
         c.disarm();
         assert!(!path.exists());
-        c.record(CrashKind::RustPanic, 0, 1, 1);
+        c.record(CrashKind::RustPanic, 0, &located(1, 1));
         assert!(!path.exists());
     }
     #[test]
@@ -409,22 +461,27 @@ mod tests {
             .unwrap();
         assert!(!output.status.success());
         let bytes = std::fs::read(&path).unwrap();
-        assert_eq!(bytes.len(), 128);
+        assert_eq!(bytes.len(), SIZE);
         assert!(!String::from_utf8_lossy(&bytes).contains("poison"));
-        assert!(
-            recover(
-                &path,
-                ReportConsent {
-                    choice: Choice::Granted,
-                    policy_version: 3,
-                    generation: 1
-                },
-                &manifest(),
-                OsVersionClass::Unknown,
-                now()
-            )
-            .is_some()
+        let (crash, _) = recover(
+            &path,
+            ReportConsent {
+                choice: Choice::Granted,
+                policy_version: 3,
+                generation: 1,
+            },
+            &manifest(),
+            OsVersionClass::Unknown,
+            now(),
+        )
+        .unwrap();
+        // The location names the panicking file (this test), not just a line.
+        assert_eq!(
+            crash.source.as_ref().map(SourcePath::as_str),
+            Some("oink-crash/src/capsule.rs")
         );
+        assert!(crash.line.is_some() && crash.column.is_some());
+        assert!(Report::SafeCrash(crash).validate().is_ok());
     }
 }
 

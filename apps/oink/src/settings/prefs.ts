@@ -56,9 +56,12 @@ export interface Prefs {
     macScrollFeel: boolean;
     forwardInjectedInput: boolean;
     takeForegroundOnLeave: boolean;
+    quickerCompat: boolean;
+    syncUnlock: boolean;
     pointerTrail: boolean;
     clipReceive: boolean;
     clipSend: boolean;
+    clipDedupe: boolean;
     removeDsStore: boolean;
     audioEncodingQuality: 'smooth' | 'quality' | 'lossless';
     audioDevice: string;
@@ -93,9 +96,12 @@ export const DEFAULT_PREFS: Prefs = {
     macScrollFeel: true,
     forwardInjectedInput: true,
     takeForegroundOnLeave: false,
+    quickerCompat: false,
+    syncUnlock: false,
     pointerTrail: true,
     clipReceive: true,
     clipSend: true,
+    clipDedupe: true,
     removeDsStore: true,
     audioEncodingQuality: 'quality',
     audioDevice: 'default',

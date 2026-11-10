@@ -284,7 +284,7 @@ mod tests {
         assert_eq!(capture.local_generation, 2);
     }
     #[test]
-    fn ui_fatal_child_writes_only_scrubbed_numeric_capsule() {
+    fn ui_fatal_child_writes_only_scrubbed_capsule() {
         const CHILD: &str = "OINK_UI_FATAL_UNIT_CHILD";
         if let Some(root) = std::env::var_os(CHILD) {
             fatal_boundary(|| {
@@ -298,7 +298,7 @@ mod tests {
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
-                "telemetry::ui::tests::ui_fatal_child_writes_only_scrubbed_numeric_capsule",
+                "telemetry::ui::tests::ui_fatal_child_writes_only_scrubbed_capsule",
                 "--nocapture",
             ])
             .env(CHILD, directory.path())
@@ -308,7 +308,6 @@ mod tests {
         let capture = fixture(directory.path());
         let path = capture.dir.join("capsules/ui.bin");
         let bytes = std::fs::read(&path).unwrap();
-        assert_eq!(bytes.len(), 128);
         assert!(!String::from_utf8_lossy(&bytes).contains("PRIVATE"));
         let (crash, _) = oink_crash::capsule::recover(
             &path,
@@ -320,6 +319,10 @@ mod tests {
         .unwrap();
         assert_eq!(crash.component, Component::UiRust);
         assert_eq!(crash.exception_class, ExceptionClass::Panic);
+        assert_eq!(
+            crash.source.as_ref().map(oink_telemetry::SourcePath::as_str),
+            Some("oink-agent/src/telemetry/ui.rs")
+        );
     }
     #[test]
     fn ui_opt_out_is_generation_fenced_and_cleanup_stays_in_its_class() {

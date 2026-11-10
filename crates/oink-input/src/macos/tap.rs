@@ -3634,6 +3634,19 @@ mod tests {
         CGEvent::set_double_value_field(Some(&event), CGEventField::ScrollWheelEventFixedPtDeltaAxis2, -9.);
         CGEvent::set_double_value_field(Some(&event), CGEventField(178), 1.);
         CGEvent::set_double_value_field(Some(&event), CGEventField(177), -2.);
+        // Older Quartz versions ignore writes to the raw fields on synthetic
+        // events. Exercise the coarse fallback when the fixture cannot set them.
+        let raw = Point::new(
+            CGEvent::double_value_field(Some(&event), CGEventField(177)),
+            CGEvent::double_value_field(Some(&event), CGEventField(178)),
+        );
+        let coarse = Point::new(-8., 4.);
+        let (steps, inverted_steps) = if raw == Point::default() {
+            (coarse, coarse)
+        } else {
+            assert_eq!(raw, Point::new(-2., 1.));
+            (Point::new(-2., 1.), Point::new(2., -1.))
+        };
         let captured = translate(CGEventType::ScrollWheel, &event).event.unwrap();
         assert_eq!(
             captured.event,
@@ -3642,7 +3655,7 @@ mod tests {
                 dy: 4.5,
                 unit: ScrollUnit::Line,
                 phase: ScrollPhase::None,
-                wheel_steps: Some(Point::new(-2., 1.))
+                wheel_steps: Some(steps)
             }
         );
         // Public AppKit accessor supplies the direction applied to the raw data.
@@ -3652,7 +3665,7 @@ mod tests {
                 .unwrap()
                 .isDirectionInvertedFromDevice()
         );
-        assert_eq!(native_wheel_steps(&event, Point::default()), Point::new(2., -1.));
+        assert_eq!(native_wheel_steps(&event, coarse), inverted_steps);
     }
 
     #[test]

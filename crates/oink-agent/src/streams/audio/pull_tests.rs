@@ -202,7 +202,7 @@ fn real_m1_malformed_records_consume_one_callback_scan_budget() {
 }
 
 #[test]
-#[ignore = "Release benchmark, 16 real M1 readers, synthetic Mach/MMCSS cadence; no native devices"]
+#[ignore = "slow: release benchmark with 16 synthetic readers and Mach/MMCSS cadence"]
 // An explicitly requested ignored test must reject debug builds rather than
 // silently report unoptimized timings as a performance result.
 #[allow(clippy::assertions_on_constants)]

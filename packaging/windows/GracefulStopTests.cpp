@@ -22,24 +22,22 @@ int main() {
                 assert(scans == waits + 1 + (stops && !responds ? 1u : 0u));
                 ++checks;
             }
-    for (const auto operation : {"install", "upgrade", "repair", "uninstall"}) {
-        unsigned scans = 0, stops = 0, waits = 0;
-        assert(prepare(true, [&] { return ++scans == 4 ? State::clear : State::busy; },
-            [&] { ++stops; return true; }, [&] { ++waits; return true; }) == State::clear);
-        assert(stops == 1 && waits == 3);
-        assert(prepare(false, [] { return State::clear; }, [] { assert(false); return false; }, [] { assert(false); return true; }) == State::clear);
-        std::cout << operation << ": graceful success and retry after manual quit passed\n";
-        // StopServices has notified ALL installed sessions; the deferred CA
-        // waits for real exit rather than failing on the first observation.
-        scans = 0; waits = 0;
-        assert(observe([&] { return ++scans == 4 ? State::clear : State::busy; },
-            [&] { ++waits; return true; }) == State::clear);
-        assert(waits == 3);
-        waits = 0;
-        assert(observe([] { return State::busy; }, [&] { ++waits; return true; }) == State::busy);
-        assert(waits == 60); // Bounded failure, never terminate a process.
-        ++checks;
-    }
+    unsigned scans = 0, stops = 0, waits = 0;
+    assert(prepare(true, [&] { return ++scans == 4 ? State::clear : State::busy; },
+        [&] { ++stops; return true; }, [&] { ++waits; return true; }) == State::clear);
+    assert(stops == 1 && waits == 3);
+    assert(prepare(false, [] { return State::clear; }, [] { assert(false); return false; }, [] { assert(false); return true; }) == State::clear);
+    std::cout << "graceful operation success and retry after manual quit passed\n";
+    // StopServices has notified ALL installed sessions; the deferred CA
+    // waits for real exit rather than failing on the first observation.
+    scans = 0; waits = 0;
+    assert(observe([&] { return ++scans == 4 ? State::clear : State::busy; },
+        [&] { ++waits; return true; }) == State::clear);
+    assert(waits == 3);
+    waits = 0;
+    assert(observe([] { return State::busy; }, [&] { ++waits; return true; }) == State::busy);
+    assert(waits == 60); // Bounded failure, never terminate a process.
+    ++checks;
     assert(prepare(true, [] { return State::busy; }, [] { return true; }, [] { return false; }) == State::canceled);
     for (int code = 1; code != 13; ++code) {
         assert(std::wstring(failure(code)).find(L"[1]") == std::wstring::npos);

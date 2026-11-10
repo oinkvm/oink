@@ -881,42 +881,28 @@ fn fast_recross_waits_for_cancel_then_resumes_original_native_session() {
 }
 
 #[test]
-fn file_recross_with_source_input_preserves_current_capture() {
+fn file_recross_preserves_current_capture_for_both_input_roles() {
     common::watchdog::run(
         module_path!(),
-        "file_recross_with_source_input_preserves_current_capture",
+        "file_recross_preserves_current_capture_for_both_input_roles",
         Some(4),
-        file_recross_preserves_current_capture(false, false),
+        async {
+            file_recross_preserves_current_capture(false, false).await;
+            file_recross_preserves_current_capture(true, false).await;
+        },
     );
 }
 
 #[test]
-fn file_recross_with_target_input_preserves_current_capture() {
+fn file_recross_after_abandoned_probe_releases_current_host_for_both_input_roles() {
     common::watchdog::run(
         module_path!(),
-        "file_recross_with_target_input_preserves_current_capture",
-        Some(4),
-        file_recross_preserves_current_capture(true, false),
-    );
-}
-
-#[test]
-fn file_recross_after_abandoned_probe_with_source_input_releases_current_host() {
-    common::watchdog::run(
-        module_path!(),
-        "file_recross_after_abandoned_probe_with_source_input_releases_current_host",
+        "file_recross_after_abandoned_probe_releases_current_host_for_both_input_roles",
         Some(10),
-        file_recross_preserves_current_capture(false, true),
-    );
-}
-
-#[test]
-fn file_recross_after_abandoned_probe_with_target_input_releases_current_host() {
-    common::watchdog::run(
-        module_path!(),
-        "file_recross_after_abandoned_probe_with_target_input_releases_current_host",
-        Some(10),
-        file_recross_preserves_current_capture(true, true),
+        async {
+            file_recross_preserves_current_capture(false, true).await;
+            file_recross_preserves_current_capture(true, true).await;
+        },
     );
 }
 
@@ -1431,7 +1417,6 @@ async fn drag_escape_cancel_completes_before_release_scenario() {
     common::watchdog::until("native Cancel entered", || db.calls.lock().unwrap().contains(&"cancel")).await;
     b.input.take_injected();
     button(&a.input, false);
-    tokio::time::sleep(Duration::from_millis(100)).await;
     let early_up = has_up(&b);
     release.send(()).unwrap();
     assert!(!early_up, "Up reached a drop target while Cancel was still pending");

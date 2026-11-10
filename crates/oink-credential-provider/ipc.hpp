@@ -30,7 +30,9 @@ enum Op : DWORD {
   Acquire = 6,
   Outcome = 7,
   // Input thread notifications are authenticated by the local Oink backend.
-  RemoteInput = 8
+  RemoteInput = 8,
+  // Sync unlock: the agent already holds the source's UnlockReply(true).
+  SyncTrigger = 9
 };
 // Stable, display-free failure categories carried in Reply::reserved. The
 // value is local to this machine and never crosses the device-group protocol.
@@ -60,8 +62,12 @@ struct Reply {
   // are exposed to the local diagnostics snapshot, never to the wire protocol.
   uint64_t ready_at = 0, remote_input_at = 0, remote_input_source = 0;
   DWORD decision = 0;
+  // Latest sync operation outcome (low byte) and provider-polled bit (0x100),
+  // the provider success time and the service clock at reply. Local only.
+  DWORD sync = 0;
+  uint64_t succeeded_at = 0, now = 0, sync_id = 0;
 };
-static_assert(sizeof(Request) == 1048 && sizeof(Reply) == 1976);
+static_assert(sizeof(Request) == 1048 && sizeof(Reply) == 2000);
 struct Handle {
   HANDLE h = nullptr;
   explicit Handle(HANDLE v = nullptr) : h(v) {}

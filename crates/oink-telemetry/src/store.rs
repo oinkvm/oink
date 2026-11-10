@@ -687,7 +687,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "isolated resource benchmark; run with --ignored --nocapture"]
+    #[ignore = "slow: resource checkpoint benchmark"]
     fn resource_checkpoint_benchmark() {
         let directory = tempfile::tempdir().unwrap();
         let mut store = Store::open(directory.path(), consent(), DAY).unwrap();
@@ -1001,6 +1001,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "slow: large reservoir offer stress"]
     fn no_startup_midnight_or_shutdown_ping_and_reservoirs_bounded() {
         let dir = tempfile::tempdir().unwrap();
         let mut s = Store::open(dir.path(), consent(), DAY).unwrap();

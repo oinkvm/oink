@@ -109,6 +109,7 @@ impl Node {
                 let mut last_pointer = None;
                 let mut last_capture_application = None;
                 let mut last_session = None;
+                let mut unlock_edge = crate::auto_unlock::sync::UnlockEdge::default();
                 let mut display_revision = 0;
                 let mut enumerated = None;
                 let mut display_retry_at = None;
@@ -143,6 +144,13 @@ impl Node {
                         );
                         input.send(InputCommand::SessionLocked(session));
                         last_session = Some(session);
+                    }
+                    if unlock_edge.observe(session) {
+                        // Ordinary pool: the Windows own-unlock check is a local RPC.
+                        let edge = node.clone();
+                        node.inner
+                            .rt
+                            .spawn_blocking(move || crate::auto_unlock::local_unlock_edge(&edge));
                     }
                     let now = Instant::now();
                     let refresh_displays = dirty.swap(false, Ordering::AcqRel)

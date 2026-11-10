@@ -7,7 +7,7 @@ import type { Platform } from '../window/DesktopWindow';
 import { ACCENT_SWATCHES, DEFAULT_ACCENT } from './appearance';
 import type { ReceivedFilesCleanup } from '../api/types';
 import { ApiFailure, api as backend, shell } from '../api/client';
-import type { AutoUnlockFailure, AutoUnlockStatus } from '../api/client';
+import type { AutoUnlockFailure, AutoUnlockStatus, AutoUnlockSyncSkip } from '../api/client';
 import { agent, useAgent } from '../api/store';
 import { MicrophoneInput } from './MicrophoneInput';
 import { ScreenPointerGains } from './ScreenPointerGains';
@@ -50,6 +50,17 @@ function autoUnlockFailureText(failure: AutoUnlockFailure): string {
         case 'windows_hello_only': return tr('上次解锁失败：已开启“仅允许 Windows Hello 登录”，请在设置中关闭');
         case 'login_ui_not_ready': return tr('上次解锁失败：登录界面未就绪，请检查锁屏状态后重试');
         case 'unknown': return tr('上次解锁失败：未知原因，请检查设置和登录界面');
+    }
+}
+/** A skipped sync unlock needs no action: secondary text, never the alert icon. */
+function syncUnlockSkipText(kind: AutoUnlockSyncSkip): string {
+    switch (kind) {
+        case 'lock_screen': return tr('上次同步解锁未执行：锁屏画面未收起');
+        case 'display_wake': return tr('上次同步解锁未执行：无法唤醒屏幕');
+        case 'password_field': return tr('上次同步解锁未执行：锁屏密码框未就绪');
+        case 'source_locked': return tr('上次同步解锁未执行：发起的设备已重新锁定');
+        case 'local_typing': return tr('上次同步解锁未执行：本机正在输入');
+        case 'source_disconnected': return tr('上次同步解锁未执行：发起的设备已断开');
     }
 }
 const formatSize = (b: number) => {
@@ -294,6 +305,8 @@ export function SettingsPage({ open, platform, api, capsIme, query, jump, onActi
             case 'forwardWheelByLines':
             case 'forwardInjectedInput':
             case 'takeForegroundOnLeave':
+            case 'quickerCompat':
+            case 'syncUnlock':
             case 'keepAwake':
             case 'pointerTrail':
             case 'keepLocalPlayback':
@@ -301,6 +314,7 @@ export function SettingsPage({ open, platform, api, capsIme, query, jump, onActi
             case 'removeDsStore':
             case 'clipReceive':
             case 'clipSend':
+            case 'clipDedupe':
                 return sw(item.id);
             case 'touchpadInject': return {
                 desc: !contactsAvailable ? <>{text(item.desc, platform)} · {tr('原生触摸板注入暂不可用')}</> : undefined,
@@ -312,7 +326,8 @@ export function SettingsPage({ open, platform, api, capsIme, query, jump, onActi
             case 'autoUnlock': return {
                 desc: platform === 'win' && autoUnlock?.enabled && autoUnlock.windows_hello_only
                     ? tr('自动解锁不可用：请在系统设置中关闭“仅允许 Windows Hello 登录”')
-                    : autoUnlock?.failure ? autoUnlockFailureText(autoUnlock.failure) : undefined,
+                    : autoUnlock?.failure ? autoUnlockFailureText(autoUnlock.failure)
+                    : autoUnlock?.enabled && autoUnlock.sync_last ? syncUnlockSkipText(autoUnlock.sync_last.kind) : undefined,
                 node: <AutoUnlockControl platform={platform} enabled={autoUnlock?.enabled ?? false} failure={autoUnlock?.failure ?? null} windowsHelloOnly={platform === 'win' && (autoUnlock?.windows_hello_only ?? false)} label={label} onSave={saveAutoUnlock} onDisable={disableAutoUnlock}/>,
             };
             case 'onboarding': return { node: <Button size="sm" onClick={onOnboarding}>{tr('显示')}</Button> };

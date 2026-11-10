@@ -37,6 +37,7 @@ def main():
     p.add_argument('--notary-keychain', type=Path)
     p.add_argument('--notary-timeout', type=int, default=300)
     p.add_argument('--windows-update-test-fail-health', action='store_true', help='TEST ONLY: withhold candidate health proof for rollback qualification')
+    p.add_argument('--run-native-tests', action='store_true', help='Run Windows C++/PowerShell tests explicitly')
     a = p.parse_args()
     if a.windows_update_test_fail_health and not a.windows_update_test_feed:
         p.error('test health failure requires a test feed')
@@ -111,6 +112,8 @@ def main():
                 command += [flag, str(value)]
     else:
         command += ['--tool-cache', str(a.tool_cache)]
+        if a.run_native_tests:
+            command += ['--run-native-tests']
     subprocess.run(command, cwd=ROOT, check=True)
     # Public CI uploads in its explicit workflow step; in-house packages use
     # the same uploader and retain symbols even when no token is configured.

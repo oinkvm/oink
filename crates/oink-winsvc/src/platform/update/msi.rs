@@ -625,7 +625,7 @@ mod tests {
         assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
     }
     #[test]
-    #[ignore = "explicit external TEST MSI and previously verified inventory; no installation"]
+    #[ignore = "slow: external MSI cabinet and release inventory"]
     fn external_msi_native_cabinet_matches_every_previously_verified_file() {
         let path = std::env::var("OINK_UPDATE_TEST_MSI").expect("external TEST MSI path required");
         let inventory = std::env::var("OINK_UPDATE_TEST_INVENTORY").expect("external verified inventory required");

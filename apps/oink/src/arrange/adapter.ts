@@ -1,9 +1,28 @@
-import type { Layout, Placement } from '../api/types';
+import type { DisplayInfo, Layout, Placement } from '../api/types';
 import type { Screen } from './geometry';
 import type { Device } from '../devices/types';
 
 // A fixed renderer scale keeps drag arithmetic precise; API values remain in the ratio plane.
 export const RENDER_SCALE = 4096;
+
+/**
+ * Resolution shown on a screen tile (badge and accessible name). `bounds` is the
+ * OS's own desktop coordinate space, whose unit differs by platform: Quartz points
+ * on macOS (a Retina panel reads half its pixels, 1512 × 982 for 3024 × 1964) and
+ * physical pixels on Windows. Labelling `bounds` would therefore give the same 4K
+ * monitor two different figures depending on which computer reports it. The
+ * backing-store pixels are the one unit both platforms share; on macOS they are
+ * already swapped for rotation. In a scaled macOS mode ("More Space") they are the
+ * framebuffer size, which can exceed the panel; that is accepted. A layout-only
+ * placeholder for a missing snapshot reports 0 × 0 pixels (the API never derives
+ * pixels from coordinates), so only then does the label fall back to `bounds`.
+ * Display only: layout and pointer mapping never read this figure.
+ */
+function displayResolution(display: DisplayInfo): { w: number; h: number } {
+  return display.pixel_width > 0 && display.pixel_height > 0
+    ? { w: display.pixel_width, h: display.pixel_height }
+    : { w: display.bounds.w, h: display.bounds.h };
+}
 
 /** Draws device transforms over native geometry (live, or a history snapshot's via nativeLayout). */
 export function renderLayout(
@@ -20,6 +39,7 @@ export function renderLayout(
     } : screen.origin;
     const size = saved ? { w: native.w * saved.scale, h: native.h * saved.scale } : screen.size;
     const id = `${screen.key.device}:${screen.key.display}`;
+    const resolution = displayResolution(screen.display);
     return {
       id,
       device: screen.key.device,
@@ -31,8 +51,8 @@ export function renderLayout(
       groupSize: layout.geometry.screens.filter(peer => peer.key.device === screen.key.device).length,
       wallpaper: index,
       image: wallpapers[id],
-      labelWidth: native.w,
-      labelHeight: native.h,
+      labelWidth: resolution.w,
+      labelHeight: resolution.h,
       minimumWidth: screen.size.w * RENDER_SCALE * Math.min(1, 640 / native.w),
     };
   });

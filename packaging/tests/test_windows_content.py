@@ -119,8 +119,10 @@ class MsiContent(unittest.TestCase):
         acl['Control'] += [['OinkWelcomeDlg', 'LicenseText', 'ScrollableText', '130', '36', '226', '142', '7', '', license_rtf.read_text(), 'DesktopChoice'],
                            ['OinkWelcomeDlg', 'Artwork', 'Bitmap', '0', '0', '370', '234', '1', '', 'WixUI_Bmp_Dialog', 'LicenseText'],
                            ['OinkExitDlg', 'Artwork', 'Bitmap', '0', '0', '370', '234', '1', '', 'WixUI_Bmp_Dialog', 'LaunchChoice']]
-        acl['ControlCondition'] = [['OinkExitDlg', control, 'Show', 'UILevel = 5 AND NOT Installed AND NOT REMOVE']
-                                   for control in ['LaunchChoice']]
+        acl['ControlCondition'] = [['OinkExitDlg', 'LaunchChoice', 'Show',
+                                    'UILevel = 5 AND NOT Installed AND NOT REMOVE AND NOT WIX_UPGRADE_DETECTED'],
+                                   ['OinkExitDlg', 'RestartNote', 'Show',
+                                    'UILevel = 5 AND NOT REMOVE AND (Installed OR WIX_UPGRADE_DETECTED)']]
         acl['ControlEvent'] = [['OinkExitDlg', 'Finish', 'DoAction', 'FinishInstall',
                                'UILevel = 5 AND NOT Installed AND NOT REMOVE AND (OinkLaunch = "1" OR OINK_START_AT_LOGIN = "1")', '1']]
         acl['Control'] += [['OinkFinishWarningDlg', 'Description', 'Text', '20', '49', '330', '58', '3', '',
@@ -153,6 +155,10 @@ class MsiContent(unittest.TestCase):
         acl['CustomAction'].append(['PrepareUserSessions', '1', 'InstallerCA', 'PrepareUserSessions'])
         acl['InstallExecuteSequence'] += [['PrepareUserSessions', 'NOT UPGRADINGPRODUCTCODE', '1399'],
                                           ['CheckInstallPath', '', '1499']]
+        acl['CustomAction'] += [['RelaunchUserSessions', '3649', 'InstallerCA', 'RelaunchUserSessions'],
+                                ['NoUpgradeLaunch', '51', 'OinkLaunch', '0']]
+        acl['InstallExecuteSequence'].append(['RelaunchUserSessions', 'NOT REMOVE', '6505'])
+        acl['InstallUISequence'] += [['FindRelatedProducts', '', '25'], ['NoUpgradeLaunch', 'WIX_UPGRADE_DETECTED', '26']]
         ET.SubElement(xml, 'Launch', Condition='Installed OR WEBVIEW2RUNTIME')
         return xml, extracted, acl
 
@@ -268,6 +274,36 @@ class MsiContent(unittest.TestCase):
             changed['ControlEvent'].append(['OinkWelcomeDlg', 'Install', 'DoAction', 'PrepareUserSessions', '1', '1'])
             with self.assertRaises(RuntimeError):
                 C.verify_user_session_ui(changed)
+
+    def test_standalone_upgrade_relaunches_without_a_finish_click(self):
+        with tempfile.TemporaryDirectory() as temp:
+            _, _, tables = self.fixture(Path(temp))
+            C.verify_install_ui(tables)
+            for table, name, column, value in [
+                    ('CustomAction', 'RelaunchUserSessions', 1, '3137'),   # Deferred: before commit/rollback.
+                    ('CustomAction', 'RelaunchUserSessions', 1, '1601'),   # Impersonated user/elevated token.
+                    ('CustomAction', 'RelaunchUserSessions', 1, '3585'),   # Fatal after commit.
+                    ('InstallExecuteSequence', 'RelaunchUserSessions', 1, ''),
+                    ('InstallExecuteSequence', 'RelaunchUserSessions', 2, '6501'),
+                    ('CustomAction', 'NoUpgradeLaunch', 3, '1'),
+                    ('InstallUISequence', 'NoUpgradeLaunch', 1, ''),
+                    ('InstallUISequence', 'NoUpgradeLaunch', 2, '1301'),
+                    ('ControlCondition', 'OinkExitDlg', 3, 'UILevel = 5 AND NOT REMOVE')]:
+                changed = copy.deepcopy(tables)
+                row = next(row for row in changed[table] if row[0] == name and
+                           (table != 'ControlCondition' or row[1] == 'RestartNote'))
+                row[column] = value
+                with self.subTest(table=table, name=name, value=value), self.assertRaises(RuntimeError):
+                    C.verify_install_ui(changed)
+            changed = copy.deepcopy(tables)
+            next(row for row in changed['ControlCondition'] if row[1] == 'LaunchChoice')[3] = \
+                'UILevel = 5 AND NOT Installed AND NOT REMOVE'
+            with self.assertRaisesRegex(RuntimeError, 'fresh install'):
+                C.verify_install_ui(changed)
+            changed = copy.deepcopy(tables)
+            changed['InstallUISequence'].append(['RelaunchUserSessions', '', '1301'])
+            with self.assertRaisesRegex(RuntimeError, 'commit action'):
+                C.verify_install_ui(changed)
 
     def test_finish_failure_is_a_conditional_child_dialog_before_setup_closes(self):
         with tempfile.TemporaryDirectory() as temp:

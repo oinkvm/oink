@@ -83,6 +83,8 @@ impl Record {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Resolution {
+    /// No active group, or the owner could not reconcile its records. Missing
+    /// member records never produce it; see [`Claims::resolve`].
     #[default]
     Unknown,
     None {
@@ -178,33 +180,30 @@ impl Claims {
             .filter(|r| r.claim.is_some())
             .max_by_key(|r| r.stamp())
     }
+    /// A member without a record here (offline, never met, removed) is no
+    /// evidence; it does not make the result unknown (oinkvm/oink#32). Its
+    /// record joins the same total order when it arrives, below any selection
+    /// made after the observed history. A witness above every record names the
+    /// last selection whose owner record is missing: that exit is unavailable
+    /// (a witness never authorizes media), or there is no exit at that stamp.
     pub fn resolve(&self, members: &BTreeSet<DeviceId>, available: &BTreeSet<DeviceId>) -> Resolution {
-        if members.iter().any(|m| !self.records.contains_key(m)) {
-            return Resolution::Unknown;
-        }
-        let maximum = self.maximum();
-        if self
+        let maximum = self
+            .maximum()
+            .and_then(|r| r.claim.as_ref())
+            .map(|claim| claim_order(claim).expect("validated claim"));
+        let witness = self
             .watermark
             .as_ref()
-            .map(claim_order)
-            .transpose()
-            .expect("validated watermark")
-            > maximum
-                .and_then(|r| r.claim.as_ref())
-                .map(claim_order)
-                .transpose()
-                .expect("validated claim")
-        {
-            return Resolution::Unknown;
-        }
-        match maximum {
-            Some(record) if record.claimed() => Resolution::Exit {
-                stamp: record.stamp().expect("claim exists"),
-                available: members.contains(&record.owner) && available.contains(&record.owner),
+            .map(|claim| claim_order(claim).expect("validated watermark"));
+        let top = maximum.max(witness);
+        match top {
+            // `claim_order` puts withdrawal second: false here means claimed.
+            Some((stamp, false)) => Resolution::Exit {
+                stamp,
+                available: top == maximum && members.contains(&stamp.owner) && available.contains(&stamp.owner),
             },
-            record => Resolution::None {
-                barrier: record.and_then(Record::stamp),
-            },
+            Some((stamp, true)) => Resolution::None { barrier: Some(stamp) },
+            None => Resolution::None { barrier: None },
         }
     }
     /// Apply to a candidate copy, commit that copy durably, then publish. An
@@ -253,8 +252,11 @@ impl Claims {
         self.records.insert(record.owner, record);
         Ok(true)
     }
-    /// An explicit owner command produces a new stamp. Clear is legal only at
-    /// the current winning owner; automatic yield uses a different operation.
+    /// An explicit owner command produces a new stamp above everything this
+    /// owner has seen. Other members' records are not prerequisites; whoever
+    /// lacks this one adopts it through ordinary facts (oinkvm/oink#32). Clear
+    /// is legal only at the current winning owner; automatic yield uses a
+    /// different operation.
     pub fn command(
         &self,
         owner: DeviceId,
@@ -269,17 +271,7 @@ impl Claims {
         if previous.revision != expected_revision {
             return Err(ControlFailure::StaleRevision);
         }
-        if members.iter().any(|member| !self.records.contains_key(member)) {
-            return Err(ControlFailure::Busy);
-        }
-        let winner = match self.resolve(members, &BTreeSet::new()) {
-            // Complete owner baselines plus a stronger ordering witness permit
-            // an explicit takeover above that witness, never guessed playback.
-            Resolution::Unknown if claimed => None,
-            Resolution::Unknown => return Err(ControlFailure::Busy),
-            Resolution::Exit { stamp, .. } => Some(stamp.owner),
-            Resolution::None { .. } => None,
-        };
+        let winner = self.resolve(members, &BTreeSet::new()).owner();
         if claimed && winner == Some(owner) {
             return Ok(None);
         }
@@ -361,13 +353,28 @@ mod tests {
     fn members() -> BTreeSet<DeviceId> {
         BTreeSet::from([id(1), id(2)])
     }
+    /// What a witness alone resolves to: never an available exit.
+    fn witnessed(owner: u8, counter: u64, claimed: bool) -> Resolution {
+        let stamp = Stamp {
+            counter,
+            owner: id(owner),
+        };
+        if claimed {
+            Resolution::Exit {
+                stamp,
+                available: false,
+            }
+        } else {
+            Resolution::None { barrier: Some(stamp) }
+        }
+    }
     #[test]
     fn ordering_witness_stops_stale_playback_but_only_explicit_selection_can_replace_it() {
         for claimed in [false, true] {
             let historical = record(9, 4, 7, claimed).claim.unwrap();
             let mut fresh = Claims::restore([record(1, 2, 1, true), record(2, 1, 0, false)], 1).unwrap();
             assert!(fresh.observe_watermark(historical.clone()).unwrap());
-            assert_eq!(fresh.resolve(&members(), &members()), Resolution::Unknown);
+            assert_eq!(fresh.resolve(&members(), &members()), witnessed(9, 7, claimed));
             assert!(
                 fresh.record(id(9)).is_none(),
                 "a witness cannot impersonate the removed owner"
@@ -376,7 +383,7 @@ mod tests {
             fresh.observe(id(1), yielded).unwrap();
             let mut restored = Claims::restore(fresh.records().cloned(), fresh.seen_counter()).unwrap();
             restored.observe_watermark(fresh.watermark().unwrap().clone()).unwrap();
-            assert_eq!(restored.resolve(&members(), &members()), Resolution::Unknown);
+            assert_eq!(restored.resolve(&members(), &members()), witnessed(9, 7, claimed));
             let selection = restored.command(id(1), 3, true, &members()).unwrap().unwrap();
             assert_eq!(selection.stamp().unwrap().counter, 8);
             restored.observe(id(1), selection).unwrap();
@@ -388,7 +395,7 @@ mod tests {
     fn equal_counter_owner_order_and_same_stamp_withdrawal_are_ordering_evidence() {
         let mut fresh = Claims::restore([record(1, 2, 1, true), record(2, 1, 0, false)], 1).unwrap();
         fresh.observe_watermark(record(9, 2, 1, true).claim.unwrap()).unwrap();
-        assert_eq!(fresh.resolve(&members(), &members()), Resolution::Unknown);
+        assert_eq!(fresh.resolve(&members(), &members()), witnessed(9, 1, true));
         assert_eq!(
             fresh
                 .command(id(1), 2, true, &members())
@@ -401,7 +408,7 @@ mod tests {
         );
         let mut claims = Claims::restore([record(1, 2, 1, true), record(2, 1, 0, false)], 1).unwrap();
         claims.observe_watermark(record(1, 3, 1, false).claim.unwrap()).unwrap();
-        assert_eq!(claims.resolve(&members(), &members()), Resolution::Unknown);
+        assert_eq!(claims.resolve(&members(), &members()), witnessed(1, 1, false));
         claims.observe(id(1), record(1, 3, 1, false)).unwrap();
         assert!(matches!(
             claims.resolve(&members(), &members()),
@@ -473,10 +480,11 @@ mod tests {
         );
     }
     #[test]
-    fn incomplete_baseline_offline_and_removed_winner_never_select_runner_up() {
+    fn late_record_offline_and_removed_winner_never_select_runner_up() {
         let mut claims = Claims::restore([record(1, 2, 1, true)], 7).unwrap();
-        assert_eq!(claims.resolve(&members(), &members()), Resolution::Unknown);
-        assert_eq!(claims.command(id(1), 2, true, &members()), Err(ControlFailure::Busy));
+        // Member 2's record is missing: no evidence, not an unknown state.
+        assert_eq!(claims.resolve(&members(), &members()).owner(), Some(id(1)));
+        assert_eq!(claims.command(id(1), 2, true, &members()), Ok(None));
         claims.observe(id(2), record(2, 2, 8, true)).unwrap();
         let first_only = BTreeSet::from([id(1)]);
         let unavailable = Resolution::Exit {
@@ -490,6 +498,81 @@ mod tests {
         assert_eq!(claims.resolve(&first_only, &first_only), unavailable);
         let takeover = claims.command(id(1), 2, true, &first_only).unwrap().unwrap();
         assert_eq!(takeover.stamp().unwrap().counter, 9);
+    }
+    #[test]
+    fn offline_member_without_a_record_does_not_block_selection() {
+        // oinkvm/oink#32: member 3 is offline and this owner never received
+        // its record. The online owners still resolve and can select an exit.
+        let all = BTreeSet::from([id(1), id(2), id(3)]);
+        let online = members();
+        let mut claims = Claims::restore([record(1, 1, 0, false), record(2, 1, 0, false)], 0).unwrap();
+        assert_eq!(claims.resolve(&all, &online), Resolution::None { barrier: None });
+        let selection = claims.command(id(1), 1, true, &all).unwrap().unwrap();
+        assert_eq!(selection.stamp().unwrap().counter, 1);
+        claims.observe(id(1), selection).unwrap();
+        assert_eq!(
+            claims.resolve(&all, &online),
+            Resolution::Exit {
+                stamp: Stamp {
+                    counter: 1,
+                    owner: id(1)
+                },
+                available: true
+            }
+        );
+    }
+    #[test]
+    fn witness_for_a_missing_owner_names_the_unavailable_selection() {
+        // Only a relayed witness says that member 3 was selected last. That is
+        // the selected exit, unavailable, not an unknown state.
+        let all = BTreeSet::from([id(1), id(2), id(3)]);
+        for claimed in [true, false] {
+            let mut claims = Claims::restore([record(1, 1, 0, false), record(2, 1, 0, false)], 0).unwrap();
+            claims
+                .observe_watermark(record(3, 2, 4, claimed).claim.unwrap())
+                .unwrap();
+            assert_eq!(claims.resolve(&all, &all), witnessed(3, 4, claimed));
+            assert_eq!(claims.command(id(1), 1, false, &all), Err(ControlFailure::NotExit));
+            let selection = claims.command(id(2), 1, true, &all).unwrap().unwrap();
+            assert_eq!(selection.stamp().unwrap().counter, 5);
+            claims.observe(id(2), selection).unwrap();
+            assert_eq!(claims.resolve(&all, &all).owner(), Some(id(2)));
+        }
+    }
+    #[test]
+    fn returning_member_is_overridden_by_the_selection_made_while_it_was_offline() {
+        let all = BTreeSet::from([id(1), id(2), id(3)]);
+        // Member 3 was the exit at counter 2 before it went offline. Member 1
+        // kept its record; member 2 joined later and only has 1's witness.
+        let old_exit = record(3, 2, 2, true);
+        let mut first = Claims::restore([record(1, 1, 0, false), old_exit.clone()], 2).unwrap();
+        let mut second = Claims::restore([record(1, 1, 0, false), record(2, 1, 0, false)], 0).unwrap();
+        second.observe_watermark(old_exit.claim.clone().unwrap()).unwrap();
+        let online = members();
+        let selection = second.command(id(2), 1, true, &all).unwrap().unwrap();
+        assert_eq!(selection.stamp().unwrap().counter, 3);
+        second.observe(id(2), selection.clone()).unwrap();
+        first.observe(id(2), selection.clone()).unwrap();
+        assert_eq!(first.resolve(&all, &online), second.resolve(&all, &online));
+        assert!(second.resolve(&all, &online).available());
+        // Member 3 comes back with its old durable claim and learns the
+        // selection. It yields; nobody falls back to its old claim.
+        let mut returning = Claims::restore([record(1, 1, 0, false), old_exit.clone()], 2).unwrap();
+        returning.observe(id(2), selection.clone()).unwrap();
+        second.observe(id(3), old_exit.clone()).unwrap();
+        let yielded = returning.yield_to_winner(id(3)).unwrap().unwrap();
+        assert_eq!(yielded.stamp().unwrap().counter, 2);
+        assert!(!yielded.claimed());
+        for claims in [&mut first, &mut second, &mut returning] {
+            claims.observe(id(3), yielded.clone()).unwrap();
+            assert_eq!(
+                claims.resolve(&all, &all),
+                Resolution::Exit {
+                    stamp: selection.stamp().unwrap(),
+                    available: true
+                }
+            );
+        }
     }
     #[test]
     fn no_claim_baseline_is_not_missing_and_commands_obey_cas_and_overflow() {

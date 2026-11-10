@@ -23,18 +23,21 @@ int main() {
   for (HANDLE signal : {stopEvent, sessionChanged.load()}) {
     ResetEvent(stopEvent);
     ResetEvent(sessionChanged.load());
-    Handle pipe(testPipe()), done(CreateEventW(nullptr, TRUE, FALSE, nullptr));
-    assert(pipe.h != INVALID_HANDLE_VALUE && done.h);
+    Handle pipe(testPipe()), started(CreateEventW(nullptr, TRUE, FALSE, nullptr)),
+        done(CreateEventW(nullptr, TRUE, FALSE, nullptr));
+    assert(pipe.h != INVALID_HANDLE_VALUE && started.h && done.h);
     bool connected = true;
     std::thread waiter([&] {
+      SetEvent(started.h);
       connected = connect(pipe.h);
       SetEvent(done.h);
     });
     // An empty listener parks until an event. This is a real kernel wait, not
     // a simulation of the system service or an unlock test.
-    assert(WaitForSingleObject(done.h, 150) == WAIT_TIMEOUT);
+    assert(WaitForSingleObject(started.h, INFINITE) == WAIT_OBJECT_0);
+    assert(WaitForSingleObject(done.h, 0) == WAIT_TIMEOUT);
     SetEvent(signal);
-    assert(WaitForSingleObject(done.h, 1000) == WAIT_OBJECT_0);
+    assert(WaitForSingleObject(done.h, INFINITE) == WAIT_OBJECT_0);
     waiter.join();
     assert(!connected);
     DisconnectNamedPipe(

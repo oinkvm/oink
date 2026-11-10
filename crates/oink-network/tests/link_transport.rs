@@ -109,7 +109,12 @@ impl Node {
 }
 async fn connect(a: &mut Node, b: &mut Node) -> (Box<LinkConnected>, Box<LinkConnected>) {
     a.network
-        .dial(b.network.id(), vec![b.network.local_addr()], DialMode::DirectOnly)
+        .dial(
+            b.network.id(),
+            vec![b.network.local_addr()],
+            DialMode::DirectOnly,
+            DialOrigin::Initial,
+        )
         .unwrap();
     tokio::join!(a.connected(), b.connected())
 }
@@ -134,6 +139,7 @@ async fn parallel_candidates_skip_a_black_hole_without_spending_its_budget() {
             b.network.id(),
             vec![black_hole.local_addr().unwrap(), b.network.local_addr()],
             DialMode::DirectOnly,
+            DialOrigin::Initial,
         )
         .unwrap();
     let (ac, bc) = tokio::join!(a.connected(), b.connected());
@@ -156,6 +162,7 @@ async fn parallel_unreachable_candidates_each_get_one_full_budget() {
             peer,
             holes.iter().map(|s| s.local_addr().unwrap()).collect(),
             DialMode::DirectOnly,
+            DialOrigin::Initial,
         )
         .unwrap();
     let mut first = [0; 1500];
@@ -185,7 +192,9 @@ async fn parallel_candidates_beyond_eight_run_in_full_budget_rounds() {
     }
     let mut addresses: Vec<_> = holes.iter().map(|s| s.local_addr().unwrap()).collect();
     addresses.push(b.network.local_addr());
-    a.network.dial(b.network.id(), addresses, DialMode::DirectOnly).unwrap();
+    a.network
+        .dial(b.network.id(), addresses, DialMode::DirectOnly, DialOrigin::Initial)
+        .unwrap();
     for hole in &holes {
         let mut packet = [0; 1500];
         timeout(Duration::from_millis(500), hole.recv_from(&mut packet))
@@ -233,10 +242,10 @@ async fn simultaneous_dials_and_all_direct_modes_have_complementary_roles() {
         let mut a = Node::start().await;
         let mut b = Node::start().await;
         a.network
-            .dial(b.network.id(), vec![b.network.local_addr()], mode)
+            .dial(b.network.id(), vec![b.network.local_addr()], mode, DialOrigin::Initial)
             .unwrap();
         b.network
-            .dial(a.network.id(), vec![a.network.local_addr()], mode)
+            .dial(a.network.id(), vec![a.network.local_addr()], mode, DialOrigin::Initial)
             .unwrap();
         let (ac, bc) = tokio::join!(a.connected(), b.connected());
         assert_ne!(ac.direction, bc.direction);
@@ -274,7 +283,9 @@ impl Relayed {
         b.ready(br.link).await;
         relay.ready(rb.link).await;
         // With no addresses PreferDirect must start relay discovery immediately.
-        a.network.dial(b.network.id(), vec![], DialMode::PreferDirect).unwrap();
+        a.network
+            .dial(b.network.id(), vec![], DialMode::PreferDirect, DialOrigin::Initial)
+            .unwrap();
         let (ac, bc) = tokio::join!(a.connected(), b.connected());
         assert!(matches!(ac.path, LinkPath::Relayed { .. }));
         assert_eq!(ac.remote_address, None);
@@ -814,7 +825,8 @@ async fn ipv6_candidates_are_rejected_before_dial() {
         a.network.dial(
             oink_foundation::DeviceId([3; 32]),
             vec!["[::1]:1234".parse().unwrap()],
-            DialMode::DirectOnly
+            DialMode::DirectOnly,
+            DialOrigin::Initial,
         ),
         Err(DialRefused::InvalidAddress)
     );

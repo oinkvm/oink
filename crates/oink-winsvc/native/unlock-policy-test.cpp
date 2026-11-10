@@ -10,7 +10,7 @@ int main() {
   assert(!op.pending(8, 200));
   assert(op.consume(1, 7, 200));
   assert(!op.consume(1, 7, 201));
-  op.result(1, 7, false);
+  op.result(1, 7, false, 201);
   // A failed attempt leaves a notice but the next accepted entry may retry.
   assert(op.begin(2, 7, 203, true, 11));
   op.reset();
@@ -22,9 +22,9 @@ int main() {
   assert(op.begin(3, 7, 100, true, 11));
   assert(op.ready(3, 7, 101, 11, 100));
   assert(op.consume(3, 7, 102));
-  op.result(3, 8, true);
+  op.result(3, 8, true, 103);
   assert(!op.own_unlock(7, 103));
-  op.result(3, 7, true);
+  op.result(3, 7, true, 103);
   assert(op.own_unlock(7, 103));
   assert(!op.own_unlock(7, 104));
   // Save/Disable invalidate prior provider instances and preparation workers.
@@ -39,7 +39,7 @@ int main() {
   assert(op.ready(11, 7, 105, 11, 104));
   assert(!op.consume(10, 7, 106));
   assert(op.consume(11, 7, 106));
-  op.result(10, 7, true);
+  op.result(10, 7, true, 106);
   assert(op.state == UnlockOperation::Submitted);
   op.reset(); // Disable: stale CP cannot acquire after acknowledged deletion.
   assert(!op.consume(11, 7, 107));
@@ -79,4 +79,64 @@ int main() {
   assert(op.begin(23, 7, 1000, true, 21));
   assert(!op.ready(23, 7, 999, 21, 999));
   assert(!op.pending(7, 999));
+
+  // Sync unlock: the source's UnlockReply replaces the remote-input rule, so
+  // the first Poll is eligible without any remote input.
+  op.reset();
+  assert(op.begin(30, 7, 1000, true, 21, true));
+  assert(op.ready(30, 7, 1001, 0, 0));
+  assert(op.pending(7, 1001));
+  assert(op.consume(30, 7, 1500));
+  assert(!op.consume(30, 7, 1501)); // consumed once, never replayed
+  // The outcome keeps the ordinary window once the credential was taken.
+  op.result(30, 7, true, 5000);
+  assert(op.state == UnlockOperation::Succeeded && op.succeeded_at == 5000);
+  assert(op.own_unlock(7, 5010));
+
+  // LogonUI never serialized within 3 s (curtain up): expired, a skip.
+  op.reset();
+  assert(op.begin(31, 7, 1000, true, 21, true));
+  assert(op.ready(31, 7, 1100, 0, 0));
+  assert(op.pending(7, 3999));
+  assert(!op.pending(7, 4000));
+  assert(!op.consume(31, 7, 4000));
+  op.expire(4000);
+  assert(op.state == UnlockOperation::Expired && op.sync_abandoned());
+
+  // Not even polled within the window is the same skip.
+  op.reset();
+  assert(op.begin(32, 7, 1000, true, 21, true));
+  op.expire(3999);
+  assert(op.state == UnlockOperation::Pending);
+  op.expire(4000);
+  assert(op.sync_abandoned() && !op.prepared);
+
+  // A submitted sync credential is not expired by the short window.
+  op.reset();
+  assert(op.begin(33, 7, 1000, true, 21, true));
+  assert(op.ready(33, 7, 1001, 0, 0));
+  assert(op.consume(33, 7, 2999));
+  op.expire(4500);
+  assert(op.state == UnlockOperation::Submitted && !op.sync_abandoned());
+  op.expire(31000);
+  assert(op.state == UnlockOperation::Failed && !op.sync_abandoned());
+
+  // Sync and pointer operations exclude each other while one is open.
+  op.reset();
+  assert(op.begin(34, 7, 1000, true, 21, true));
+  assert(!op.begin(35, 7, 1001, true, 21));
+  op.reset();
+  assert(op.begin(36, 7, 1000, true, 21));
+  assert(!op.begin(37, 7, 1001, true, 21, true));
+  // Pointer rules are unchanged: still 30 s and still the 2 s input rule.
+  assert(op.ready(36, 7, 1002, 0, 0));
+  assert(!op.pending(7, 1002));
+  op.reset();
+  assert(op.begin(38, 7, 1000, true, 21));
+  assert(op.ready(38, 7, 1001, 21, 1000));
+  assert(op.pending(7, 30999));
+  assert(!op.sync_abandoned());
+  // No sign-in token: no sync operation either.
+  op.reset();
+  assert(!op.begin(39, 7, 1000, false, 21, true));
 }

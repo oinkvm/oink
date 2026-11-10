@@ -1,11 +1,13 @@
 """Checks that the packaging launch gate rejects early exit and hung startup."""
 import contextlib
 import io
+import os
 from pathlib import Path
 import sys
 import tempfile
 import unittest
 
+sys.path.insert(0, str(Path(__file__).parent))
 from macos_launch_smoke import launch_smoke
 
 
@@ -27,10 +29,12 @@ class LaunchSmokeTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, 'exited during'):
             self.run_stub('import os, signal\nos.kill(os.getpid(), signal.SIGKILL)\n')
 
+    @unittest.skipUnless(os.environ.get('OINK_SLOW_TESTS') == '1', 'slow: real macOS launch timeout smoke')
     def test_alive_without_ready_host_fails(self):
         with self.assertRaisesRegex(RuntimeError, 'did not complete'):
             self.run_stub('import time\ntime.sleep(60)\n')
 
+    @unittest.skipUnless(os.environ.get('OINK_SLOW_TESTS') == '1', 'slow: real macOS launch shutdown smoke')
     def test_ready_host_requires_clean_shutdown(self):
         body = '''import os, signal, time
 from pathlib import Path

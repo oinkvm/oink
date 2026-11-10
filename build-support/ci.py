@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import platform
 import subprocess
+import sys
 from sparkle import prepare
 import tempfile
 
@@ -37,6 +38,7 @@ def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--base', help='PR merge base; omit for a full build/test')
     p.add_argument('--plan', action='store_true')
+    p.add_argument('--slow', action='store_true', help='Run explicitly opted-in slow, device, and native tests')
     a = p.parse_args()
     metadata = json.loads(subprocess.check_output(['cargo', 'metadata', '--no-deps', '--format-version', '1', '--locked'], cwd=ROOT))
     changed = subprocess.check_output(['git', 'diff', '--name-only', f'{a.base}...HEAD'], cwd=ROOT, text=True).splitlines() if a.base else None
@@ -45,6 +47,19 @@ def main():
     if a.plan or not selected:
         return
     packages = [arg for name in selected for arg in ['-p', name]] if a.base else ['--workspace']
+    if a.slow:
+        subprocess.run(['cargo', 'test', '--locked', *packages, '--', '--ignored', '--skip', 'held_process_fixture'],
+                       cwd=ROOT, check=True)
+        subprocess.run(['npm', 'run', '-w', 'apps/oink', 'test:slow'], cwd=ROOT, check=True)
+        environment = os.environ.copy()
+        environment['OINK_SLOW_TESTS'] = '1'
+        subprocess.run([sys.executable, '-m', 'unittest', 'discover', '-s', 'packaging/tests', '-v'],
+                       cwd=ROOT, env=environment, check=True)
+        subprocess.run([sys.executable, '-m', 'unittest', 'discover', '-s', 'build-support', '-p', 'test_*.py', '-v'],
+                       cwd=ROOT, env=environment, check=True)
+        subprocess.run([sys.executable, '-m', 'unittest', 'discover', '-s', 'tools/session-recorder',
+                        '-p', 'test_export_layout.py', '-v'], cwd=ROOT, env=environment, check=True)
+        return
     for args in [['clippy', '--locked', '--all-targets', *packages, '--', '-D', 'warnings'],
                  ['test', '--locked', *packages], ['check', '--locked', '--release', *packages],
                  ['test', '--locked', '--release', '--lib', *packages]]:

@@ -25,16 +25,11 @@ const LEGACY_TRANSIENT: &[&str] = &["de.petermaurer.TransientPasteboardType"];
 const LEGACY_CONCEALED: &[&str] = &["com.agilebits.onepassword"];
 const LEGACY_AUTO_GENERATED: &[&str] = &["com.typeit4me.clipping", "Pasteboard generator type"];
 
-/// `None` 为系统剪贴板；`Some(name)` 为具名剪贴板（测试、同机多实例用）。
-fn board(name: Option<&str>) -> Retained<NSPasteboard> {
-    match name {
-        None => NSPasteboard::generalPasteboard(),
-        Some(n) => NSPasteboard::pasteboardWithName(&NSString::from_str(n)),
-    }
-}
+use super::gate::{self, board};
 
 pub(crate) fn change_count(name: Option<&str>) -> u64 {
-    autoreleasepool(|_| board(name).changeCount() as u64)
+    let turn = gate::enter();
+    autoreleasepool(|_| board(&turn, name).changeCount() as u64)
 }
 
 /// 由剪贴板上的类型列表判断隐私级别（取最严格的）。
@@ -182,7 +177,8 @@ fn file_roots(pb: &NSPasteboard, t_file: &NSPasteboardType) -> Vec<PathBuf> {
 }
 
 fn read_once(name: Option<&str>) -> (ClipSnapshot, Vec<PathBuf>) {
-    let pb = board(name);
+    let turn = gate::enter();
+    let pb = board(&turn, name);
     let change_count = pb.changeCount() as u64;
     let types: Vec<String> = pb
         .types()
@@ -462,7 +458,8 @@ pub(crate) fn write_with(
             objects.push(ProtocolObject::from_retained(item));
         }
 
-        let pb = board(name);
+        let turn = gate::enter();
+        let pb = board(&turn, name);
         pb.clearContents();
         if !pb.writeObjects(&NSArray::from_retained_slice(&objects)) {
             return Err(ClipboardError::Platform("writeObjects 失败".into()));
@@ -531,7 +528,7 @@ mod tests {
         use std::time::{Duration, Instant};
 
         let name = format!("com.hachiwii.oink.test.settle.{}", std::process::id());
-        let pb = board(Some(&name));
+        let pb = board(&gate::enter(), Some(&name));
         // These calls use a private pasteboard, never the user's general clipboard.
         // SAFETY: AppKit exports these immutable pasteboard type constants.
         let (text, html) = unsafe { (NSPasteboardTypeString, NSPasteboardTypeHTML) };
@@ -704,7 +701,7 @@ mod tests {
 
     fn file_types_per_item(n: Option<&str>) -> Vec<Vec<String>> {
         autoreleasepool(|_| {
-            board(n)
+            board(&gate::enter(), n)
                 .pasteboardItems()
                 .map(|items| {
                     items
@@ -787,7 +784,7 @@ mod tests {
         autoreleasepool(|_| {
             let rep = NSBitmapImageRep::imageRepWithData(&NSData::with_bytes(&tiny_png())).unwrap();
             let tiff = rep.TIFFRepresentation().unwrap();
-            let pb = board(n);
+            let pb = board(&gate::enter(), n);
             pb.clearContents();
             let item = NSPasteboardItem::new();
             // SAFETY: 读取 AppKit 导出的类型常量。
@@ -911,7 +908,7 @@ mod tests {
         autoreleasepool(|_| {
             let rep = NSBitmapImageRep::imageRepWithData(&NSData::with_bytes(&tiny_png())).unwrap();
             let tiff = rep.TIFFRepresentation().unwrap();
-            let pb = board(n);
+            let pb = board(&gate::enter(), n);
             pb.clearContents();
             // SAFETY: 读取 AppKit 导出的类型常量。
             assert!(pb.setData_forType(Some(&tiff), unsafe { NSPasteboardTypeTIFF }));

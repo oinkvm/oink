@@ -7,6 +7,7 @@ use std::{
     time::{Duration, Instant},
 };
 use zeroize::Zeroize;
+pub mod sync;
 pub mod typing;
 
 #[cfg(target_os = "macos")]
@@ -56,6 +57,9 @@ pub struct Status {
     pub enabled: bool,
     pub failure: Option<FailureKind>,
     pub windows_hello_only: bool,
+    /// Latest skipped sync unlock request; secondary text, never an alert.
+    #[serde(default)]
+    pub sync_last: Option<sync::SyncLast>,
 }
 static OPERATION: Mutex<()> = Mutex::new(());
 const FAILURE_FILE: &str = "auto-unlock-failure.json";
@@ -81,6 +85,7 @@ pub(crate) fn status(dir: &Path) -> crate::api::ApiResult<Status> {
         enabled,
         failure,
         windows_hello_only,
+        sync_last: enabled.then(|| sync::read_last(dir)).flatten(),
     })
 }
 pub(crate) fn save(dir: &Path, password: Password) -> crate::api::ApiResult<()> {
@@ -91,11 +96,13 @@ pub(crate) fn save(dir: &Path, password: Password) -> crate::api::ApiResult<()> 
         });
     }
     platform_save(password.expose()).map_err(error)?;
+    sync::clear_last(dir);
     clear_failure(dir).map_err(error)
 }
 pub(crate) fn disable(dir: &Path) -> crate::api::ApiResult<()> {
     let _guard = OPERATION.lock().map_err(|_| error("自动解锁不可用"))?;
     platform_disable().map_err(error)?;
+    sync::clear_last(dir);
     clear_failure(dir).map_err(error)
 }
 fn clear_failure(dir: &Path) -> Result<(), &'static str> {
@@ -221,17 +228,23 @@ fn platform_attempt(
 ) -> Result<(), FailureKind> {
     macos::attempt(node.input_backend().clone(), |job| {
         let input = node.input_thread().map_err(|_| "输入线程不可用")?;
-        input.send(crate::threads::input::InputCommand::LocalUnlock { epoch, job });
+        input.send(crate::threads::input::InputCommand::LocalUnlock {
+            admission: crate::threads::input::LocalUnlockAdmission::Focus(epoch),
+            job,
+        });
         Ok(())
     })
-    .map_err(|reason| match reason {
-        "密码不正确" => FailureKind::IncorrectPassword,
-        "无法唤醒 macOS 锁屏显示器"
-        | "macOS 锁屏密码框未在规定时间内就绪"
-        | "自动输入未能及时完成，已取消"
-        | "锁屏状态或登录会话已变化，自动解锁已停止" => FailureKind::LoginUiNotReady,
+    .map_err(macos_failure)
+}
+#[cfg(target_os = "macos")]
+fn macos_failure(reason: &str) -> FailureKind {
+    match reason {
+        macos::PASSWORD_INCORRECT => FailureKind::IncorrectPassword,
+        macos::DISPLAY_ASLEEP | macos::NOT_READY | "自动输入未能及时完成，已取消" | macos::LOCK_CHANGED => {
+            FailureKind::LoginUiNotReady
+        }
         _ => FailureKind::Unknown,
-    })
+    }
 }
 #[cfg(windows)]
 fn platform_status() -> Result<bool, &'static str> {
@@ -288,6 +301,282 @@ fn platform_disable() -> Result<(), &'static str> {
 #[cfg(not(any(windows, target_os = "macos")))]
 fn platform_attempt(_: &crate::node::Node, _: u64, _: DeviceId, _: Option<u32>) -> Result<(), FailureKind> {
     Err(FailureKind::Unknown)
+}
+
+/// The failure latch that the settings row shows. Windows keeps it in the
+/// service; macOS in the agent data directory.
+fn latched_failure(dir: &Path) -> Option<FailureKind> {
+    platform_failure().or_else(|| if cfg!(windows) { None } else { read_failure(dir) })
+}
+
+/// Initiator side of sync unlock, run on an ordinary thread for each user
+/// unlock edge (confirmed lock, then confirmed unlock) seen by the observer.
+/// Pause is enforced by the input thread, which owns I0 and never sends while
+/// this device is paused.
+pub(crate) fn local_unlock_edge(node: &crate::node::Node) {
+    let epoch = sync::next_edge_epoch();
+    if node.profile() != crate::node::Profile::User || !platform_console_session() {
+        sync::record_diagnostic(1, epoch, 3);
+        return;
+    }
+    if !node.settings().sync_unlock_others {
+        sync::record_diagnostic(1, epoch, 2);
+        return;
+    }
+    // Oink's own unlock (pointer entry or sync) never fans out: no cascade.
+    if platform_own_unlock() {
+        sync::record_diagnostic(1, epoch, 1);
+        return;
+    }
+    sync::record_diagnostic(1, epoch, 0);
+    if let Ok(input) = node.input_thread() {
+        input.send(crate::threads::input::InputCommand::SyncUnlockBroadcast { epoch });
+    }
+}
+
+/// Target side of sync unlock: one transaction per admitted request. Local
+/// prechecks that need no waiting come first, so a device that is unlocked,
+/// paused or not set up is never woken. Every skip is silent; only the reasons
+/// listed in `sync::SyncSkip` are recorded.
+pub(crate) fn sync_attempt(node: &crate::node::Node, source: DeviceId, epoch: u64) {
+    use sync::{SourceAnswer, SyncSkip};
+    sync::record_diagnostic(3, epoch, 0);
+    if node.profile() != crate::node::Profile::User {
+        sync::record_diagnostic(4, epoch, 1);
+        return;
+    }
+    // No waiting/replaying: a concurrent save, disable or attempt wins.
+    let Ok(guard) = OPERATION.try_lock() else {
+        sync::record_diagnostic(4, epoch, 2);
+        return;
+    };
+    let dir = node.data_dir();
+    let backend = node.input_backend().clone();
+    let precheck = if !node.input_status().is_ok_and(|s| !s.paused) {
+        3
+    } else if platform_status() != Ok(true) {
+        4
+    } else if platform_windows_hello_only() != Ok(false) {
+        5
+    } else if latched_failure(dir) == Some(FailureKind::IncorrectPassword) {
+        // User decision Q5: after a wrong password, unattended sync attempts
+        // stop until the password is changed (Save clears the latch).
+        6
+    } else if backend.session_locked() != Some(true) || !platform_sync_target() {
+        7
+    } else {
+        0
+    };
+    sync::record_diagnostic(4, epoch, precheck);
+    if precheck != 0 {
+        return;
+    }
+    let Ok(input) = node.input_thread() else {
+        return;
+    };
+    // Challenge the source and wake the display in parallel.
+    let (reply, answer) = std::sync::mpsc::sync_channel(1);
+    let asked = Instant::now();
+    input.send(crate::threads::input::InputCommand::SyncUnlockQuery { source, reply });
+    let woke = platform_wake(backend.as_ref());
+    sync::record_diagnostic(5, epoch, u64::from(woke.is_err()));
+    let answer = match answer.recv_timeout(sync::SOURCE_REPLY.saturating_sub(asked.elapsed())) {
+        Ok(answer) => answer,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => SourceAnswer::Locked,
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => SourceAnswer::Cancelled,
+    };
+    sync::record_diagnostic(6, epoch, answer.diagnostic_code());
+    let skip = match (woke, answer) {
+        (_, SourceAnswer::Cancelled) => return,
+        (Err(()), _) => SyncSkip::DisplayWake,
+        (Ok(_), SourceAnswer::Locked) => SyncSkip::SourceLocked,
+        (Ok(_), SourceAnswer::Disconnected) => SyncSkip::SourceDisconnected,
+        (Ok(woke), SourceAnswer::Unlocked) => {
+            platform_sync_attempt(node, source, epoch, woke, guard);
+            return;
+        }
+    };
+    sync::persist_skip(dir, skip);
+}
+
+#[cfg(target_os = "macos")]
+fn platform_sync_attempt(
+    node: &crate::node::Node,
+    source: DeviceId,
+    epoch: u64,
+    woke: Instant,
+    _guard: std::sync::MutexGuard<'_, ()>,
+) {
+    use sync::SyncSkip;
+    let dir = node.data_dir();
+    let result = macos::sync_attempt(node.input_backend().clone(), woke, |job| {
+        let input = node.input_thread().map_err(|_| "输入线程不可用")?;
+        input.send(crate::threads::input::InputCommand::LocalUnlock {
+            admission: crate::threads::input::LocalUnlockAdmission::Sync(source),
+            job,
+        });
+        Ok(())
+    });
+    match result {
+        Ok(()) => {
+            sync::record_diagnostic(7, epoch, 0);
+            sync::record_diagnostic(8, epoch, 0);
+            sync::clear_last(dir);
+            let _ = clear_failure(dir);
+        }
+        Err(macos::DISPLAY_ASLEEP) => {
+            sync::record_diagnostic(7, epoch, 2);
+            sync::persist_skip(dir, SyncSkip::DisplayWake);
+        }
+        Err(macos::NOT_READY) => {
+            sync::record_diagnostic(7, epoch, 1);
+            sync::persist_skip(dir, SyncSkip::PasswordField);
+        }
+        Err(macos::LOCAL_TYPING) => {
+            sync::record_diagnostic(8, epoch, 2);
+            sync::persist_skip(dir, SyncSkip::LocalTyping);
+        }
+        // The user unlocked meanwhile, or pause/source loss revoked the
+        // transaction before its first character: nothing to report.
+        Err(reason) if macos::stopped_by_state_change(reason) => sync::record_diagnostic(8, epoch, 3),
+        Err(reason) => {
+            sync::record_diagnostic(8, epoch, 1);
+            let _ = persist_failure(dir, macos_failure(reason));
+        }
+    }
+}
+#[cfg(windows)]
+fn platform_sync_attempt(
+    node: &crate::node::Node,
+    source: DeviceId,
+    epoch: u64,
+    _woke: Instant,
+    guard: std::sync::MutexGuard<'_, ()>,
+) {
+    use oink_winsvc::AutoUnlockSync;
+    let dir = node.data_dir();
+    let Ok(operation) = oink_winsvc::auto_unlock_sync_attempt(source_tag(source)) else {
+        // Another operation is pending, the session is not the signed-in
+        // console user's, or the service is unavailable: a silent skip.
+        sync::record_diagnostic(8, epoch, 4);
+        return;
+    };
+    drop(guard);
+    // One check after the service's sync window, not a poll: the service
+    // expires the operation on the first request after its 3 s window.
+    std::thread::sleep(oink_winsvc::AUTO_UNLOCK_SYNC_WINDOW + Duration::from_millis(300));
+    let Ok(status) = oink_winsvc::auto_unlock_status() else {
+        return;
+    };
+    record_provider_readiness_diagnostic(&status);
+    if status.sync_id != operation {
+        return;
+    }
+    match status.sync_outcome {
+        AutoUnlockSync::Expired => {
+            // LogonUI did not serialize: the LockApp curtain was still up
+            // (prepared=false additionally means the provider never polled).
+            sync::record_diagnostic(7, epoch, if status.sync_prepared { 1 } else { 2 });
+            sync::persist_skip(dir, sync::SyncSkip::LockScreen);
+        }
+        AutoUnlockSync::Submitted | AutoUnlockSync::Succeeded => {
+            sync::record_diagnostic(7, epoch, 0);
+            sync::record_diagnostic(8, epoch, 0);
+            sync::clear_last(dir);
+        }
+        // The service latched the failure (for example a wrong password).
+        AutoUnlockSync::Failed => sync::record_diagnostic(8, epoch, 1),
+        // The user unlocked locally, which resets the pending operation.
+        AutoUnlockSync::None | AutoUnlockSync::Pending => sync::record_diagnostic(8, epoch, 3),
+    }
+}
+#[cfg(not(any(windows, target_os = "macos")))]
+fn platform_sync_attempt(_: &crate::node::Node, _: DeviceId, _: u64, _: Instant, _: std::sync::MutexGuard<'_, ()>) {}
+
+#[cfg(target_os = "macos")]
+fn platform_wake(backend: &dyn oink_input::InputBackend) -> Result<Instant, ()> {
+    // IOPMAssertionDeclareUserActivity lights a sleeping display (measured on
+    // the 14.7 lock screen, including from display sleep).
+    backend.declare_user_activity().map(|_| Instant::now()).map_err(|_| ())
+}
+#[cfg(windows)]
+fn platform_wake(backend: &dyn oink_input::InputBackend) -> Result<Instant, ()> {
+    let mut monitor = backend.display_power_observation().ok();
+    // The subscription reports the current console display state on creation.
+    let mut asleep = monitor.as_mut().and_then(|m| m.poll());
+    backend.declare_user_activity().map_err(|_| ())?;
+    let mut wait_awake = |limit: Duration, asleep: &mut Option<bool>| {
+        let end = Instant::now() + limit;
+        while *asleep == Some(true) && Instant::now() < end {
+            std::thread::sleep(Duration::from_millis(20));
+            if let Some(state) = monitor.as_mut().and_then(|m| m.poll()) {
+                *asleep = Some(state);
+            }
+        }
+    };
+    wait_awake(Duration::from_millis(500), &mut asleep);
+    if asleep == Some(true) {
+        // SetThreadExecutionState(ES_DISPLAY_REQUIRED) only resets the display
+        // idle timer; Microsoft does not document it turning an off display
+        // back on, and here it observably did not. User decision Q4 approves
+        // exactly this fallback: one Oink-tagged zero-displacement mouse move
+        // (no click, no key, the pointer does not move) solely to wake the
+        // display. It is never used to dismiss the LockApp curtain.
+        backend.reset_user_idle().map_err(|_| ())?;
+        wait_awake(Duration::from_secs(1), &mut asleep);
+    }
+    if asleep == Some(true) {
+        Err(())
+    } else {
+        Ok(Instant::now())
+    }
+}
+#[cfg(not(any(windows, target_os = "macos")))]
+fn platform_wake(_: &dyn oink_input::InputBackend) -> Result<Instant, ()> {
+    Err(())
+}
+
+#[cfg(target_os = "macos")]
+fn platform_sync_target() -> bool {
+    // Locked, on console and login done for this backend's own user session.
+    macos::console_locked()
+}
+#[cfg(not(target_os = "macos"))]
+fn platform_sync_target() -> bool {
+    // Windows: the service binds every operation to the signed-in console
+    // user's token and rejects any other session itself.
+    cfg!(windows)
+}
+
+#[cfg(windows)]
+fn platform_console_session() -> bool {
+    use windows::Win32::System::{
+        RemoteDesktop::{ProcessIdToSessionId, WTSGetActiveConsoleSessionId},
+        Threading::GetCurrentProcessId,
+    };
+    let mut own = 0;
+    // SAFETY: read-only session queries with a valid output slot.
+    unsafe { ProcessIdToSessionId(GetCurrentProcessId(), &mut own).is_ok() && WTSGetActiveConsoleSessionId() == own }
+}
+#[cfg(not(windows))]
+fn platform_console_session() -> bool {
+    // macOS lock readings are already unknown for an off-console session.
+    cfg!(target_os = "macos")
+}
+
+#[cfg(windows)]
+fn platform_own_unlock() -> bool {
+    // The service stamps provider success (ReportResult) 12–24 ms before WTS
+    // UNLOCK; the observer sees the edge later still.
+    oink_winsvc::auto_unlock_status().is_ok_and(|s| {
+        s.last_result == oink_winsvc::AutoUnlockResult::Succeeded
+            && s.succeeded_at_ms != 0
+            && s.now_ms.saturating_sub(s.succeeded_at_ms) <= sync::OWN_UNLOCK.as_millis() as u64
+    })
+}
+#[cfg(not(windows))]
+fn platform_own_unlock() -> bool {
+    sync::own_unlock_recent(Instant::now())
 }
 
 /// One challenge per accepted pointer entry; a response is bound to the actual

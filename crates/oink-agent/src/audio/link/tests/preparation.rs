@@ -17,6 +17,7 @@ async fn unresponsive_candidate_dial_does_not_block_live_media() {
             DeviceId([200; 32]),
             vec![silent.local_addr().unwrap()],
             oink_network::link::DialMode::PreferDirect,
+            oink_network::link::DialOrigin::Initial,
         )
         .unwrap();
     for _ in 0..16 {

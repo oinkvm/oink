@@ -660,7 +660,10 @@ impl Owner {
                 // endpoint also covers the case where selection retired every
                 // physical candidate before the replacement was queued.
                 if self.selected_session(device).is_none() {
-                    match self.links.dial(device, vec![address], DialMode::DirectOnly) {
+                    match self
+                        .links
+                        .dial(device, vec![address], DialMode::DirectOnly, DialOrigin::Initial)
+                    {
                         Ok(()) | Err(oink_network::link::DialRefused::AlreadyLinked) => {}
                         Err(_) => self.fail_connecting(device, dto::PairCode::PreparedPeerLost),
                     }
@@ -668,7 +671,10 @@ impl Owner {
                     self.fail_connecting(device, dto::PairCode::PreparedPeerLost);
                 }
             } else {
-                match self.links.dial(device, vec![address], DialMode::DirectOnly) {
+                match self
+                    .links
+                    .dial(device, vec![address], DialMode::DirectOnly, DialOrigin::Initial)
+                {
                     Ok(()) => {}
                     Err(oink_network::link::DialRefused::AlreadyLinked) => {}
                     Err(_) => self.fail_connecting(device, dto::PairCode::Unreachable),

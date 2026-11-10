@@ -86,8 +86,10 @@ fn a_prelogin_working_copy_rejoins_as_the_same_device_and_refuses_pairing() {
             common::phase("pre-login copy is an active member again");
             common::active(&[&a, &prelogin]).await;
             // The link survives the member's content/audio owners for a while.
-            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-            common::active(&[&a, &prelogin]).await;
+            common::until("pre-login copy remains active", || {
+                common::linked(&a, device) && prelogin.links().is_ok()
+            })
+            .await;
             assert!(common::linked(&a, device));
             common::phase("an outsider cannot pair with the pre-login backend");
             let outsider = Node::start_with_fake_platform(options(root.path(), "outsider", 0))
