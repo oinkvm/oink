@@ -478,7 +478,7 @@ it.each(['mac', 'win'] as const)('places the sync unlock switch right after auto
   expect(rows.indexOf('syncUnlock')).toBe(rows.indexOf('autoUnlock') + 1);
   const row = container.querySelector<HTMLElement>('[data-item="syncUnlock"]')!;
   expect((within(row).getByRole('switch', { name: '同步解锁其它设备' }) as HTMLInputElement).checked).toBe(false);
-  expect(row.querySelector('.ok-row__desc')?.textContent).toBe('本机解锁后，同时解锁已开启“自动解锁本机”的其它设备。Windows 设备需要锁屏画面已收起。');
+  expect(row.querySelector('.ok-row__desc')?.textContent).toBe('本机解锁后，同时解锁已开启“自动解锁本机”的其它设备。');
   const found = [...searchSections(platform, '一起解锁').values()];
   expect(found.some(hit => hit === 'all' || hit.has('syncUnlock'))).toBe(true);
 });

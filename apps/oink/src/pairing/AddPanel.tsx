@@ -208,7 +208,7 @@ export function NearbyRow({ peer, onConnect, sub, ctx = false }: {
         if (r)
             busy.run(r).catch(() => { });
     };
-    return (<div className="peer" data-ctx={ctx ? `nearby:${peer.id}` : undefined}>
+    return (<div className="peer" data-ctx={ctx ? `nearby:${peer.id}` : undefined} data-incompatible={!peer.compatible || undefined}>
       <PeerInfo peer={peer} sub={!peer.compatible ? peer.problem ?? tr('协议版本不兼容') : sub ?? formatAddress(peer)}/>
       <span className="peer__actions">
         <Button size="sm" iconOnly className="peer__btn" disabled={!peer.compatible} aria-label={tr('连接 {0}', peer.name)} {...busy.buttonProps} statusLabels={{ loading: tr('正在连接 {0}', peer.name), success: tr('已连接'), error: tr('连接失败') }} onClick={connect}>

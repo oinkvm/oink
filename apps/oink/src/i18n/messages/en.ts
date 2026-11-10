@@ -878,7 +878,7 @@ export const en = {
   "自动解锁本机": "Unlock this device automatically",
   "本机锁定时，从其它设备移入指针，或其它设备开启“同步解锁其它设备”后被解锁时，自动解锁本机。需要输入登录密码，密码加密储存在本地。": "When this device is locked, it unlocks when you move the pointer in from another device, or when another device with “Unlock other devices too” is unlocked. Requires your login password, stored encrypted on this device.",
   "同步解锁其它设备": "Unlock other devices too",
-  "本机解锁后，同时解锁已开启“自动解锁本机”的其它设备。Windows 设备需要锁屏画面已收起。": "When you unlock this device, other devices with “Unlock this device automatically” turned on are unlocked too. Windows devices must already be past the lock screen.",
+  "本机解锁后，同时解锁已开启“自动解锁本机”的其它设备。": "When you unlock this device, other devices with “Unlock this device automatically” turned on are unlocked too.",
   "解锁 同步解锁 锁屏 一起解锁 全部解锁": "unlock sync unlock lock screen unlock all",
   "上次同步解锁未执行：锁屏画面未收起": "Last sync unlock skipped: the lock screen was still showing",
   "上次同步解锁未执行：无法唤醒屏幕": "Last sync unlock skipped: the display couldn’t be woken",

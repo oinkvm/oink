@@ -130,6 +130,7 @@
   color: var(--ok-text-2);
 }
 .peer__sub { font: 450 11.5px/1.3 var(--ok-font-mono); font-variant-numeric: tabular-nums; color: var(--ok-text-3); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.peer[data-incompatible] .peer__sub { font-family: var(--ok-font); font-variant-numeric: normal; }
 .peer__actions { display: inline-flex; align-items: center; gap: 6px; flex: none; margin-left: auto; }
 .ok-btn.peer__btn { --_h: 30px; }
 .ok-btn.peer__btn .ok-icon { width: 16px; height: 16px; }

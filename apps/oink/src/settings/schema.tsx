@@ -68,7 +68,7 @@ export const SECTIONS: SectionMeta[] = [
               get desc() { return tr('本机锁定时，从其它设备移入指针，或其它设备开启“同步解锁其它设备”后被解锁时，自动解锁本机。需要输入登录密码，密码加密储存在本地。'); },
               get keywords() { return tr('解锁 锁屏 密码 登录 自动登录 自动解锁'); } },
             { id: 'syncUnlock', get label() { return tr('同步解锁其它设备'); },
-              get desc() { return tr('本机解锁后，同时解锁已开启“自动解锁本机”的其它设备。Windows 设备需要锁屏画面已收起。'); },
+              get desc() { return tr('本机解锁后，同时解锁已开启“自动解锁本机”的其它设备。'); },
               get keywords() { return tr('解锁 同步解锁 锁屏 一起解锁 全部解锁'); } },
             { id: 'confirmQuit', get label() {
                     return tr('退出前确认');
