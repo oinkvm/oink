@@ -72,7 +72,8 @@
     <Property Id="MSIRESTARTMANAGERCONTROL" Value="Disable" />
     <!-- Never restart or prompt on install, upgrade, repair or silent runs.
          Only CheckMicrophoneRestart clears it, for an interactive uninstall
-         whose microphone removal needs a restart. -->
+         whose microphone removal needs a restart; the full-UI wizard's
+         Remove button also clears it (Dialogs.wxs) so that UI can prompt. -->
     <Property Id="REBOOT" Value="ReallySuppress" />
     <!-- Product builds can change without changing PE semver. Force the owned
          payload/receipt to match this MSI even when file versions are equal.

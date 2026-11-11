@@ -77,6 +77,11 @@ def verify_restart_prompt(tables):
                  and not any(row[0] == 'CheckMicrophoneRestart' for row in tables.get('InstallUISequence', []))
                  and not any(row[2] == 'DoAction' and row[3] == 'CheckMicrophoneRestart'
                              for row in tables.get('ControlEvent', [])))
+        # Full UI prompts in the client: only its copy of REBOOT is cleared, and
+        # only by the maintenance wizard's Remove button.
+        clears = sorted(row[:4] for row in tables.get('ControlEvent', []) if row[2] == '[REBOOT]')
+        valid = (valid and clears == [['VerifyReadyDlg', button, '[REBOOT]', '{}'] for button in ('Remove', 'RemoveNoShield')]
+                 and not any(row[2] == 'REBOOT' for row in actions.values()))
     except (KeyError, ValueError, IndexError):
         valid = False
     if not valid:

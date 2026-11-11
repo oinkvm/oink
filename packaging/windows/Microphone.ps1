@@ -301,7 +301,8 @@ function RecordOperation([ValidateSet('install','uninstall')][string]$operation,
     # key exists only while a restart is owed and names the latest successful
     # operation for the restart prompt. An operation that needs no restart
     # cannot settle a restart owed by an earlier one: it only renames the key's
-    # operation. The MSI uninstall reads the same key to request its prompt.
+    # operation. The MSI uninstall's cleanup action hands it on to request the
+    # Windows Installer restart prompt (MicrophoneRestart.h).
     $root = if ($null -ne $registry) { $registry } else { [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::LocalMachine, [Microsoft.Win32.RegistryView]::Registry64) }
     try {
         if ($restart) {

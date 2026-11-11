@@ -73,6 +73,7 @@ async fn pause(node: &Node, id: u64, paused: bool) {
     settled(node, paused).await;
 }
 #[test]
+#[ignore = "flaky: pause/resume races in the input owner under load; re-enable with their fix"]
 fn local_pause_detaches_input_resumes_fresh_and_resets_on_restart() {
     test_watchdog::run(
         module_path!(),

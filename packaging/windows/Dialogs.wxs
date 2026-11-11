@@ -25,6 +25,18 @@
       <Publish Dialog="MaintenanceTypeDlg" Control="RemoveButton" Event="NewDialog" Value="VerifyReadyDlg" />
       <Publish Dialog="MaintenanceTypeDlg" Control="Back" Event="NewDialog" Value="MaintenanceWelcomeDlg" />
       <Publish Dialog="VerifyReadyDlg" Control="Back" Event="NewDialog" Value="MaintenanceTypeDlg" />
+      <!-- Full UI shows the restart prompt in the client: the server only
+           propagates a restart that CheckMicrophoneRestart scheduled, and a
+           client still holding REBOOT=ReallySuppress defers it silently (VM:
+           "The restart was deferred", exit 3010, no prompt). Clear only the
+           client's copy, only on the wizard's Remove ({} sets a property to
+           null). The server inherits the cleared value for this run (VM log),
+           which is safe: full UI always asks before restarting, and only
+           CheckMicrophoneRestart or Windows itself schedules one. A sequence
+           action cannot do this: there is no slot after the wizard dialog.
+           An already elevated client shows RemoveNoShield instead of Remove. -->
+      <Publish Dialog="VerifyReadyDlg" Control="Remove" Property="REBOOT" Value="{}" />
+      <Publish Dialog="VerifyReadyDlg" Control="RemoveNoShield" Property="REBOOT" Value="{}" />
 
       <Dialog Id="OinkWelcomeDlg" Width="370" Height="270" Title="Oink Setup">
         <!-- Include the background in the control chain, as WiX's stock dialogs

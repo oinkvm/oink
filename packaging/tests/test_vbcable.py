@@ -74,6 +74,8 @@ class VBCableBundle(unittest.TestCase):
         condition = 'REMOVE~="ALL" AND NOT UPGRADINGPRODUCTCODE'
         return {'CustomAction': [['CleanupMicrophone', '3649', 'InstallerCA', 'CleanupMicrophone'],
                                  ['CheckMicrophoneRestart', '65', 'InstallerCA', 'CheckMicrophoneRestart']],
+                'ControlEvent': [['VerifyReadyDlg', 'Remove', '[REBOOT]', '{}', '1', '1'],
+                                 ['VerifyReadyDlg', 'RemoveNoShield', '[REBOOT]', '{}', '1', '1']],
                 'InstallExecuteSequence': [['CheckQuiescence', '', '2000'],
                                            ['CleanupMicrophone', condition, '6500'],
                                            ['CleanupUserData', '', '6501'], ['InstallFinalize', '', '6600'],
@@ -85,7 +87,8 @@ class VBCableBundle(unittest.TestCase):
         tables = self.restart_tables()
         V.verify_restart_prompt(tables)
         for kind in ('deferred', 'commit', 'fatal', 'install', 'upgrade', 'before-commit', 'ui', 'button',
-                     'reboot-allowed', 'reboot-missing', 'missing'):
+                     'reboot-allowed', 'reboot-missing', 'missing', 'client-repair', 'client-install',
+                     'client-value', 'client-twice', 'client-sequence-action', 'client-missing', 'client-elevated-missing'):
             changed = copy.deepcopy(tables)
             action = changed['CustomAction'][1]
             sequence = changed['InstallExecuteSequence'][4]
@@ -96,6 +99,13 @@ class VBCableBundle(unittest.TestCase):
             if kind == 'upgrade': sequence[1] = 'REMOVE~="ALL"'
             if kind == 'before-commit': sequence[2] = '6599'
             if kind == 'ui': changed['InstallUISequence'] = [['CheckMicrophoneRestart', '', '1300']]
+            if kind == 'client-repair': changed['ControlEvent'][0][1] = 'Repair'
+            if kind == 'client-install': changed['ControlEvent'][0][:2] = ['OinkWelcomeDlg', 'Install']
+            if kind == 'client-value': changed['ControlEvent'][0][3] = 'Force'
+            if kind == 'client-twice': changed['ControlEvent'].append(['VerifyReadyDlg', 'Repair', '[REBOOT]', '{}', '1', '1'])
+            if kind == 'client-sequence-action': changed['CustomAction'].append(['AllowRestart', '51', 'REBOOT', '[X]'])
+            if kind == 'client-missing': changed['ControlEvent'] = []
+            if kind == 'client-elevated-missing': del changed['ControlEvent'][1]
             if kind == 'button': changed['ControlEvent'] = [['OinkExitDlg', 'Finish', 'DoAction', 'CheckMicrophoneRestart', '1', '1']]
             if kind == 'reboot-allowed': changed['Property'] = [['REBOOT', 'Force']]
             if kind == 'reboot-missing': changed['Property'] = []

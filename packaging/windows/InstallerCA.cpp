@@ -675,33 +675,38 @@ extern "C" __declspec(dllexport) UINT __stdcall CleanupUserData(MSIHANDLE instal
 // embedded script rechecks ownership, exact device identity, hash and trust.
 #include "microphone-cleanup.h"
 #include "EmbeddedPowerShell.h"
+#include "MicrophoneRestart.h"
 extern "C" __declspec(dllexport) UINT __stdcall CleanupMicrophone(MSIHANDLE install) {
     wchar_t system[MAX_PATH]{};
     if (!GetSystemDirectoryW(system, MAX_PATH)) return ERROR_SUCCESS;
     std::wstring executable = std::wstring(system) + L"\\WindowsPowerShell\\v1.0\\powershell.exe";
     DWORD code = embedded_powershell::run(executable, MICROPHONE_CLEANUP, system);
     if (code) cleanup_log(install, L"VB-CABLE", L"managed microphone cleanup", code);
+    // Also covers a restart still owed by an earlier in-app operation.
+    bool owed = false;
+    const LONG carried = microphone_restart::carry(HKEY_LOCAL_MACHINE, microphone_restart::marker_key,
+                                                   microphone_restart::uninstall_signal_key, owed);
+    if (carried != ERROR_SUCCESS) cleanup_log(install, microphone_restart::uninstall_signal_key, L"restart hand-off", carried);
     return ERROR_SUCCESS;
 }
 
 // Commit actions cannot call MsiSetMode, so this immediate action after
-// InstallFinalize reads the cleanup's volatile restart marker and asks Windows
-// Installer for its own end-of-uninstall restart prompt. The package keeps
-// REBOOT=ReallySuppress; only this interactive run clears it, so silent runs
-// never restart or prompt.
-#include "MicrophoneRestart.h"
+// InstallFinalize reads the restart owed by the microphone cleanup and asks
+// Windows Installer for its own end-of-uninstall restart prompt. The package
+// keeps REBOOT=ReallySuppress; only this interactive run clears it, so silent
+// runs never restart or prompt.
 extern "C" __declspec(dllexport) UINT __stdcall CheckMicrophoneRestart(MSIHANDLE install) {
     const auto ui = property(install, L"UILevel");
     const auto reboot_prompt = property(install, L"REBOOTPROMPT");
     bool marker = false;
-    const LONG read = microphone_restart::marker(marker);
+    const LONG read = microphone_restart::take(HKEY_LOCAL_MACHINE, microphone_restart::uninstall_signal_key, marker);
     const bool ask = microphone_restart::prompt(ui, reboot_prompt, marker);
     UINT result = ERROR_SUCCESS;
     if (ask) {
         result = MsiSetPropertyW(install, L"REBOOT", L"");
         if (result == ERROR_SUCCESS) result = MsiSetMode(install, MSIRUNMODE_REBOOTATEND, TRUE);
     }
-    info(install, L"CheckMicrophoneRestart: marker=" + std::to_wstring(marker) + L", read=" + std::to_wstring(read) +
+    info(install, L"CheckMicrophoneRestart: owed=" + std::to_wstring(marker) + L", read=" + std::to_wstring(read) +
         L", UILevel=" + ui + L", REBOOTPROMPT=" + reboot_prompt + L", prompt=" + std::to_wstring(ask) +
         L", result=" + std::to_wstring(result) + L".");
     return ERROR_SUCCESS;
