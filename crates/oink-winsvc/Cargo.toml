@@ -29,6 +29,7 @@ ed25519-dalek = "2.2"
 
 [target.'cfg(windows)'.dependencies]
 oink-foundation.workspace = true
+tracing-subscriber.workspace = true
 oink-update = { path = "../oink-update", features = ["http"] }
 windows = { version = "0.62", features = ["Win32_System_TaskScheduler", "Win32_System_Com", "Win32_System_Ole", "Win32_System_Variant"] }
 getrandom = "0.3"

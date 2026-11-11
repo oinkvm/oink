@@ -107,11 +107,13 @@ unsafe extern "system" fn main(_argc: u32, _argv: *mut *mut u16) {
     // SAFETY: static service name and callback; no context needed.
     let handle = unsafe { RegisterServiceCtrlHandlerExW(wide(NAME).as_ptr(), Some(control), ptr::null_mut()) };
     if handle.is_null() {
+        tracing::error!(error = %io::Error::last_os_error(), "service control handler registration failed");
         return;
     }
     status(handle, SERVICE_START_PENDING, 0);
     if !matches!(session(), Ok(0)) {
-        status(handle, SERVICE_STOPPED, ERROR_ACCESS_DENIED);
+        tracing::error!("service process is not in session 0");
+        stopped(handle, ERROR_ACCESS_DENIED);
         return;
     }
     let initialized = super::wake::Hub::new().and_then(|hub| {
@@ -120,38 +122,42 @@ unsafe extern "system" fn main(_argc: u32, _argv: *mut *mut u16) {
             .map_err(|_| io::Error::other("service wake sources already initialized"))
     });
     if let Err(error) = initialized {
-        eprintln!("Oink event sources unavailable: {error}");
-        status(handle, SERVICE_STOPPED, ERROR_GEN_FAILURE);
+        tracing::error!(%error, "event sources unavailable");
+        stopped(handle, ERROR_GEN_FAILURE);
         return;
     }
+    tracing::info!(version = env!("CARGO_PKG_VERSION"), "OinkInput service running");
     // Reverse authentication requires SCM's stable RUNNING PID. Publish that state
     // before the launch worker can expose its pipe; clients already wait for the
     // pipe at logon. Otherwise an early connection races SERVICE_START_PENDING,
     // where QueryServiceStatusEx does not guarantee a valid PID.
     status(handle, SERVICE_RUNNING, 0);
     if let Err(error) = super::auto_unlock::start() {
-        eprintln!("Oink auto unlock unavailable: {error}");
+        tracing::warn!(%error, "auto unlock unavailable");
     }
     let launcher = thread::spawn(super::backend::serve);
     let updater = thread::spawn(super::update::serve);
     let result = supervise(events().unwrap());
     if let Err(error) = &result {
-        eprintln!("Oink supervision event source failed: {error}");
+        tracing::error!(%error, "supervision event source failed");
     }
     STOP.store(true, Ordering::Release);
     events().unwrap().stop();
     status(handle, SERVICE_STOP_PENDING, 0);
     if let Err(error) = super::prelogin::stop() {
-        eprintln!("Oink pre-login stop failed: {error}");
+        tracing::warn!(%error, "pre-login stop failed");
     }
     super::auto_unlock::stop();
     let _ = launcher.join();
     let _ = updater.join();
-    status(
-        handle,
-        SERVICE_STOPPED,
-        if result.is_ok() { 0 } else { ERROR_GEN_FAILURE },
-    );
+    tracing::info!(failed = result.is_err(), "OinkInput service stopped");
+    stopped(handle, if result.is_ok() { 0 } else { ERROR_GEN_FAILURE });
+}
+/// SCM may end the process as soon as it reads SERVICE_STOPPED, so queued log
+/// records are written first (bounded; logging never holds up the stop).
+fn stopped(handle: SERVICE_STATUS_HANDLE, error: u32) {
+    super::logs::flush();
+    status(handle, SERVICE_STOPPED, error);
 }
 
 fn supervise(events: &super::wake::Hub) -> io::Result<()> {
@@ -208,7 +214,7 @@ fn supervise(events: &super::wake::Hub) -> io::Result<()> {
             helpers.update(desired, spawn)
         })();
         if let Err(error) = &result {
-            eprintln!("Oink input helper transition failed: {error}");
+            tracing::warn!(%error, "input helper transition failed");
         }
         let complete = std::time::Instant::now();
         schedule.helper_result(complete, result.is_err());
@@ -391,9 +397,10 @@ impl crate::prelogin_route::Helper for Child {
                     WAIT_TIMEOUT => {
                         check(TerminateProcess(self.process.0, 1))?;
                         let exited = WaitForSingleObject(self.process.0, 500) == WAIT_OBJECT_0;
-                        eprintln!(
-                            "Oink helper stop timed out: session={} process_exit_confirmed={exited}",
-                            self.target.session
+                        tracing::warn!(
+                            session = self.target.session,
+                            process_exit_confirmed = exited,
+                            "input helper stop timed out"
                         );
                         if !exited {
                             return Err(io::Error::new(
@@ -407,11 +414,13 @@ impl crate::prelogin_route::Helper for Child {
             }
             let mut exit = 1;
             if GetExitCodeProcess(self.process.0, &mut exit) == 0 {
-                eprintln!("Oink helper exit code unavailable: {}", io::Error::last_os_error());
+                let error = io::Error::last_os_error();
+                tracing::warn!(%error, "input helper exit code unavailable");
             } else if exit != 0 {
-                eprintln!(
-                    "Oink helper exited during handoff: session={} code={exit:#010x}",
-                    self.target.session
+                tracing::warn!(
+                    session = self.target.session,
+                    code = format_args!("{exit:#010x}"),
+                    "input helper exited during handoff"
                 );
             }
         }

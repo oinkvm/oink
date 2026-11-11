@@ -89,31 +89,48 @@ pub fn roots() -> io::Result<Roots> {
 /// Open (or create) one protected directory level. Creation applies the
 /// protected DACL atomically; an existing level must already be protected.
 fn protected_dir(path: &Path, create: bool) -> io::Result<File> {
-    if create {
-        let sd = security::descriptor(DIRECTORY_SDDL)?;
+    protected_dir_with(path, create.then_some(DIRECTORY_SDDL))
+}
+
+/// [`protected_dir`] with the creation DACL `create` (`None` opens only). The
+/// opened level must have a privileged owner and no unprivileged write ACE.
+pub(super) fn protected_dir_with(path: &Path, create: Option<&str>) -> io::Result<File> {
+    if let Some(sddl) = create {
+        let sd = security::descriptor(sddl)?;
         let attrs = sd.attrs();
         // SAFETY: fixed child path below ProgramData and a live descriptor.
         let created = unsafe { CreateDirectoryW(wide(path.to_str().ok_or_else(denied)?).as_ptr(), &attrs) };
         // SAFETY: immediately after the call.
         if created == 0 && unsafe { GetLastError() } != ERROR_ALREADY_EXISTS {
-            return Err(context("CreateDirectoryW(prelogin)", io::Error::last_os_error()));
+            return Err(context(
+                "CreateDirectoryW(ProgramData store)",
+                io::Error::last_os_error(),
+            ));
         }
     }
-    super::update::protected::open_one(path, true).map_err(|e| context("protected prelogin directory", e))
+    super::update::protected::open_one(path, true).map_err(|e| context("protected ProgramData directory", e))
 }
 
-/// Pin `Oink`, `Prelogin` and the requested child directories. ProgramData itself
-/// lets users create folders, so it is only checked for reparse points; every
-/// level Oink owns must be protected, or the whole store is refused.
-fn pin(children: &[&str], create: bool) -> io::Result<Vec<File>> {
+/// Pin `%ProgramData%\Oink` (created with the protected SYSTEM + Administrators
+/// DACL when `create`). ProgramData itself lets users create folders, so it is
+/// only checked for reparse points; every level Oink owns must be protected.
+pub(super) fn pin_product(create: bool) -> io::Result<(PathBuf, File)> {
     let data = program_data()?;
     // SAFETY: read-only attribute query of a fixed path.
     let attributes = unsafe { GetFileAttributesW(wide(data.to_str().ok_or_else(denied)?).as_ptr()) };
     if attributes == INVALID_FILE_ATTRIBUTES || attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
         return Err(context("ProgramData reparse/attribute check", denied()));
     }
-    let mut path = data.join("Oink");
-    let mut pinned = vec![protected_dir(&path, create)?];
+    let path = data.join("Oink");
+    let pinned = protected_dir(&path, create)?;
+    Ok((path, pinned))
+}
+
+/// Pin `Oink`, `Prelogin` and the requested child directories; any unprotected
+/// level refuses the whole store.
+fn pin(children: &[&str], create: bool) -> io::Result<Vec<File>> {
+    let (mut path, product) = pin_product(create)?;
+    let mut pinned = vec![product];
     path.push("Prelogin");
     pinned.push(protected_dir(&path, create)?);
     for child in children {
@@ -403,7 +420,14 @@ pub(super) fn handle(request: &BackendLaunch, id: u32, process: &Handle) -> io::
             BackendLaunch::PreloginSnapshot { .. } => "snapshot",
             _ => "status",
         };
-        eprintln!("Oink pre-login {kind}: session {id}, enabled={enabled}, owner={owner:?}, snapshot={snapshot}");
+        tracing::info!(
+            kind,
+            session = id,
+            enabled,
+            ?owner,
+            snapshot,
+            "pre-login store request applied"
+        );
     }
     reply
 }
@@ -438,16 +462,20 @@ impl prelogin_policy::Child for Child {
                 WAIT_OBJECT_0 => {
                     let mut code = 1;
                     if GetExitCodeProcess(self.process.0, &mut code) == 0 {
-                        eprintln!("Oink pre-login exit code unavailable: {}", io::Error::last_os_error());
+                        let error = io::Error::last_os_error();
+                        tracing::warn!(%error, "pre-login exit code unavailable");
                     } else if code != 0 {
-                        eprintln!("Oink pre-login backend exited during handoff: code={code:#010x}");
+                        tracing::warn!(
+                            code = format_args!("{code:#010x}"),
+                            "pre-login backend exited during handoff"
+                        );
                     }
                     Ok(())
                 }
                 WAIT_TIMEOUT => {
                     check(TerminateProcess(self.process.0, 1))?;
                     let exited = WaitForSingleObject(self.process.0, 500) == WAIT_OBJECT_0;
-                    eprintln!("Oink pre-login stop timed out; process_exit_confirmed={exited}");
+                    tracing::warn!(process_exit_confirmed = exited, "pre-login stop timed out");
                     if exited {
                         Ok(())
                     } else {
@@ -646,7 +674,7 @@ pub(super) fn tick() -> Watch {
             Err(error) => {
                 static REPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
                 if !REPORTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                    eprintln!("Oink pre-login store unavailable: {error}");
+                    tracing::warn!(%error, "pre-login store unavailable");
                 }
                 Ok(None)
             }
@@ -655,16 +683,16 @@ pub(super) fn tick() -> Watch {
     );
     let retry = result.is_err().then(|| Instant::now() + Duration::from_millis(250));
     match result {
-        Ok(prelogin_policy::Tick::Started(id)) => eprintln!("Oink pre-login backend started in session {id}"),
-        Ok(prelogin_policy::Tick::Stopped) => eprintln!("Oink pre-login backend stopped: {observed:?}"),
+        Ok(prelogin_policy::Tick::Started(id)) => tracing::info!(session = id, "pre-login backend started"),
+        Ok(prelogin_policy::Tick::Stopped) => tracing::info!(?observed, "pre-login backend stopped"),
         Ok(prelogin_policy::Tick::Exited) => {
-            eprintln!("Oink pre-login backend exited");
+            tracing::info!("pre-login backend exited");
             // Reaping returns before startup decisions. Continue once without
             // relying on a future poll; existing restart backoff still applies.
             super::broker::changed();
         }
         Ok(_) => {}
-        Err(error) => eprintln!("Oink pre-login backend start failed: {error}"),
+        Err(error) => tracing::warn!(%error, "pre-login backend start failed"),
     }
     Watch {
         deadline: supervisor
@@ -685,7 +713,7 @@ pub(super) fn tick() -> Watch {
 /// live processes.
 pub(super) fn stop() -> io::Result<()> {
     if supervisor().lock().unwrap_or_else(|e| e.into_inner()).stop()? {
-        eprintln!("Oink pre-login backend stop confirmed");
+        tracing::info!("pre-login backend stop confirmed");
     }
     Ok(())
 }

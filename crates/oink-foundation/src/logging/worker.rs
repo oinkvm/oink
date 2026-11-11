@@ -1,7 +1,11 @@
 //! Bounded file queue with a reusable drain barrier (including from a panic hook).
-use crossbeam_channel::{Sender, bounded};
+use crossbeam_channel::{Sender, TrySendError, bounded};
 use std::{
     io::{self, Write},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant},
 };
 use tracing_subscriber::fmt::MakeWriter;
@@ -15,10 +19,28 @@ const QUEUE_CAPACITY: usize = 1024;
 const BATCH_RECORDS: usize = 256;
 const BATCH_BYTES: usize = 64 * 1024;
 
-#[derive(Clone)]
-pub(super) struct FileWriter(Sender<Message>);
+/// Hands formatted records to one background thread that appends them.
+#[derive(Clone, Debug)]
+pub struct FileWriter {
+    send: Sender<Message>,
+    /// Lossy writers count records refused by a full queue instead of waiting.
+    dropped: Option<Arc<AtomicU64>>,
+}
 impl FileWriter {
-    pub(super) fn new(mut file: impl Write + Send + 'static) -> io::Result<Self> {
+    /// A full queue applies backpressure to the logging thread; no produced
+    /// record is discarded.
+    pub fn new(file: impl Write + Send + 'static) -> io::Result<Self> {
+        Self::spawn(file, None)
+    }
+
+    /// Never waits on the file: a full queue drops the record and a later
+    /// record reports how many were dropped, and `flush` does not wait either.
+    /// For processes whose logging threads must never stall on a filesystem.
+    pub fn lossy(file: impl Write + Send + 'static) -> io::Result<Self> {
+        Self::spawn(file, Some(Arc::default()))
+    }
+
+    fn spawn(mut file: impl Write + Send + 'static, dropped: Option<Arc<AtomicU64>>) -> io::Result<Self> {
         let (send, receive) = bounded(QUEUE_CAPACITY);
         std::thread::Builder::new()
             .name("oink-log-writer".into())
@@ -62,30 +84,36 @@ impl FileWriter {
                     }
                 }
             })?;
-        Ok(Self(send))
+        Ok(Self { send, dropped })
     }
 
-    pub(super) fn drain(&self) -> io::Result<()> {
+    /// Wait until every record queued before this call has been appended.
+    pub fn drain(&self) -> io::Result<()> {
         let (send, receive) = bounded(1);
-        self.0.send(Message::Flush(send)).map_err(|_| disconnected())?;
+        self.send.send(Message::Flush(send)).map_err(|_| disconnected())?;
         receive.recv().map_err(|_| disconnected())?
+    }
+
+    /// [`drain`](Self::drain), giving up at `deadline`. Returns whether the
+    /// queued records reached the file in time.
+    pub fn drain_until(&self, deadline: Instant) -> bool {
+        let (send, receive) = bounded(1);
+        self.send.send_deadline(Message::Flush(send), deadline).is_ok()
+            && matches!(receive.recv_deadline(deadline), Ok(Ok(())))
     }
 
     // A panic must not wait forever on a broken filesystem. The normal entry
     // boundary also drains on unwind; abort profiles have only this hook.
-    pub(super) fn record_panic(&self, message: String) {
+    pub fn record_panic(&self, message: String) {
         let deadline = Instant::now() + Duration::from_secs(2);
         if self
-            .0
+            .send
             .send_deadline(Message::Line(message.into_bytes()), deadline)
             .is_err()
         {
             return;
         }
-        let (send, receive) = bounded(1);
-        if self.0.send_deadline(Message::Flush(send), deadline).is_ok() {
-            let _ = receive.recv_deadline(deadline);
-        }
+        let _ = self.drain_until(deadline);
     }
 }
 fn disconnected() -> io::Error {
@@ -93,12 +121,35 @@ fn disconnected() -> io::Error {
 }
 impl Write for FileWriter {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        // Backpressure instead of silently discarding a produced record when
-        // the queue fills. No filesystem work runs on the logging thread.
-        self.0.send(Message::Line(bytes.to_vec())).map_err(|_| disconnected())?;
+        let Some(dropped) = &self.dropped else {
+            // Backpressure instead of silently discarding a produced record when
+            // the queue fills. No filesystem work runs on the logging thread.
+            self.send
+                .send(Message::Line(bytes.to_vec()))
+                .map_err(|_| disconnected())?;
+            return Ok(bytes.len());
+        };
+        match self.send.try_send(Message::Line(bytes.to_vec())) {
+            Ok(()) => {
+                let lost = dropped.swap(0, Ordering::Relaxed);
+                if lost > 0 {
+                    let notice = format!("WARN oink_log: {lost} earlier log records dropped: log queue full\n");
+                    if self.send.try_send(Message::Line(notice.into_bytes())).is_err() {
+                        dropped.fetch_add(lost, Ordering::Relaxed);
+                    }
+                }
+            }
+            Err(TrySendError::Full(_)) => {
+                dropped.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(TrySendError::Disconnected(_)) => return Err(disconnected()),
+        }
         Ok(bytes.len())
     }
     fn flush(&mut self) -> io::Result<()> {
+        if self.dropped.is_some() {
+            return Ok(());
+        }
         self.drain()
     }
 }
@@ -159,7 +210,7 @@ mod tests {
                 writer.write_all(&vec![byte; record_bytes]).unwrap();
             }
             let (done, acknowledgement) = bounded(1);
-            writer.0.send(Message::Flush(done)).unwrap();
+            writer.send.send(Message::Flush(done)).unwrap();
             acknowledgements.push(acknowledgement);
         }
         release.send(()).unwrap();
@@ -206,5 +257,41 @@ mod tests {
         );
         writer.drain().unwrap();
         assert_eq!(observed.recv().unwrap(), Operation::Flush);
+    }
+
+    #[test]
+    fn lossy_writer_never_waits_on_a_stalled_file_and_reports_the_loss() {
+        let (operations, observed) = unbounded();
+        let (release, wait) = bounded(1);
+        let mut writer = FileWriter::lossy(ObservedWriter {
+            operations,
+            first_write: Some(wait),
+        })
+        .unwrap();
+        writer.write_all(b"first").unwrap();
+        assert_eq!(observed.recv().unwrap(), Operation::Write(b"first".to_vec()));
+        // The file is stalled inside the first append: overfill the queue.
+        let started = Instant::now();
+        for _ in 0..QUEUE_CAPACITY + 10 {
+            writer.write_all(b"x").unwrap();
+        }
+        writer.flush().unwrap();
+        assert!(!writer.drain_until(Instant::now() + Duration::from_millis(50)));
+        assert!(started.elapsed() < Duration::from_secs(2), "lossy writes must not wait");
+        release.send(()).unwrap();
+        // The stale barrier above is still queued; wait for a fresh one.
+        assert!(writer.drain_until(Instant::now() + Duration::from_secs(2)));
+        writer.write_all(b"after").unwrap();
+        assert!(writer.drain_until(Instant::now() + Duration::from_secs(2)));
+        let mut bytes = Vec::new();
+        while let Ok(operation) = observed.try_recv() {
+            if let Operation::Write(batch) = operation {
+                bytes.extend_from_slice(&batch);
+            }
+        }
+        let text = String::from_utf8(bytes).unwrap();
+        assert_eq!(text.matches('x').count(), QUEUE_CAPACITY);
+        assert!(text.contains("after"));
+        assert!(text.contains("WARN oink_log: 10 earlier log records dropped"), "{text}");
     }
 }

@@ -419,6 +419,37 @@ fn remove_tree(path: &Path, open: &mut impl FnMut(&Path, bool) -> io::Result<Fil
     std::fs::remove_dir(path).map_err(|_| Error::Storage)
 }
 
+/// The protected-directory ACL policy applied to an in-memory SDDL descriptor.
+#[cfg(test)]
+pub(in crate::platform) fn sddl_policy(sddl: &str) -> io::Result<()> {
+    let mut descriptor = ptr::null_mut();
+    // SAFETY: in-memory descriptor parser, with no filesystem/security setting changes.
+    check(unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(wide(sddl).as_ptr(), 1, &mut descriptor, ptr::null_mut())
+    })?;
+    let result = (|| {
+        let (mut owner, mut dacl, mut present, mut defaulted) = (ptr::null_mut(), ptr::null_mut(), 0, 0);
+        // SAFETY: descriptor remains allocated through the complete policy check.
+        unsafe {
+            check(GetSecurityDescriptorOwner(descriptor, &mut owner, &mut defaulted))?;
+            check(GetSecurityDescriptorDacl(
+                descriptor,
+                &mut present,
+                &mut dacl,
+                &mut defaulted,
+            ))?;
+        }
+        if present == 0 {
+            return Err(denied());
+        }
+        acl_policy(owner, dacl)
+    })();
+    // SAFETY: free exactly the descriptor allocated by the parser.
+    unsafe {
+        LocalFree(descriptor);
+    }
+    result
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -479,40 +510,7 @@ mod tests {
     }
     #[test]
     fn staging_acl_rejects_user_ownership_and_any_unprivileged_write_right() {
-        let inspect = |sddl: &str| -> io::Result<()> {
-            let mut descriptor = ptr::null_mut();
-            // SAFETY: in-memory descriptor parser, with no filesystem/security setting changes.
-            check(unsafe {
-                ConvertStringSecurityDescriptorToSecurityDescriptorW(
-                    wide(sddl).as_ptr(),
-                    1,
-                    &mut descriptor,
-                    ptr::null_mut(),
-                )
-            })?;
-            let result = (|| {
-                let (mut owner, mut dacl, mut present, mut defaulted) = (ptr::null_mut(), ptr::null_mut(), 0, 0);
-                // SAFETY: descriptor remains allocated through the complete policy check.
-                unsafe {
-                    check(GetSecurityDescriptorOwner(descriptor, &mut owner, &mut defaulted))?;
-                    check(GetSecurityDescriptorDacl(
-                        descriptor,
-                        &mut present,
-                        &mut dacl,
-                        &mut defaulted,
-                    ))?;
-                }
-                if present == 0 {
-                    return Err(denied());
-                }
-                acl_policy(owner, dacl)
-            })();
-            // SAFETY: free exactly the descriptor allocated by the parser.
-            unsafe {
-                LocalFree(descriptor);
-            }
-            result
-        };
+        let inspect = sddl_policy;
         assert!(inspect("O:SYG:SYD:P(A;OICI;FA;;;SY)").is_ok());
         assert!(inspect("O:BAG:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;GRGX;;;BU)").is_ok());
         assert!(inspect("O:SYG:SYD:P(D;;FA;;;BU)(A;;FA;;;SY)").is_ok());

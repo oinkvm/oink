@@ -20,6 +20,10 @@ tracing-subscriber.workspace = true
 arc-swap = "1.7"
 # Clipboard deduplication digests (src/clipboard_dedupe.rs).
 blake3 = "1"
+# Rolling ordinary-log files shared by the agent and the Windows service (src/logging).
+fs2 = "0.4"
+crossbeam-channel = "0.5"
+time = { version = "0.3", features = ["formatting", "parsing"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Com", "Win32_System_Threading", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_WindowsProgramming"] }

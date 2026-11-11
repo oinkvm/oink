@@ -176,6 +176,18 @@ impl Stream {
         }
     }
 }
+// macOS cannot create a socket close-on-exec atomically: a child process
+// spawned between socket() and fcntl(FD_CLOEXEC) keeps a copy of the client's
+// descriptor for its whole life, so closing ours would not tell the backend
+// this client left, and it would still run a request nobody waits for.
+// shutdown acts on the socket rather than on one descriptor, so the backend
+// sees the client leave however many copies exist.
+#[cfg(unix)]
+impl Drop for Stream {
+    fn drop(&mut self) {
+        let _ = self.shutdown(Shutdown::Both);
+    }
+}
 impl Read for &Stream {
     fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
         match self {
@@ -255,6 +267,25 @@ mod tests {
         assert!(!peer.closed(), "a connected client that is waiting");
         drop(client);
         assert!(peer.closed());
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_client_that_leaves_is_seen_while_a_child_still_holds_its_descriptor() {
+        use std::os::fd::AsFd;
+        let directory = tempfile::tempdir().unwrap();
+        let listener = Listener::bind(directory.path(), "inherited").unwrap();
+        let client = listener.address().connect(Duration::from_secs(1)).unwrap();
+        let (stream, ()) = listener.accept().await.unwrap();
+        let peer = peer(&stream).unwrap();
+        // A child spawned before the descriptor became close-on-exec keeps a
+        // copy; a duplicate has the same effect without forking.
+        let Stream::Native(native) = &client else {
+            unreachable!()
+        };
+        let inherited = native.as_fd().try_clone_to_owned().unwrap();
+        drop(client);
+        assert!(peer.closed());
+        drop(inherited);
     }
     #[cfg(unix)]
     #[tokio::test]

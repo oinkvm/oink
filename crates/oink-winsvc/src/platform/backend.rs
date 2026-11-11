@@ -206,14 +206,23 @@ fn receive(pipe: &Handle) -> io::Result<BackendLaunch> {
 
 pub(super) fn serve() {
     let Some(events) = broker::events() else { return };
+    // A persistent failure retries every 250 ms; log each distinct error once.
+    let mut reported: Option<String> = None;
     while !broker::STOP.load(Ordering::Acquire) {
         // SAFETY: read-only active console session query.
         let id = unsafe { WTSGetActiveConsoleSessionId() };
         let retry = if id != 0 && id != u32::MAX && security::user_sid(id).is_ok() {
             match serve_session(id) {
-                Ok(()) => continue,
+                Ok(()) => {
+                    reported = None;
+                    continue;
+                }
                 Err(error) => {
-                    eprintln!("Oink UIAccess launch broker: {error}");
+                    let text = error.to_string();
+                    if reported.as_deref() != Some(text.as_str()) {
+                        tracing::warn!(session = id, error = %text, "UIAccess launch broker failed");
+                        reported = Some(text);
+                    }
                     // Preserve bind-failure recovery, but never wake periodically
                     // while a session simply has no interactive user.
                     Some(std::time::Instant::now() + Duration::from_millis(250))
@@ -308,7 +317,7 @@ fn serve_session(id: u32) -> io::Result<()> {
         let reply = match result {
             Ok(reply) => reply,
             Err(error) => {
-                eprintln!("Oink UIAccess backend start failed: {error}");
+                tracing::warn!(%error, "UIAccess backend start failed");
                 BackendLaunch::Failed {
                     error: format!("OinkInput 无法启动 UIAccess 后台：{error}")
                         .chars()

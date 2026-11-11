@@ -5,6 +5,7 @@ mod backend_stop;
 mod broker;
 pub mod client;
 mod console;
+mod logs;
 mod pipe_io;
 mod power;
 pub mod prelogin;
@@ -98,16 +99,27 @@ pub fn run() -> io::Result<()> {
     security::verify_self()?;
     let args: Vec<_> = std::env::args().skip(1).collect();
     match args.as_slice() {
-        [] => broker::run(),
+        [] => {
+            logs::init(logs::Role::Service);
+            logs::finish(logs::Role::Service, broker::run())
+        }
+        // One-shot installer step: stderr only (the MSI log captures it).
         [arg] if arg == "--unregister-credential-provider" => auto_unlock::unregister(),
-        [arg, pid] if arg == "--helper" => server::run(pid.parse().map_err(|_| denied())?, None),
+        [arg, pid] if arg == "--helper" => {
+            let parent = pid.parse().map_err(|_| denied())?;
+            let role = logs::Role::Helper { session: session()? };
+            logs::init(role);
+            logs::finish(role, server::run(parent, None))
+        }
         [arg, encoded] if arg == "--routed-helper" => {
             use base64::Engine;
             let bytes = base64::engine::general_purpose::STANDARD
                 .decode(encoded)
                 .map_err(|_| denied())?;
             let source: crate::prelogin_route::Source = serde_json::from_slice(&bytes).map_err(|_| denied())?;
-            server::run(source.identity.parent, Some(source))
+            let role = logs::Role::RoutedHelper { session: session()? };
+            logs::init(role);
+            logs::finish(role, server::run(source.identity.parent, Some(source)))
         }
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidInput,

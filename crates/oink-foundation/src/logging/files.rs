@@ -1,14 +1,14 @@
-//! Ordinary text logs alone share one decimal-byte budget across all process roles.
+//! Ordinary text logs alone share one decimal-byte budget across all process
+//! roles writing into the same directory: daily `<role>.<YYYY-MM-DD>.log` files
+//! (UTC dates), oldest pruned first once the directory's budget is exceeded.
 use fs2::FileExt;
 use std::{
     fs::{self, File, OpenOptions},
     io::{self, Read, Seek, Write},
     path::{Path, PathBuf},
-    sync::OnceLock,
 };
 
 const MB: u64 = 1_000_000;
-static WRITER_DIR: OnceLock<PathBuf> = OnceLock::new();
 const ROLES: &[&str] = &[
     "oink",
     "oink-ui",
@@ -18,17 +18,25 @@ const ROLES: &[&str] = &[
     "oink-update-worker",
     "oink-prelogin",
 ];
+/// Per-session roles of the Windows input service, named `<family>-<session id>`.
+const SESSION_ROLES: &[&str] = &["oink-service-helper", "oink-service-routed"];
 
-/// Update ordinary-log retention, including already closed files. Diagnostics
-/// and the private report queue have their own owners and budgets.
-pub fn set_max_mb(mb: u64) -> io::Result<()> {
+fn known_role(role: &str) -> bool {
+    ROLES.contains(&role)
+        || SESSION_ROLES.iter().any(|family| {
+            role.strip_prefix(family)
+                .and_then(|rest| rest.strip_prefix('-'))
+                .is_some_and(|id| !id.is_empty() && id.len() <= 10 && id.bytes().all(|b| b.is_ascii_digit()))
+        })
+}
+
+/// Update ordinary-log retention of `dir`, including already closed files.
+/// Diagnostics and the private report queue have their own owners and budgets.
+pub fn set_max_mb(dir: &Path, mb: u64) -> io::Result<()> {
     let bytes = mb.saturating_mul(MB);
-    if let Some(dir) = WRITER_DIR.get() {
-        let mut lock = directory_lock(dir)?;
-        publish_cap(&mut lock, bytes)?;
-        prune(dir, bytes, 0)?;
-    }
-    Ok(())
+    let mut lock = directory_lock(dir)?;
+    publish_cap(&mut lock, bytes)?;
+    prune(dir, bytes, 0)
 }
 
 fn directory_lock(dir: &Path) -> io::Result<File> {
@@ -62,7 +70,7 @@ fn shared_cap(lock: &mut File) -> io::Result<u64> {
 fn ordinary_log(name: &str) -> Option<&str> {
     let stem = name.strip_suffix(".log")?;
     let (role, date) = stem.rsplit_once('.')?;
-    if !ROLES.contains(&role) || date.len() != 10 {
+    if !known_role(role) || date.len() != 10 {
         return None;
     }
     let format = time::format_description::parse_borrowed::<2>("[year]-[month]-[day]").ok()?;
@@ -97,25 +105,29 @@ fn prune(dir: &Path, cap: u64, incoming: u64) -> io::Result<()> {
     Ok(())
 }
 
-pub(super) struct Writer {
+/// Appends one role's records to its daily file. Every batch takes the
+/// directory lock, prunes to the shared live cap and reopens the file, so
+/// several processes may write into one directory.
+#[derive(Debug)]
+pub struct Writer {
     dir: PathBuf,
-    role: &'static str,
+    role: String,
 }
 impl Writer {
-    pub(super) fn new(dir: PathBuf, role: &str, configured_mb: impl FnOnce() -> u64) -> io::Result<Self> {
-        let role = ROLES
-            .iter()
-            .copied()
-            .find(|r| *r == role)
-            .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?;
+    /// `role` must be a known ordinary-log role, or pruning would never see its
+    /// files. `configured_mb` is read under the directory lock and published as
+    /// the directory's shared cap.
+    pub fn new(dir: PathBuf, role: &str, configured_mb: impl FnOnce() -> u64) -> io::Result<Self> {
+        if !known_role(role) {
+            return Err(io::ErrorKind::InvalidInput.into());
+        }
+        let role = role.to_owned();
         let mut lock = directory_lock(&dir)?;
         // Read durable settings while holding the same lock as live updates. A
         // concurrently starting process must not republish a stale snapshot.
         let cap = configured_mb().saturating_mul(MB);
         publish_cap(&mut lock, cap)?;
         prune(&dir, cap, 0)?;
-        #[cfg(not(test))]
-        let _ = WRITER_DIR.set(dir.clone());
         Ok(Self { dir, role })
     }
     fn append(&self, date: time::Date, bytes: &[u8], cap: Option<u64>) -> io::Result<()> {
@@ -211,13 +223,43 @@ mod tests {
         // its role; the Windows pre-login backend did exactly that.
         let dir = tempfile::tempdir().unwrap();
         let day = time::Date::from_calendar_date(2026, time::Month::January, 1).unwrap();
-        for role in ["oink", "oink-ui", "oink-update-worker", "oink-prelogin"] {
+        for role in [
+            "oink",
+            "oink-ui",
+            "oink-update-worker",
+            "oink-prelogin",
+            "oink-service",
+            "oink-service-helper-1",
+            "oink-service-routed-4294967295",
+        ] {
             let writer = Writer::new(dir.path().into(), role, || 1024).unwrap();
             writer.append(day, role.as_bytes(), Some(1 << 20)).unwrap();
             let name = format!("{role}.2026-01-01.log");
             assert_eq!(ordinary_log(&name), Some("2026-01-01"), "{role}");
             assert_eq!(fs::read(dir.path().join(name)).unwrap(), role.as_bytes());
         }
+    }
+
+    #[test]
+    fn session_roles_need_a_numeric_session_suffix() {
+        for role in [
+            "oink-service-helper",
+            "oink-service-helper-",
+            "oink-service-helper-x",
+            "oink-service-helper-1-2",
+            "oink-service-routed-12345678901",
+            "oink-helper-1",
+        ] {
+            assert!(!known_role(role), "{role}");
+            let dir = tempfile::tempdir().unwrap();
+            assert_eq!(
+                Writer::new(dir.path().into(), role, || 1).err().map(|e| e.kind()),
+                Some(io::ErrorKind::InvalidInput),
+                "{role}"
+            );
+        }
+        assert!(known_role("oink-service-helper-0"));
+        assert!(known_role("oink-service-routed-7"));
     }
 
     #[test]

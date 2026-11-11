@@ -683,11 +683,16 @@ pub(super) fn serve() {
     let Some(events) = super::super::broker::events() else {
         return;
     };
-    if protected::system().is_err() {
+    if let Err(error) = protected::system() {
+        tracing::error!(%error, "update service disabled: not running as SYSTEM");
         return;
     }
-    let Ok(mut initial) = State::new() else {
-        return;
+    let mut initial = match State::new() {
+        Ok(state) => state,
+        Err(error) => {
+            tracing::error!(?error, "update service disabled: state unavailable");
+            return;
+        }
     };
     let wake = events.engine.clone();
     initial.wake = Some(wake.clone());
@@ -696,6 +701,15 @@ pub(super) fn serve() {
     let engine = std::thread::spawn(move || engine(engine_state, wake));
     let mut workers = BTreeMap::<u32, Endpoint>::new();
     let mut retries = BTreeMap::<u32, Instant>::new();
+    // Failed endpoints retry every 500 ms; log each distinct error once.
+    let mut reported: Option<String> = None;
+    let mut report = |id: u32, error: &dyn std::fmt::Display| {
+        let text = error.to_string();
+        if reported.as_deref() != Some(text.as_str()) {
+            tracing::warn!(session = id, error = %text, "update session endpoint failed");
+            reported = Some(text);
+        }
+    };
     while !super::super::broker::STOP.load(Ordering::Acquire) {
         let now = Instant::now();
         let mut unavailable = None;
@@ -715,7 +729,7 @@ pub(super) fn serve() {
                 if let Some(mut worker) = workers.remove(&id)
                     && let Err(error) = worker.join()
                 {
-                    eprintln!("Oink update session endpoint: {error}");
+                    report(id, &error);
                     retries.insert(id, now + Duration::from_millis(500));
                 }
                 if retries.get(&id).is_some_and(|at| *at > now) {
@@ -727,7 +741,7 @@ pub(super) fn serve() {
                         retries.remove(&id);
                     }
                     Err(error) => {
-                        eprintln!("Oink update session endpoint: {error}");
+                        report(id, &error);
                         retries.insert(id, Instant::now() + Duration::from_millis(500));
                     }
                 }

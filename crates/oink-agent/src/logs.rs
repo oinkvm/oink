@@ -24,12 +24,19 @@ use crate::api::{LogLevel, LogLine};
 
 #[cfg(all(test, debug_assertions))]
 mod exit_tests;
-mod files;
-mod worker;
-pub use files::set_max_mb;
-use worker::FileWriter;
+use oink_foundation::logging::{FileWriter, RollingFiles};
 
 static FILE_WRITER: OnceLock<FileWriter> = OnceLock::new();
+static WRITER_DIR: OnceLock<PathBuf> = OnceLock::new();
+
+/// Update ordinary-log retention of this process's log directory, including
+/// already closed files. No-op before a file writer exists.
+pub fn set_max_mb(mb: u64) -> std::io::Result<()> {
+    match WRITER_DIR.get() {
+        Some(dir) => oink_foundation::logging::set_max_mb(dir, mb),
+        None => Ok(()),
+    }
+}
 
 /// Owned by the application entry boundary, outside every role's error handler.
 /// Static subscribers are never dropped at process exit, so explicitly wait for
@@ -136,13 +143,17 @@ pub fn log_dir() -> PathBuf {
 fn file_writer(prefix: &str) -> Option<FileWriter> {
     let dir = log_dir();
     std::fs::create_dir_all(&dir).ok()?;
-    let appender = files::Writer::new(dir, prefix, || {
+    let appender = RollingFiles::new(dir.clone(), prefix, || {
         crate::config::AgentConfig::load().map_or_else(
             |_| u64::from(crate::config::Settings::default().log_max_mb.get()),
             |config| u64::from(config.settings.log_max_mb.get()),
         )
     })
     .ok()?;
+    // Unit tests never publish a live retention directory (unchanged from
+    // before the writer moved to oink-foundation).
+    #[cfg(not(test))]
+    let _ = WRITER_DIR.set(dir);
     let writer = FileWriter::new(appender).ok()?;
     FILE_WRITER.set(writer.clone()).ok()?;
     Some(writer)
