@@ -334,12 +334,14 @@ pub(super) fn write_guarded(
 ) -> Result<u64, ClipboardError> {
     if fake.lock().deferred_native {
         guard().map_err(|_| ClipboardError::Busy)?;
-        let marker = oink_clipboard::dedupe::marker(spec.inventory.id);
-        let count = fake.set(content::items(&spec.inventory), spec.sensitivity);
-        let mut inner = fake.lock();
-        inner.native = Some(spec);
-        inner.marker = marker;
-        return Ok(count);
+        let items = content::items(&spec.inventory);
+        let sensitivity = spec.sensitivity;
+        let published = Published {
+            marker: oink_clipboard::dedupe::marker(spec.inventory.id),
+            contents: None,
+            native: Some(spec),
+        };
+        return Ok(fake.publish(items, sensitivity, published));
     }
     if !spec.files.is_empty() && spec.file_contents.is_some() && !fake.lock().virtual_files {
         return Err(ClipboardError::FileProviderUnavailable);
@@ -361,11 +363,12 @@ pub(super) fn write_guarded(
         items.push(ClipData::Files(spec.files));
     }
     guard().map_err(|_| ClipboardError::Busy)?;
-    let count = fake.set(items, spec.sensitivity);
-    let mut inner = fake.lock();
-    inner.contents = spec.file_contents;
-    inner.marker = oink_clipboard::dedupe::marker(spec.inventory.id);
-    Ok(count)
+    let published = Published {
+        marker: oink_clipboard::dedupe::marker(spec.inventory.id),
+        contents: spec.file_contents,
+        native: None,
+    };
+    Ok(fake.publish(items, spec.sensitivity, published))
 }
 
 #[cfg(test)]
@@ -480,6 +483,56 @@ mod tests {
         );
         assert!(matches!(result, Err(ClipboardError::Busy)));
         assert_eq!(target.items(), vec![ClipData::Text("local".into())]);
+    }
+    #[test]
+    fn a_copy_made_as_soon_as_a_write_appears_carries_none_of_the_write() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        for deferred in [false, true] {
+            let source = FakeClipboard::new();
+            source.copy(vec![ClipData::Text("remote".into())], Sensitivity::Normal);
+            let provider = source.capture(Path::new("unused")).unwrap().content.unwrap();
+            let target = Arc::new(FakeClipboard::new());
+            target.set_deferred_native(deferred);
+            // The first change callback is the earliest moment a user (or the
+            // agent's watcher) can see the write; copy right there.
+            let seen = Arc::new(Mutex::new(None));
+            let observed = seen.clone();
+            let copied = Arc::new(AtomicBool::new(false));
+            let clipboard = Arc::downgrade(&target);
+            target
+                .watch(Arc::new(move || {
+                    if copied.swap(true, Ordering::AcqRel) {
+                        return;
+                    }
+                    let clipboard = clipboard.upgrade().unwrap();
+                    *observed.lock().unwrap() = Some(clipboard.marker());
+                    clipboard.copy(vec![ClipData::Text("user copy".into())], Sensitivity::Normal);
+                }))
+                .unwrap();
+            // Only clips from a real device carry a marker.
+            let mut inventory = provider.inventory();
+            inventory.id.clip.origin = DeviceId([7; 32]);
+            target
+                .write_native(oink_clipboard::NativeSpec {
+                    inventory,
+                    contents: provider,
+                    files: vec![],
+                    file_contents: None,
+                    sensitivity: Sensitivity::Normal,
+                })
+                .unwrap();
+            assert_eq!(target.items(), vec![ClipData::Text("user copy".into())]);
+            assert_eq!(
+                target.marker(),
+                None,
+                "deferred={deferred}: the user's copy must not inherit the write's Oink marker"
+            );
+            assert!(target.native_spec().is_none(), "deferred={deferred}");
+            assert!(
+                seen.lock().unwrap().clone().unwrap().is_some(),
+                "deferred={deferred}: the write is visible with its marker"
+            );
+        }
     }
     #[test]
     fn native_write_reads_the_native_contract_and_uses_the_write_counter() {

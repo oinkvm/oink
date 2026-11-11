@@ -54,6 +54,24 @@ pub struct Packet {
     pub encode_end: Instant,
     pub remaining_samples: usize,
 }
+impl Packet {
+    /// Sleep for a whole burst, sent by an owner whose source has no encoder
+    /// running. Sequence 0 is below any media sequence of that burst.
+    pub fn sleep(burst: u64, at: Instant) -> Self {
+        Self {
+            ordinal: 0,
+            burst,
+            sleep: true,
+            payload: [0; dsp::MAX_PACKET_BYTES],
+            len: 0,
+            silent: true,
+            delivered_at: at,
+            encode_start: at,
+            encode_end: at,
+            remaining_samples: 0,
+        }
+    }
+}
 type PacketWriter = Arc<dyn Fn(&Packet) -> bool + Send + Sync>;
 
 struct Reconfigure {
@@ -132,6 +150,12 @@ impl Encoded {
     }
     pub fn set_muted(&self, muted: bool) {
         self.shared.muted.store(muted, Ordering::Release);
+    }
+    /// A replacement encoder on a route whose receiver already admitted `burst`
+    /// (an earlier capture or the owner's closed-source Sleep). Receivers reject
+    /// older bursts, so this one starts above it. Call before the encoder runs.
+    pub fn continue_after(&self, burst: u64) {
+        self.shared.burst.store(burst.saturating_add(1), Ordering::Release);
     }
     pub fn sleeping(&self) -> bool {
         self.shared.asleep.load(Ordering::Acquire)

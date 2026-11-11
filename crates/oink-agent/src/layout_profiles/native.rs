@@ -161,7 +161,8 @@ fn response(
 }
 impl Node {
     /// The owner reacts to global layout visibility after the register has
-    /// been accepted. The OS write is deliberately downstream of the shared
+    /// been accepted, and once when the Windows hidden-display policy is
+    /// switched on. The OS write is deliberately downstream of the shared
     /// register; it never edits owner visibility preferences.
     pub(crate) fn apply_global_layout_visibility(&self, layout: &oink_display::layout::Layout) -> Result<()> {
         let settings = self.settings();

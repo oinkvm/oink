@@ -635,21 +635,32 @@ impl AudioStreams {
     /// Send intent on reliable M0 as well as media on M1. This is bounded to
     /// state changes plus one heartbeat per second, with current-stream fencing.
     pub fn report_media(&mut self, kind: MediaKind, encoded: &oink_audio::source::Encoded, now: Instant) {
+        self.report_media_state(kind, encoded.burst(), encoded.sleeping(), false, now);
+    }
+    /// A source whose native capture is closed while its routes stay admitted
+    /// (the shared microphone is muted or at zero volume). Receivers, including
+    /// ones already playing, must see an ordinary quiet source, not lost media:
+    /// the Sleep datagram lets the sink drain without PLC, and the reliable state
+    /// keeps media health quiet if that datagram is lost. `burst` must be above
+    /// every burst the closed encoder used. Same cadence as `report_media`.
+    pub fn report_closed_source(&mut self, kind: MediaKind, burst: u64, now: Instant) {
+        self.report_media_state(kind, burst, true, true, now);
+    }
+    fn report_media_state(&mut self, kind: MediaKind, burst: u64, sleeping: bool, closed: bool, now: Instant) {
         use v1::schema::{WireDto, WireValue};
         let table = match kind {
             MediaKind::Speaker => self.forward.load(),
             MediaKind::Microphone => self.microphone_forward.load(),
         };
-        let destinations: Vec<_> = table.to.iter().map(|d| (d.peer, d.stream_id)).collect();
+        let destinations: Vec<_> = table
+            .to
+            .iter()
+            .map(|d| (d.peer, d.stream_id, closed.then(|| d.packets.clone())))
+            .collect();
         drop(table);
         self.media_reports
-            .retain(|(k, peer), _| *k != kind || destinations.iter().any(|(p, _)| p == peer));
-        let burst = encoded.burst();
-        let sleeping = encoded.sleeping();
-        for (peer, stream) in destinations {
-            if !self.config.peer_supports(peer, "oink.audio.media-health/1") {
-                continue;
-            }
+            .retain(|(k, peer), _| *k != kind || destinations.iter().any(|(p, ..)| p == peer));
+        for (peer, stream, packets) in destinations {
             let key = (kind, peer);
             if self
                 .media_reports
@@ -661,17 +672,33 @@ impl AudioStreams {
             {
                 continue;
             }
-            let state = v1::dto::AudioMediaState::from_raw(
-                [
-                    (1, kind.to_wire().write()),
-                    (2, stream.write()),
-                    (3, burst.write()),
-                    (4, sleeping.write()),
-                ]
-                .into(),
-            )
-            .expect("bounded media state");
-            if self.send(peer, &Message::AudioMediaState(state), now).is_ok() {
+            let mut reported = false;
+            if let Some(packets) = packets {
+                let mut bytes = [0; oink_audio::media::FRAME_CAPACITY];
+                if let Ok(len) = oink_audio::media::encode_kind(
+                    kind,
+                    &oink_audio::source::Packet::sleep(burst, now),
+                    stream,
+                    now,
+                    &mut bytes,
+                ) {
+                    reported |= packets.post(&bytes[..len]).is_ok();
+                }
+            }
+            if self.config.peer_supports(peer, "oink.audio.media-health/1") {
+                let state = v1::dto::AudioMediaState::from_raw(
+                    [
+                        (1, kind.to_wire().write()),
+                        (2, stream.write()),
+                        (3, burst.write()),
+                        (4, sleeping.write()),
+                    ]
+                    .into(),
+                )
+                .expect("bounded media state");
+                reported |= self.send(peer, &Message::AudioMediaState(state), now).is_ok();
+            }
+            if reported {
                 self.media_reports.insert(key, (stream, burst, sleeping, now));
             }
         }

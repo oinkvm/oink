@@ -12,6 +12,13 @@ fn input_key(id: &str) -> u64 {
     bytes[..6].copy_from_slice(&hash.as_bytes()[..6]);
     u64::from_le_bytes(bytes)
 }
+#[derive(Debug, PartialEq, Eq)]
+enum Gate {
+    Open,
+    Closed,
+    /// Leases remain but the shared microphone is muted or at zero volume.
+    Silenced(u64),
+}
 struct Receiving {
     peer: DeviceId,
     session: dto::MicrophoneSession,
@@ -27,6 +34,11 @@ pub(super) struct Runtime {
     source: mic::session::Source,
     capture: Option<mic::Capture>,
     encoded: Option<oink_audio::source::Encoded>,
+    /// Highest media burst this source has used; a new encoder continues above it.
+    burst: u64,
+    /// The Sleep burst announced while the gate is closed by mute/zero volume
+    /// but receivers still hold leases.
+    silenced: Option<u64>,
     receiving: Option<Receiving>,
     monitor: Option<mic::DemandMonitor>,
     demand: mic::Demand,
@@ -163,6 +175,11 @@ impl Runtime {
     pub(super) fn active(&self) -> bool {
         self.capture.is_some() || self.receiving.is_some()
     }
+    /// A silenced source has no native work to maintain, but its receivers
+    /// still hold live routes, like a sleeping speaker capture.
+    pub(super) fn live(&self) -> bool {
+        self.active() || self.silenced.is_some()
+    }
     pub(super) fn output_quality(
         &self,
         at_ms: u64,
@@ -185,9 +202,36 @@ impl Runtime {
             .chain(self.retry_at)
             .min()
     }
+    /// The demand gate of the local source. Native capture may exist only while
+    /// `permit` holds; otherwise this drops it (closing the OS stream) and
+    /// retires its encoder's bursts. A route kept only by mute or zero volume is
+    /// `Silenced`: its receivers keep their leases and are told the source sleeps
+    /// on a burst above every one used so far, so they stay quiet without a
+    /// fault, and the next encoder (`continue_after(self.burst)`) wakes them.
+    fn gate(&mut self, permit: mic::StartPermit) -> Gate {
+        if permit.check().is_ok() {
+            return Gate::Open;
+        }
+        self.capture = None;
+        if let Some(encoded) = self.encoded.take() {
+            self.burst = self.burst.max(encoded.burst());
+            self.silenced = None;
+        }
+        if !permit.user_enabled || !permit.receiver_has_consumer {
+            self.silenced = None;
+            return Gate::Closed;
+        }
+        Gate::Silenced(*self.silenced.get_or_insert_with(|| {
+            self.burst += 1;
+            self.burst
+        }))
+    }
     fn retire_source(&mut self, owner: &mut Owner) {
         self.capture = None;
-        self.encoded = None;
+        if let Some(encoded) = self.encoded.take() {
+            self.burst = self.burst.max(encoded.burst());
+        }
+        self.silenced = None;
         for (peer, lease) in self.source.leases() {
             if let Ok(session) = lease.prepared.session() {
                 let stop =
@@ -338,10 +382,17 @@ impl Runtime {
         if permitted && self.source.active() {
             crate::usage_days::mark(crate::usage_days::Feature::Microphone);
         }
-        if !self.source.active() || !permitted {
-            self.capture = None;
-            self.encoded = None;
-        } else if self.capture.is_none()
+        let permit = mic::StartPermit {
+            user_enabled: permitted,
+            receiver_has_consumer: self.source.active(),
+            audible: settings.audible(),
+        };
+        let gate = self.gate(permit);
+        if let Gate::Silenced(burst) = gate {
+            owner.streams.report_closed_source(Kind::Microphone, burst, now);
+        }
+        if gate == Gate::Open
+            && self.capture.is_none()
             && self.fault.is_none()
             && let Some(input) = &self.selected
         {
@@ -357,6 +408,7 @@ impl Runtime {
             }
             let result = oink_audio::source::channel(StreamFormat::Opus5ms.config(), settings.volume_percent, false)
                 .and_then(|(encoder, encoded)| {
+                    encoded.continue_after(self.burst);
                     encoded.set_muted(settings.muted);
                     let writer =
                         ForwardTable::source_writer_kind(owner.streams.microphone_table(), now, Kind::Microphone);
@@ -368,14 +420,7 @@ impl Runtime {
                         }
                         accepted
                     }));
-                    let capture = mic::Capture::start(
-                        input,
-                        mic::StartPermit {
-                            user_enabled: true,
-                            receiver_has_consumer: true,
-                        },
-                        encoder,
-                    )?;
+                    let capture = mic::Capture::start(input, permit, encoder)?;
                     Ok((capture, encoded))
                 });
             match result {
@@ -383,6 +428,7 @@ impl Runtime {
                     self.capture_watchdog.opened(now.max(Instant::now()));
                     self.capture = Some(capture);
                     self.encoded = Some(encoded);
+                    self.silenced = None;
                 }
                 Err(error) => self.fail(owner, error, now),
             }
@@ -1006,6 +1052,61 @@ mod health_tests {
         let first = runtime.retry_at.unwrap() - now;
         runtime.select_input(None, true, now, |_, _| panic!("no replacement exists"));
         assert!(runtime.retry_at.unwrap() - now > first);
+    }
+    #[test]
+    fn mute_or_zero_volume_closes_capture_and_unmute_continues_above_the_announced_sleep() {
+        let permit = |settings: &mic::Settings, consumer| mic::StartPermit {
+            user_enabled: true,
+            receiver_has_consumer: consumer,
+            audible: settings.audible(),
+        };
+        // Stands in for a successful open in tick(): Capture itself needs hardware.
+        let open = |runtime: &mut Runtime| {
+            let (_, encoded) = oink_audio::source::channel(StreamFormat::Opus5ms.config(), 100, false).unwrap();
+            encoded.continue_after(runtime.burst);
+            let burst = encoded.burst();
+            runtime.encoded = Some(encoded);
+            runtime.silenced = None;
+            burst
+        };
+        let mut runtime = Runtime::default();
+        let mut settings = mic::Settings::default();
+        assert_eq!(runtime.gate(permit(&settings, true)), Gate::Open);
+        assert_eq!(open(&mut runtime), 1);
+        assert_eq!(runtime.gate(permit(&settings, true)), Gate::Open);
+        assert!(runtime.encoded.is_some(), "an open gate keeps the running capture");
+
+        settings.muted = true;
+        assert_eq!(runtime.gate(permit(&settings, true)), Gate::Silenced(2));
+        assert!(runtime.capture.is_none() && runtime.encoded.is_none());
+        assert!(runtime.live() && !runtime.active());
+        assert_eq!(
+            runtime.gate(permit(&settings, true)),
+            Gate::Silenced(2),
+            "later ticks repeat the same Sleep"
+        );
+
+        settings.muted = false;
+        assert_eq!(runtime.gate(permit(&settings, true)), Gate::Open);
+        assert_eq!(open(&mut runtime), 3, "the new encoder wakes receivers above the Sleep");
+
+        settings.volume_percent = 0;
+        assert_eq!(runtime.gate(permit(&settings, true)), Gate::Silenced(4));
+        assert!(runtime.encoded.is_none());
+        assert_eq!(runtime.gate(permit(&settings, false)), Gate::Closed);
+        assert!(!runtime.live());
+        assert_eq!(runtime.gate(permit(&settings, true)), Gate::Silenced(5));
+        settings.volume_percent = 1;
+        assert_eq!(runtime.gate(permit(&settings, true)), Gate::Open);
+        assert_eq!(open(&mut runtime), 6);
+        assert_eq!(
+            runtime.gate(mic::StartPermit {
+                user_enabled: false,
+                ..permit(&settings, true)
+            }),
+            Gate::Closed
+        );
+        assert!(runtime.encoded.is_none() && !runtime.live());
     }
     #[test]
     fn fault_retry_does_not_need_a_revision_or_change_the_authorized_endpoint() {

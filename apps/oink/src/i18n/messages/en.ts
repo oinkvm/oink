@@ -974,7 +974,6 @@ export const en = {
   "安装后，在应用中选择 {0}，即可使用其他设备共享的麦克风": "After installing, select {0} in your apps to use a microphone shared by another device.",
   "使用 VB-CABLE：访问{0}查看许可证条款和捐赠": "Uses VB-CABLE: visit the {0} for license terms and donations",
   "官网": "official website",
-  "安装或卸载后，请重启 Windows": "Restart Windows after installing or uninstalling.",
   "安装": "Install",
   "卸载": "Uninstall",
   "已取消": "Cancelled",

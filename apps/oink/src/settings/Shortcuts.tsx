@@ -33,9 +33,6 @@ export const SHORTCUTS: Array<{
         }, get desc() {
             return tr('把指针从其他设备拉回本机屏幕中央');
         }, get keywords() { return tr('光标 鼠标 拉回 回来'); } },
-    { id: 'pointerNext', get label() { return tr('切换指针位置'); },
-      get desc() { return tr('把指针移动到在线列表中的下一台设备'); },
-      get keywords() { return tr('光标 鼠标 下一台 切换 循环'); } },
     { id: 'lock', get label() {
             return tr('锁定/解锁指针到当前设备');
         }, get desc() {
@@ -62,6 +59,9 @@ export const SHORTCUTS: Array<{
         }, get desc() {
             return tr('切换指针所在设备游戏模式开关');
         }, get keywords() { return tr('游戏 手柄 3D'); } },
+    { id: 'pointerNext', get label() { return tr('切换指针位置'); },
+      get desc() { return tr('把指针移动到在线列表中的下一台设备'); },
+      get keywords() { return tr('光标 鼠标 下一台 切换 循环'); } },
 ];
 export const DEFAULT_SHORTCUTS: Record<ShortcutId, ShortcutPref> = {
     openWindow: { on: false, keys: 'Control+Alt+A' },

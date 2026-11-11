@@ -34,7 +34,8 @@ public static class OinkMicrophoneDevices {
     [DllImport("setupapi.dll", CharSet=CharSet.Unicode, SetLastError=true)] static extern bool SetupDiGetDeviceInstanceIdW(IntPtr set, ref Device device, StringBuilder id, uint size, out uint needed);
     [DllImport("setupapi.dll", CharSet=CharSet.Unicode, SetLastError=true)] static extern bool SetupDiGetDeviceRegistryPropertyW(IntPtr set, ref Device device, uint property, out uint type, byte[] data, uint size, out uint needed);
     [DllImport("setupapi.dll")] static extern bool SetupDiDestroyDeviceInfoList(IntPtr set);
-    public sealed class Driver { public string DeviceID; public string InfName; public string DriverVersion; }
+    [DllImport("cfgmgr32.dll")] static extern int CM_Get_DevNode_Status(out uint status, out uint problem, uint devInst, uint flags);
+    public sealed class Driver { public string DeviceID; public string InfName; public string DriverVersion; public uint Status; public uint Problem; }
     static string[] Property(IntPtr set, ref Device device, uint property) {
         byte[] data=new byte[65536]; uint type,needed;
         if (!SetupDiGetDeviceRegistryPropertyW(set,ref device,property,out type,data,(uint)data.Length,out needed)) {
@@ -68,7 +69,11 @@ public static class OinkMicrophoneDevices {
                 using(var key=root.OpenSubKey(@"SYSTEM\CurrentControlSet\Control\Class\"+keys[0])) {
                     if(key==null) continue;
                     string inf=key.GetValue("InfPath") as string, version=key.GetValue("DriverVersion") as string;
-                    if(inf!=null && version!=null) found.Add(new Driver {DeviceID=id.ToString(),InfName=inf,DriverVersion=version});
+                    if(inf==null || version==null) continue;
+                    uint status,problem;
+                    int cr=CM_Get_DevNode_Status(out status,out problem,device.DevInst,0);
+                    if(cr!=0) throw new InvalidOperationException("Microphone device status query failed: CONFIGRET "+cr);
+                    found.Add(new Driver {DeviceID=id.ToString(),InfName=inf,DriverVersion=version,Status=status,Problem=problem});
                 }
             }
         } finally { SetupDiDestroyDeviceInfoList(set); }
@@ -90,11 +95,12 @@ function RemoveOwnedPackage($record) {
     # succeeded. The vendor removes the devnode, but leaves its staged INF and
     # stopped service. Delete only that receipt's package, without /force or
     # /uninstall: Windows must refuse if another device still uses the package.
+    # Returns whether Windows needs a restart to finish the package removal.
     if (!$record -or $record.Archive -ne $archiveHash -or $record.Inf -notmatch '^oem[0-9]+\.inf$') {
         throw 'Invalid microphone driver package receipt'
     }
     $published = Join-Path ([Environment]::GetFolderPath('Windows')) ('INF\' + $record.Inf)
-    if (!(Test-Path -LiteralPath $published)) { return } # Vendor already removed it.
+    if (!(Test-Path -LiteralPath $published)) { return $false } # Vendor already removed it.
     $packaged = Join-Path $stage 'vbMmeCable64_win10.inf'
     Protected $packaged
     if ((Get-FileHash -LiteralPath $published -Algorithm SHA256).Hash -ne (Get-FileHash -LiteralPath $packaged -Algorithm SHA256).Hash) {
@@ -103,6 +109,7 @@ function RemoveOwnedPackage($record) {
     $pnputil = Join-Path ([Environment]::SystemDirectory) 'pnputil.exe'
     $process = Start-Process -FilePath $pnputil -WindowStyle Hidden -ArgumentList '/delete-driver',$record.Inf -Wait -PassThru
     if ($process.ExitCode -notin @(0,3010)) { throw "Microphone driver package removal failed: $($process.ExitCode)" }
+    return $process.ExitCode -eq 3010 # ERROR_SUCCESS_REBOOT_REQUIRED
 }
 function Protected($path) {
     # Reject junctions at every level and ACLs that grant untrusted principals write access.
@@ -263,20 +270,56 @@ function InvokeVendorSetup($exe, $arguments) {
         }
     } finally { $api.Dispose() }
 }
-function MarkRestartRequired([ValidateSet('install','uninstall')][string]$operation, $registry = $null) {
+# The hash-pinned Pack45 x64 setup reports (static analysis of the exact binary,
+# confirmed on Windows 10 22H2):
+# - install (-i): 0 on success, negative on failure. It calls
+#   UpdateDriverForPlugAndPlayDevices without its reboot out-parameter, so the
+#   exit code never says whether Windows needs a restart; only the new devnode
+#   does. After a removal that was vetoed by an open stream, the old driver
+#   instance stays loaded until the next boot and the reinstalled device fails
+#   to start with CM_PROB_FAILED_START (10); a restart starts it.
+#   DN_NEED_RESTART and CM_PROB_NEED_RESTART (14) are Windows' own signals.
+# - uninstall (-u): 0 when the removal completed; 1 after a successful removal
+#   for which SetupAPI set DI_NEEDRESTART/DI_NEEDREBOOT (vetoed by an open
+#   stream); -1 on failure.
+# 3010 (ERROR_SUCCESS_REBOOT_REQUIRED) never comes from this binary; it keeps
+# its Windows meaning should it appear.
+function InstallNeedsRestart($exitCode, $drivers) {
+    if ($exitCode -notin @(0,3010)) { throw "VB-CABLE install failed: $exitCode" }
+    if ($exitCode -eq 3010) { return $true }
+    return [bool]@($drivers | Where-Object { ($_.Status -band 0x100) -or $_.Problem -in @(10,14) }).Count
+}
+function UninstallNeedsRestart($exitCode) {
+    # Accept 1 only for the verified vendor uninstall; pnputil has its own codes
+    # and must still refuse an in-use or nonmatching owned package.
+    if ($exitCode -notin @(0,1,3010)) { throw "VB-CABLE uninstall failed: $exitCode" }
+    return $exitCode -ne 0
+}
+function RecordOperation([ValidateSet('install','uninstall')][string]$operation, [bool]$restart, $registry = $null) {
     # Volatile registry keys survive app restarts but Windows discards them at
-    # the next system boot. No wall-clock/uptime approximation and no WMI.
+    # the next system boot. No wall-clock/uptime approximation and no WMI. The
+    # key exists only while a restart is owed and names the latest successful
+    # operation for the restart prompt. An operation that needs no restart
+    # cannot settle a restart owed by an earlier one: it only renames the key's
+    # operation. The MSI uninstall reads the same key to request its prompt.
     $root = if ($null -ne $registry) { $registry } else { [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::LocalMachine, [Microsoft.Win32.RegistryView]::Registry64) }
     try {
-        # Ensure the parent is durable even on the very first Oink installation.
-        $parent = $root.CreateSubKey('SOFTWARE\Oink', [Microsoft.Win32.RegistryKeyPermissionCheck]::ReadWriteSubTree, [Microsoft.Win32.RegistryOptions]::None)
-        try {
-            $key = $parent.CreateSubKey('MicrophoneRestartRequired', [Microsoft.Win32.RegistryKeyPermissionCheck]::ReadWriteSubTree, [Microsoft.Win32.RegistryOptions]::Volatile)
+        if ($restart) {
+            # Ensure the parent is durable even on the very first Oink installation.
+            $parent = $root.CreateSubKey('SOFTWARE\Oink', [Microsoft.Win32.RegistryKeyPermissionCheck]::ReadWriteSubTree, [Microsoft.Win32.RegistryOptions]::None)
             try {
-                $key.SetValue('LastOperation', $operation, [Microsoft.Win32.RegistryValueKind]::String)
-                $key.SetValue('Required', 1, [Microsoft.Win32.RegistryValueKind]::DWord)
-            } finally { $key.Dispose() }
-        } finally { $parent.Dispose() }
+                $key = $parent.CreateSubKey('MicrophoneRestartRequired', [Microsoft.Win32.RegistryKeyPermissionCheck]::ReadWriteSubTree, [Microsoft.Win32.RegistryOptions]::Volatile)
+                try {
+                    $key.SetValue('LastOperation', $operation, [Microsoft.Win32.RegistryValueKind]::String)
+                    $key.SetValue('Required', 1, [Microsoft.Win32.RegistryValueKind]::DWord)
+                } finally { $key.Dispose() }
+            } finally { $parent.Dispose() }
+        } else {
+            $key = $root.OpenSubKey('SOFTWARE\Oink\MicrophoneRestartRequired', $true)
+            if ($null -ne $key) {
+                try { $key.SetValue('LastOperation', $operation, [Microsoft.Win32.RegistryValueKind]::String) } finally { $key.Dispose() }
+            }
+        }
     } finally { $root.Dispose() }
 }
 function VerifySetup {
@@ -328,9 +371,10 @@ try {
             Progress 'install_driver'
             $process = InvokeVendorSetup $exe @('-i','-h')
             if ($process.ExitCode -notin @(0,3010)) { throw "VB-CABLE install failed: $($process.ExitCode)" }
-            MarkRestartRequired $Action
-            Progress 'finish'
             $drivers = @(Driver)
+            # Record before ownership bookkeeping: its failure does not undo the driver change.
+            RecordOperation $Action (InstallNeedsRestart $process.ExitCode $drivers)
+            Progress 'finish'
             if ($drivers.Count -ne 1) { throw 'VB-CABLE installation could not be identified; ownership was not recorded' }
             New-Item -Path $marker -Force | Out-Null
             foreach ($entry in @{Archive=$archiveHash;Device=$drivers[0].DeviceID;Inf=$drivers[0].InfName;Version=$drivers[0].DriverVersion}.GetEnumerator()) {
@@ -343,16 +387,9 @@ try {
             $exe = VerifySetup
             Progress 'uninstall_driver'
             $process = InvokeVendorSetup $exe @('-u','-h')
-            # Pack45's hash-pinned x64 uninstaller returns 1 after successful
-            # removal with DI_NEEDRESTART/DI_NEEDREBOOT, not a Win32 error.
-            # Its removal routine returns -1 on failure, 0 on completion, and
-            # 1 when SP_DEVINSTALL_PARAMS.Flags & 0x180 is set. Confirmed from
-            # the shipped binary and a Windows 11 needs-reboot removal log.
-            # Accept 1 only here, after VerifySetup; pnputil has its own codes
-            # and must still refuse an in-use or nonmatching owned package.
-            if ($process.ExitCode -notin @(0,1,3010)) { throw "VB-CABLE uninstall failed: $($process.ExitCode)" }
-            MarkRestartRequired $Action
-            RemoveOwnedPackage $record
+            # Record before package cleanup: its failure does not undo the removal.
+            RecordOperation $Action (UninstallNeedsRestart $process.ExitCode)
+            if (RemoveOwnedPackage $record) { RecordOperation $Action $true }
             Progress 'finish'
             Remove-Item -LiteralPath $marker -Force
             Remove-Item -LiteralPath $stage -Recurse -Force

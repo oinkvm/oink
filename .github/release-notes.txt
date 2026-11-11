@@ -7,12 +7,16 @@ Oink 0.3.6 improves automatic updates and fixes Oink becoming unresponsive on Wi
 - The pointer event rate limit offers more levels to choose from.
 - New "Switch pointer position" shortcut: it moves the pointer to the next device in the online device list. It is off by default.
 - The device list shows devices in one order shared by the whole group, and you can drag online devices to reorder them.
+- When the shared microphone is muted or its volume is 0, the sending device stops capturing the microphone.
+- On Windows, the Oink background service writes its logs to files, which makes problems easier to investigate.
 
 ## Fixes
 
 - Fixed the Oink background on Windows no longer responding after being idle for a long time, which made the device list, speakers and microphones unavailable.
 - Fixed uninstalling failing on Windows (#46).
 - Fixed moving the mouse briefly entering game mode on Windows while a full-screen program hides the pointer.
+- Fixed "Disable hidden displays in the system" on Windows taking effect only after the layout changed or Oink restarted.
+- Fixed Windows always asking for a restart after installing or uninstalling the virtual microphone. It now asks only when a restart is really needed, and uninstalling Oink also asks when one is needed.
 
 ## Compatibility
 

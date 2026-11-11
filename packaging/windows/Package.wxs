@@ -70,6 +70,9 @@
          resolved primary folder after costing, not a literal formatted value. -->
     <SetProperty Id="ARPINSTALLLOCATION" Value="[INSTALLFOLDER]" After="CostFinalize" Sequence="execute" />
     <Property Id="MSIRESTARTMANAGERCONTROL" Value="Disable" />
+    <!-- Never restart or prompt on install, upgrade, repair or silent runs.
+         Only CheckMicrophoneRestart clears it, for an interactive uninstall
+         whose microphone removal needs a restart. -->
     <Property Id="REBOOT" Value="ReallySuppress" />
     <!-- Product builds can change without changing PE semver. Force the owned
          payload/receipt to match this MSI even when file versions are equal.
@@ -181,6 +184,11 @@
     <CustomAction Id="CheckProtectedState" BinaryRef="InstallerCA" DllEntry="CheckProtectedState" Execute="deferred" Impersonate="no" Return="check" />
     <CustomAction Id="CheckQuiescence" BinaryRef="InstallerCA" DllEntry="CheckQuiescence" Execute="deferred" Impersonate="no" Return="check" />
     <CustomAction Id="CleanupMicrophone" BinaryRef="InstallerCA" DllEntry="CleanupMicrophone" Execute="commit" Impersonate="no" Return="ignore" />
+    <!-- Commit actions cannot request a restart. After InstallFinalize this
+         immediate action turns the cleanup's volatile microphone restart
+         marker into Windows Installer's own restart prompt, for an
+         interactive uninstall only; REBOOT stays ReallySuppress otherwise. -->
+    <CustomAction Id="CheckMicrophoneRestart" BinaryRef="InstallerCA" DllEntry="CheckMicrophoneRestart" Execute="immediate" Return="ignore" />
     <CustomAction Id="CleanupUserData" BinaryRef="InstallerCA" DllEntry="CleanupUserData" Execute="commit" Impersonate="no" Return="ignore" />
     <CustomAction Id="CleanupMaintenance" BinaryRef="InstallerCA" DllEntry="CleanupMaintenance" Execute="commit" Impersonate="no" Return="ignore" />
     <!-- Commit-only: a failed uninstall must not silently disable autostart. -->
@@ -240,6 +248,7 @@
       <!-- Commit-only: never destroy user data if MSI rolls back. Cloud Files
            unregister happens inside this action before deleting any data tree. -->
       <Custom Action="CleanupMicrophone" Before="CleanupUserData" Condition="REMOVE~=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />
+      <Custom Action="CheckMicrophoneRestart" After="InstallFinalize" Condition="REMOVE~=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />
       <Custom Action="CleanupUserData" Before="CleanupMaintenance" Condition="REMOVE~=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />
       <Custom Action="CleanupMaintenance" Before="InstallFinalize" Condition="REMOVE~=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />
       <Custom Action="RemoveLoginEntry" Before="RemoveRegistryValues" Condition="REMOVE~=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />

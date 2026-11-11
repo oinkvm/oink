@@ -59,7 +59,8 @@ pub struct MicrophonePluginStatus {
     pub step: Option<MicrophonePluginStep>,
     #[serde(default)]
     pub restart_required: bool,
-    /// Last successful operation: Windows reboot lifetime, macOS process lifetime.
+    /// Last successful operation. Windows: only while a restart is owed (the
+    /// volatile restart marker names it), otherwise null. macOS: process lifetime.
     #[serde(default)]
     pub last_operation: Option<Action>,
     pub step_started_at_ms: Option<u64>,

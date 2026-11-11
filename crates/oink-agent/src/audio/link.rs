@@ -1049,7 +1049,7 @@ impl Owner {
             && self.playback.is_none()
             && self.starting_playback.is_none()
             && self.receivers.is_empty()
-            && !self.microphone_active()
+            && !self.microphone_live()
             && self.mute_cleanup_error.is_none()
         {
             self.update_activity = None;

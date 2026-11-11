@@ -236,10 +236,7 @@ pub(super) fn request(
                 tracing::warn!(action, %detail, "microphone installation operation failed");
             }
             *RESULT.lock().unwrap_or_else(|e| e.into_inner()) = Some(match result {
-                Ok(_) => (
-                    true,
-                    "Virtual microphone operation completed; Windows may require a restart".into(),
-                ),
+                Ok(_) => (true, "Virtual microphone operation completed".into()),
                 Err(e) => (false, e),
             });
             OPERATION.store(0, Ordering::Release);
@@ -299,6 +296,22 @@ mod tests {
         let harness = dir.path().join("package-test.ps1");
         std::fs::write(&installer, SCRIPT).unwrap();
         std::fs::write(&harness, include_str!("tests/owned-package.ps1")).unwrap();
+        let output = Command::new(powershell().unwrap())
+            .args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File"])
+            .arg(harness)
+            .arg(installer)
+            .creation_flags(0x08000000)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    }
+    #[test]
+    fn restart_is_recorded_only_when_the_vendor_package_or_device_needs_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let installer = dir.path().join("Microphone.ps1");
+        let harness = dir.path().join("restart-record.ps1");
+        std::fs::write(&installer, SCRIPT).unwrap();
+        std::fs::write(&harness, include_str!("tests/restart-record.ps1")).unwrap();
         let output = Command::new(powershell().unwrap())
             .args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File"])
             .arg(harness)

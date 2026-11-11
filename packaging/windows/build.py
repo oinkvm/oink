@@ -286,7 +286,7 @@ def main():
     (symbols / 'manifest.json').write_text(json.dumps({'source_tree_sha256': a.source_tree_sha256,
                                                      'images': symbol_records}, indent=2) + '\n')
     if a.run_native_tests:
-        for test in ('AuthorizationTests', 'QuiescenceTests', 'MaintenanceCleanupTests', 'CloudFilesCleanupTests', 'FinishInstallTests', 'GracefulStopTests', 'RelaunchTests', 'UserDataCleanupTests', 'EmbeddedPowerShellTests'):
+        for test in ('AuthorizationTests', 'QuiescenceTests', 'MaintenanceCleanupTests', 'CloudFilesCleanupTests', 'FinishInstallTests', 'GracefulStopTests', 'RelaunchTests', 'UserDataCleanupTests', 'EmbeddedPowerShellTests', 'MicrophoneRestartTests'):
             run('cl.exe', '/nologo', '/EHsc', '/std:c++17', '/W4', '/WX', '/MT', ROOT / f'packaging/windows/{test}.cpp',
                 f'/Fo{a.output}/{test}.obj', f'/Fe{a.output}/{test}.exe', 'advapi32.lib', 'user32.lib')
             run(a.output / f'{test}.exe')

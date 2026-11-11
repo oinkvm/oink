@@ -3471,7 +3471,11 @@ fn windows_hidden_policy_defaults_off_and_releases_on_both_switches_and_exit() {
             "default-off policy changed OS visibility"
         );
         set_hidden_policy(&node, true, "release-policy-on").await;
-        assert!(lock(&displays.disabled).is_empty(), "enabling a preference wrote OS");
+        assert_eq!(
+            *lock(&displays.disabled),
+            vec!["second"],
+            "enabling the policy applies the hidden layout"
+        );
         let _: serde_json::Value = call(
             &node,
             Request::SetScreenHidden {
@@ -3506,6 +3510,7 @@ fn windows_hidden_policy_defaults_off_and_releases_on_both_switches_and_exit() {
         );
         assert_eq!(*lock(&displays.state), geometry, "policy-off restored positions");
         set_hidden_policy(&node, true, "release-policy-back-on").await;
+        assert_eq!(*lock(&displays.disabled), vec!["second"]);
         let _: serde_json::Value = call(
             &node,
             Request::SetScreenHidden {
@@ -3586,6 +3591,52 @@ fn windows_hidden_policy_defaults_off_and_releases_on_both_switches_and_exit() {
                 .disabled
         );
         restarted.shutdown().await;
+        assert!(lock(&displays.disabled).is_empty());
+    });
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_hidden_policy_switch_applies_current_layout_once() {
+    crate::test_watchdog::run(module_path!(), "Windows hidden policy switch", Some(4), async {
+        let dir = tempfile::tempdir().unwrap();
+        let displays = Displays::new();
+        displays.visibility.store(true, Ordering::SeqCst);
+        let node = start(dir.path(), displays.clone()).await;
+        enable(&node, node.id().into(), "switch-parent-on").await;
+        set_hidden_policy(&node, true, "switch-on-nothing-hidden").await;
+        assert!(lock(&displays.disabled).is_empty(), "no screen is hidden in the layout");
+        set_hidden_policy(&node, false, "switch-off-nothing-hidden").await;
+        let _: serde_json::Value = call(
+            &node,
+            Request::SetScreenHidden {
+                screen: crate::api::ScreenKey {
+                    device: node.id().into(),
+                    display: "second".into(),
+                },
+                hidden: true,
+            },
+        )
+        .await;
+        assert!(lock(&displays.disabled).is_empty(), "policy off left the OS alone");
+        let geometry = lock(&displays.state).clone();
+        let calls = displays.calls.load(Ordering::SeqCst);
+        set_hidden_policy(&node, true, "switch-on").await;
+        assert_eq!(
+            *lock(&displays.disabled),
+            vec!["second"],
+            "switching on did not apply the hidden screen"
+        );
+        assert_eq!(displays.calls.load(Ordering::SeqCst), calls + 1, "one OS transaction");
+        set_hidden_policy(&node, false, "switch-off").await;
+        assert!(
+            lock(&displays.disabled).is_empty(),
+            "switching off kept the screen disabled"
+        );
+        assert_eq!(*lock(&displays.state), geometry);
+        set_hidden_policy(&node, true, "switch-on-again").await;
+        assert_eq!(*lock(&displays.disabled), vec!["second"]);
+        node.shutdown().await;
         assert!(lock(&displays.disabled).is_empty());
     });
 }

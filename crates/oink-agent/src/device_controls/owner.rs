@@ -443,6 +443,27 @@ impl Node {
             if persist_owner {
                 item = lock(&self.inner.config).edit_owner(option, expected, owner_patch)?;
             }
+            // Switching the policy on applies the current shared layout's hidden
+            // screens once, through the same writer an accepted layout uses. The
+            // policy is already stored, so that writer reads it as enabled; the
+            // backend keeps the last active screen. Switching off released above.
+            #[cfg(windows)]
+            let policy_apply = if option == dto::LocalOption::DisableHiddenDisplays
+                && bool::read(&patch).map_err(|_| Failure::InvalidValue)?
+            {
+                let layout = self
+                    .link_config()
+                    .map_err(|_| Failure::Offline)?
+                    .applied()
+                    .layout
+                    .clone();
+                self.apply_global_layout_visibility(&layout)
+                    .map_err(|_| Failure::ApplyFailed)
+            } else {
+                Ok(())
+            };
+            #[cfg(not(windows))]
+            let policy_apply: Result<(), Failure> = Ok(());
             let global_apply = global_edits.into_iter().try_for_each(|edit| {
                 self.edit_global_visibility(self.id().into(), edit.screen.as_deref(), edit.hidden)
                     .map_err(|_| Failure::ApplyFailed)
@@ -468,7 +489,7 @@ impl Node {
                 Ok(())
             };
             let owner_changed = field(item.revision())? != expected;
-            let applied = released.and(global_apply).and_then(|()| {
+            let applied = released.and(policy_apply).and(global_apply).and_then(|()| {
                 if owner_changed {
                     self.apply_saved_input_owner(emergency_sequence)
                 } else {

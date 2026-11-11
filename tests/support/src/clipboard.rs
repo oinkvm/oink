@@ -29,6 +29,17 @@ struct Inner {
     marker: Option<Vec<u8>>,
 }
 
+/// What a write publishes next to its items. A native publication is one
+/// transaction: the change count, the items and these fields become visible
+/// together, before any watch callback runs. Setting them afterwards would let
+/// a copy made right after the write appear inherit the write's Oink marker.
+#[derive(Default)]
+struct Published {
+    marker: Option<Vec<u8>>,
+    contents: Option<Arc<dyn FileContents>>,
+    native: Option<oink_clipboard::NativeSpec>,
+}
+
 /// 内存里的剪贴板。`copy` 模拟用户复制；`write` 由同步逻辑调用。
 #[derive(Default)]
 pub struct FakeClipboard {
@@ -52,11 +63,15 @@ impl FakeClipboard {
     }
 
     fn set(&self, items: Vec<ClipData>, s: Sensitivity) -> u64 {
+        self.publish(items, s, Published::default())
+    }
+
+    fn publish(&self, items: Vec<ClipData>, s: Sensitivity, published: Published) -> u64 {
         let (count, handlers) = {
             let mut i = self.lock();
-            i.contents = None;
-            i.native = None;
-            i.marker = None;
+            i.contents = published.contents;
+            i.native = published.native;
+            i.marker = published.marker;
             let items = match i.rewrite {
                 Some(f) => items.into_iter().map(f).collect(),
                 None => items,
@@ -195,8 +210,13 @@ impl ClipboardBackend for FakeClipboard {
         }
         let mut items = vec![ClipData::Files(entries.to_vec())];
         items.extend_from_slice(others);
-        let n = self.set(items, sensitivity);
-        self.lock().contents = Some(contents);
-        Ok(n)
+        Ok(self.publish(
+            items,
+            sensitivity,
+            Published {
+                contents: Some(contents),
+                ..Default::default()
+            },
+        ))
     }
 }

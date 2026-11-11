@@ -227,6 +227,20 @@ it('never offers a system restart on macOS',async()=>{
  expect(await screen.findByRole('button',{name:'Uninstall'})).toBeTruthy();
  expect(screen.queryByRole('button',{name:'Restart'})).toBeNull();
 });
+it.each([[true,'Uninstall'],[false,'Install']] as const)('offers no Windows restart when none is owed (installed=%s)',async(installed,next)=>{
+ setLanguage('en');
+ // No restart marker after a successful install/uninstall: restart_required is false.
+ vi.spyOn(api,'microphonePluginStatus').mockResolvedValue({...status(installed,true),restart_required:false,last_operation:null,last_operation_succeeded:true});
+ render(<OinkProvider><VirtualMicrophoneDescription windows/><VirtualMicrophone windows active/></OinkProvider>);
+ expect(await screen.findByRole('button',{name:next})).toBeTruthy();
+ expect(screen.queryByRole('button',{name:'Restart'})).toBeNull();
+ expect(document.body.textContent).not.toMatch(/restart/i);
+});
+it.each(['zh-Hans','en','ja','ko'] as const)('has no fixed restart sentence in the Windows description in %s',language=>{
+ setLanguage(language);
+ render(<VirtualMicrophoneDescription windows/>);
+ expect(document.body.textContent).not.toMatch(/重启|restart|再起動|다시 시작/i);
+});
 it('explains the explicit unmanaged state',async()=>{
  setLanguage('zh-Hans');
  vi.spyOn(api,'microphonePluginStatus').mockResolvedValue({...status(true,false),state:'unmanaged'});

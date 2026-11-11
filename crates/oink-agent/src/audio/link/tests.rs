@@ -2868,6 +2868,114 @@ async fn microphone_receive_without_source_is_a_durable_owner_preference() {
 }
 
 #[tokio::test]
+async fn silenced_microphone_source_sleeps_its_receiver_until_a_continued_encoder_wakes_it() {
+    use oink_audio::media::Kind;
+    const STREAM: u64 = 9;
+    let mut r = Running::start(false).await;
+    let (source, receiver) = (r.owners[0].links.id(), r.owners[1].links.id());
+    r.owners[0]
+        .streams
+        .admit_microphone_source(receiver, STREAM, StreamFormat::Opus5ms);
+    r.owners[1]
+        .streams
+        .admit_microphone_receiver(source, STREAM, StreamFormat::Opus5ms);
+    let reader = crate::streams::audio::MediaReader::new_kind(
+        r.owners[1].streams.microphone_table(),
+        source,
+        None,
+        Kind::Microphone,
+    );
+    let late = || Instant::now() + Duration::from_secs(60);
+    assert!(
+        reader.health_error(late()).is_some(),
+        "silence without Sleep is lost media"
+    );
+    // Capture closed by mute/zero volume after encoder bursts up to 2.
+    r.owners[0]
+        .streams
+        .report_closed_source(Kind::Microphone, 3, Instant::now());
+    let mut received = None;
+    let mut state = None;
+    let delivered = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            received = received.or(reader.read().1);
+            while let Ok(Some(event)) = tokio::time::timeout(Duration::from_millis(1), r.fixture.port(1).next()).await {
+                match event {
+                    ModuleEvent::Inbound(stream) => r.owners[1].streams.inbound(stream),
+                    ModuleEvent::InboundLow(op) => r.owners[1].streams.inbound_low(*op),
+                    _ => {}
+                }
+            }
+            for (peer, message) in r.owners[1].streams.poll(Instant::now()) {
+                if let (true, Message::AudioMediaState(media)) = (peer == source, message) {
+                    state = Some(media);
+                }
+            }
+            if state.is_some() && reader.bursts.generation() == 3 {
+                break;
+            }
+        }
+    })
+    .await;
+    assert!(
+        delivered.is_ok(),
+        "closed-source Sleep and its reliable state reach the receiver"
+    );
+    let state = state.unwrap();
+    assert_eq!((state.burst(), state.sleeping()), (Ok(3), Ok(true)));
+    reader.observe_media(&state, Instant::now());
+    assert!(received.is_none(), "a silenced source sends no media");
+    assert!(
+        reader.bursts.asleep(Instant::now()),
+        "the sink drains instead of concealing"
+    );
+    assert_eq!(
+        reader.health_error(late()),
+        None,
+        "a silenced source is not a lost source"
+    );
+
+    // Unmute: the next encoder continues above the announced Sleep.
+    let (mut encoder, encoded) = oink_audio::source::channel(StreamFormat::Opus5ms.config(), 100, false).unwrap();
+    encoded.continue_after(3);
+    encoded.set_packet_writer(crate::streams::audio::ForwardTable::source_writer_kind(
+        r.owners[0].streams.microphone_table(),
+        Instant::now(),
+        Kind::Microphone,
+    ));
+    let woke = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let now = Instant::now();
+            encoder.supply(
+                &vec![0.2; encoder.config().frame_samples()],
+                oink_audio::source::Stamp {
+                    first_sample_at: None,
+                    callback_at: Some(now),
+                    delivered_at: now,
+                    source_frame_position: None,
+                    discontinuity: false,
+                },
+            );
+            while let Ok(Some(event)) = tokio::time::timeout(Duration::from_millis(1), r.fixture.port(1).next()).await {
+                match event {
+                    ModuleEvent::Inbound(stream) => r.owners[1].streams.inbound(stream),
+                    ModuleEvent::InboundLow(op) => r.owners[1].streams.inbound_low(*op),
+                    _ => {}
+                }
+            }
+            if let Some(packet) = reader.read().1 {
+                break packet;
+            }
+        }
+    })
+    .await
+    .expect("resumed media reaches the receiver");
+    assert_eq!(woke.burst, 4);
+    assert!(!reader.bursts.asleep(Instant::now()));
+    r.stop().await;
+}
+
+#[tokio::test]
 #[ignore = "slow: delayed HAL notification integration"]
 async fn service_reset_recovers_after_delayed_notification_and_empty_device_list() {
     let mut running = Running::start(false).await;

@@ -16,7 +16,6 @@ export function VirtualMicrophoneDescription({windows}:{windows:boolean}) {
                 event.preventDefault();
                 void shell.openUrl('https://www.vb-cable.com').catch(()=>agent.fail('unavailable'));
             }}>{tr('官网')}</a>)}</span>}
-        {windows&&<span className="setp__microphone-description">{tr('安装或卸载后，请重启 Windows')}</span>}
     </>;
 }
 

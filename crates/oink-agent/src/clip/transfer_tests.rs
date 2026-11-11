@@ -183,6 +183,87 @@ fn file_offer_has_initial_items_and_late_progress_cannot_restore_a_retired_offer
     );
 }
 
+/// The user copies again the moment Oink's write of a remote copy appears:
+/// the change callback fires before the write call returns to the actor.
+struct CopyOnPublication {
+    clipboard: Arc<FakeClipboard>,
+    copy: Mutex<Option<Vec<ClipData>>>,
+}
+impl ClipboardBackend for CopyOnPublication {
+    fn change_count(&self) -> u64 {
+        self.clipboard.change_count()
+    }
+    fn read(&self) -> Result<ClipSnapshot, ClipboardError> {
+        self.clipboard.read()
+    }
+    fn capture(&self, data: &std::path::Path) -> Result<oink_clipboard::CapturedClipboard, ClipboardError> {
+        self.clipboard.capture(data)
+    }
+    fn write(&self, items: &[ClipData], sensitivity: Sensitivity) -> Result<u64, ClipboardError> {
+        self.clipboard.write(items, sensitivity)
+    }
+    fn watch(&self, handler: ChangeHandler) -> Result<(), ClipboardError> {
+        self.clipboard.watch(handler)
+    }
+    fn write_native_guarded(
+        &self,
+        spec: oink_clipboard::NativeSpec,
+        guard: content::ReaderGuard,
+    ) -> Result<u64, ClipboardError> {
+        let count = self.clipboard.write_native_guarded(spec, guard)?;
+        if let Some(items) = self.copy.lock().unwrap().take() {
+            self.clipboard.copy(items, Sensitivity::Normal);
+        }
+        Ok(count)
+    }
+}
+
+#[test]
+fn copy_over_an_unconfirmed_oink_write_is_compared_with_that_write() {
+    crate::test_watchdog::run(
+        module_path!(),
+        "copy_over_an_unconfirmed_oink_write_is_compared_with_that_write",
+        Some(4),
+        async {
+            let root = tempfile::tempdir().unwrap();
+            let first = vec![ClipData::Text("copied twice".into())];
+            let source = Arc::new(FakeClipboard::new());
+            let target = Arc::new(FakeClipboard::new());
+            let a = start_with_clip(
+                &oink_test_support::network_config(root.path().join("a"), "a", 0),
+                &Displays::new("a"),
+                Some(Arc::new(CopyOnPublication {
+                    clipboard: source.clone(),
+                    copy: Mutex::new(Some(first.clone())),
+                })),
+            )
+            .await;
+            let b = start_with_clip(
+                &oink_test_support::network_config(root.path().join("b"), "b", 0),
+                &Displays::new("b"),
+                Some(target.clone()),
+            )
+            .await;
+            common::pair(&a, &b).await;
+            common::active(&[&a, &b]).await;
+            source.copy(first.clone(), Sensitivity::Normal);
+            common::until("first copy reaches b", || target.items() == first).await;
+            // A's clipboard goes copied twice -> remote text (Oink's write) ->
+            // copied twice. The second copy replaced Oink's write, so it is new
+            // content, not a duplicate of the first copy.
+            target.copy(vec![ClipData::Text("remote text".into())], Sensitivity::Normal);
+            tokio::time::timeout(
+                Duration::from_secs(10),
+                common::until("second copy reaches b", || target.items() == first),
+            )
+            .await
+            .expect("a copy over Oink's write was suppressed as a duplicate of the earlier copy");
+            a.shutdown().await;
+            b.shutdown().await;
+        },
+    );
+}
+
 // Model the native provider's final file and durable catalog. This fixture
 // exercises transport/publication ordering; it does not simulate a desktop API.
 struct NativeCopy {

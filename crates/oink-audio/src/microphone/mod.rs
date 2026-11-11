@@ -111,13 +111,16 @@ pub struct CaptureInfo {
     pub resampler_delay_frames: u32,
 }
 
-/// Both values must come from current local policy / a live receiver demand lease.
-/// This guard prevents accidental starts during capability discovery. Stage two
-/// must drop Capture immediately on revocation, last consumer stop or lease expiry.
+/// All values must come from current local policy / a live receiver demand lease.
+/// This guard prevents accidental starts during capability discovery. The owner
+/// drops Capture as soon as it fails: on revocation, last consumer stop, lease
+/// expiry, or while the shared microphone is muted or at zero volume.
 #[derive(Clone, Copy, Debug)]
 pub struct StartPermit {
     pub user_enabled: bool,
     pub receiver_has_consumer: bool,
+    /// `Settings::audible()` of the sharing device.
+    pub audible: bool,
 }
 impl StartPermit {
     pub fn check(self) -> Result<(), String> {
@@ -127,6 +130,9 @@ impl StartPermit {
         if !self.receiver_has_consumer {
             return Err("virtual microphone has no active consumer".into());
         }
+        if !self.audible {
+            return Err("shared microphone is muted".into());
+        }
         Ok(())
     }
 }
@@ -135,20 +141,36 @@ impl StartPermit {
 mod tests {
     use super::*;
     #[test]
-    fn capture_requires_both_local_consent_and_consumer() {
+    fn capture_requires_local_consent_a_consumer_and_an_audible_shared_microphone() {
         for enabled in [false, true] {
             for consumer in [false, true] {
-                assert_eq!(
-                    StartPermit {
-                        user_enabled: enabled,
-                        receiver_has_consumer: consumer
-                    }
-                    .check()
-                    .is_ok(),
-                    enabled && consumer
-                );
+                for audible in [false, true] {
+                    assert_eq!(
+                        StartPermit {
+                            user_enabled: enabled,
+                            receiver_has_consumer: consumer,
+                            audible,
+                        }
+                        .check()
+                        .is_ok(),
+                        enabled && consumer && audible
+                    );
+                }
             }
         }
+    }
+    #[test]
+    fn muted_or_zero_volume_shared_microphone_is_not_audible() {
+        let settings = |volume_percent, muted| Settings {
+            volume_percent,
+            muted,
+            ..Default::default()
+        };
+        assert!(Settings::default().audible());
+        assert!(settings(1, false).audible());
+        assert!(!settings(100, true).audible());
+        assert!(!settings(0, false).audible());
+        assert!(!settings(0, true).audible());
     }
 }
 
@@ -160,6 +182,14 @@ pub struct Settings {
     pub volume_percent: u16,
     pub muted: bool,
     pub receive_muted: bool,
+}
+impl Settings {
+    /// The sharing device's own forwarding controls, which the shared-microphone
+    /// card and its mute hotkey edit from any group member. Muted or 0 % forwards
+    /// only silence, so the sender holds no capture stream for it.
+    pub fn audible(&self) -> bool {
+        !self.muted && self.volume_percent > 0
+    }
 }
 impl Default for Settings {
     fn default() -> Self {

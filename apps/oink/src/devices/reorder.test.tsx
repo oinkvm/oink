@@ -154,6 +154,8 @@ describe('switch pointer position shortcut', () => {
         setLanguage('en');
         expect(SHORTCUTS.find(s => s.id === 'pointerNext')?.label).toBe('Switch pointer position');
         expect(DEFAULT_SHORTCUTS.pointerNext).toEqual({ on: false, keys: 'Control+Alt+N' });
+        const ids = SHORTCUTS.map(s => s.id);
+        expect(ids.indexOf('pointerNext')).toBe(ids.indexOf('game') + 1);
         expect(shortcutId({ action: 'move_pointer_next', enabled: false, keys: ['Ctrl', 'Alt', 'N'] })).toBe('pointerNext');
         for (const [lang, label] of [['zh-Hans', '切换指针位置'], ['ja', 'ポインタ位置を切り替え'], ['ko', '포인터 위치 전환']]) {
             setLanguage(lang);

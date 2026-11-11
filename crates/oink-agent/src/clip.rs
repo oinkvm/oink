@@ -1013,6 +1013,12 @@ impl Task {
         // Mark that exact write before observing any newer physical local copy.
         if let Ok(count) = &publication.result {
             self.last_write = Some(*count);
+            // The clipboard now holds Oink's write, whatever happens to its
+            // ticket. A newer local copy observed below replaced this write
+            // (never read to compare, see `written`), not the content before
+            // it: deduplicating against that would drop a real copy.
+            self.identity = None;
+            self.echo_base = None;
         }
         self.observe(self.backend.change_count());
         if ticket.valid.load(Ordering::Acquire) && self.may_write(id) {

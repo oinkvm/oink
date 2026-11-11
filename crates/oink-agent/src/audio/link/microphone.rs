@@ -215,6 +215,13 @@ impl Owner {
         }
         false
     }
+    pub(super) fn microphone_live(&self) -> bool {
+        #[cfg(any(target_os = "macos", windows))]
+        if let Some(runtime) = &self.microphone.runtime {
+            return runtime.live();
+        }
+        false
+    }
     pub(super) fn output_quality_snapshot(
         &self,
         at_ms: u64,

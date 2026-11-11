@@ -683,3 +683,26 @@ extern "C" __declspec(dllexport) UINT __stdcall CleanupMicrophone(MSIHANDLE inst
     if (code) cleanup_log(install, L"VB-CABLE", L"managed microphone cleanup", code);
     return ERROR_SUCCESS;
 }
+
+// Commit actions cannot call MsiSetMode, so this immediate action after
+// InstallFinalize reads the cleanup's volatile restart marker and asks Windows
+// Installer for its own end-of-uninstall restart prompt. The package keeps
+// REBOOT=ReallySuppress; only this interactive run clears it, so silent runs
+// never restart or prompt.
+#include "MicrophoneRestart.h"
+extern "C" __declspec(dllexport) UINT __stdcall CheckMicrophoneRestart(MSIHANDLE install) {
+    const auto ui = property(install, L"UILevel");
+    const auto reboot_prompt = property(install, L"REBOOTPROMPT");
+    bool marker = false;
+    const LONG read = microphone_restart::marker(marker);
+    const bool ask = microphone_restart::prompt(ui, reboot_prompt, marker);
+    UINT result = ERROR_SUCCESS;
+    if (ask) {
+        result = MsiSetPropertyW(install, L"REBOOT", L"");
+        if (result == ERROR_SUCCESS) result = MsiSetMode(install, MSIRUNMODE_REBOOTATEND, TRUE);
+    }
+    info(install, L"CheckMicrophoneRestart: marker=" + std::to_wstring(marker) + L", read=" + std::to_wstring(read) +
+        L", UILevel=" + ui + L", REBOOTPROMPT=" + reboot_prompt + L", prompt=" + std::to_wstring(ask) +
+        L", result=" + std::to_wstring(result) + L".");
+    return ERROR_SUCCESS;
+}
