@@ -78,6 +78,9 @@ export function usePreferences(): PrefsApi {
   const [prefs,setPrefs] = useState(DEFAULT_PREFS);
   const [presentation,setPresentation] = useState(readPresentation);
   const [transform,setTransform] = useState<InputTransform|null>(null);
+  // The keymap is editable only once prefs show the loaded transform: the
+  // effect below decodes it one render after it arrives.
+  const [shownTransform,setShownTransform] = useState<InputTransform|null>(null);
   const report=state.report;
   const [pending,setPending] = useState(false);
   const busy = useRef(false), queued = useRef<Prefs|null>(null), committed = useRef(prefs), latest = useRef(prefs);
@@ -113,6 +116,7 @@ export function usePreferences(): PrefsApi {
     setPrefs(p=>{const next={...p,keyPreset:decoded.keyPreset,scrollInvert:transform[platform==='mac'?'macos':'windows'].reverse_wheel,capsSplit:decoded.capsSplit,allowFnMapping:decoded.allowFnMapping,
       keyCustom:{...p.keyCustom,[platform]:decoded.map},keyCustomTouched:{...p.keyCustomTouched,[platform]:decoded.hasCustom}};
       committed.current=next;return next;});
+    setShownTransform(transform);
   },[transform,platform,pending]);
   const save = async(next:Prefs):Promise<void>=>{
     setPrefs(next);
@@ -170,7 +174,7 @@ export function usePreferences(): PrefsApi {
   };
   return{prefs,pending,launchStatus:state.launch,canEdit: key => {
       if(['pasteAsFile','language','showInMenuBar','confirmQuit','notificationLevel','logLevel','logMaxMb','theme','accent'].includes(key))return local!==null;
-      if(['keymap','scrollInvert'].includes(key))return transform!==null;
+      if(['keymap','scrollInvert'].includes(key))return shownTransform!==null;
       if(['pollLimit','pointerGain','keepAwake','pointerTrail','touchpadInject','nativeMultifinger','macScrollFeel','forwardWheelByLines','forwardInjectedInput','takeForegroundOnLeave','quickerCompat','syncUnlock','escStop'].includes(key)||key.startsWith('sc-'))return state.input!==null;
       if(key.startsWith('clip')||key==='removeDsStore')return state.clipboard!==null;
       if(['audioEncodingQuality','audioDevice','keepLocalPlayback'].includes(key))return state.audio!==null;

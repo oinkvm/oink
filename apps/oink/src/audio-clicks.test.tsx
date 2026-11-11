@@ -529,7 +529,8 @@ it.each(micModes.flatMap(from=>micModes.filter(first=>first!==from).flatMap(firs
   }else await finish(1,cards('forwarding',from,false,4));
   expect(document.querySelector('.ok-toast:not([data-leaving])')).toBeNull();
   expect(notices()).toEqual([]);
-});
+// Two menu round trips of jsdom role queries: CPU-bound, 2-5 s on a hosted Intel Mac runner.
+},15000);
 it('still reports an actual microphone release refusal rather than suppressing not_exit',async()=>{
   const {container}=mount('forwarding','source');backend.refuseToken='receive:1';
   await chooseMicrophone(container,'receiver');

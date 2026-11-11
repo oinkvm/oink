@@ -48,6 +48,18 @@ it.each(['macos','windows'])('persists a separate custom map through preset chan
   if(mac)expect(stored[target].keyboard.table).toContainEqual({from:0xff0003,to:0});
   expect(localStorage.getItem('oink:prefs')).toBeNull();
 });
+it('makes the keymap editable only in the render that shows the loaded map', async()=>{
+  const keyboard:InputTransform['windows']['keyboard']={preset:'custom',table:[{from:0x700e0,to:0x700e3}],caps_tap_hold:null};
+  const stored:InputTransform={macos:{reverse_wheel:false,keyboard:{preset:'none',table:[]}},windows:{reverse_wheel:false,keyboard},overrides:[]};
+  mocks.state={...mocks.state,boot:{platform:'macos'},overview:{this_device:{id:'self'}}};
+  mocks.group.mockResolvedValue({members:[{is_self:true,input_transform:stored}]});
+  const renders:{editable:boolean,map:unknown}[]=[];
+  renderHook(()=>{const api=usePreferences();renders.push({editable:api.canEdit('keymap'),map:api.prefs.keyCustom.mac});return api;});
+  await waitFor(()=>expect(renders.at(-1)?.editable).toBe(true));
+  const loaded=renders.at(-1)!.map;
+  expect(renders.filter(r=>r.editable).every(r=>JSON.stringify(r.map)===JSON.stringify(loaded))).toBe(true);
+  expect(renders[0].map).not.toEqual(loaded);
+});
 it('keeps the stored touchpad preference while injection is temporarily unavailable', async()=>{
   mocks.state.input={...(mocks.state.input as object),accept_contacts:false,touchpad_injection_enabled:true,contacts_injection_available:false};
   const {result}=renderHook(usePreferences);

@@ -2544,7 +2544,8 @@
       "selectedLicense": "MIT",
       "modified": false,
       "scope": [
-        "runtime"
+        "runtime",
+        "test"
       ],
       "platforms": [
         "macos-arm64",
