@@ -1,5 +1,5 @@
 //! Reviewed release roots are compiled into binaries. No environment/IPC override.
-use crate::{Error, WINDOWS_EPOCH};
+use crate::{Error, MAC_EPOCH, WINDOWS_EPOCH};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use serde::Deserialize;
 #[derive(Clone, Debug)]
@@ -10,6 +10,9 @@ pub struct Roots {
 #[derive(Deserialize)]
 struct Config {
     schema: u32,
+    /// Ordered HTTPS origins that host the same signed catalogs (metadata only).
+    #[serde(default)]
+    sources: Vec<String>,
     windows: Vec<Windows>,
     mac: Mac,
 }
@@ -44,16 +47,76 @@ fn mac_configured(raw: &[u8]) -> Result<(), Error> {
     }
     Ok(())
 }
+/// Catalog origins in the order they are tried.
+pub fn sources() -> Result<Vec<String>, Error> {
+    #[cfg(feature = "test-feed")]
+    {
+        Ok(vec![crate::feed::feed_origin().to_owned()])
+    }
+    #[cfg(not(feature = "test-feed"))]
+    configured_sources(CONFIG)
+}
+#[cfg_attr(feature = "test-feed", allow(dead_code))]
+fn configured_sources(raw: &[u8]) -> Result<Vec<String>, Error> {
+    let config: Config = crate::feed::strict_json(raw)?;
+    if config.sources.is_empty() || config.sources.len() > 8 {
+        return Err(Error::NotConfigured);
+    }
+    for source in &config.sources {
+        // An origin with an optional path prefix; catalog paths are appended.
+        crate::feed::validate_redirect(source, 0).map_err(|_| Error::NotConfigured)?;
+        if source.ends_with('/') || source.contains(['?', '#']) {
+            return Err(Error::NotConfigured);
+        }
+    }
+    Ok(config.sources)
+}
+/// The macOS update key signs both v2 catalogs and the DMG bytes they name.
+pub fn mac_compiled() -> Result<MacRoots, Error> {
+    #[cfg(feature = "test-feed")]
+    {
+        let _: Config = crate::feed::strict_json(CONFIG)?;
+        Ok(MacRoots { key: test_key()? })
+    }
+    #[cfg(not(feature = "test-feed"))]
+    {
+        mac_configured(CONFIG)?;
+        let config: Config = crate::feed::strict_json(CONFIG)?;
+        let key = STANDARD
+            .decode(config.mac.public_key.ok_or(Error::NotConfigured)?)
+            .map_err(|_| Error::NotConfigured)?;
+        Ok(MacRoots {
+            key: key.try_into().map_err(|_| Error::NotConfigured)?,
+        })
+    }
+}
+#[derive(Clone, Debug)]
+pub struct MacRoots {
+    pub key: [u8; 32],
+}
+impl MacRoots {
+    pub fn feed(&self) -> crate::feed::Trust<'_> {
+        crate::feed::Trust {
+            epoch: MAC_EPOCH,
+            key: &self.key,
+        }
+    }
+}
+#[cfg(feature = "test-feed")]
+fn test_key() -> Result<[u8; 32], Error> {
+    // RFC 8032 public TEST key. No production secret or config override.
+    STANDARD
+        .decode("11qYAYKxCrfVS/7TyWQHOg7hcvPapiMlrwIaaPcHURo=")
+        .map_err(|_| Error::NotConfigured)?
+        .try_into()
+        .map_err(|_| Error::NotConfigured)
+}
 pub fn compiled() -> Result<Roots, Error> {
     #[cfg(feature = "test-feed")]
     {
         let _: Config = crate::feed::strict_json(CONFIG)?;
-        // RFC 8032 public TEST key. No production secret or config override.
-        let public = STANDARD
-            .decode("11qYAYKxCrfVS/7TyWQHOg7hcvPapiMlrwIaaPcHURo=")
-            .map_err(|_| Error::NotConfigured)?;
         Ok(Roots {
-            key: public.try_into().map_err(|_| Error::NotConfigured)?,
+            key: test_key()?,
             signer_spki_sha256: vec![],
         })
     }
@@ -135,6 +198,29 @@ pub fn health_ready(ready: bool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn sources_are_ordered_https_origins() {
+        assert_eq!(
+            configured_sources(CONFIG).unwrap()[0],
+            "https://updates.oink.hachiwii.com"
+        );
+        let mut config: serde_json::Value = serde_json::from_slice(CONFIG).unwrap();
+        for bad in [
+            serde_json::json!([]),
+            serde_json::json!(["http://updates.oink.hachiwii.com"]),
+            serde_json::json!(["https://user@updates.oink.hachiwii.com"]),
+            serde_json::json!(["https://updates.oink.hachiwii.com/"]),
+            serde_json::json!(["https://updates.oink.hachiwii.com?x=1"]),
+        ] {
+            config["sources"] = bad;
+            assert!(configured_sources(&serde_json::to_vec(&config).unwrap()).is_err());
+        }
+        config["sources"] = serde_json::json!(["https://a.example", "https://b.example/oink"]);
+        assert_eq!(
+            configured_sources(&serde_json::to_vec(&config).unwrap()).unwrap(),
+            ["https://a.example", "https://b.example/oink"]
+        );
+    }
     #[test]
     fn local_packages_keep_pins_without_enabling_or_requiring_a_feed_key() {
         let mut config: serde_json::Value = serde_json::from_slice(CONFIG).unwrap();

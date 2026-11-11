@@ -547,6 +547,11 @@ impl Remote {
     }
     fn open_until(&self, id: RepresentationId, deadline: Option<std::time::Instant>) -> io::Result<FileReader> {
         let native = super::native_read::remote_read();
+        if !self.0.report_drag
+            && let Some(read) = &native
+        {
+            read.clipboard();
+        }
         let cached = self.0.representations.lock().unwrap().contains_key(&id);
         let diagnostic = crate::copy_diagnostics::Read::begin(
             self.0.inventory.id,

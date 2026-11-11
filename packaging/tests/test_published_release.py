@@ -101,14 +101,19 @@ class PublishedReleaseGuard(unittest.TestCase):
         self.path.write_text(json.dumps(self.event))
         return self.module.published(tag, request=lambda path: copy.deepcopy(self.live))
 
-    def test_main_dispatch_verifies_current_published_stable_release(self):
+    def test_main_dispatch_verifies_current_published_release_and_its_channel(self):
         self.assertEqual(self.verify(), self.live)
-        for field, value in [('draft', True), ('prerelease', True), ('published_at', None), ('tag_name', 'v0.1.0')]:
+        self.assertEqual(self.module.channel(self.verify()), 'stable')
+        for field, value in [('draft', True), ('published_at', None), ('tag_name', 'v0.1.0'),
+                             ('prerelease', None), ('prerelease', 1)]:
             original = self.live[field]
             self.live[field] = value
-            with self.subTest(field=field), self.assertRaisesRegex(ValueError, 'release_not_public'):
+            with self.subTest(field=field, value=value), self.assertRaisesRegex(ValueError, 'release_not_public'):
                 self.verify()
             self.live[field] = original
+        # The same vX.Y.Z release is beta while it is a prerelease.
+        self.live['prerelease'] = True
+        self.assertEqual(self.module.channel(self.verify()), 'beta')
 
     def test_dispatch_rejects_other_refs_repositories_events_and_tag_inputs(self):
         for field, value in [('GITHUB_REF', 'refs/tags/v0.1.1'), ('GITHUB_REF', 'refs/heads/topic'),
@@ -117,6 +122,22 @@ class PublishedReleaseGuard(unittest.TestCase):
                 self.verify()
         for tag in ['v0.1.2', 'v0.1.1-beta.1', '../main']:
             with self.subTest(tag=tag), self.assertRaises(ValueError): self.verify(tag)
+
+    def test_beta_tags_are_prerelease_beta_only_and_never_reach_stable(self):
+        tag = 'v0.1.1-beta.2'
+        self.event['inputs']['release_tag'] = tag
+        self.live.update(tag_name=tag, prerelease=True)
+        self.assertEqual(self.module.channel(self.verify(tag)), 'beta')
+        # Clearing the prerelease flag of a beta tag never promotes it.
+        self.live['prerelease'] = False
+        with self.assertRaisesRegex(ValueError, 'release_tag'):
+            self.verify(tag)
+        self.live['prerelease'] = True
+        for bad in ('v0.1.1-beta.0', 'v0.1.1-rc.1', 'v0.1.1-beta'):
+            self.event['inputs']['release_tag'] = bad
+            self.live['tag_name'] = bad
+            with self.subTest(tag=bad), self.assertRaisesRegex(ValueError, 'release_tag'):
+                self.verify(bad)
 
     def test_release_published_event_is_rejected_before_any_live_request(self):
         self.event.update(action='published', release=copy.deepcopy(self.live))
@@ -128,9 +149,23 @@ class PublishedReleaseGuard(unittest.TestCase):
 
     def test_trusted_notes_validate_channel_severity_and_existing_language_rules(self):
         annotations = dict(channel='stable', severity='critical', notes={'en': 'Final', 'zh-Hans': '最终', 'ja': '最終', 'ko': '최종'})
-        for change in [dict(channel='beta'), dict(severity='urgent'), dict(extra=True),
+        self.assertEqual(self.module.validate_annotations({**annotations, 'channel': 'beta'})['channel'], 'beta')
+        for change in [dict(channel='alpha'), dict(severity='urgent'), dict(extra=True),
                        dict(notes={'en': 'Missing Chinese'}), dict(notes={**annotations['notes'], 'EN': 'Duplicate'}),
                        dict(notes={**annotations['notes'], 'en': 'bad\x00text'})]:
             with self.subTest(change=change), self.assertRaises(ValueError):
                 self.module.validate_annotations({**annotations, **change})
         self.assertEqual(self.module.validate_annotations(annotations), annotations)
+
+    def test_committed_notes_carry_no_channel_and_the_live_flag_supplies_it(self):
+        committed = dict(severity='normal', notes={'en': 'Final', 'zh-Hans': '最终'})
+        root = self.path.parent
+        with patch.object(feed, 'ROOT', root):
+            feed.write(root / '.github/update-notes.json', committed)
+            self.assertEqual(self.module.annotations(dict(prerelease=True)), {'channel': 'beta', **committed})
+            self.assertEqual(self.module.annotations(dict(prerelease=False)), {'channel': 'stable', **committed})
+            for change in [dict(channel='stable'), dict(channel='beta'), dict(severity='urgent')]:
+                feed.write(root / '.github/update-notes.json', {**committed, **change})
+                with self.subTest(change=change), self.assertRaisesRegex(ValueError, 'release_annotations_required'):
+                    self.module.update_notes()
+        self.module.validate_notes_file(feed.read(ROOT / '.github/update-notes.json'))

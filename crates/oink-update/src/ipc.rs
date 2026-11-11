@@ -44,7 +44,7 @@ pub enum Request {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Reply {
-    Status { status: UpdateStatus },
+    Status { status: Box<UpdateStatus> },
     Prepare { transaction: String },
     Abort { transaction: String },
     Shutdown { transaction: String },

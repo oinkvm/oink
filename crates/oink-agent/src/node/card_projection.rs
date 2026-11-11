@@ -31,6 +31,7 @@ impl Node {
                     live_boot: Some(self.inner.boot.nonce),
                     facts: None,
                     capabilities: vec![],
+                    order: None,
                 }],
                 screen_shared: vec![],
                 focus,
@@ -108,6 +109,7 @@ impl Node {
                     live_boot,
                     facts,
                     capabilities,
+                    order: state.device_order.get(&member.device).copied(),
                 }
             })
             .collect();

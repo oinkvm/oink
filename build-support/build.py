@@ -9,7 +9,6 @@ import re
 import shlex
 import subprocess
 from provenance import digest, source_tree_sha256
-from sparkle import prepare as prepare_sparkle
 from versioning import release_version
 from package_cache import configure_cache
 from update_qualification import origin as test_origin, verify_binaries
@@ -47,7 +46,6 @@ def main():
     p.add_argument('--version', default=IDENTITY['version'])
     p.add_argument('--source-commit', help='Full source commit for a in-house build-labelled version')
     p.add_argument('--build', required=True)
-    p.add_argument('--sparkle-cache', type=Path)
     p.add_argument('--windows-update-test-feed', help='TEST ONLY: compile a literal HTTP loopback feed and public TEST key')
     p.add_argument('--symbols-output', type=Path, help='Private symbols outside the source and package payload')
     p.add_argument('--windows-update-test-fail-health', action='store_true', help='TEST ONLY: withhold candidate health proof for rollback qualification')
@@ -124,12 +122,6 @@ def main():
         # rustc must gather native objects while its LTO temporary directories
         # still exist; running dsymutil later loses their debug information.
         environment['CARGO_PROFILE_RELEASE_SPLIT_DEBUGINFO'] = 'packed'
-        if not a.sparkle_cache:
-            p.error('Mac product builds require the pinned Sparkle framework')
-        environment['SPARKLE_FRAMEWORK_DIR'] = str(prepare_sparkle(a.sparkle_cache))
-        features += ',oink-agent/sparkle'
-    elif a.sparkle_cache:
-        p.error('Sparkle is macOS-only')
     environment = configure_cache(environment)
     npm = 'npm.cmd' if platform.system() == 'Windows' else 'npm'
     # A hash can be an all-numeric identifier with a leading zero, which SemVer
@@ -179,7 +171,7 @@ def main():
     verify_binaries([output / name for name in names], a.windows_update_test_feed)
     verify_binaries([path for path in (ROOT / 'apps/oink/dist').rglob('*') if path.is_file()], a.windows_update_test_feed)
     record = dict(schema=1, provenance='source-tree', source_tree_sha256=a.source_tree_sha256,
-                  version=display_version, source_commit=a.source_commit, build=a.build, target=a.target, sparkle=macos,
+                  version=display_version, source_commit=a.source_commit, build=a.build, target=a.target,
                   updater_included=not macos, collector_included=True, worker_static_crt=not macos,
                   update_test_feed=a.windows_update_test_feed, update_test_fail_health=a.windows_update_test_fail_health,
                   identity_sha256=digest(ROOT / 'packaging/identity.json'),

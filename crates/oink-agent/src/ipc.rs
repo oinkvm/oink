@@ -297,10 +297,20 @@ async fn serve(
     closing: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
     let connection_client = api::request_context::new_client();
+    let peer = transport::peer(&stream)?;
     let (r, mut w) = tokio::io::split(stream);
     let mut lines = Frames::new(r);
     let mut next = lines.first_line().await?;
     while let Some(line) = next.take() {
+        // A client that timed out or exited closes its end. What it asked for
+        // must not take effect later, when nobody is waiting for it any more:
+        // on 2026-11-10 a backlog of 31 abandoned requests ran 15 minutes late
+        // and changed the audio route. A close just after this check is the
+        // ordinary race of a client leaving mid-request.
+        if peer.closed() {
+            tracing::debug!("local IPC request dropped: the client already closed its connection");
+            return Ok(());
+        }
         let mut line = zeroize::Zeroizing::new(line);
         let request = serde_json::from_str::<Envelope>(&line);
         zeroize::Zeroize::zeroize(&mut *line);
@@ -718,6 +728,64 @@ mod tests {
         crate::test_watchdog::phase("cancel before first IPC event read");
         assert_eq!(early.join().unwrap(), crate::remote::EventsEnd::Cancelled);
         server.stop();
+        node.shutdown().await;
+    }
+
+    #[test]
+    fn request_from_a_client_that_already_left_is_not_executed() {
+        crate::test_watchdog::run(
+            module_path!(),
+            "request_from_a_client_that_already_left_is_not_executed",
+            Some(2),
+            request_from_a_client_that_already_left_is_not_executed_scenario(),
+        );
+    }
+
+    async fn request_from_a_client_that_already_left_is_not_executed_scenario() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let node = Node::start(crate::node::NodeOptions {
+            net: oink_test_support::network_config(dir.path().into(), "abandoned-request", 0),
+            input: Arc::new(oink_test_support::input::FakeInput::new()),
+            displays: vec![],
+            display_backend: None,
+            clipboard: None,
+            mode_switch_in_callback: true,
+            capture_reports_key_repeat: true,
+            cursor_trail: false,
+        })
+        .await
+        .unwrap();
+        let listener = Listener::bind(dir.path(), "abandoned-request").unwrap();
+        let (closing, _) = watch::channel(false);
+        let mut stop = serde_json::to_string(&Envelope {
+            token: "token".into(),
+            stop: true,
+            ..Envelope::default()
+        })
+        .unwrap();
+        stop.push('\n');
+        // The client asked, gave up and left before the backend got to it.
+        let mut client = listener.address().connect(Duration::from_secs(1)).unwrap();
+        client.write_all(stop.as_bytes()).unwrap();
+        let (stream, ()) = listener.accept().await.unwrap();
+        drop(client);
+        serve(stream, node.clone(), "token".into(), closing.subscribe())
+            .await
+            .unwrap();
+        assert!(
+            !*node.stop_receiver().borrow(),
+            "a request whose client is gone must not take effect"
+        );
+        // The same request from a client that is still waiting is honoured.
+        let mut client = listener.address().connect(Duration::from_secs(1)).unwrap();
+        client.write_all(stop.as_bytes()).unwrap();
+        let (stream, ()) = listener.accept().await.unwrap();
+        serve(stream, node.clone(), "token".into(), closing.subscribe())
+            .await
+            .unwrap();
+        assert!(*node.stop_receiver().borrow());
+        drop(client);
         node.shutdown().await;
     }
 

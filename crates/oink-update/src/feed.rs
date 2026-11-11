@@ -19,12 +19,22 @@ pub const MAX_PACKAGE: u64 = 512 * 1024 * 1024;
 pub const MAX_UNPACKED: u64 = 1024 * 1024 * 1024;
 pub const MAX_NOTES: usize = 16 * 1024;
 
-// Preserve the published feed schema while accepting only stable metadata.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// Stable feeds carry stable releases only; beta feeds carry both. Ordering is
+/// the selection rule: a channel admits every release at or below it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Channel {
     #[default]
     Stable,
+    Beta,
+}
+impl Channel {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Stable => "stable",
+            Self::Beta => "beta",
+        }
+    }
 }
 
 pub fn manifest_url() -> String {
@@ -34,7 +44,7 @@ pub fn manifest_url() -> String {
         crate::WINDOWS_EPOCH
     )
 }
-fn feed_origin() -> &'static str {
+pub(crate) fn feed_origin() -> &'static str {
     #[cfg(feature = "test-feed")]
     {
         concat!(env!("OINK_WINDOWS_UPDATE_TEST_FEED"), "/oink-update-qualification")
@@ -184,7 +194,7 @@ pub struct Trust<'a> {
     pub epoch: &'a str,
     pub key: &'a [u8; 32],
 }
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Watermark {
     pub sequence: u64,
@@ -243,6 +253,50 @@ impl VerifiedManifest {
 }
 
 pub fn verify_manifest(bytes: &[u8], trust: &Trust<'_>, seen: &Watermark, now: i64) -> Result<VerifiedManifest, Error> {
+    let payload = signed_payload(bytes, trust)?;
+    let manifest: Manifest = strict_json(&payload)?;
+    if manifest.schema != SCHEMA
+        || manifest.product != PRODUCT
+        || manifest.key_epoch != trust.epoch
+        || manifest.sequence == 0
+    {
+        return Err(Error::Policy);
+    }
+    // v1 is the stable feed of ≤0.3.5 clients; beta lives in v2 catalogs only.
+    if manifest.channel != Channel::Stable || manifest.releases.iter().any(|r| r.channel != Channel::Stable) {
+        return Err(Error::Metadata);
+    }
+    let (watermark, expires_unix) = freshness(
+        &payload,
+        manifest.sequence,
+        &manifest.generated_at,
+        &manifest.expires_at,
+        seen,
+        now,
+    )?;
+    if manifest.releases.len() > 32 {
+        return Err(Error::Limit);
+    }
+    let mut builds = BTreeSet::new();
+    for release in &manifest.releases {
+        if release.build == 0
+            || !builds.insert(release.build)
+            || release.version.is_empty()
+            || release.version.len() > 128
+            || !is_hex(&release.source_tree_sha256, 64)
+        {
+            return Err(Error::Metadata);
+        }
+        validate_package(&release.package, trust)?;
+    }
+    Ok(VerifiedManifest {
+        manifest,
+        watermark,
+        expires_unix,
+    })
+}
+/// The exact payload bytes behind a valid signature by the trusted epoch key.
+pub(crate) fn signed_payload(bytes: &[u8], trust: &Trust<'_>) -> Result<Vec<u8>, Error> {
     if bytes.len() > MAX_FEED {
         return Err(Error::Limit);
     }
@@ -263,16 +317,19 @@ pub fn verify_manifest(bytes: &[u8], trust: &Trust<'_>, seen: &Watermark, now: i
         .find(|s| s.key_id == trust.epoch)
         .ok_or(Error::Signature)?;
     verify_signature(&payload, &signature.ed25519, trust.key)?;
-    let manifest: Manifest = strict_json(&payload)?;
-    if manifest.schema != SCHEMA
-        || manifest.product != PRODUCT
-        || manifest.key_epoch != trust.epoch
-        || manifest.sequence == 0
-    {
-        return Err(Error::Policy);
-    }
-    let generated = timestamp(&manifest.generated_at)?;
-    let expires = timestamp(&manifest.expires_at)?;
+    Ok(payload)
+}
+/// Expiry, clock and replay checks shared by every signed feed document.
+pub(crate) fn freshness(
+    payload: &[u8],
+    sequence: u64,
+    generated_at: &str,
+    expires_at: &str,
+    seen: &Watermark,
+    now: i64,
+) -> Result<(Watermark, i64), Error> {
+    let generated = timestamp(generated_at)?;
+    let expires = timestamp(expires_at)?;
     if expires <= generated || expires - generated > 30 * 86400 {
         return Err(Error::Metadata);
     }
@@ -282,42 +339,29 @@ pub fn verify_manifest(bytes: &[u8], trust: &Trust<'_>, seen: &Watermark, now: i
     if now >= expires {
         return Err(Error::ExpiredFeed);
     }
-    let digest = hex(&Sha256::digest(&payload));
-    if manifest.sequence < seen.sequence || (manifest.sequence == seen.sequence && digest != seen.payload_sha256) {
+    let digest = hex(&Sha256::digest(payload));
+    if sequence < seen.sequence || (sequence == seen.sequence && digest != seen.payload_sha256) {
         return Err(Error::Replay);
     }
-    if manifest.releases.len() > 32 {
-        return Err(Error::Limit);
+    Ok((
+        Watermark {
+            sequence,
+            payload_sha256: digest,
+            last_verified_unix: now.max(seen.last_verified_unix),
+        },
+        expires,
+    ))
+}
+pub(crate) fn validate_package(package: &Package, trust: &Trust<'_>) -> Result<(), Error> {
+    if package.key_id != trust.epoch
+        || package.length == 0
+        || package.length > MAX_PACKAGE
+        || !is_hex(&package.sha256, 64)
+        || STANDARD.decode(&package.ed25519).map_or(true, |s| s.len() != 64)
+    {
+        return Err(Error::Metadata);
     }
-    let mut builds = BTreeSet::new();
-    for release in &manifest.releases {
-        if release.build == 0
-            || !builds.insert(release.build)
-            || release.version.is_empty()
-            || release.version.len() > 128
-            || !is_hex(&release.source_tree_sha256, 64)
-            || release.package.key_id != trust.epoch
-            || release.package.length == 0
-            || release.package.length > MAX_PACKAGE
-            || !is_hex(&release.package.sha256, 64)
-            || STANDARD
-                .decode(&release.package.ed25519)
-                .map_or(true, |s| s.len() != 64)
-        {
-            return Err(Error::Metadata);
-        }
-        validate_package_url(&release.package.url)?;
-    }
-    let watermark = Watermark {
-        sequence: manifest.sequence,
-        payload_sha256: digest,
-        last_verified_unix: now.max(seen.last_verified_unix),
-    };
-    Ok(VerifiedManifest {
-        manifest,
-        watermark,
-        expires_unix: expires,
-    })
+    validate_package_url(&package.url)
 }
 pub fn verify_package(bytes: &[u8], package: &Package, trust: &Trust<'_>) -> Result<(), Error> {
     if package.key_id != trust.epoch || bytes.len() as u64 != package.length || package.length > MAX_PACKAGE {
@@ -355,7 +399,7 @@ pub fn timestamp(s: &str) -> Result<i64, Error> {
 pub fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
-fn is_hex(s: &str, len: usize) -> bool {
+pub(crate) fn is_hex(s: &str, len: usize) -> bool {
     s.len() == len && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 fn https_url(s: &str) -> Result<Url, Error> {

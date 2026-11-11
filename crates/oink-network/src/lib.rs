@@ -151,6 +151,7 @@ pub struct TcpBulkStatus {
     pub pacing: Option<LowPacingStatus>,
 }
 
+pub mod device_order;
 pub mod pointer_slots;
 
 mod listeners;

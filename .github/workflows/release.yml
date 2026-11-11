@@ -2,10 +2,9 @@ name: Release packages
 on:
   workflow_dispatch:
     inputs:
-      build:
-        description: Reserved product build shared by public and in-house packages (0.3.5 uses 113)
+      sequence:
+        description: Build sequence n of the packaged version (build = major*10^7 + minor*10^5 + patch*10^3 + n); higher than every in-house n of that version
         required: true
-        default: '113'
         type: string
 permissions:
   contents: read
@@ -76,7 +75,7 @@ jobs:
         id: inputs
         shell: bash
         env:
-          BUILD: ${{ inputs.build }}
+          SEQUENCE: ${{ inputs.sequence }}
           OINK_REPORT_DSN: ${{ secrets.OINK_REPORT_DSN }}
           SIGNPATH_API_TOKEN: ${{ secrets.SIGNPATH_API_TOKEN }}
           SIGNPATH_ORGANIZATION_ID: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
@@ -126,16 +125,16 @@ jobs:
         env:
           OINK_REPORT_DSN: ${{ secrets.OINK_REPORT_DSN }}
           MACOS_SIGNING_FINGERPRINT: ${{ vars.MACOS_SIGNING_FINGERPRINT }}
-          BUILD: ${{ inputs.build }}
+          SEQUENCE: ${{ inputs.sequence }}
           PLATFORM: ${{ matrix.platform }}
         run: |
           args=()
           if [[ "$RUNNER_OS" == macOS ]]; then
             args+=(--arch "${{ matrix.arch }}" --notary-profile release-notary --notary-keychain "$RUNNER_TEMP/release-signing/signing.keychain-db" --notary-timeout 1200)
           fi
-          python build-support/package.py --public-version --platform "$PLATFORM" --build "$BUILD" --output-root "$RUNNER_TEMP/packages" --tool-cache "$RUNNER_TEMP/package-tools" "${args[@]}"
+          python build-support/package.py --public-version --platform "$PLATFORM" --sequence "$SEQUENCE" --output-root "$RUNNER_TEMP/packages" --tool-cache "$RUNNER_TEMP/package-tools" "${args[@]}"
           python build-support/check-report-configuration.py --packages "$RUNNER_TEMP/packages" --platform "$PLATFORM"
-          python build-support/public_release.py stage --packages "$RUNNER_TEMP/packages" --platform "$PLATFORM" --build "$BUILD" --output "$RUNNER_TEMP/distribution"
+          python build-support/public_release.py stage --packages "$RUNNER_TEMP/packages" --platform "$PLATFORM" --sequence "$SEQUENCE" --output "$RUNNER_TEMP/distribution"
       - name: Upload native debug files to the existing EU project
         shell: bash
         env:
@@ -149,7 +148,7 @@ jobs:
         if: runner.os == 'Windows' && steps.inputs.outputs.sign_windows == 'true'
         id: unsigned
         with:
-          name: windows-signing-input-${{ inputs.build }}
+          name: windows-signing-input-${{ inputs.sequence }}
           path: ${{ runner.temp }}/distribution/*
           if-no-files-found: error
       - name: Sign Windows MSI when configured
@@ -172,13 +171,13 @@ jobs:
           Copy-Item "$env:RUNNER_TEMP/signed/*.msi" "$env:RUNNER_TEMP/distribution/" -Force
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: package-${{ matrix.platform }}-${{ matrix.target }}-${{ inputs.build }}
+          name: package-${{ matrix.platform }}-${{ matrix.target }}-${{ inputs.sequence }}
           path: ${{ runner.temp }}/distribution/*
           if-no-files-found: error
       - name: Preserve symbols separately (never release assets)
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: symbols-${{ matrix.platform }}-${{ matrix.target }}-${{ inputs.build }}
+          name: symbols-${{ matrix.platform }}-${{ matrix.target }}-${{ inputs.sequence }}
           path: ${{ runner.temp }}/packages/**/symbols.noindex/**
           include-hidden-files: true
           if-no-files-found: error
@@ -198,12 +197,12 @@ jobs:
           python-version: '3.14.6'
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          pattern: package-*-${{ inputs.build }}
+          pattern: package-*-${{ inputs.sequence }}
           path: ${{ runner.temp }}/downloaded
       - name: Assemble matching final assets and create draft
         env:
-          BUILD: ${{ inputs.build }}
+          SEQUENCE: ${{ inputs.sequence }}
           GH_TOKEN: ${{ github.token }}
         run: |
-          python build-support/public_release.py assemble --downloads "$RUNNER_TEMP/downloaded" --output "$RUNNER_TEMP/release" --build "$BUILD"
+          python build-support/public_release.py assemble --downloads "$RUNNER_TEMP/downloaded" --output "$RUNNER_TEMP/release" --sequence "$SEQUENCE"
           python build-support/public_release.py publish --output "$RUNNER_TEMP/release" --notes .github/release-notes.txt

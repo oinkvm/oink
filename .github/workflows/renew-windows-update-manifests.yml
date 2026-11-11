@@ -1,4 +1,4 @@
-name: Renew Windows update manifests
+name: Renew update manifests
 on:
   schedule:
     - cron: '17 3 * * *'
@@ -15,6 +15,7 @@ jobs:
       contents: read
     outputs:
       enabled: ${{ steps.catalog.outputs.enabled }}
+      mac: ${{ steps.mac-catalog.outputs.enabled }}
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
@@ -24,8 +25,11 @@ jobs:
           enabled=$(python3 build-support/update/feed_site.py enabled --platform windows --config-only)
           echo "enabled=$enabled" >> "$GITHUB_OUTPUT"
           if [ "$enabled" = false ]; then echo 'Windows feed disabled; renewal skipped.' >> "$GITHUB_STEP_SUMMARY"; fi
+          mac=$(python3 build-support/update/feed_site.py enabled --platform mac --config-only)
+          echo "mac=$mac" >> "$GITHUB_OUTPUT"
+          if [ "$mac" = false ]; then echo 'Mac feed disabled; v2 renewal skipped.' >> "$GITHUB_STEP_SUMMARY"; fi
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
-        if: steps.gate.outputs.enabled == 'true'
+        if: steps.gate.outputs.enabled == 'true' || steps.gate.outputs.mac == 'true'
         with:
           ref: update-feed-state
           path: feed-state
@@ -36,6 +40,12 @@ jobs:
           enabled=$(python3 build-support/update/feed_site.py enabled --platform windows --require-catalog)
           echo "enabled=$enabled" >> "$GITHUB_OUTPUT"
           if [ "$enabled" = false ]; then echo 'Windows feed disabled; renewal skipped.' >> "$GITHUB_STEP_SUMMARY"; fi
+      - id: mac-catalog
+        if: steps.gate.outputs.mac == 'true'
+        run: |
+          enabled=$(python3 build-support/update/feed_site.py enabled --platform mac --require-catalog)
+          echo "enabled=$enabled" >> "$GITHUB_OUTPUT"
+          if [ "$enabled" = false ]; then echo 'Mac feed not published yet; v2 renewal skipped.' >> "$GITHUB_STEP_SUMMARY"; fi
   sign:
     needs: gate
     if: needs.gate.outputs.enabled == 'true'
@@ -56,15 +66,17 @@ jobs:
           ref: update-feed-state
           path: feed-state
           token: ${{ secrets.UPDATE_FEED_WRITER_TOKEN }}
-      - name: Validate unchanged Windows catalog and durably reserve sequences
+      - name: Validate unchanged Windows catalog and durably reserve v1 and v2 sequences
         run: |
           python3 build-support/update/feed.py allocate
+          python3 build-support/update/feed_v2.py allocate --platform windows
           python3 build-support/update/reserve.py
       - name: Sign exact reserved bytes
         env:
           WINDOWS_UPDATE_ED25519_PEM_WIN_2026_01: ${{ secrets.WINDOWS_UPDATE_ED25519_PEM_WIN_2026_01 }}
         run: |
           python3 build-support/update/feed.py sign
+          python3 build-support/update/feed_v2.py sign --platform windows
           python3 build-support/update/feed_site.py candidate --platform windows --output windows-candidate
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
@@ -77,5 +89,59 @@ jobs:
     with:
       platform: windows
       artifact: renewed-windows-feed
+    secrets:
+      UPDATE_FEED_WRITER_TOKEN: ${{ secrets.UPDATE_FEED_WRITER_TOKEN }}
+  # Mac v2 manifests expire like Windows ones. Runs after the Windows deploy:
+  # jobs queued in one concurrency group cancel each other's pending runs.
+  # Only this job's signing step sees the Mac key, and only through the pinned
+  # official signer (the Sparkle secret need not be an OpenSSL-loadable seed).
+  sign-mac:
+    needs: [gate, deploy]
+    if: ${{ !cancelled() && needs.gate.outputs.mac == 'true' }}
+    runs-on: macos-15
+    permissions:
+      contents: read
+    timeout-minutes: 30
+    environment: release
+    concurrency:
+      group: oink-update-feed-publish
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: update-feed-state
+          path: feed-state
+          token: ${{ secrets.UPDATE_FEED_WRITER_TOKEN }}
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.14.6'
+      - name: Select OpenSSL 3
+        run: |
+          echo "$(brew --prefix openssl@3)/bin" >> "$GITHUB_PATH"
+          "$(brew --prefix openssl@3)/bin/openssl" version | grep '^OpenSSL 3\.'
+      - name: Validate unchanged Mac v2 catalogs and durably reserve sequences
+        run: |
+          python build-support/update/feed_v2.py allocate --platform mac
+          python build-support/update/reserve.py
+      - name: Sign exact reserved bytes
+        env:
+          SPARKLE_ED25519_PRIVATE_KEY: ${{ secrets.SPARKLE_ED25519_PRIVATE_KEY }}
+        run: python build-support/update/feed_v2.py sign --platform mac --tool-cache "$RUNNER_TEMP/sparkle"
+      - name: Verify the renewed Mac candidate
+        run: python build-support/update/feed_site.py candidate --platform mac --output mac-candidate
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: renewed-macos-feed
+          path: mac-candidate
+          retention-days: 2
+  deploy-mac:
+    needs: sign-mac
+    uses: ./.github/workflows/deploy-feed.yml
+    with:
+      platform: mac
+      artifact: renewed-macos-feed
     secrets:
       UPDATE_FEED_WRITER_TOKEN: ${{ secrets.UPDATE_FEED_WRITER_TOKEN }}

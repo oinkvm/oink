@@ -21,7 +21,7 @@ import { PermissionControl } from '../permissions/PermissionControl';
 import { useGrant } from './useGrant';
 import { UninstallControl } from './UninstallControl';
 import { AutoUnlockControl } from './AutoUnlock';
-import { UpdateCheck, UpdatePreferences, manualUpdates } from './UpdatePreferences';
+import { UpdateChannel, UpdateCheck, UpdatePreferences, manualUpdates } from './UpdatePreferences';
 import { SHORTCUTS, deviceShortcuts, ShortcutRecorder, spokenKeys } from './Shortcuts';
 import type { ShortcutId } from './Shortcuts';
 import type { LogLevel, PermissionId, Prefs, PrefsApi } from './prefs';
@@ -370,6 +370,7 @@ export function SettingsPage({ open, platform, api, capsIme, query, jump, onActi
                     node: <UpdateCheck status={agentState.update} open={open}/>,
                 };
             case 'updates': return { desc: manualUpdates(agentState.update) ? tr('此版本需要手动下载并安装更新。') : undefined, node: <UpdatePreferences status={agentState.update} label={label}/> };
+            case 'updateChannel': return { node: <UpdateChannel status={agentState.update} label={label}/> };
             case 'about':
                 return { node: <Button size="sm" onClick={onAbout}>{tr('查看')}</Button> };
             case 'language':
@@ -413,9 +414,14 @@ export function SettingsPage({ open, platform, api, capsIme, query, jump, onActi
                 return { desc: api.hasOverrides ? tr('有按设备设置的覆盖') : undefined, node: <KeyMapControl platform={platform} api={api} capsIme={capsIme} label={label} onLog={onLog}/>, stack: true };
             case 'pollLimit':
                 return {
-                    node: (<Segmented<Prefs['pollLimit']> size="sm" aria-label={label} value={prefs.pollLimit} onChange={(v) => { set('pollLimit', v); onLog(tr('指针事件频率上限 → {0}', v === '125' ? '125 Hz' : tr('不限制'))); }} options={[{ value: '125', label: '125 Hz' }, { value: 'none', get label() {
-                                return tr('不限制');
-                            } }]}/>),
+                    node: (<Select size="sm" aria-label={label} value={prefs.pollLimit} onChange={(v) => { set('pollLimit', v as Prefs['pollLimit']); onLog(tr('指针事件频率上限 → {0}', v === 'none' ? tr('不限制') : `${v} Hz`)); }} options={[
+                            { value: '125', label: '125 Hz' },
+                            { value: '250', label: '250 Hz' },
+                            { value: '500', label: '500 Hz' },
+                            { value: 'none', get label() {
+                                    return tr('不限制');
+                                } },
+                        ]}/>),
                 };
             case 'screenPointerGains': return { node: <ScreenPointerGains/>, panel: true };
             case 'pointerGain':

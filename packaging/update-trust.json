@@ -1,6 +1,9 @@
 {
   "schema": 1,
   "repository": "oinkvm/oink",
+  "sources": [
+    "https://updates.oink.hachiwii.com"
+  ],
   "windows": [
     {
       "epoch": "win-2026-01",

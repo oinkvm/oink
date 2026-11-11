@@ -5,11 +5,6 @@ fn main() {
     if target_os != "macos" && target_os != "windows" {
         return;
     }
-    if target_os == "macos" {
-        // The UI is a LaunchServices helper inside the host app. Sparkle lives
-        // in the outer app's Frameworks directory, shared with the backend.
-        println!("cargo:rustc-link-arg-bin=oink=-Wl,-rpath,@executable_path/../../../../Frameworks");
-    }
     #[cfg(any(target_os = "macos", windows))]
     if target_os == "windows" {
         #[cfg(windows)]

@@ -380,6 +380,7 @@ impl Node {
         if native_services {
             oink_clipboard::received::configure(settings.received_files_cleanup);
             crate::microphone_plugin::start();
+            crate::usage_days::start(&data_dir);
         }
         let native = opts.cursor_trail;
         let node = Self {

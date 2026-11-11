@@ -1808,6 +1808,17 @@ impl Driver {
                 _ => {}
             }
         }
+        if attached
+            && let Message::Dnd(DndMsg::Source {
+                offer,
+                action: oink_routing::dnd::SourceAction::StartDelivery,
+                ..
+            }) = &message
+            && offer.clip.origin == self.local
+        {
+            // The holder sends this after its native drop of this device's content.
+            crate::usage_days::mark(crate::usage_days::Feature::Drag);
+        }
         let incoming_source = match &message {
             Message::Control(
                 ControlMsg::FocusEnter { pointer_source, .. } | ControlMsg::MovePointerEnter { pointer_source, .. },
@@ -2037,12 +2048,18 @@ impl Driver {
                         let _ = self.main.send(MainCommand::Media { event, work });
                     }
                 }
-                Output::Inject(event) => self.inject.push_reported_in_epoch(
-                    self.input_safety,
-                    InjectItem::Inject { event, from },
-                    self.input_time,
-                    self.input_report.take(),
-                ),
+                Output::Inject(event) => {
+                    // Remote captured input carries its capture time; router-made releases do not.
+                    if from.is_some() && self.input_time.is_some() {
+                        crate::usage_days::mark(crate::usage_days::Feature::KeyboardMouse);
+                    }
+                    self.inject.push_reported_in_epoch(
+                        self.input_safety,
+                        InjectItem::Inject { event, from },
+                        self.input_time,
+                        self.input_report.take(),
+                    )
+                }
                 Output::SetMode(_) | Output::RestoreLocal { .. } if immediate_modes => {}
                 Output::SetMode(mode) => self.inject.push_in_epoch(self.input_safety, InjectItem::SetMode(mode)),
                 Output::RestoreLocal { at } => self
@@ -2206,6 +2223,10 @@ impl Driver {
         else {
             return;
         };
+        // Only this device's own captured input has a capture time and no relay origin.
+        if time.is_some() && origin.is_none() && matches!(&message, Message::Input(input) if captured_input(input)) {
+            crate::usage_days::mark(crate::usage_days::Feature::KeyboardMouse);
+        }
         if let Message::Dnd(DndMsg::Notice(notice)) = &message
             && let Some((head, tail)) = self.declarations.get(&None).and_then(|d| d.for_notice(notice))
         {
@@ -2253,10 +2274,11 @@ impl Driver {
                     event.elapsed_us = due.saturating_duration_since(self.now).as_micros() as u64;
                     // Low 16 bits: Hz (0=unlimited); bit16: existing coalesced tail;
                     // bit17: first motion must wait for the pacing deadline.
-                    event.code = if self.budget.frequency() == crate::api::EventFrequency::Hz125 {
-                        125
-                    } else {
-                        0
+                    event.code = match self.budget.frequency() {
+                        crate::api::EventFrequency::Hz125 => 125,
+                        crate::api::EventFrequency::Hz250 => 250,
+                        crate::api::EventFrequency::Hz500 => 500,
+                        crate::api::EventFrequency::Unlimited => 0,
                     } | (u32::from(self.motion.is_some()) << 16)
                         | (u32::from(due > self.now) << 17);
                     handoff_timing::emit(event);

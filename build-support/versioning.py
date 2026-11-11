@@ -1,7 +1,7 @@
-"""In-house display labels and ordering use release builds; commits record provenance."""
+"""Display labels and numeric builds: a build encodes the version it packages (identity.encode_build)."""
 import re
 import subprocess
-from identity import IDENTITY
+from identity import IDENTITY, decode_build, encode_build
 from provenance import ROOT, product_source
 
 
@@ -10,18 +10,29 @@ def validate_source_commit(source_commit):
         raise ValueError('source commit must be the full lowercase 40-character Git commit')
 
 
-def release_version(base, source_commit=None, build=None):
-    if source_commit is None:
-        return base
-    validate_source_commit(source_commit)
-    if type(build) is not int or not 1 <= build < 2**31:
-        raise ValueError('in-house build must be an integer in 1..2147483647')
-    if not re.fullmatch(r'[0-9]+\.[0-9]+\.[0-9]+(?:-beta\.[0-9]+)?', base):
-        raise ValueError('in-house versions require a stable or beta.N base version')
+def inhouse_version():
     inhouse = IDENTITY['inhouse_version']
     if not isinstance(inhouse, str) or not re.fullmatch(r'(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)', inhouse):
         raise ValueError('inhouse_version must be a numeric major.minor.patch version')
-    return f'{inhouse}-inhouse.{build}'
+    return inhouse
+
+
+def package_build(sequence, inhouse):
+    """In-house packages number inhouse_version's builds; public ones the manifest version's."""
+    return encode_build(inhouse_version() if inhouse else IDENTITY['version'].split('-')[0], sequence)
+
+
+def release_version(base, source_commit, build):
+    """Display label of a package; rejects a build that does not encode the labelled version."""
+    if not re.fullmatch(r'[0-9]+\.[0-9]+\.[0-9]+(?:-beta\.[0-9]+)?', base):
+        raise ValueError('packages require a stable or beta.N base version')
+    if source_commit is not None:
+        validate_source_commit(source_commit)
+    version = base.split('-')[0] if source_commit is None else inhouse_version()
+    encoded, sequence = decode_build(build)
+    if encoded != version:
+        raise ValueError(f'build {build} encodes {encoded}, but this package is {version}')
+    return base if source_commit is None else f'{version}-inhouse.{sequence}'
 
 
 def local_source_commit(explicit=None, root=ROOT):
@@ -43,5 +54,7 @@ def local_source_commit(explicit=None, root=ROOT):
 
 
 def macos_version_fields(version, build):
+    if decode_build(build)[0] != version.split('-')[0]:
+        raise ValueError('CFBundleVersion must encode CFBundleShortVersionString')
     return dict(CFBundleShortVersionString=version.split('-')[0], CFBundleVersion=str(build),
                 CFBundleGetInfoString=version)

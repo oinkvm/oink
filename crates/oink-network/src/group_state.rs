@@ -42,7 +42,8 @@ impl State {
             )?,
             roster.anchor(),
         )?
-        .reconcile_pointer_slots(identity.id())
+        .reconcile_pointer_slots(identity.id())?
+        .reconcile_device_order(identity.id())
     }
     pub fn verify(state: dto::GroupState, anchor: Anchor) -> v1::Result<Self> {
         if state.group()?.0 != anchor.group.0 {
@@ -63,6 +64,7 @@ impl State {
         }
         let state = Self { wire: state, roster };
         state.pointer_slots()?;
+        state.device_order()?;
         Ok(state)
     }
     pub fn wire(&self) -> &dto::GroupState {
@@ -81,6 +83,44 @@ impl State {
             .into_iter()
             .find(|r| r.kind() == Ok(2))
             .ok_or(v1::ErrorCode::MalformedFrame.into())
+    }
+    pub fn register(&self, kind: u32) -> v1::Result<Option<dto::Register>> {
+        Ok(self.wire.registers()?.0.into_iter().find(|r| r.kind() == Ok(kind)))
+    }
+    /// Set the given keys of one optional retained register value, authored by
+    /// `writer` on top of its current version. Unknown value keys are kept, and
+    /// an unchanged value is a no-op.
+    pub(crate) fn put_register(&self, kind: u32, writer: DeviceId, value: RawMap) -> v1::Result<Self> {
+        let current = self.register(kind)?;
+        let mut patched = current.as_ref().map(|r| r.value()).transpose()?.unwrap_or_default();
+        patched.extend(value);
+        if current.as_ref().is_some_and(|r| r.value() == Ok(patched.clone())) {
+            return Ok(self.clone());
+        }
+        let register = if let Some(current) = current {
+            retained::edit_register(&current, &current.version()?, wire::device(writer), |raw| {
+                *raw = patched;
+                Ok(())
+            })?
+        } else {
+            let version = dto::ConfigVersion::from_raw([(1, 1u64.write()), (3, wire::device(writer).write())].into())?;
+            let mut raw: RawMap = [(1, kind.write()), (3, version.write()), (4, RawValue::Map(patched))].into();
+            let digest = retained::register_digest(&raw)?;
+            raw.insert(6, digest.write());
+            dto::Register::from_raw(raw)?
+        };
+        let mut registers = self
+            .wire
+            .registers()?
+            .0
+            .into_iter()
+            .filter(|r| r.kind() != Ok(kind))
+            .collect::<Vec<_>>();
+        registers.push(register);
+        registers.sort_by_key(|r| r.kind().expect("validated kind"));
+        let mut raw = self.wire.raw().clone();
+        raw.insert(2, RawValue::Array(registers.iter().map(WireValue::write).collect()));
+        Self::verify(dto::GroupState::from_raw(raw)?, self.roster.anchor())
     }
     pub fn with_roster(&self, roster: &Roster) -> v1::Result<Self> {
         let mut raw = self.wire.raw().clone();

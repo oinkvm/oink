@@ -167,7 +167,7 @@ class PublicationTests(FeedTests):
         import release
         for version in ('0.1.0', '0.2.0', '0.2.1', '0.2.2'):
             self.assertEqual(release.minimum_updater_schema(version), 1)
-        for version in ('0.2.3', '0.3.0', '1.0.0'):
+        for version in ('0.2.3', '0.3.0', '1.0.0', '0.3.6-beta.1'):
             self.assertEqual(release.minimum_updater_schema(version), 2)
         for version in ('garbage', '0.2.2-inhouse.test', '0.3.0-inhouse.44', '0.3.0-inhouse.0f806215', '00.2.2'):
             with self.assertRaises(ValueError):
@@ -188,18 +188,23 @@ class PublicationTests(FeedTests):
         # Notes from the trusted checkout win even if an old input contains update.json.
         feed.write(folder/'update.json', {'channel': 'beta', 'notes': {'en': 'Stale release asset'}})
         notes_path = self.state/'.github/update-notes.json'
-        feed.write(notes_path, {'channel': 'stable', 'severity': 'normal', 'notes': {'zh-Hans': '测试更新', 'en': 'Test update'}})
+        feed.write(notes_path, {'severity': 'normal', 'notes': {'zh-Hans': '测试更新', 'en': 'Test update'}})
         config = {'windows': [EPOCH], 'repository': 'oinkvm/oink'}
         context = {'GITHUB_ACTIONS': 'true', 'GITHUB_REPOSITORY': 'oinkvm/oink', 'GITHUB_RUN_ID': '12',
                    'OINK_SOURCE_TREE_SHA256': 'a'*64, 'OINK_RELEASE_TAG': 'v1.0.0', 'OINK_SIGNPATH_APPROVAL_ID': 'TEST'}
-        with patch.dict(os.environ, context), patch.object(feed, 'ROOT', self.state):
+        live = {'prerelease': False}
+        with patch.dict(os.environ, context), patch.object(feed, 'ROOT', self.state), \
+                patch.object(release.published_release, 'published', side_effect=lambda tag: live) as published:
             release.sign_package(config, folder, self.state/'output.json')
+            published.assert_called_once_with('v1.0.0')
             output = feed.read(self.state/'output.json')
+            self.assertEqual(output['release']['channel'], 'stable')
             self.assertEqual(output['release']['package']['url'],
                              'https://github.com/oinkvm/oink/releases/download/v1.0.0/Oink-1.0.0-windows-x64.msi')
             self.assertEqual(output['release']['build'], 2)
             feed.write(self.state / 'registry.json', {'schema': 1, 'feeds': {EPOCH['epoch']: {
-                c: {'records': [], 'last_allocated': 0, 'manifest_sha256': None} for c in EPOCH['channels']}}})
+                c: {'records': [], 'last_allocated': 0, 'manifest_sha256': None} for c in EPOCH['channels']}},
+                'platforms': {p: {'enabled': False, 'revision': 0, 'files': {}} for p in ('mac', 'windows')}})
             with patch.dict(os.environ, {'OINK_PUBLISHED_BUILD': '2'}), patch.object(feed, 'download', return_value=raw):
                 release.register(config, self.state, self.state/'output.json', NOW)
                 before = feed.registry(self.state)['feeds'][EPOCH['epoch']]['stable']

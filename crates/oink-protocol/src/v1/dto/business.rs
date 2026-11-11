@@ -858,6 +858,16 @@ wire_map!(PointerShortcutSlot, no_validation, {
     2 => membership_epoch: u64 = required;
     3 => slot: Option<u8> = optional;
 });
+// Retained group register value (kind 0x1302): whole-list LWW device list order,
+// unknown to 0.3.x peers, which merge and relay it opaquely.
+wire_map!(DeviceOrder, no_validation, {
+    1 => entries: List<DeviceOrderEntry,16> = required;
+});
+wire_map!(DeviceOrderEntry, no_validation, {
+    1 => device: DeviceId = required;
+    2 => membership_epoch: u64 = required;
+    3 => order: i64 = required;
+});
 
 // Optional physical-source hold state; never changes the device lock preference.
 wire_map!(ControlLockEscape, no_validation, {1 => held: bool = required;});

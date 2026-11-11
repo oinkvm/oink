@@ -1,4 +1,4 @@
-//! Authenticated local DMG installation, independent of Sparkle feed policy.
+//! Authenticated DMG installation for dropped and downloaded packages.
 use super::{Error, Node, close_mac_clients, local::Staged};
 use std::{
     ffi::CString,
@@ -11,6 +11,8 @@ use std::{
 };
 unsafe extern "C" {
     fn oink_local_verify_app(path: *const std::ffi::c_char) -> u32;
+    fn oink_local_verify_image(path: *const std::ffi::c_char) -> u32;
+    fn oink_local_plist_strings(path: *const std::ffi::c_char, buffer: *mut u8, capacity: usize) -> std::ffi::c_long;
 }
 fn io_step<T>(step: &'static str, result: std::io::Result<T>, error: Error) -> Result<T, Error> {
     result.map_err(|source| {
@@ -34,14 +36,24 @@ fn run(step: &'static str, binary: &str, args: &[&std::ffi::OsStr]) -> Result<Ve
     Ok(output.stdout)
 }
 pub fn verify_app(path: &Path) -> Result<(), Error> {
+    verify("authenticate_bundle", path, oink_local_verify_app)
+}
+fn verify_image(path: &Path) -> Result<(), Error> {
+    verify("authenticate_image", path, oink_local_verify_image)
+}
+fn verify(
+    step: &'static str,
+    path: &Path,
+    check: unsafe extern "C" fn(*const std::ffi::c_char) -> u32,
+) -> Result<(), Error> {
     let path = CString::new(path.as_os_str().as_encoded_bytes()).map_err(|_| Error::Storage)?;
-    // SAFETY: immutable staged bundle; pointer remains live through native checks.
-    let result = match unsafe { oink_local_verify_app(path.as_ptr()) } {
+    // SAFETY: immutable private staged file; pointer remains live through native checks.
+    let result = match unsafe { check(path.as_ptr()) } {
         0 => Ok(()),
         2 => Err(Error::NotNotarized),
         _ => Err(Error::Signature),
     };
-    tracing::info!(step = "authenticate_bundle", ?result, "local upgrade");
+    tracing::info!(step, ?result, "local upgrade");
     result
 }
 pub(super) fn architecture() -> &'static str {
@@ -101,7 +113,8 @@ fn compatible_executable(path: &Path) -> Result<bool, Error> {
         _ => Err(Error::CorruptPackage),
     }
 }
-fn bundle() -> Result<PathBuf, Error> {
+/// The installed bundle, which a staged package replaces.
+pub(super) fn bundle() -> Result<PathBuf, Error> {
     let exe = std::env::current_exe().map_err(|_| Error::Storage)?;
     exe.parent()
         .and_then(Path::parent)
@@ -110,17 +123,23 @@ fn bundle() -> Result<PathBuf, Error> {
         .map(Path::to_owned)
         .ok_or(Error::NotWritable)
 }
-fn plist(path: &Path, field: &str) -> Result<String, Error> {
-    let key = format!(":{field}");
-    let bytes = run(
-        "read_bundle_metadata",
-        "/usr/libexec/PlistBuddy",
-        &["-c".as_ref(), format!("Print {key}").as_ref(), path.as_os_str()],
-    )?;
-    Ok(String::from_utf8(bytes)
-        .map_err(|_| Error::CorruptPackage)?
-        .trim()
-        .to_owned())
+/// Top-level string values of an Info.plist, parsed once in-process.
+fn plist(path: &Path) -> Result<std::collections::HashMap<String, String>, Error> {
+    let path = CString::new(path.as_os_str().as_encoded_bytes()).map_err(|_| Error::Storage)?;
+    let mut buffer = vec![0u8; 16 * 1024];
+    loop {
+        // SAFETY: the native side writes at most `capacity` bytes into the live buffer.
+        let length = unsafe { oink_local_plist_strings(path.as_ptr(), buffer.as_mut_ptr(), buffer.len()) };
+        let length = usize::try_from(length).map_err(|_| Error::CorruptPackage)?;
+        if length <= buffer.len() {
+            buffer.truncate(length);
+            return serde_json::from_slice(&buffer).map_err(|_| Error::CorruptPackage);
+        }
+        buffer.resize(length, 0);
+    }
+}
+fn field(info: &std::collections::HashMap<String, String>, key: &str) -> Result<String, Error> {
+    info.get(key).cloned().ok_or(Error::CorruptPackage)
 }
 fn tree(path: &Path, root: &Path, total: &mut u64) -> Result<(), Error> {
     let metadata = fs::symlink_metadata(path).map_err(|_| Error::CorruptPackage)?;
@@ -145,22 +164,120 @@ fn tree(path: &Path, root: &Path, total: &mut u64) -> Result<(), Error> {
     }
     Ok(())
 }
-struct Mount(PathBuf);
-impl Drop for Mount {
+/// The private image copy and its mount point. They live outside the replacement
+/// staging directory, so removing that directory never walks into a live mount.
+struct Image {
+    directory: Option<tempfile::TempDir>,
+    mounted: bool,
+}
+static DETACHING: std::sync::Mutex<Vec<std::thread::JoinHandle<()>>> = std::sync::Mutex::new(Vec::new());
+impl Image {
+    fn new() -> Result<Self, Error> {
+        let directory = tempfile::Builder::new()
+            .prefix("oink-local-image-")
+            .suffix(".noindex")
+            .tempdir()
+            .map_err(|_| Error::Storage)?;
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).map_err(|_| Error::Storage)?;
+        fs::create_dir(directory.path().join("mount")).map_err(|_| Error::Storage)?;
+        Ok(Self {
+            directory: Some(directory),
+            mounted: false,
+        })
+    }
+    fn file(&self) -> PathBuf {
+        self.directory.as_ref().unwrap().path().join("input.dmg")
+    }
+    fn mount_point(&self) -> PathBuf {
+        self.directory.as_ref().unwrap().path().join("mount")
+    }
+    fn mount(&mut self) -> Result<(), Error> {
+        // Authenticate the image before any filesystem in it is parsed.
+        verify_image(&self.file())?;
+        // `hdiutil attach` otherwise runs a full UDIF CRC32 pass before mounting
+        // (1.2-4.9 s for a 45 MB release image). The Developer ID signature just
+        // checked hashes every byte of the image with SHA-256 (one code-directory
+        // slot over the data and resource fork, the UDIF trailer in a special
+        // slot), so the CRC adds no integrity. The image is a private copy in a
+        // 0700 directory; it cannot change between the check and the attach.
+        // The copied app bundle is still authenticated in full afterwards.
+        run(
+            "mount_image",
+            "/usr/bin/hdiutil",
+            &[
+                "attach".as_ref(),
+                "-readonly".as_ref(),
+                "-nobrowse".as_ref(),
+                "-noautoopen".as_ref(),
+                "-noverify".as_ref(),
+                "-stdinpass".as_ref(),
+                "-mountpoint".as_ref(),
+                self.mount_point().as_os_str(),
+                self.file().as_os_str(),
+            ],
+        )?;
+        self.mounted = true;
+        Ok(())
+    }
+}
+impl Drop for Image {
     fn drop(&mut self) {
-        let _ = Command::new("/usr/bin/hdiutil")
+        let Some(directory) = self.directory.take() else {
+            return;
+        };
+        if !self.mounted {
+            return;
+        }
+        // `hdiutil detach` sometimes blocks ~10 s in the kernel although nothing
+        // reads the volume any more once the bundle is copied out. Detach in a
+        // separate process (it completes even if this process exits) and remove
+        // the image directory only after the volume is gone.
+        let child = Command::new("/usr/bin/hdiutil")
             .arg("detach")
             .arg("-force")
-            .arg(&self.0)
-            .output();
+            .arg(directory.path().join("mount"))
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+        let mut child = match child {
+            Ok(child) => child,
+            Err(error) => {
+                tracing::info!(step = "detach_image", %error, "local upgrade image left attached");
+                let _ = directory.keep();
+                return;
+            }
+        };
+        let detach = std::thread::spawn(move || {
+            let status = child.wait();
+            tracing::info!(step = "detach_image", ?status, "local upgrade");
+            if !status.is_ok_and(|status| status.success()) {
+                // Never remove through a mount that may still be attached.
+                let _ = directory.keep();
+            }
+        });
+        let mut pending = crate::node::lock(&DETACHING);
+        pending.retain(|detach| !detach.is_finished());
+        pending.push(detach);
+    }
+}
+/// The backend exits at the end of an install; finish pending detaches first so
+/// their image copies are removed.
+pub(super) fn wait_for_detach() {
+    let pending = std::mem::take(&mut *crate::node::lock(&DETACHING));
+    for detach in pending {
+        let _ = detach.join();
     }
 }
 pub(super) fn stage(path: &Path) -> Result<Staged, Error> {
-    tracing::info!(step = "stage_started", "local upgrade");
     if !path.extension().is_some_and(|e| e.eq_ignore_ascii_case("dmg")) {
         return Err(Error::WrongProduct);
     }
-    let destination = bundle()?;
+    stage_image(&bundle()?, |image| super::local::copy_input(path, image))
+}
+/// `fill` writes the DMG into the private image file and returns its length.
+pub(super) fn stage_image(destination: &Path, fill: impl FnOnce(&Path) -> Result<u64, Error>) -> Result<Staged, Error> {
+    tracing::info!(step = "stage_started", "local upgrade");
     // A sibling staging directory proves replacement access before any drain.
     // No privilege escalation or authorization dialog is attempted on macOS.
     let directory = tempfile::Builder::new()
@@ -169,26 +286,10 @@ pub(super) fn stage(path: &Path) -> Result<Staged, Error> {
         .tempdir_in(destination.parent().ok_or(Error::NotWritable)?)
         .map_err(|_| Error::NotWritable)?;
     fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).map_err(|_| Error::Storage)?;
-    let image = directory.path().join("input.dmg");
-    let length = super::local::copy_input(path, &image)?;
-    let mount = directory.path().join("mount");
-    fs::create_dir(&mount).map_err(|_| Error::Storage)?;
-    run(
-        "mount_image",
-        "/usr/bin/hdiutil",
-        &[
-            "attach".as_ref(),
-            "-readonly".as_ref(),
-            "-nobrowse".as_ref(),
-            "-noautoopen".as_ref(),
-            "-stdinpass".as_ref(),
-            "-mountpoint".as_ref(),
-            mount.as_os_str(),
-            image.as_os_str(),
-        ],
-    )?;
-    let mounted = Mount(mount.clone());
-    let source = mount.join("Oink.app");
+    let mut image = Image::new()?;
+    let length = fill(&image.file())?;
+    image.mount()?;
+    let source = image.mount_point().join("Oink.app");
     if fs::symlink_metadata(&source)
         .map_err(|_| Error::WrongProduct)?
         .file_type()
@@ -204,21 +305,19 @@ pub(super) fn stage(path: &Path) -> Result<Staged, Error> {
         "/usr/bin/ditto",
         &["--noqtn".as_ref(), source.as_os_str(), app.as_os_str()],
     )?;
-    drop(mounted);
-    fs::remove_file(image).map_err(|_| Error::Storage)?;
-    let info = app.join("Contents/Info.plist");
-    if plist(&info, "CFBundleIdentifier")? != oink_update::PRODUCT {
+    drop(image);
+    let info = plist(&app.join("Contents/Info.plist"))?;
+    if field(&info, "CFBundleIdentifier")? != oink_update::PRODUCT {
         return Err(Error::WrongProduct);
     }
-    let executable = plist(&info, "CFBundleExecutable")?;
-    if executable != "oink-backend" {
+    if field(&info, "CFBundleExecutable")? != "oink-backend" {
         return Err(Error::WrongProduct);
     }
     if !compatible_executable(&app.join("Contents/MacOS/oink-backend"))? {
         return Err(Error::WrongArchitecture);
     }
     verify_app(&app)?;
-    let version = plist(&info, "CFBundleGetInfoString").or_else(|_| plist(&info, "CFBundleShortVersionString"))?;
+    let version = field(&info, "CFBundleGetInfoString").or_else(|_| field(&info, "CFBundleShortVersionString"))?;
     // The app signature seals its report manifest, including source identity.
     let report: serde_json::Value = serde_json::from_slice(
         &fs::read(app.join("Contents/Resources/report-manifest.json")).map_err(|_| Error::CorruptPackage)?,
@@ -228,7 +327,7 @@ pub(super) fn stage(path: &Path) -> Result<Staged, Error> {
     let package = oink_update::local::Package {
         product: oink_update::PRODUCT.into(),
         version,
-        build: plist(&info, "CFBundleVersion")?
+        build: field(&info, "CFBundleVersion")?
             .parse()
             .map_err(|_| Error::CorruptPackage)?,
         architecture: architecture().into(),
@@ -265,27 +364,7 @@ pub(super) fn install(node: &Node, staged: Staged) -> Result<(), Error> {
         "local upgrade"
     );
     verify_app(&staged.path)?;
-    // Cancel a possible scheduled/cached Sparkle cycle without changing its
-    // feed policy. Wait for its ready-on-quit continuation to be disarmed before
-    // starting our own maintenance/shutdown; the normal update path is untouched.
-    let deadline = Instant::now() + Duration::from_secs(3);
-    loop {
-        let (done, wait) = std::sync::mpsc::sync_channel(1);
-        crate::backend::on_main(move || {
-            super::native::cancel();
-            let _ = done.send(super::native::quit_allowed());
-        });
-        if wait
-            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
-            .map_err(|_| Error::Busy)?
-        {
-            break;
-        }
-        if Instant::now() >= deadline {
-            return Err(Error::Busy);
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    wait_for_detach();
     tracing::info!(step = "prepare_maintenance", "local upgrade");
     let mut token = node.prepare_for_update().map_err(|_| Error::Busy)?;
     let destination = bundle()?;
@@ -609,6 +688,78 @@ mod tests {
         assert_eq!(read_notes(root.path()), Err(Error::CorruptPackage));
     }
     #[test]
+    fn unsigned_image_is_never_mounted_and_a_mounted_image_detaches_in_the_background() {
+        use std::os::unix::fs::MetadataExt;
+        let source = tempfile::tempdir().unwrap();
+        fs::create_dir(source.path().join("Oink.app")).unwrap();
+        let mut image = Image::new().unwrap();
+        let directory = image.directory.as_ref().unwrap().path().to_owned();
+        assert!(
+            Command::new("/usr/bin/hdiutil")
+                .args(["create", "-quiet", "-fs", "HFS+", "-format", "UDZO", "-srcfolder"])
+                .arg(source.path())
+                .arg(image.file())
+                .status()
+                .unwrap()
+                .success()
+        );
+        let device = |path: &Path| fs::metadata(path).unwrap().dev();
+        // A well-formed but unsigned image: mounting first would succeed.
+        assert_eq!(image.mount(), Err(Error::Signature));
+        assert!(!image.mounted);
+        assert_eq!(device(&image.mount_point()), device(&directory));
+        assert!(
+            Command::new("/usr/bin/hdiutil")
+                .args([
+                    "attach",
+                    "-quiet",
+                    "-readonly",
+                    "-nobrowse",
+                    "-noautoopen",
+                    "-mountpoint"
+                ])
+                .arg(image.mount_point())
+                .arg(image.file())
+                .stdin(std::process::Stdio::null())
+                .status()
+                .unwrap()
+                .success()
+        );
+        image.mounted = true;
+        assert_ne!(device(&image.mount_point()), device(&directory));
+        drop(image);
+        wait_for_detach();
+        assert!(!directory.exists());
+    }
+    #[test]
+    fn bundle_metadata_is_read_in_process_once() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("Info.plist");
+        let filler = "x".repeat(20 * 1024);
+        fs::write(
+            &path,
+            format!(
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>CFBundleIdentifier</key><string>com.hachiwii.oink</string>
+<key>CFBundleVersion</key><string>306002</string>
+<key>LSUIElement</key><true/>
+<key>Filler</key><string>{filler}</string>
+</dict></plist>"#
+            ),
+        )
+        .unwrap();
+        let info = plist(&path).unwrap();
+        assert_eq!(field(&info, "CFBundleIdentifier"), Ok("com.hachiwii.oink".into()));
+        assert_eq!(field(&info, "CFBundleVersion"), Ok("306002".into()));
+        assert_eq!(field(&info, "Filler"), Ok(filler));
+        assert_eq!(field(&info, "LSUIElement"), Err(Error::CorruptPackage));
+        fs::write(&path, b"damaged").unwrap();
+        assert_eq!(plist(&path), Err(Error::CorruptPackage));
+        assert_eq!(plist(&root.path().join("missing.plist")), Err(Error::CorruptPackage));
+    }
+    #[test]
     fn architecture_check_needs_no_developer_tool_or_process() {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("image");
@@ -674,8 +825,16 @@ mod tests {
         for app in [&baseline, &candidate] {
             verify_app(app).unwrap();
         }
-        let before = plist(&baseline.join("Contents/Info.plist"), "CFBundleVersion").unwrap();
-        let expected = plist(&candidate.join("Contents/Info.plist"), "CFBundleVersion").unwrap();
+        let before = field(
+            &plist(&baseline.join("Contents/Info.plist")).unwrap(),
+            "CFBundleVersion",
+        )
+        .unwrap();
+        let expected = field(
+            &plist(&candidate.join("Contents/Info.plist")).unwrap(),
+            "CFBundleVersion",
+        )
+        .unwrap();
         let root = tempfile::Builder::new()
             .suffix(".noindex")
             .tempdir_in(&evidence)
@@ -714,7 +873,10 @@ mod tests {
                 // This probe never opens LaunchServices or starts a UI/backend.
                 // Validate the real replacement at the production launch boundary.
                 verify_app(app)?;
-                assert_eq!(plist(&app.join("Contents/Info.plist"), "CFBundleVersion")?, expected);
+                assert_eq!(
+                    field(&plist(&app.join("Contents/Info.plist"))?, "CFBundleVersion")?,
+                    expected
+                );
                 assert_eq!(
                     std::os::unix::fs::MetadataExt::ino(&fs::metadata(app).unwrap()),
                     expected_inode

@@ -25,7 +25,7 @@ macro_rules! enum_schemas {
 dto_schemas! {
     ControlUnlockQuery,ControlUnlockReply,ControlSyncUnlock,    ControlPowerState,
     CloudLinkRequest,CloudLinkOffer,CloudLinkUnavailable,CloudLinkList,CloudLinkSelect,CloudLinkRead,NativeFileMetadata,WindowsFileDescriptor,MacPromiseGroup,MacPromiseControl,FulfilledRoot,
-    ControlLocalClick, ControlMovePointer, PointerShortcutSlots, PointerShortcutSlot,
+    ControlLocalClick, ControlMovePointer, PointerShortcutSlots, PointerShortcutSlot, DeviceOrder, DeviceOrderEntry,
     LocalOutputVolume,
     LayoutProfilesStateV3,LayoutProfileCatalogV3,LayoutProfileJoinCompletion,LayoutProfileJoinAppends,LayoutProfilesJoin,
     LayoutProfilesStateV2,LayoutProfileCatalogV2,LayoutProfileCatalog,LayoutProfile,LayoutProfileRecency,LayoutProfileDeviceState,LayoutPhysicalDevice,LayoutPhysicalScreen,

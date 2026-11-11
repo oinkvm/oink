@@ -16957,46 +16957,6 @@
       ]
     },
     {
-      "id": "native:Sparkle@2.9.6",
-      "name": "Sparkle",
-      "version": "2.9.6",
-      "ecosystem": "native",
-      "repository": "https://github.com/sparkle-project/Sparkle",
-      "source": {
-        "url": "https://github.com/sparkle-project/Sparkle/tree/ac2def288cbff5cfc7df3ffef6abdf45b72bcb0a",
-        "integrity": "git:ac2def288cbff5cfc7df3ffef6abdf45b72bcb0a"
-      },
-      "licenseExpression": "MIT AND BSD-2-Clause AND Zlib",
-      "selectedLicense": "MIT AND BSD-2-Clause AND Zlib",
-      "licenseFiles": [
-        {
-          "path": "licenses/texts/389a4e4e9a32f059775b13a06e25a591445ba229d2838d26dd3e7c0c45127cfe.txt",
-          "sha256": "389a4e4e9a32f059775b13a06e25a591445ba229d2838d26dd3e7c0c45127cfe"
-        }
-      ],
-      "modified": false,
-      "scope": [
-        "runtime"
-      ],
-      "platforms": [
-        "macos-arm64",
-        "macos-x64"
-      ],
-      "copyright": [
-        "Copyright (c) 2006-2013 Andy Matuschak.",
-        "Copyright (c) 2008-2010 Yuta Mori All Rights Reserved.",
-        "Copyright (c) 2009-2013 Elgato Systems GmbH.",
-        "Copyright (c) 2011 Mark Hamlin.",
-        "Copyright (c) 2011-2014 Kornel Lesiński.",
-        "Copyright (c) 2014 Big Nerd Ranch.",
-        "Copyright (c) 2014 C.W. Betts.",
-        "Copyright (c) 2014 Petroules Corporation.",
-        "Copyright (c) 2015 Orson Peters <orsonpeters@gmail.com>",
-        "Copyright (c) 2015-2017 Mayur Pawashe.",
-        "Copyright 2003-2005 Colin Percival"
-      ]
-    },
-    {
       "id": "native:VB-CABLE@45",
       "name": "VB-CABLE",
       "version": "45",

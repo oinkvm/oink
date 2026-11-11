@@ -2,24 +2,30 @@
 // meet Apple's Developer ID requirement; notarization is a separate requirement.
 #import <Foundation/Foundation.h>
 #import <Security/Security.h>
-static NSString *const identityRequirement=@"anchor apple generic and identifier \"com.hachiwii.oink\" and certificate leaf[subject.OU] = \"893V37X2CW\" and certificate 1[field.1.2.840.113635.100.6.2.6] exists and certificate leaf[field.1.2.840.113635.100.6.1.13] exists";
-static uint32_t verifyIdentity(const char *path, NSString *identity) {
+#define DEVELOPER_ID @"anchor apple generic and certificate leaf[subject.OU] = \"893V37X2CW\" and certificate 1[field.1.2.840.113635.100.6.2.6] exists and certificate leaf[field.1.2.840.113635.100.6.1.13] exists"
+static NSString *const identityRequirement=DEVELOPER_ID @" and identifier \"com.hachiwii.oink\"";
+// A signed disk image's identifier is its file name, so only the team is required.
+static NSString *const imageRequirement=DEVELOPER_ID;
+static uint32_t verifyIdentity(const char *path, NSString *identity, BOOL bundle) {
     @autoreleasepool {
         NSURL *url=[NSURL fileURLWithPath:[NSString stringWithUTF8String:path]];
         SecStaticCodeRef code=NULL; SecRequirementRef requirement=NULL;
         CFDictionaryRef info=NULL;
         uint32_t result=1;
         NSNumber *flags=nil;
+        SecCSFlags validity=bundle ? kSecCSCheckAllArchitectures|kSecCSStrictValidate : kSecCSStrictValidate;
         if (SecStaticCodeCreateWithPath((__bridge CFURLRef)url,kSecCSDefaultFlags,&code)!=errSecSuccess) goto done;
         if (SecRequirementCreateWithString((__bridge CFStringRef)identity,kSecCSDefaultFlags,&requirement)!=errSecSuccess) goto done;
-        if (SecStaticCodeCheckValidity(code,kSecCSCheckAllArchitectures|kSecCSCheckNestedCode|kSecCSStrictValidate,requirement)!=errSecSuccess) goto done;
+        if (SecStaticCodeCheckValidity(code,validity|(bundle ? kSecCSCheckNestedCode : 0),requirement)!=errSecSuccess) goto done;
         CFRelease(requirement); requirement=NULL;
-        if (SecCodeCopySigningInformation(code,kSecCSSigningInformation,&info)!=errSecSuccess) goto done;
-        flags=(__bridge NSNumber *)CFDictionaryGetValue(info,kSecCodeInfoFlags);
-        if (!(flags.unsignedIntValue & kSecCodeSignatureRuntime)) goto done;
+        if (bundle) {
+            if (SecCodeCopySigningInformation(code,kSecCSSigningInformation,&info)!=errSecSuccess) goto done;
+            flags=(__bridge NSNumber *)CFDictionaryGetValue(info,kSecCodeInfoFlags);
+            if (!(flags.unsignedIntValue & kSecCodeSignatureRuntime)) goto done;
+        }
         result=2;
         if (SecRequirementCreateWithString(CFSTR("notarized"),kSecCSDefaultFlags,&requirement)!=errSecSuccess) goto done;
-        if (SecStaticCodeCheckValidity(code,kSecCSCheckAllArchitectures|kSecCSStrictValidate,requirement)!=errSecSuccess) goto done;
+        if (SecStaticCodeCheckValidity(code,validity,requirement)!=errSecSuccess) goto done;
         result=0;
     done:
         if (info) CFRelease(info);
@@ -29,7 +35,27 @@ static uint32_t verifyIdentity(const char *path, NSString *identity) {
     }
 }
 
-uint32_t oink_local_verify_app(const char *path) {return verifyIdentity(path,identityRequirement);}
+uint32_t oink_local_verify_app(const char *path) {return verifyIdentity(path,identityRequirement,YES);}
+uint32_t oink_local_verify_image(const char *path) {return verifyIdentity(path,imageRequirement,NO);}
+// Top-level string values of a property list as a JSON object (other value
+// types are omitted). Returns the JSON length, -1 on failure; the caller
+// retries with a larger buffer when the length exceeds its capacity.
+long oink_local_plist_strings(const char *path,char *buffer,size_t capacity) {
+    @autoreleasepool {
+        NSData *data=[NSData dataWithContentsOfFile:[NSString stringWithUTF8String:path]];
+        id plist=data ? [NSPropertyListSerialization propertyListWithData:data options:NSPropertyListImmutable format:NULL error:NULL] : nil;
+        if (![plist isKindOfClass:NSDictionary.class]) return -1;
+        NSMutableDictionary *strings=[NSMutableDictionary dictionary];
+        for (id key in (NSDictionary *)plist) {
+            id value=((NSDictionary *)plist)[key];
+            if ([key isKindOfClass:NSString.class] && [value isKindOfClass:NSString.class]) strings[key]=value;
+        }
+        NSData *json=[NSJSONSerialization dataWithJSONObject:strings options:0 error:NULL];
+        if (!json) return -1;
+        if (json.length<=capacity) memcpy(buffer,json.bytes,json.length);
+        return (long)json.length;
+    }
+}
 
 #import <AppKit/AppKit.h>
 #import <objc/runtime.h>

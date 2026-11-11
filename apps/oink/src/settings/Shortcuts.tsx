@@ -4,7 +4,7 @@ import { useEffect, useRef, useState } from 'react';
 import type { KeyboardEvent as ReactKeyboardEvent } from 'react';
 import { VisuallyHidden, animate } from 'oink-ui';
 import type { Platform } from '../window/DesktopWindow';
-export type ShortcutId = 'openWindow' | 'keyboardRelease' | 'remoteWindowsLock' | 'microphoneMute' | 'recall' | 'lock' | 'lockEscape' | 'pauseSelf' | 'pauseAll' | 'game' | `move:${string}`;
+export type ShortcutId = 'openWindow' | 'keyboardRelease' | 'remoteWindowsLock' | 'microphoneMute' | 'recall' | 'pointerNext' | 'lock' | 'lockEscape' | 'pauseSelf' | 'pauseAll' | 'game' | `move:${string}`;
 export interface ShortcutPref {
     on: boolean;
     keys: string;
@@ -33,6 +33,9 @@ export const SHORTCUTS: Array<{
         }, get desc() {
             return tr('把指针从其他设备拉回本机屏幕中央');
         }, get keywords() { return tr('光标 鼠标 拉回 回来'); } },
+    { id: 'pointerNext', get label() { return tr('切换指针位置'); },
+      get desc() { return tr('把指针移动到在线列表中的下一台设备'); },
+      get keywords() { return tr('光标 鼠标 下一台 切换 循环'); } },
     { id: 'lock', get label() {
             return tr('锁定/解锁指针到当前设备');
         }, get desc() {
@@ -55,9 +58,9 @@ export const SHORTCUTS: Array<{
       get desc() { return tr('切换设备组共享麦克风的静音状态'); },
       get keywords() { return tr('麦克风 静音'); } },
     { id: 'game', get label() {
-            return tr('当前设备的游戏模式');
+            return tr('切换游戏模式');
         }, get desc() {
-            return tr('在开启和关闭之间切换当前设备的游戏模式');
+            return tr('切换指针所在设备游戏模式开关');
         }, get keywords() { return tr('游戏 手柄 3D'); } },
 ];
 export const DEFAULT_SHORTCUTS: Record<ShortcutId, ShortcutPref> = {
@@ -66,13 +69,14 @@ export const DEFAULT_SHORTCUTS: Record<ShortcutId, ShortcutPref> = {
     remoteWindowsLock: { on: true, keys: 'Meta+Shift+L' },
     microphoneMute: { on: false, keys: 'Control+Alt+M' },
     recall: { on: true, keys: 'Control+Alt+H' },
+    pointerNext: { on: false, keys: 'Control+Alt+N' },
     lock: { on: true, keys: 'Control+Alt+L' },
     lockEscape: { on: true, keys: 'Alt' },
     pauseSelf: { on: true, keys: 'Control+Alt+P' },
     pauseAll: { on: true, keys: 'Control+Alt+Shift+P' },
     game: { on: true, keys: 'Control+Alt+G' },
 };
-const actions = {open_window:'openWindow',lock_remote_windows:'remoteWindowsLock',toggle_microphone_mute:'microphoneMute',return_pointer_home:'recall',lock_focus:'lock',lock_escape:'lockEscape',toggle_sharing:'pauseSelf',pause_all:'pauseAll',toggle_game_mode:'game'} as const;
+const actions = {open_window:'openWindow',lock_remote_windows:'remoteWindowsLock',toggle_microphone_mute:'microphoneMute',return_pointer_home:'recall',move_pointer_next:'pointerNext',lock_focus:'lock',lock_escape:'lockEscape',toggle_sharing:'pauseSelf',pause_all:'pauseAll',toggle_game_mode:'game'} as const;
 export function shortcutId(h: import('../api/types').Hotkey): ShortcutId | undefined {
     return h.action === 'move_pointer_to' && h.device ? `move:${h.device}` : actions[h.action as keyof typeof actions];
 }

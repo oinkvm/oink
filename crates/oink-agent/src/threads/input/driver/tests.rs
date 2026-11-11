@@ -348,11 +348,14 @@ fn coalesced_motion_keeps_latest_source_time_and_button_barrier_order() {
     drain(&mut read);
     h.driver.budget.consume(h.driver.now);
     h.driver.budget.consume(h.driver.now);
-    for (seq, time) in [(1, 100), (2, 200)] {
-        h.driver.input_time = Some(CaptureTime(time));
-        h.driver
-            .send(peer(), Message::Input(InputMsg::Motion { seq, dx: 1., dy: 2. }));
-    }
+    let marked = crate::usage_days::captured(|| {
+        for (seq, time) in [(1, 100), (2, 200)] {
+            h.driver.input_time = Some(CaptureTime(time));
+            h.driver
+                .send(peer(), Message::Input(InputMsg::Motion { seq, dx: 1., dy: 2. }));
+        }
+    });
+    assert_eq!(marked, [crate::usage_days::Feature::KeyboardMouse]);
     assert!(drain(&mut read).is_empty());
     h.driver.input_time = Some(CaptureTime(300));
     h.driver.send(
@@ -430,13 +433,19 @@ fn input_timestamps_never_cross_the_outgoing_origins_clock_domain() {
     // A received event can trigger a local modifier snapshot or release. Its
     // timestamp belongs to the remote source, not to this outgoing plain input.
     h.driver.input_time = Some(CaptureTime(1_200_000_000));
-    h.driver
-        .send_from(peer(), Message::Input(local_input.clone()), Some(peer()));
-    // Conversely, a local capture can release another origin's forwarded key.
-    h.driver.send_from(peer(), Message::Input(forwarded.clone()), None);
-    // A genuine relay must preserve the matching remote source timestamp.
-    h.driver
-        .send_from(peer(), Message::Input(forwarded.clone()), Some(peer()));
+    let marked = crate::usage_days::captured(|| {
+        h.driver
+            .send_from(peer(), Message::Input(local_input.clone()), Some(peer()));
+        // Conversely, a local capture can release another origin's forwarded key.
+        h.driver.send_from(peer(), Message::Input(forwarded.clone()), None);
+        // A genuine relay must preserve the matching remote source timestamp.
+        h.driver
+            .send_from(peer(), Message::Input(forwarded.clone()), Some(peer()));
+    });
+    assert!(
+        marked.is_empty(),
+        "relays and foreign-origin releases are not this device's use"
+    );
     assert_eq!(
         drain(&mut read),
         vec![
@@ -3443,4 +3452,87 @@ fn local_unlock_admission_survives_focus_leaving_before_first_character() {
     h.driver.command(InputCommand::MovePointerTo(peer()));
     release.send(()).unwrap();
     assert!(result.recv_timeout(Duration::from_secs(1)).unwrap().is_ok());
+}
+
+#[test]
+fn only_a_remote_drop_of_this_devices_drag_marks_drag_use() {
+    use crate::usage_days::{Feature, captured};
+    use oink_foundation::content::{ClipId, Holder, OfferId};
+    use oink_routing::dnd::{DND_SEQ_BIT, SourceAction};
+    let mut h = Harness::new();
+    let (_reader, _) = h.outbound(1);
+    let (writer, _) = h.inbound(1);
+    opening(&writer, &remote(), true);
+    h.attach();
+    let source = |origin, action| {
+        Message::Dnd(DndMsg::Source {
+            offer: OfferId {
+                clip: ClipId {
+                    origin,
+                    seq: DND_SEQ_BIT | 1,
+                },
+                generation: 1,
+            },
+            holder: Holder {
+                device: peer(),
+                epoch: 1,
+            },
+            action,
+            cancel_at: None,
+        })
+    };
+    let local = h.driver.local;
+    assert!(captured(|| h.driver.message(peer(), source(local, SourceAction::Cancel))).is_empty());
+    assert!(captured(|| h.driver.message(peer(), source(peer(), SourceAction::StartDelivery))).is_empty());
+    assert_eq!(
+        captured(|| h.driver.message(peer(), source(local, SourceAction::StartDelivery))),
+        [Feature::Drag]
+    );
+}
+
+#[test]
+fn only_injected_remote_captured_input_marks_keyboard_mouse_use() {
+    use crate::usage_days::{Feature, captured};
+    use oink_foundation::input::KeyCode;
+    let backend = Arc::new(oink_test_support::input::FakeInput::new());
+    let mut h = Harness::with_backend(backend.clone());
+    let (_reader, _datagrams) = h.outbound(1);
+    let (writer, _motion) = h.inbound(1);
+    opening(&writer, &remote(), true);
+    h.attach();
+    let entered = captured(|| {
+        h.driver.message(
+            peer(),
+            Message::Control(ControlMsg::FocusEnter {
+                epoch: 2,
+                display: "screen".into(),
+                pos: oink_foundation::Point::new(5., 5.),
+                scope: Some(input_scope(&h.driver)),
+                pointer_source: Some(peer()),
+            }),
+        )
+    });
+    assert!(entered.is_empty(), "focus entry alone is not input");
+    let key = |pressed| InputMsg::Key {
+        code: KeyCode::keyboard(4),
+        pressed,
+    };
+    let start = h.driver.start;
+    let timed = Message::TimedInput {
+        time: CaptureTime(7),
+        input: key(true),
+    };
+    assert_eq!(
+        captured(|| h.driver.received(peer(), timed, start, false)),
+        [Feature::KeyboardMouse]
+    );
+    while !backend
+        .take_injected()
+        .iter()
+        .any(|event| matches!(event, InjectEvent::Key { pressed: true, .. }))
+    {
+        std::thread::yield_now();
+    }
+    // Untimed input is never a peer's capture (router-made releases and syncs).
+    assert!(captured(|| h.driver.message(peer(), Message::Input(key(false)))).is_empty());
 }

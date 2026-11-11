@@ -1,10 +1,12 @@
 import { useEffect, useState } from 'react';
-import { Button, Switch } from 'oink-ui';
+import { Button, Segmented, Switch, toast } from 'oink-ui';
+import { ApiFailure } from '../api/transport';
 import { api, shell } from '../api/client';
 import { openUpdateDialog } from '../window/Upgrade';
 import { agent } from '../api/store';
-import type { UpdatePreferences as Preferences, UpdateStatus } from '../api/update';
-import { tr } from '../i18n';
+import { preferencesWith } from '../api/update';
+import type { UpdateChannel as Channel, UpdatePreferences as Preferences, UpdateStatus } from '../api/update';
+import { problemText, tr } from '../i18n';
 
 const RELEASES='https://github.com/oinkvm/oink/releases';
 
@@ -40,7 +42,7 @@ export function UpdateCheck({status,open}:{status:UpdateStatus|null;open:boolean
     catch{setChecking(false);setResult('failed');}
   };
   return <span className="setp__btns">
-    {result&&<span className="setp__size" role="status" data-update-result="">{tr(result==='current'?'已是最新版本':'更新失败')}</span>}
+    {result&&<span className="setp__size" role="status" data-update-result="">{tr(result==='current'?'已是最新版本':'查询新版本失败')}</span>}
     <Button size="sm" loading={checking} disabled={checking} onClick={()=>{void check();}}>{tr('检查更新')}</Button>
   </span>;
 }
@@ -57,11 +59,25 @@ export function UpdatePreferences({status,label}:{status:UpdateStatus|null;label
     if (disabled) return;
     setPending(true);
     try {
-      await agent.query('update',()=>api.update({type:'set_preferences',preferences:{
-        checks_enabled:status.checks_enabled,...patch,
-      }}));
+      await agent.query('update',()=>api.update({type:'set_preferences',preferences:preferencesWith(status,patch)}));
     } catch { agent.fail('unavailable'); }
     finally { setPending(false); }
   };
   return <Switch aria-label={label} checked={status.checks_enabled} disabled={disabled} onChange={checks_enabled=>{void save({checks_enabled});}}/>;
+}
+
+/** Settings → Update channel. Beta also offers stable releases; leaving it never downgrades. */
+export function UpdateChannel({status,label}:{status:UpdateStatus|null;label:string}) {
+  const [pending,setPending] = useState(false);
+  if (!status || manualUpdates(status)) return null;
+  const save = async (channel:Channel) => {
+    setPending(true);
+    try { await agent.query('update',()=>api.update({type:'set_preferences',preferences:preferencesWith(status,{update_channel:channel})})); }
+    catch(error) { toast.danger({title:problemText(error instanceof ApiFailure?error.problem.code:'backend_failed')}); }
+    finally { setPending(false); }
+  };
+  return <Segmented<Channel> size="sm" aria-label={label} value={status.channel} disabled={pending||!status.can_change_policy} onChange={channel=>{void save(channel);}} options={[
+    {value:'stable',get label(){return tr('正式版');}},
+    {value:'beta',get label(){return tr('测试版');}},
+  ]}/>;
 }

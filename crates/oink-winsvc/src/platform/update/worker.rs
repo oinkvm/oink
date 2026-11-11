@@ -2,7 +2,9 @@ use super::super::{Handle, check, security, token, wide};
 use super::*;
 use base64::{Engine, engine::general_purpose::STANDARD};
 use oink_update::{
-    feed,
+    catalog::{self, Check, Expected, Kind},
+    feed::{self, Channel},
+    fetch,
     transaction::{self, InstallOutcome, Journal, Platform, Stage},
     trust::{LocalRoots, Roots},
 };
@@ -222,6 +224,7 @@ pub(super) fn prepare_package(
     candidate: feed::Release,
     previous: Option<feed::Release>,
     envelope: &[u8],
+    channel: Channel,
     roots: &PackageTrust,
     local: bool,
 ) -> Result<PreparedPackage, Error> {
@@ -285,7 +288,7 @@ pub(super) fn prepare_package(
     }
     let previous_msi = previous_directory.join("package.msi");
     if !local && !previous_msi.exists() && !previous.package.url.is_empty() {
-        let bytes = service::http(&previous.package.url, previous.package.length, true)?;
+        let bytes = fetch::get(&previous.package.url, previous.package.length, true, &mut |_, _| {})?;
         feed::verify_package(&bytes, &previous.package, &roots.feed()?)?;
         protected::write(&previous_msi, &bytes)?;
         protected::write(&previous_directory.join("release.json"), &json(&previous)?)?;
@@ -336,6 +339,7 @@ pub(super) fn prepare_package(
     Ok(PreparedPackage {
         transaction: tx,
         local,
+        channel,
         rollback_package,
         candidate,
         previous,
@@ -348,6 +352,7 @@ pub(super) fn prepare_package(
 pub(super) struct PreparedPackage {
     pub transaction: String,
     local: bool,
+    channel: Channel,
     rollback_package: bool,
     candidate: feed::Release,
     previous: feed::Release,
@@ -398,6 +403,7 @@ pub(super) fn stage(prepared: &PreparedPackage, sessions: Vec<Session>) -> Resul
         local: prepared.local,
         rollback_package: prepared.rollback_package,
         transaction: tx.clone(),
+        channel: prepared.channel,
         candidate: prepared.candidate.clone(),
         previous: prepared.previous.clone(),
         candidate_inventory: prepared.candidate_inventory.clone(),
@@ -593,21 +599,14 @@ impl Worker {
             }
             return Ok(());
         }
-        let manifest = feed::verify_manifest(
+        catalog_admits(
             &protected::read(&self.directory.join("manifest.json"), feed::MAX_FEED as u64)?,
             &self.roots.feed()?,
-            &machine.watermarks.get("stable").cloned().unwrap_or_default(),
+            &self.plan,
+            &machine,
+            windows_build()?,
             now(),
-        )?;
-        feed::verify_version(&self.plan.candidate.version, &self.plan.previous.version)?;
-        if !manifest.manifest().releases.contains(&self.plan.candidate)
-            || self.plan.candidate.architecture != "x64"
-            || self.plan.candidate.build <= self.plan.previous.build.max(machine.successful_build)
-            || machine.quarantine.contains(&self.plan.candidate.build)
-        {
-            return Err(Error::Policy);
-        }
-        Ok(())
+        )
     }
     fn save(&self, journal: &Journal) -> Result<(), Error> {
         protected::write(
@@ -1046,6 +1045,50 @@ impl Platform for Worker {
         }
         Ok(())
     }
+}
+/// The stored catalog bytes still verify and still route the installed build
+/// to exactly this candidate, which must not be a manual-only update.
+fn catalog_admits(
+    bytes: &[u8],
+    trust: &feed::Trust<'_>,
+    plan: &Plan,
+    machine: &MachinePolicy,
+    windows_build: u32,
+    now: i64,
+) -> Result<(), Error> {
+    let expected = Expected {
+        platform: catalog::Platform::Windows,
+        architecture: ARCH,
+        channel: plan.channel,
+    };
+    let seen = machine
+        .watermarks
+        .get(&catalog_watermark(plan.channel))
+        .cloned()
+        .unwrap_or_default();
+    let verified = catalog::verify(bytes, trust, &expected, &seen, now)?;
+    feed::verify_version(&plan.candidate.version, &plan.previous.version)?;
+    let selected = verified
+        .plan(&catalog::Selection {
+            installed_build: plan.previous.build,
+            successful_build: machine.successful_build,
+            quarantine: &machine.quarantine,
+            channel: plan.channel,
+            os: os_version(windows_build),
+            // The user chose this candidate; skipping only hides offers.
+            skipped_build: None,
+            check: Check::Manual,
+        })
+        .map_err(|_| Error::Policy)?;
+    if selected.kind == Kind::Manual
+        || transaction_release(&selected.release)? != plan.candidate
+        || plan.candidate.architecture != ARCH
+        || plan.candidate.build <= plan.previous.build.max(machine.successful_build)
+        || machine.quarantine.contains(&plan.candidate.build)
+    {
+        return Err(Error::Policy);
+    }
+    Ok(())
 }
 fn cache_verified_package(
     directory: &Path,
@@ -1588,6 +1631,67 @@ mod tests {
         });
         assert_eq!(local.pins(), ["a".repeat(64)]);
         assert!(matches!(local.feed(), Err(Error::Policy)));
+    }
+    #[test]
+    fn install_reverifies_that_the_stored_catalog_still_routes_to_the_candidate() {
+        use super::super::test_catalog as fixture;
+        let public = fixture::public();
+        let trust = fixture::trust(&public);
+        let catalog = fixture::verified(&fixture::payload(), Channel::Beta).unwrap();
+        let release =
+            |build| transaction_release(catalog.catalog().releases.iter().find(|r| r.build == build).unwrap()).unwrap();
+        let inventory = |build| msi::Inventory {
+            product_code: "{01234567-89AB-CDEF-0123-456789ABCDEF}".into(),
+            build,
+            hashes: BTreeMap::new(),
+        };
+        let plan = |candidate| Plan {
+            schema: 1,
+            local: false,
+            rollback_package: true,
+            transaction: "0".repeat(32),
+            channel: Channel::Beta,
+            candidate: release(candidate),
+            previous: release(305001),
+            candidate_inventory: inventory(candidate),
+            previous_inventory: inventory(305001),
+            sessions: vec![],
+            reboot_marker_armed: false,
+            lock_handle: String::new(),
+            worker_pid: 0,
+            worker_created_filetime: String::new(),
+            worker_sha256: String::new(),
+        };
+        let bytes = fixture::envelope(&fixture::payload());
+        let admits = |bytes: &[u8], plan: &Plan, machine: &MachinePolicy| {
+            catalog_admits(bytes, &trust, plan, machine, 26200, fixture::NOW)
+        };
+        let machine = MachinePolicy::default();
+        assert_eq!(admits(&bytes, &plan(307001), &machine), Ok(()));
+        // The catalog routes this installation to another build.
+        assert_eq!(admits(&bytes, &plan(306002), &machine), Err(Error::Policy));
+        let mut stable = plan(307001);
+        stable.channel = Channel::Stable;
+        assert_eq!(admits(&bytes, &stable, &machine), Err(Error::Policy));
+        let mut quarantined = MachinePolicy::default();
+        quarantined.quarantine.insert(307001);
+        assert_eq!(admits(&bytes, &plan(307001), &quarantined), Err(Error::Policy));
+        let mut newer = MachinePolicy::default();
+        newer.watermarks.insert(
+            catalog_watermark(Channel::Beta),
+            feed::Watermark {
+                sequence: 6,
+                payload_sha256: String::new(),
+                last_verified_unix: 0,
+            },
+        );
+        assert_eq!(admits(&bytes, &plan(307001), &newer), Err(Error::Replay));
+        let mut manual = fixture::payload();
+        manual["rules"] = serde_json::json!([{"installed":[0,2147483647],"kind":"manual","target":"latest"}]);
+        assert_eq!(
+            admits(&fixture::envelope(&manual), &plan(307001), &machine),
+            Err(Error::Policy)
+        );
     }
     #[test]
     fn committed_candidate_inventory_survives_for_rollback_without_another_msi_inspection() {

@@ -46,7 +46,7 @@ export interface Prefs {
     keyCustomTouched: Record<Platform, boolean>;
     capsSplit: boolean;
     allowFnMapping: boolean;
-    pollLimit: '125' | 'none';
+    pollLimit: '125' | '250' | '500' | 'none';
     scrollInvert: boolean;
     forwardWheelByLines: boolean;
     pointerGain: number;

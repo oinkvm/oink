@@ -4,7 +4,6 @@ use super::*;
 use crate::api::{DeviceKey, GroupKey};
 use oink_protocol::v1::{RawValue, dto, schema::WireDto};
 use std::{cell::OnceCell, collections::BTreeMap, sync::Arc};
-use unicode_casefold::UnicodeCaseFold;
 
 #[derive(Clone, Debug)]
 pub struct CardMember {
@@ -20,6 +19,8 @@ pub struct CardMember {
     pub facts: Option<Arc<dto::DeviceFacts>>,
     /// Negotiated logical end-to-end capabilities, never a relay's capabilities.
     pub capabilities: Vec<String>,
+    /// Group-wide device list order; None before the register lists this member.
+    pub order: Option<i64>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -71,6 +72,7 @@ impl CardInputs {
                     && a.last_seen_ms == b.last_seen_ms
                     && a.live_boot == b.live_boot
                     && a.capabilities == b.capabilities
+                    && a.order == b.order
                     && match (&a.facts, &b.facts) {
                         (None, None) => true,
                         (Some(a), Some(b)) => {
@@ -144,14 +146,16 @@ impl Projector {
         }
         self.previous_input = Some(input.clone());
         let names: BTreeMap<_, _> = input.members.iter().map(|m| (m.device, m.name.clone())).collect();
+        let order: BTreeMap<_, _> = input.members.iter().map(|m| (m.device, m.order)).collect();
         let mut cards: Vec<_> = input.members.iter().map(|m| self.card(input, m, &names)).collect();
-        cards.sort_by_cached_key(|card| {
+        cards.sort_by_key(|card| {
             let section = match card.section {
                 CardSection::ThisDevice => 0,
                 CardSection::Online => 1,
                 CardSection::Offline => 2,
             };
-            (section, card.name.case_fold().collect::<String>(), card.device)
+            let order = order.get(&card.device).copied().flatten();
+            (section, order.is_none(), order, card.device)
         });
         let mut next = DeviceCardsView {
             schema: 1,
@@ -1005,6 +1009,7 @@ mod tests {
             live_boot: Some([id; 16]),
             facts: None,
             capabilities: vec!["oink.device-options/1".into(), "oink.device-resources/1".into()],
+            order: None,
         }
     }
     fn inputs(members: Vec<CardMember>) -> CardInputs {
@@ -1359,21 +1364,37 @@ mod tests {
         assert_eq!(view.cards[1].status.as_ref().unwrap().game.active, Some(true));
     }
     #[test]
-    fn unicode_order_and_offline_rows_do_not_depend_on_latency_or_cached_facts() {
+    fn group_order_sorts_each_section_and_offline_rows_do_not_depend_on_latency_or_cached_facts() {
         let mut offline = row(9, "first", false);
         offline.facts = Some(facts(&offline, 0));
+        offline.order = Some(-5);
+        let ordered = |id, name, order| CardMember {
+            order,
+            ..row(id, name, true)
+        };
         let mut input = inputs(vec![
-            row(3, "Straße", true),
+            ordered(3, "a", Some(0)),
             offline,
-            row(1, "self", true),
-            row(2, "STRASSE", true),
+            ordered(1, "self", Some(7)),
+            ordered(2, "z", Some(0)),
+            ordered(4, "b", None),
+            ordered(5, "c", Some(-1)),
         ]);
         let mut projector = Projector::new().unwrap();
         let view = projector.update(&input, 10).unwrap();
+        // Section first, then order (ties by device id), unlisted members last; names never sort.
         assert_eq!(
             view.cards.iter().map(|c| c.device.0.0[0]).collect::<Vec<_>>(),
-            vec![1, 2, 3, 9]
+            vec![1, 5, 2, 3, 4, 9]
         );
+        input.members[0].order = Some(-2);
+        let moved = projector.update(&input, 10).unwrap();
+        assert_eq!(
+            moved.cards.iter().map(|c| c.device.0.0[0]).collect::<Vec<_>>(),
+            vec![1, 3, 5, 2, 4, 9]
+        );
+        input.members.truncate(4);
+        let view = projector.update(&input, 10).unwrap();
         assert!(view.cards[3].status.is_none() && view.cards[3].pause.is_none());
         assert_eq!(view.cards[3].last_seen_ms, Some(123));
         for reason in [

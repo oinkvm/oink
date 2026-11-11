@@ -20,7 +20,6 @@ import package_notes
 from payload import copy_notices
 from report_manifest import write_manifest, image_identity
 from signing import private_run, select_identity, notarize, staple_and_validate, awake_for_signing
-from sparkle import prepare as prepare_sparkle, VERSION as SPARKLE_VERSION, SHA256 as SPARKLE_SHA256
 from localizations import DECLARATIONS, STRINGS, write_localizations
 from macos_imports import verify_imports
 from macos_launch_smoke import launch_smoke
@@ -83,7 +82,7 @@ def main():
     p.add_argument('--notary-profile', default=os.environ.get('NOTARY_PROFILE'))
     p.add_argument('--notary-timeout', type=int, default=300)
     p.add_argument('--notary-keychain', type=Path, help='Optional non-default keychain containing the notary profile')
-    p.add_argument('--sparkle-cache', type=Path)
+    p.add_argument('--tool-cache', type=Path, required=True, help='Pinned packaging tools (dmgbuild)')
     a = p.parse_args()
     native_arch = 'x86_64' if a.arch == 'x64' else 'arm64'
     if not re.fullmatch(r'[0-9a-f]{64}', a.source_tree_sha256) or not 1 <= a.build < 2**31:
@@ -96,20 +95,16 @@ def main():
         p.error(str(error))
     trust = json.loads((ROOT / 'packaging/update-trust.json').read_text())
     if trust['mac']['enabled'] and not trust['mac']['public_key']:
-        p.error('enabled Mac updates require the compiled Sparkle public key')
-    a.sparkle_public_key = trust['mac']['public_key']
+        p.error('enabled Mac updates require the compiled Mac update public key')
+    a.update_public_key = trust['mac']['public_key']
     a.identity = select_identity(a.team, a.signing_fingerprint)
     provenance = verify(a.binaries, a.source_tree_sha256, a.version, ('aarch64-apple-darwin' if a.arch == 'arm64' else 'x86_64-apple-darwin'), a.build, a.source_commit)
-    if not a.sparkle_cache:
-        p.error('the Mac package requires Sparkle.framework')
-    if bool(a.sparkle_cache) != provenance.get('sparkle', False):
-        p.error('Sparkle feature and embedded framework must match the binary build')
-    if a.sparkle_public_key:
+    if a.update_public_key:
         try:
-            if len(base64.b64decode(a.sparkle_public_key, validate=True)) != 32:
+            if len(base64.b64decode(a.update_public_key, validate=True)) != 32:
                 raise ValueError('wrong length')
         except ValueError:
-            p.error('Sparkle Ed25519 public key must be base64 for exactly 32 bytes')
+            p.error('Mac update Ed25519 public key must be base64 for exactly 32 bytes')
     a.output = a.output.resolve()
     a.output.mkdir(parents=True, exist_ok=True)
     app = a.output / 'staging.noindex' / I['macos']['app']
@@ -147,20 +142,14 @@ def main():
     info.update(STRINGS['en'])
     write_localizations(app, permissions=True)
     info[I['macos']['app_group_key']] = group
-    if a.sparkle_cache:
-        info.update(SUVerifyUpdateBeforeExtraction=True, SURequireSignedFeed=True, SUSignedFeedFailureExpirationInterval=0,
-                    SUEnableJavaScript=False, SUEnableSystemProfiling=False, SUEnableAutomaticChecks=trust['mac']['enabled'],
-                    SUAutomaticallyUpdate=False)
-        if a.sparkle_public_key:
-            info['SUPublicEDKey'] = a.sparkle_public_key
-        else:
-            print('Automatic updates are disabled; no Sparkle public key is configured.')
-        framework = app / 'Contents/Frameworks/Sparkle.framework'
-        framework.parent.mkdir()
-        shutil.copytree(prepare_sparkle(a.sparkle_cache) / 'Sparkle.framework', framework, symlinks=True)
-        load_commands = run('otool', '-l', mac / b['backend'], capture_output=True, text=True).stdout
-        if '@executable_path/../Frameworks' not in load_commands:
-            raise RuntimeError('Sparkle backend is missing the required Frameworks rpath')
+    # The app has no Sparkle; it downloads signed DMGs itself (v2 catalogs).
+    # Clients up to 0.3.5 still install this bundle with their own Sparkle from
+    # the v1 appcast ZIP. Keeping the unchanged Mac update key here makes that a
+    # same-key update for them, and the v1 publisher checks it.
+    if a.update_public_key:
+        info['SUPublicEDKey'] = a.update_public_key
+    else:
+        print('Automatic updates are disabled; no Mac update public key is configured.')
     notes_file = a.update_notes_file or a.output / 'embedded-update-notes.json'
     if a.update_notes_file:
         package_notes.read(notes_file, a.build, a.source_commit, ROOT)
@@ -293,10 +282,9 @@ def main():
         record = dict(schema=1, product=I['name'], version=a.version, source_commit=a.source_commit, build=a.build, provenance='source-tree', source_tree_sha256=a.source_tree_sha256,
                       architecture=a.arch, minimum_os=I['macos_minimum'], protocol_baseline=1,
                       signing='developer-id', notarization='see detached release record',
-                      update_policy='sparkle' if trust['mac']['enabled'] else 'manual-only')
-        record['sparkle'] = dict(included=bool(a.sparkle_cache), version=SPARKLE_VERSION if a.sparkle_cache else None,
-                                archive_sha256=SPARKLE_SHA256 if a.sparkle_cache else None,
-                                public_key_configured=bool(a.sparkle_public_key))
+                      update_policy='feed-v2' if trust['mac']['enabled'] else 'manual-only')
+        # The v1 appcast ZIP below is signed with the same key for <=0.3.5 clients.
+        record['sparkle'] = dict(included=False, public_key_configured=bool(a.update_public_key))
         (resources / I['metadata_file']).write_text(json.dumps(record, indent=2) + '\n')
         record['report_manifest'] = report
         # Include native Swift code and all embedded framework images. Fail
@@ -309,26 +297,6 @@ def main():
                 if entitlements:
                     args += ['--entitlements', str(entitlements)]
                 private_run(*args, path)
-            if a.sparkle_cache:
-                # Sparkle's XPC services retain their upstream sandbox entitlements
-                # and identifiers while all code is re-signed by the app's team.
-                for path in sorted(framework.rglob('*'), key=lambda p: len(p.parts), reverse=True):
-                    if path.is_symlink():
-                        continue
-                    executable = path.is_file() and 'Mach-O' in run('file', '-b', path, capture_output=True, text=True).stdout
-                    bundle = path.is_dir() and path.suffix in ['.app', '.xpc', '.framework']
-                    if executable:
-                        arches = run('lipo', '-archs', path, capture_output=True, text=True).stdout.split()
-                        if arches != [native_arch]:
-                            thinned = tmp / 'thin-image'
-                            run('lipo', path, '-thin', native_arch, '-output', thinned)
-                            shutil.copymode(path, thinned)
-                            shutil.move(thinned, path)
-                    if executable or bundle:
-                        private_run('codesign', '--force', '--options', 'runtime', '--timestamp', '--sign', a.identity,
-                            '--preserve-metadata=identifier,entitlements', path)
-                private_run('codesign', '--force', '--options', 'runtime', '--timestamp', '--sign', a.identity,
-                    '--preserve-metadata=identifier,entitlements', framework)
             sign(plugin, 'com.hachiwii.oink.microphone.driver')
             sign(finder, I['bundle_id'] + '.findersync', tmp / 'finder.plist')
             sign(paste_helper, I['bundle_id'] + '.paste', tmp / 'paste-host.plist')
@@ -369,10 +337,11 @@ def main():
             stem = artifact_stem(a.version, 'macos', a.arch)
             dmg = a.output / f'{stem}.dmg'
             from dmg import create
-            create(app, dmg, a.sparkle_cache)
+            create(app, dmg, a.tool_cache)
             private_run('codesign', '--force', '--timestamp', '--sign', a.identity, dmg)
             private_run('codesign', '--verify', '--strict', dmg)
             dmg_notary = notarize(dmg, a.notary_profile, a.notary_keychain, a.notary_timeout)
+            # v1 appcast archive: the update clients up to 0.3.5 install with Sparkle.
             archive = a.output / f'{stem}.zip'
             run('ditto', '-c', '-k', '--sequesterRsrc', '--keepParent', app, archive)
             record['notarization'] = {'app': app_notary, 'dmg': dmg_notary}

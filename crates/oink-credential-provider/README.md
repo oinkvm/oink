@@ -13,6 +13,9 @@ SYSTEM user-scope DPAPI, with SYSTEM-owned, SYSTEM-only files in a pinned privat
 ProgramData directory. Disable cancels pending work and deletes the ciphertext
 and status. Standalone uninstall invokes the protected service image to remove
 that private directory and unregister the provider. Upgrade preserves enrollment.
+The uninstall step runs as SYSTEM in the msiexec client's session (not session 0),
+treats an absent directory or registration as removed, and fails with the step
+and object that failed; the MSI action copies that line into the installer log.
 
 An idle service listener blocks in overlapped ConnectNamedPipe, waking only for
 connection, session change or stop. Request I/O is bounded and cancellation is

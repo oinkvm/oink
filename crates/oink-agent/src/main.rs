@@ -93,7 +93,7 @@ enum Cmd {
         #[arg(long)]
         settings: Option<PathBuf>,
     },
-    /// Show or set the local source pointer-motion budget (default: hz125).
+    /// Show or set the local source pointer-motion budget: hz125 (default), hz250, hz500 or unlimited.
     MotionFrequency {
         #[arg(value_enum)]
         frequency: Option<MotionFrequency>,
@@ -382,6 +382,8 @@ fn print(v: &impl serde::Serialize) -> anyhow::Result<()> {
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum MotionFrequency {
     Hz125,
+    Hz250,
+    Hz500,
     Unlimited,
 }
 
@@ -389,6 +391,8 @@ impl From<MotionFrequency> for api::EventFrequency {
     fn from(value: MotionFrequency) -> Self {
         match value {
             MotionFrequency::Hz125 => Self::Hz125,
+            MotionFrequency::Hz250 => Self::Hz250,
+            MotionFrequency::Hz500 => Self::Hz500,
             MotionFrequency::Unlimited => Self::Unlimited,
         }
     }
@@ -1016,9 +1020,11 @@ mod tests {
     }
 
     #[test]
-    fn motion_frequency_cli_accepts_both_choices_and_read_only_query() {
+    fn motion_frequency_cli_accepts_every_choice_and_read_only_query() {
         for (value, expected) in [
             ("hz125", api::EventFrequency::Hz125),
+            ("hz250", api::EventFrequency::Hz250),
+            ("hz500", api::EventFrequency::Hz500),
             ("unlimited", api::EventFrequency::Unlimited),
         ] {
             let cli = Cli::try_parse_from(["oink-agent", "motion-frequency", value]).unwrap();
@@ -1034,7 +1040,7 @@ mod tests {
             Cli::try_parse_from(["oink-agent", "motion-frequency"]).unwrap().cmd,
             Cmd::MotionFrequency { frequency: None }
         ));
-        assert!(Cli::try_parse_from(["oink-agent", "motion-frequency", "hz500"]).is_err());
+        assert!(Cli::try_parse_from(["oink-agent", "motion-frequency", "hz1000"]).is_err());
     }
 }
 

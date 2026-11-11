@@ -27,11 +27,19 @@ class PublicRelease(unittest.TestCase):
     def test_configuration_is_required_but_signpath_is_optional(self):
         env = dict(OINK_REPORT_DSN=DSN, OINK_REPORT_REGION='eu')
         self.assertFalse(R.inputs('28', env))
-        for build in ['0', '27', 'x', '2147483648']:
-            with self.assertRaises(ValueError): R.inputs(build, env)
+        for sequence in ['0', '01', '1000', 'x', '', None, '100028']:
+            with self.assertRaises(ValueError): R.inputs(sequence, env)
         for change in [dict(OINK_REPORT_DSN=''), dict(OINK_REPORT_REGION='us'), dict(SIGNPATH_PROJECT_SLUG='only-one')]:
             with self.assertRaises(ValueError): R.inputs('28', {**env, **change})
         self.assertTrue(R.inputs('28', {**env, 'SIGNPATH_PROJECT_SLUG':'x', 'SIGNPATH_ORGANIZATION_ID':'x', 'SIGNPATH_API_TOKEN':'fixture'}))
+
+    def test_release_build_is_the_sequence_of_the_stable_manifest_version(self):
+        self.assertEqual(R.release_build('28'), 100028)
+        self.assertEqual(R.release_build('999'), 100999)
+        with patch.object(R, 'IDENTITY', {**R.IDENTITY, 'version': '0.3.6'}):
+            self.assertEqual(R.release_build('4'), 306004)
+        with patch.object(R, 'IDENTITY', {**R.IDENTITY, 'version': '0.3.6-beta.1'}), self.assertRaisesRegex(ValueError, 'stable'):
+            R.release_build('4')
 
     def package(self, root, platform):
         path = root / TREE / ('macos-arm64' if platform == 'macos' else platform if platform == 'macos-x64' else 'windows-x64')
@@ -150,6 +158,8 @@ class WorkflowContract(unittest.TestCase):
         self.assertEqual(workflow.count('contents: write'),1)
         self.assertIn('  draft:\n    needs: package',workflow)
         self.assertIn('--public-version',workflow)
+        self.assertNotIn('inputs.build',workflow)
+        self.assertEqual(workflow.count('--sequence "$SEQUENCE"'),3)
         self.assertIn('OINK_REPORT_REGION: eu',workflow)
         self.assertNotIn('OINK_REPORT_BUILD_MANIFEST',workflow)
         self.assertNotIn('MACOS_SIGNING_IDENTITY',workflow)

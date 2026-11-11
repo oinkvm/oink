@@ -1,5 +1,5 @@
 import { tr, problemText } from '../i18n';
-import { useRef, type MouseEvent, type ReactNode } from 'react';
+import { useEffect, useRef, useState, type KeyboardEvent as ReactKeyboardEvent, type MouseEvent, type PointerEvent as ReactPointerEvent, type ReactNode } from 'react';
 import { Tooltip } from 'oink-ui';
 import { Badge, CursorMark, GameMark, Glyph, OsLogo, PauseMark, Signal, SignalMark } from './icons';
 import type { BadgeName, GlyphName } from './icons';
@@ -11,6 +11,7 @@ import type { SpeakerAction, MicrophoneAction } from './VolumeRow';
 import { PermissionHint, type PermissionHintKind } from '../permissions/PermissionHint';
 import './devices.css';
 import { useCardLatency } from './useCardLatency';
+import { applyPlacement, placementFor, slotAt, stepPlacement, type Placement } from './reorder';
 type Tone = 'accent' | 'muted' | 'good' | 'bad' | 'warn';
 interface Indicator {
     glyph: GlyphName;
@@ -287,12 +288,94 @@ export interface DeviceListProps {
     hiddenScreens?: ReadonlyMap<string, number>;
     collapsed: boolean;
     now?: number;
+    /** Moves an online device in the group-wide order (press-and-drag, or Alt+↑/↓ on a focused row). */
+    onReorder?: (id: string, placement: Placement) => Promise<unknown> | void;
 }
-export function DeviceList({ devices, selectedId, onSelect, onToggle, onSpeaker, onMicrophone, onPause, onGrantAccessibility, onGrantPermission, growIds, hiddenScreens, collapsed, now = Date.now() }: DeviceListProps) {
+// Rows are dragged with pointer events, not HTML drag-and-drop: the webview's
+// native file drop (installer packages) owns OS drags, and HTML drags would
+// also start from the row's own buttons and icons.
+const DRAG_THRESHOLD = 5;
+const NOT_DRAGGABLE = 'button:not(.dev__hit), [role="slider"], input, a';
+function useReorder(online: Device[], enabled: boolean, onReorder: DeviceListProps['onReorder']) {
+    const [pending, setPending] = useState<{ base: string; ids: string[] } | null>(null);
+    const [drag, setDrag] = useState<{ id: string; slot: number } | null>(null);
+    const base = online.map(d => d.id).join(' ');
+    // An optimistic order lasts until the backend's cards change or the command fails.
+    useEffect(() => { setPending(p => p && p.base !== base ? null : p); }, [base]);
+    const shown = pending?.base === base ? pending.ids.flatMap(id => online.filter(d => d.id === id)) : online;
+    const ids = shown.map(d => d.id);
+    const latest = useRef({ ids, base, onReorder });
+    latest.current = { ids, base, onReorder };
+    const list = useRef<HTMLUListElement>(null);
+    const suppressClick = useRef(false);
+    const commit = (id: string, placement: Placement | null) => {
+        const { ids, base, onReorder } = latest.current;
+        if (!placement || !onReorder)
+            return;
+        const next = { base, ids: applyPlacement(ids, id, placement) };
+        setPending(next);
+        const clear = () => setPending(p => p === next ? null : p);
+        Promise.resolve(onReorder(id, placement)).then(() => setTimeout(clear, 1500), clear);
+    };
+    const onPointerDown = (e: ReactPointerEvent<HTMLLIElement>, id: string) => {
+        if (!enabled || e.button !== 0 || e.ctrlKey || e.pointerType === 'touch' || (e.target as Element).closest(NOT_DRAGGABLE))
+            return;
+        const pointer = e.pointerId, startY = e.clientY;
+        let active = false, slot = -1;
+        const move = (ev: PointerEvent) => {
+            if (ev.pointerId !== pointer || (!active && Math.abs(ev.clientY - startY) < DRAG_THRESHOLD))
+                return;
+            active = true;
+            const rows = [...(list.current?.children ?? [])].filter(li => (li as HTMLElement).dataset.id !== id);
+            slot = slotAt(rows.map(li => { const r = li.getBoundingClientRect(); return r.top + r.height / 2; }), ev.clientY);
+            setDrag({ id, slot });
+        };
+        const stop = (ev: Event) => {
+            if (ev.type === 'keydown' ? (ev as KeyboardEvent).key !== 'Escape' : (ev as PointerEvent).pointerId !== pointer)
+                return;
+            window.removeEventListener('pointermove', move);
+            window.removeEventListener('pointerup', stop);
+            window.removeEventListener('pointercancel', stop);
+            window.removeEventListener('keydown', stop, true);
+            setDrag(null);
+            if (!active)
+                return;
+            // The click that ends a drag must not also select the row or toggle an icon.
+            suppressClick.current = true;
+            setTimeout(() => { suppressClick.current = false; });
+            if (ev.type === 'pointerup')
+                commit(id, placementFor(latest.current.ids, id, slot));
+        };
+        window.addEventListener('pointermove', move);
+        window.addEventListener('pointerup', stop);
+        window.addEventListener('pointercancel', stop);
+        window.addEventListener('keydown', stop, true);
+    };
+    const rowProps = (id: string) => {
+        const placement = drag && placementFor(ids, drag.id, drag.slot);
+        const drop = !placement ? undefined : 'above' in placement ? (placement.above === id ? 'above' : undefined) : placement.after === id ? 'below' : undefined;
+        return {
+            'data-id': id, 'data-dragging': drag?.id === id ? '' : undefined, 'data-drop': drop,
+            onPointerDown: (e: ReactPointerEvent<HTMLLIElement>) => onPointerDown(e, id),
+            onClickCapture: (e: MouseEvent<HTMLLIElement>) => { if (suppressClick.current) { suppressClick.current = false; e.stopPropagation(); e.preventDefault(); } },
+            onKeyDown: (e: ReactKeyboardEvent<HTMLLIElement>) => {
+                if (!enabled || !e.altKey || (e.key !== 'ArrowUp' && e.key !== 'ArrowDown') || !(e.target as Element).closest('.dev__hit'))
+                    return;
+                e.preventDefault();
+                commit(id, stepPlacement(ids, id, e.key === 'ArrowUp' ? -1 : 1));
+            },
+        };
+    };
+    return { shown, list, rowProps, reordering: !!drag };
+}
+export function DeviceList({ devices, selectedId, onSelect, onToggle, onSpeaker, onMicrophone, onPause, onGrantAccessibility, onGrantPermission, growIds, hiddenScreens, collapsed, now = Date.now(), onReorder }: DeviceListProps) {
     const exit = devices.find(d => d.group !== 'offline' && d.speaker.mode === 'exit');
+    const reorderable = !!onReorder && !collapsed;
+    const reorder = useReorder(devices.filter(d => d.group === 'online'), reorderable, onReorder);
     return (<div className="devs" data-collapsed={collapsed ? '' : undefined} role="group" aria-label={tr('设备')}>
       {GROUPS.map((g) => {
-            const list = devices.filter((d) => d.group === g.id);
+            const online = g.id === 'online';
+            const list = online ? reorder.shown : devices.filter((d) => d.group === g.id);
             if (!list.length)
                 return null;
             const headingId = `devs-${g.id}`;
@@ -300,17 +383,17 @@ export function DeviceList({ devices, selectedId, onSelect, onToggle, onSpeaker,
             <h3 className="devs__label" id={headingId}>
               <span>{g.label}</span>{g.id !== 'self' && <span className="devs__count">{list.length}</span>}
             </h3>
-            <ul className="devs__list">
-              {list.map((d) => (<li key={d.id}>
-                  <DeviceItem onGrantPermission={onGrantPermission ? kind => onGrantPermission(d.id, kind) : undefined} onGrantAccessibility={onGrantAccessibility} d={d} now={now} selected={!collapsed && d.id === selectedId} collapsed={collapsed} exitName={exit?.name ?? null} onSelect={() => onSelect(d.id)} onToggle={onToggle ? (kind, mode) => onToggle(d.id, kind, mode) : undefined} onSpeaker={onSpeaker ? (a) => onSpeaker(d.id, a) : undefined} onPause={onPause ? (p) => onPause(d.id, p) : undefined} onMicrophone={onMicrophone ? a=>onMicrophone(d.id,a) : undefined} grow={collapsed && !!growIds?.has(d.id)} hiddenScreens={hiddenScreens?.get(d.id) ?? 0}/>
+            <ul className="devs__list" ref={online ? reorder.list : undefined} data-reordering={online && reorder.reordering ? '' : undefined}>
+              {list.map((d) => (<li key={d.id} {...(online ? reorder.rowProps(d.id) : {})}>
+                  <DeviceItem onGrantPermission={onGrantPermission ? kind => onGrantPermission(d.id, kind) : undefined} onGrantAccessibility={onGrantAccessibility} d={d} now={now} selected={!collapsed && d.id === selectedId} collapsed={collapsed} exitName={exit?.name ?? null} onSelect={() => onSelect(d.id)} onToggle={onToggle ? (kind, mode) => onToggle(d.id, kind, mode) : undefined} onSpeaker={onSpeaker ? (a) => onSpeaker(d.id, a) : undefined} onPause={onPause ? (p) => onPause(d.id, p) : undefined} onMicrophone={onMicrophone ? a=>onMicrophone(d.id,a) : undefined} grow={collapsed && !!growIds?.has(d.id)} hiddenScreens={hiddenScreens?.get(d.id) ?? 0} reorderable={online && reorderable && list.length > 1}/>
                 </li>))}
             </ul>
           </section>);
         })}
     </div>);
 }
-function DeviceHit({ d, now, selected, collapsed, onSelect }: {
-    d: Device; now: number; selected: boolean; collapsed: boolean; onSelect: () => void;
+function DeviceHit({ d, now, selected, collapsed, onSelect, reorderable }: {
+    d: Device; now: number; selected: boolean; collapsed: boolean; onSelect: () => void; reorderable?: boolean;
 }) {
     const latency = useCardLatency(d);
     const summary = d.group === 'offline' ? tr('{0}，离线，上次在线 {1}', d.name, formatLastSeen(d.lastSeen, now)) : d.group === 'online' ? tr('{0}，在线，延迟 {1} ms', d.name, latency === null ? tr("未知") : latency) : tr('{0}，本机', d.name);
@@ -319,14 +402,14 @@ function DeviceHit({ d, now, selected, collapsed, onSelect }: {
     const game = d.group !== 'offline' && gameActive(d) && (d.cursor === 'local' || d.cursor === 'locked');
     const cursorNote = d.group !== 'offline' && (d.cursor === 'local' || d.cursor === 'locked') ? (d.cursor === 'locked' ? tr('，指针锁定在这里') : tr('，指针在这里')) : '';
     return (<Tooltip interactive={false} placement="right" disabled={!collapsed} content={d.group === 'online' ? `${d.name} · ${latency === null ? tr("延迟未知") : `${Math.round(latency)} ms`}` : d.name}>
-      <button type="button" className="dev__hit ok-focusable" aria-current={selected ? 'true' : undefined} aria-disabled={d.group === 'offline' ? 'true' : undefined} aria-label={summary + pausedNote + (screenOff ? tr('，屏幕已禁用') : '') + (game ? tr('，游戏模式已开启') : '') + cursorNote} onClick={onSelect}/>
+      <button type="button" className="dev__hit ok-focusable" aria-current={selected ? 'true' : undefined} aria-disabled={d.group === 'offline' ? 'true' : undefined} aria-label={summary + pausedNote + (screenOff ? tr('，屏幕已禁用') : '') + (game ? tr('，游戏模式已开启') : '') + cursorNote} aria-keyshortcuts={reorderable ? 'Alt+ArrowUp Alt+ArrowDown' : undefined} onClick={onSelect}/>
       </Tooltip>);
 }
 function DeviceSignal({ d, shown }: { d: Device; shown: boolean }) {
     const latency = useCardLatency(d);
     return <SignalMark latency={latency} offline={d.group === 'offline'} shown={shown}/>;
 }
-export function DeviceItem({ d, now, selected, collapsed, exitName = null, onSelect, onToggle, onSpeaker, onMicrophone, volumeOpen = false, grow = false, hiddenScreens = 0, onGrantAccessibility, onGrantPermission }: {
+export function DeviceItem({ d, now, selected, collapsed, exitName = null, onSelect, onToggle, onSpeaker, onMicrophone, volumeOpen = false, grow = false, hiddenScreens = 0, onGrantAccessibility, onGrantPermission, reorderable = false }: {
     d: Device;
     now: number;
     selected: boolean;
@@ -343,11 +426,13 @@ export function DeviceItem({ d, now, selected, collapsed, exitName = null, onSel
     hiddenScreens?: number;
     onGrantAccessibility?: () => void;
     onGrantPermission?: (kind: 'input_monitoring' | 'microphone') => void;
+    /** Alt+↑/↓ on the focused row moves it in the online list. */
+    reorderable?: boolean;
 }) {
     selected = selected && !collapsed;
     const game = d.group !== 'offline' && gameActive(d) && (d.cursor === 'local' || d.cursor === 'locked');
     return (<div className="dev" data-ctx={`device:${d.id}`} data-group={d.group} data-current={selected ? '' : undefined} data-grow={grow && hasVolume(d) ? '' : undefined}>
-      <DeviceHit d={d} now={now} selected={selected} collapsed={collapsed} onSelect={onSelect}/>
+      <DeviceHit d={d} now={now} selected={selected} collapsed={collapsed} onSelect={onSelect} reorderable={reorderable}/>
       <span className="dev__os">
         <OsLogo os={d.os}/>
         

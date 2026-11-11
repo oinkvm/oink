@@ -1,18 +1,27 @@
 //! Windows policy, independent of Win32. Sampling and input only supply facts.
-//! Two consecutive qualifying samples plus intervening motion enter; two
-//! consecutive failing samples exit. macOS policy is unchanged.
+//! Motion that starts between two qualifying samples and stays hidden for
+//! 100 ms enters (the macOS debounce); two consecutive failing samples exit.
+//! Full-screen players and slides hide an idle cursor and show it again a
+//! frame or two after it moves, so a single hidden sample after the first
+//! move is not capture: a Windows test machine on 2026-11-11 entered and left
+//! within 50–100 ms.
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct MotionBatch {
+    first: Option<u64>,
     last: Option<u64>,
 }
 
 impl MotionBatch {
     /// Record once per nonzero physical report or successful remote injection.
     pub fn record(&mut self, now: u64) {
+        self.first.get_or_insert(now);
         self.last = Some(now);
     }
 }
+
+/// Hidden motion must last this long before it counts as capture.
+const ENTER_US: u64 = 100_000;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct WindowsSample {
@@ -74,6 +83,8 @@ impl Bounds {
 pub(super) struct Detector {
     foreground: Option<u64>,
     previous: Option<(u64, bool)>,
+    /// First move while the cursor stayed hidden; cleared when it shows.
+    hidden_motion_since: Option<u64>,
     pub active: bool,
 }
 
@@ -89,12 +100,24 @@ impl Detector {
                 // The batch is drained under the same lock used to timestamp
                 // this sample. Only movement after the preceding sample counts;
                 // old/replayed batches cannot acquire a new capture interval.
-                if w.motion.last.is_some_and(|t| previous_at < t && t <= w.sampled_at) {
+                let within = |t: u64| previous_at < t && t <= w.sampled_at;
+                if let (Some(first), Some(last)) = (w.motion.first, w.motion.last)
+                    && within(last)
+                {
+                    self.hidden_motion_since.get_or_insert(first.max(previous_at + 1));
+                }
+                if self
+                    .hidden_motion_since
+                    .is_some_and(|since| w.sampled_at.saturating_sub(since) >= ENTER_US)
+                {
                     self.active = true;
                 }
             } else if !evidence && !previous_evidence {
                 self.active = false;
             }
+        }
+        if !evidence {
+            self.hidden_motion_since = None;
         }
         self.previous = Some((w.sampled_at, evidence));
         self.active
@@ -130,21 +153,49 @@ mod tests {
     fn feed(d: &mut CaptureDetector, s: CaptureSample) -> bool {
         d.update(Some(s), true, false, s.windows.unwrap().sampled_at)
     }
+    /// Hidden motion from start + 25 ms, still hidden at start + 150 ms.
     fn enter(d: &mut CaptureDetector, start: u64, fullscreen: bool, confined: bool) {
         assert!(!feed(d, sample(start, true, fullscreen, confined, &[])));
-        assert!(feed(
+        assert!(!feed(
             d,
             sample(start + 50_000, true, fullscreen, confined, &[start + 25_000])
         ));
+        assert!(!feed(
+            d,
+            sample(start + 100_000, true, fullscreen, confined, &[start + 75_000])
+        ));
+        assert!(feed(d, sample(start + 150_000, true, fullscreen, confined, &[])));
     }
 
     #[test]
-    fn two_qualifying_samples_with_intervening_motion_enter() {
+    fn hidden_motion_for_100_ms_enters() {
         for (fullscreen, confined) in [(true, false), (false, true), (true, true)] {
             let mut d = CaptureDetector::default();
-            assert!(!feed(&mut d, sample(0, true, fullscreen, confined, &[])));
-            assert!(feed(&mut d, sample(50_000, true, fullscreen, confined, &[25_000])));
+            enter(&mut d, 0, fullscreen, confined);
         }
+    }
+
+    #[test]
+    fn a_cursor_shown_again_shortly_after_moving_never_enters() {
+        // Windows test machine, 2026-11-11: a full-screen app hid the idle cursor; the first
+        // sample after the move still saw it hidden, the next one visible.
+        let mut d = CaptureDetector::default();
+        for i in 0..40 {
+            assert!(!feed(&mut d, sample(i * 50_000, true, true, false, &[])));
+        }
+        assert!(!feed(
+            &mut d,
+            sample(2_000_000, true, true, false, &[1_990_000, 1_998_000])
+        ));
+        assert!(!feed(
+            &mut d,
+            sample(2_050_000, false, true, false, &[2_010_000, 2_040_000])
+        ));
+        assert!(!feed(&mut d, sample(2_100_000, false, true, false, &[2_090_000])));
+        // Hidden again later, with fresh motion: the 100 ms starts over.
+        assert!(!feed(&mut d, sample(3_000_000, true, true, false, &[])));
+        assert!(!feed(&mut d, sample(3_050_000, true, true, false, &[3_020_000])));
+        assert!(feed(&mut d, sample(3_150_000, true, true, false, &[])));
     }
 
     #[test]
@@ -158,17 +209,17 @@ mod tests {
     fn two_failing_samples_exit() {
         let mut d = CaptureDetector::default();
         enter(&mut d, 0, true, false);
-        assert!(feed(&mut d, sample(100_000, false, true, false, &[])));
-        assert!(!feed(&mut d, sample(150_000, false, true, false, &[])));
+        assert!(feed(&mut d, sample(200_000, false, true, false, &[])));
+        assert!(!feed(&mut d, sample(250_000, false, true, false, &[])));
     }
 
     #[test]
     fn one_failing_sample_does_not_exit() {
         let mut d = CaptureDetector::default();
         enter(&mut d, 0, true, false);
-        assert!(feed(&mut d, sample(100_000, false, true, false, &[])));
-        assert!(feed(&mut d, sample(150_000, true, true, false, &[])));
         assert!(feed(&mut d, sample(200_000, false, true, false, &[])));
+        assert!(feed(&mut d, sample(250_000, true, true, false, &[])));
+        assert!(feed(&mut d, sample(300_000, false, true, false, &[])));
     }
 
     #[test]
@@ -301,11 +352,13 @@ mod tests {
     }
 
     #[test]
-    fn one_move_enters_without_duration_or_sampling_gap_thresholds() {
+    fn one_move_enters_once_the_cursor_stayed_hidden_for_100_ms() {
         for gap in [1, 50_000, 150_000, 1_000_000] {
             let mut d = CaptureDetector::default();
             assert!(!feed(&mut d, sample(0, true, true, false, &[])));
-            assert!(feed(&mut d, sample(gap, true, true, false, &[gap])));
+            assert!(!feed(&mut d, sample(gap, true, true, false, &[gap])));
+            assert!(!feed(&mut d, sample(gap + 99_999, true, true, false, &[])));
+            assert!(feed(&mut d, sample(gap + 100_000, true, true, false, &[])));
         }
     }
 
@@ -317,7 +370,8 @@ mod tests {
         assert!(!feed(&mut d, sample(150_000, true, true, false, &[25_000])));
         assert!(!feed(&mut d, sample(200_000, true, true, false, &[150_000])));
         assert!(!feed(&mut d, sample(250_000, true, true, false, &[300_000])));
-        assert!(feed(&mut d, sample(300_000, true, true, false, &[275_000])));
+        assert!(!feed(&mut d, sample(300_000, true, true, false, &[275_000])));
+        assert!(feed(&mut d, sample(375_000, true, true, false, &[])));
     }
 
     #[test]
@@ -326,7 +380,8 @@ mod tests {
         assert!(!feed(&mut d, sample(0, true, true, false, &[])));
         assert!(!feed(&mut d, sample(50_000, false, true, false, &[25_000])));
         assert!(!feed(&mut d, sample(100_000, true, true, false, &[75_000])));
-        assert!(feed(&mut d, sample(150_000, true, true, false, &[125_000])));
+        assert!(!feed(&mut d, sample(150_000, true, true, false, &[125_000])));
+        assert!(feed(&mut d, sample(225_000, true, true, false, &[])));
     }
 
     #[test]

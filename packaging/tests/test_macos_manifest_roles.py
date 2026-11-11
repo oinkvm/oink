@@ -15,10 +15,12 @@ sys.path[:0] = [str(ROOT / 'packaging/macos'), str(ROOT / 'build-support')]
 SPEC = importlib.util.spec_from_file_location('macos_manifest_content', ROOT / 'packaging/macos/content.py')
 C = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(C)
-from identity import IDENTITY
+from identity import IDENTITY, encode_build
 from native_image_fixtures import GUID, macho_image
 from report_manifest import image_identity, write_manifest
 from versioning import macos_version_fields, release_version
+
+BUILD = encode_build(IDENTITY['inhouse_version'], 37)
 
 
 class MacManifestRoles(unittest.TestCase):
@@ -43,11 +45,11 @@ class MacManifestRoles(unittest.TestCase):
             data = macho_image()
             self.assertEqual(data.count(GUID.bytes), 1)
             path.write_bytes(data.replace(GUID.bytes, uuid.uuid5(uuid.NAMESPACE_DNS, role).bytes))
-        version = release_version(IDENTITY['version'], 'b' * 40, 137)
-        self.metadata = {'version': version, 'build': 137, 'source_commit': 'b' * 40,
-                         'source_tree_sha256': 'a' * 64, 'update_policy': 'sparkle'}
+        version = release_version(IDENTITY['version'], 'b' * 40, BUILD)
+        self.metadata = {'version': version, 'build': BUILD, 'source_commit': 'b' * 40,
+                         'source_tree_sha256': 'a' * 64}
         trust = json.loads((ROOT / 'packaging/update-trust.json').read_text())['mac']
-        self.metadata['update_policy'] = 'sparkle' if trust['enabled'] else 'manual-only'
+        self.metadata['update_policy'] = 'feed-v2' if trust['enabled'] else 'manual-only'
         for bundle, ident, executable in [
                 (self.app, IDENTITY['bundle_id'], self.b['backend']),
                 (self.helper, self.mac['ui_id'], self.b['ui']),
@@ -59,19 +61,18 @@ class MacManifestRoles(unittest.TestCase):
                         LSMinimumSystemVersion='14.2', NSAudioCaptureUsageDescription='Share audio.',
                         SUPublicEDKey=trust['public_key'],
                         NSExtension={'NSExtensionPointIdentifier': 'com.apple.FinderSync'},
-                        **macos_version_fields(version, 137))
+                        **macos_version_fields(version, BUILD))
             info[self.mac['app_group_key']] = self.group
             (bundle / 'Contents').mkdir(parents=True, exist_ok=True)
             (bundle / 'Contents/Info.plist').write_bytes(plistlib.dumps(info))
         resource = self.app / 'Contents/Resources'; resource.mkdir()
         (resource / IDENTITY['metadata_file']).write_text(json.dumps(self.metadata))
         (self.helper / 'Contents/Resources').mkdir()
-        (self.app / 'Contents/Frameworks/Sparkle.framework').mkdir(parents=True)
         self.set_report(['backend', 'agent', 'ui', 'file_provider_extension'])
 
     def set_report(self, roles):
         manifest = self.app / 'Contents/Resources/report-manifest.json'
-        write_manifest(manifest, 'a' * 64, self.metadata['version'], 137,
+        write_manifest(manifest, 'a' * 64, self.metadata['version'], BUILD,
                        list(zip(['agent', 'agent', 'ui_rust', 'file_provider'],
                                 [self.images[k] for k in roles])))
         (self.helper / 'Contents/Resources/report-manifest.json').write_bytes(manifest.read_bytes())

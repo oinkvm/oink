@@ -108,6 +108,11 @@ it.each(['clipboard','audio','input'] as const)('sends only the changed %s prefe
   });
   expect(mocks[group]).toHaveBeenCalledWith(group==='clipboard'?{send:false}:group==='audio'?{keep_local_playback:false}:{event_frequency:'hz125'});
 });
+it.each([['125','hz125'],['250','hz250'],['500','hz500']] as const)('maps the %s pointer limit to %s',async(limit,frequency)=>{
+  const {result}=renderHook(usePreferences);
+  await act(async()=>result.current.set('pollLimit',limit));
+  expect(mocks.input).toHaveBeenCalledWith({event_frequency:frequency});
+});
 it('persists only edited presentation fields',()=>{
   const {result}=renderHook(usePreferences);
   act(()=>result.current.savePresentation({motion:'reduced'}));

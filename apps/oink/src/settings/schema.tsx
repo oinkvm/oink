@@ -94,6 +94,7 @@ export const SECTIONS: SectionMeta[] = [
                     return tr('版本、项目主页、开源软件引用');
                 }, get keywords() { return tr('about 关于 版本 开源 许可 github'); } },
             { id: 'updates', get label() { return tr('自动检查更新'); }, get desc() { return tr('在后台定时检查新版本并提示升级'); }, get keywords() { return tr('版本 更新 升级 检查 自动 后台 软件更新'); } },
+            { id: 'updateChannel', get label() { return tr('更新频道'); }, get desc() { return tr('测试版会更早收到新版本，可能不够稳定'); }, get keywords() { return tr('频道 更新 测试 beta 正式 稳定'); } },
             { id: 'uninstall', only: 'mac', get label() { return tr('卸载 Oink'); }, get desc() { return tr('移除 Oink 及其数据、权限和系统组件'); }, get keywords() { return tr('卸载 移除 删除 废纸篓 清除 数据 权限 卸载 Oink…'); } },
         ],
     },

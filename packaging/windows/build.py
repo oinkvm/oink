@@ -314,6 +314,8 @@ def main():
     (a.output / 'content-tables.json').write_text(json.dumps(tables, indent=2) + '\n')
     verify_extracted(a.output / 'decompiled.wxs', a.output / 'extracted')
     verify_cleanup(tables)
+    from content import verify_credential_provider_unregister
+    verify_credential_provider_unregister(tables)
     record['embedded_executables'] = verify_msi(a.output / 'decompiled.wxs', a.output / 'extracted', I, tables)
     record.update(product_code=product_code, msi_version=msi_version, signing='unsigned',
                   artifacts=[dict(name=msi.name, size=msi.stat().st_size, sha256=hashlib.sha256(msi.read_bytes()).hexdigest())])

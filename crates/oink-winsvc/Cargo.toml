@@ -25,11 +25,12 @@ crossbeam-queue = "0.3"
 oink-input = { path = "../oink-input" }
 cab = "0.6"
 tempfile = "3"
+ed25519-dalek = "2.2"
 
 [target.'cfg(windows)'.dependencies]
 oink-foundation.workspace = true
+oink-update = { path = "../oink-update", features = ["http"] }
 windows = { version = "0.62", features = ["Win32_System_TaskScheduler", "Win32_System_Com", "Win32_System_Ole", "Win32_System_Variant"] }
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
 getrandom = "0.3"
 windows-sys = { version = "0.61", features = [
  "Win32_Devices_DeviceAndDriverInstallation",

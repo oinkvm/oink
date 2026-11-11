@@ -17,7 +17,10 @@ pub(crate) mod request_context;
 pub use preferences::UiPreferences;
 
 pub use oink_update::Error as UpdateError;
-pub use oink_update::policy::{Command as UpdateCommand, UpdateStatus};
+pub use oink_update::{
+    catalog::Kind as UpdateKind,
+    policy::{Command as UpdateCommand, UpdateStatus},
+};
 
 pub use oink_autostart::{LaunchAtLoginState, LaunchAtLoginStatus};
 
@@ -935,6 +938,8 @@ pub enum HotkeyAction {
     LockEscape,
     /// Windows source: lock only the remote Windows pointer focus.
     LockRemoteWindows,
+    /// Move the pointer to the online device after the focus device, in group order.
+    MovePointerNext,
 }
 
 impl HotkeyAction {
@@ -951,6 +956,7 @@ impl HotkeyAction {
         HotkeyAction::SwitchLayout,
         HotkeyAction::LockEscape,
         HotkeyAction::LockRemoteWindows,
+        HotkeyAction::MovePointerNext,
     ];
 
     /// 序列化时的名字（`"lock_focus"` 等），也是路由 `StatusEvent::Hotkey::action` 的写法。
@@ -967,12 +973,22 @@ impl HotkeyAction {
             HotkeyAction::SwitchLayout => "switch_layout",
             HotkeyAction::LockEscape => "lock_escape",
             HotkeyAction::LockRemoteWindows => "lock_remote_windows",
+            HotkeyAction::MovePointerNext => "move_pointer_next",
         }
     }
 
     pub fn parse(s: &str) -> Option<Self> {
         Self::ALL.iter().copied().find(|a| a.as_str() == s)
     }
+}
+
+/// Where a dragged online device lands: directly above another device, or
+/// after the previous last online device (`{"above": id}` / `{"after": id}`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeviceOrderPlacement {
+    Above(DeviceKey),
+    After(DeviceKey),
 }
 
 /// 全局快捷键。`keys` 为按键名（修饰键 `Ctrl` `Alt` `Shift` `Meta`，其余为 `KeyboardEvent.code` 去掉前缀，
@@ -1886,6 +1902,8 @@ pub trait AgentApi: Send + Sync {
     fn pause_all(&self, request_id: String) -> ApiResult<crate::device_cards::PauseAllAccepted>;
     fn member_addresses(&self, device: DeviceKey) -> ApiResult<Vec<String>>;
     fn set_member_address(&self, device: DeviceKey, address: String) -> ApiResult<()>;
+    /// Move one member in the group-wide device list order.
+    fn move_device_order(&self, device: DeviceKey, placement: DeviceOrderPlacement) -> ApiResult<()>;
     fn nearby(&self) -> ApiResult<pairing::NearbySnapshot>;
     fn refresh_nearby(&self, operation_id: String) -> ApiResult<pairing::PairReply<pairing::Accepted>>;
     fn query_pairing_address(
@@ -2219,6 +2237,10 @@ pub enum Request {
     SetMemberAddress {
         device: DeviceKey,
         address: String,
+    },
+    MoveDeviceOrder {
+        device: DeviceKey,
+        placement: DeviceOrderPlacement,
     },
     Nearby,
     RefreshNearby {
@@ -2615,6 +2637,7 @@ pub fn dispatch<A: AgentApi + ?Sized>(api: &A, req: Request) -> ApiResult<Reply>
         R::PauseAll { request_id } => api.pause_all(request_id).map(Reply::PauseAll),
         R::MemberAddresses { device } => api.member_addresses(device).map(Reply::MemberAddresses),
         R::SetMemberAddress { device, address } => unit(api.set_member_address(device, address)),
+        R::MoveDeviceOrder { device, placement } => unit(api.move_device_order(device, placement)),
         R::Nearby => api.nearby().map(Reply::Nearby),
         R::RefreshNearby { operation_id } => api.refresh_nearby(operation_id).map(Reply::RefreshNearby),
         R::QueryPairingAddress {
@@ -2835,6 +2858,10 @@ mod tests {
             Request::SetMemberAddress {
                 device,
                 address: "192.0.2.4:47470".into(),
+            },
+            Request::MoveDeviceOrder {
+                device,
+                placement: DeviceOrderPlacement::Above(DeviceKey(DeviceId([3; 32]))),
             },
         ] {
             assert_eq!(

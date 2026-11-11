@@ -184,6 +184,21 @@ def verify_start_registration(tables, identity):
         raise RuntimeError('MSI Start menu registration must map real app targets and stable identity to a removable ARP product')
 
 
+def verify_credential_provider_unregister(tables):
+    # Issue #46: removal of the auto unlock provider and vault runs as a deferred
+    # SYSTEM DLL action that logs the service image's failing step, on
+    # standalone uninstall only, after the service stopped and before its files go.
+    actions = {row[0]: row for row in tables.get('CustomAction', [])}
+    execute = {row[0]: row for row in tables.get('InstallExecuteSequence', [])}
+    row = execute.get('UnregisterCredentialProvider')
+    if (actions.get('UnregisterCredentialProvider', [])[1:4] != ['3073', 'InstallerCA', 'UnregisterCredentialProvider'] or
+            not row or row[1] != 'REMOVE~="ALL" AND NOT UPGRADINGPRODUCTCODE' or
+            not int(execute['StopServices'][2]) < int(row[2]) < int(execute['RemoveFiles'][2]) or
+            any(r[0] == 'UnregisterCredentialProvider' for r in tables.get('InstallUISequence', []))):
+        raise RuntimeError('MSI credential provider removal must be a fatal deferred SYSTEM DLL action on standalone uninstall, '
+                           'after StopServices and before RemoveFiles')
+
+
 def verify_data_cleanup(tables):
     actions = {row[0]: row for row in tables.get('CustomAction', [])}
     execute = {row[0]: row for row in tables.get('InstallExecuteSequence', [])}

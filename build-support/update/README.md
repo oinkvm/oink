@@ -165,10 +165,11 @@ never accesses a Windows epoch or signing secret.
 `renew-windows-update-manifests.yml` runs daily at 03:17 UTC. Disabled Windows
 catalogs skip before entering the signing environment. An enabled catalog with
 missing trust fails. Renewal may only extend expiry and sequence of the unchanged
-Windows catalog. It never creates a Mac feed. Windows TTL remains 30 days, with
-renewal at 21 days remaining. Daily successful readback refreshes the host
-heartbeat even when the signed Windows bytes do not need renewal. Mac has no
-Windows TTL or sequence dependency.
+Windows catalog. It never creates a Mac appcast; it renews Mac v2 manifests
+(see Feed v2) in a separate macOS job after the Windows deploy. TTL remains 30
+days, with renewal at 21 days remaining. Daily successful readback refreshes the
+host heartbeat even when the signed Windows bytes do not need renewal. Mac v1
+appcasts have no TTL or sequence.
 
 Every state writer uses concurrency group `oink-update-feed-publish`. Windows
 reserves sequences and commits metadata before signing, so a failed allocation
@@ -224,7 +225,8 @@ The release procedure is:
 1. K1 drafts the English and Simplified Chinese update notes in
    `.github/update-notes.json`. Obtain user approval, translate Japanese and
    Korean, validate and commit all four languages on the trusted default branch.
-   Use `channel: stable`, `severity: normal|critical`; each newline separates a
+   The file holds `severity: normal|critical` and `notes` only; the channel is
+   the live release's prerelease flag (see Feed v2). Each newline separates a
    plain-text bullet. Include user-visible changes only. The unsigned-MSI
    limitation belongs in the GitHub release's Known limitations.
 
@@ -238,16 +240,16 @@ The release procedure is:
    the reserved monotonically increasing build. For example, for 0.2.0/build 35:
 
    ```sh
-   gh workflow run release.yml --repo oinkvm/oink --ref main -f build=35
+   gh workflow run release.yml --repo oinkvm/oink --ref main -f sequence=1
    ```
 
 3. The user may edit the draft's release body directly on GitHub, reviews the
-   draft and clicks **Publish**. Publishing the GitHub release triggers no
+   draft and clicks **Publish** (optionally as a pre-release first; see Feed v2). Publishing the GitHub release triggers no
    workflow and does not publish either update feed. GitHub body edits, including
    later edits, do not change the embedded/committed in-app notes.
 
 4. Keep the approved file unchanged for this build. After publication, explicitly
-   dispatch **Seed published stable release feeds** on the trusted default branch
+   dispatch **Seed published release feeds** on the trusted default branch
    carrying those same finalized notes, for the published tag:
 
    ```sh
@@ -259,11 +261,12 @@ The release procedure is:
 The manual dispatcher and both reusable publishers check out the dispatch's
 exact default-branch SHA, so code and notes remain consistent even if the branch
 advances during the run. They validate notes with `feed.validate_notes` and the
-stable-channel/severity rules before signing. Windows reads notes from that
+severity rules before signing. Windows reads notes from that
 trusted checkout at signing time; Mac embeds them in the signed appcast.
 Neither publisher downloads release-asset notes, including legacy `update.json`.
 Do not change the notes between retries for a build already registered in the
-Windows catalog: the immutable-build check still rejects changed records.
+Windows catalog, nor between its prerelease publication and its promotion:
+the immutable-build check still rejects changed records.
 
 Notes are an extensible language map on the existing feeds and signing schema.
 Clients require English; the publisher requires English and Simplified Chinese,
@@ -286,15 +289,16 @@ deployments run under a release event; see
 [actions/deploy-pages#383](https://github.com/actions/deploy-pages/issues/383).
 Using the supported dispatch event avoids that behavior without deployment-ID
 changes, delays or retries. No `release.published` trigger or automatic dispatch
-remains. Drafts and prereleases are rejected by the live-release gate.
+remains. Drafts are rejected by the live-release gate; a prerelease is published
+as a beta release (see Feed v2).
 
 To recover a failed initial publication without rebuilding
-or retagging the release, dispatch **Seed published stable release feeds** on the
+or retagging the release, dispatch **Seed published release feeds** on the
 default branch with `release_tag` and `platform=mac`, `windows` or `both` (default).
 Select only the platform that has not committed, preserving the other platform's
 catalog and sequence. The shared authorization
-checks the live GitHub API for a published, non-draft, non-prerelease stable
-release before either publisher proceeds. Both paths use the same native/source/
+checks the live GitHub API for a published, non-draft release (non-prerelease for
+stable, prerelease for beta) before either publisher proceeds. Both paths use the same native/source/
 hash/signature checks, monotonic catalog and transactional Pages publisher.
 An already-committed platform build remains protected against republication.
 Disabled trust skips before accessing secrets or the
@@ -328,6 +332,67 @@ an omitted name otherwise resolves empty. The reusable interfaces require the
 names, packaging tests check every caller, and signers reject empty values before
 invoking cryptographic tools. No private key belongs in repository secrets or
 source files for this purpose.
+
+## Feed v2 (clients from 0.3.6)
+
+v1 publication above is unchanged for 0.3.5 and older clients. `feed_v2.py`
+additionally writes one signed manifest per platform/epoch/architecture/channel
+(`windows/v2/<epoch>/x64/<channel>/manifest.json`,
+`mac/v2/mac-2026-01/{arm64,x64}/<channel>/manifest.json`) with the v1 envelope.
+Stable manifests carry stable releases only; beta manifests carry both.
+
+- Channel: the live release's prerelease flag, read by each publisher
+  (`published_release.annotations`). A published prerelease is beta, a public
+  release stable; `.github/update-notes.json` carries no channel. A
+  `vX.Y.Z-beta.K` tag must be a prerelease and can never reach stable.
+- Beta releases: publish the GitHub release as a **prerelease** (tag
+  `vX.Y.Z-beta.K`, or `vX.Y.Z` when the same build is to be promoted later),
+  then dispatch the seed workflow. Beta releases enter only v2 beta manifests:
+  Windows keeps them in the beta slot's `v2_records` (never the v1 `records`),
+  Mac skips the ZIP and v1 appcasts entirely.
+- Promotion: turn the `vX.Y.Z` prerelease off on GitHub and dispatch the seed
+  workflow again with the committed notes unchanged. The same build is then
+  published stable: v2 stable manifests, Windows v1 `records` (stable and beta
+  slots), Mac ZIP + v1 appcasts. A build appears once in every catalog: Windows
+  removes the beta record from `v2_records` (the stable record serves the v2
+  beta manifest), Mac rewrites `mac/releases/<build>/<arch>.json` with
+  `channel: stable`. Only that channel flip is accepted (`release.register`,
+  `mac_release.candidate`, `feed_v2.promotion`); any other change to the build
+  and stable -> beta are rejected.
+- Mac apps from 0.3.6 (build 306000) contain no Sparkle. Stable releases still
+  reach <= 0.3.5 clients through the signed ZIP in the v1 appcast; the
+  publisher's Sparkle checks (`sparkle.public_key_configured`, `SUPublicEDKey`)
+  apply only to builds below 306000. ATS stays forbidden for every build.
+- `feed.py monitor` also checks every v2 manifest on every source.
+
+- Windows v2 releases are derived from the registered v1 records (same signed
+  MSI package objects). `release.py register` reserves v2 sequences with v1.
+- Mac publication also downloads the notarized DMG, checks length/SHA-256,
+  Gatekeeper (`spctl -t open`) and the mounted app identity, signs the exact
+  DMG bytes with the official `sign_update`, and writes the public record
+  `mac/releases/<build>/<arch>.json`. The Mac sign job then reserves v2
+  sequences (`feed_v2.py allocate --platform mac --release-build N`,
+  `reserve.py`, under the feed lock) and signs them (`feed_v2.py sign`).
+- Rules live in `packaging/update-rules.json` as version ranges and compile to
+  build ranges (`rules.py`). The file must end with a catch-all; notices are
+  critical-only and need `en` and `zh-Hans`; explicit targets must exist in each
+  manifest. A rules-only change is published by the renewal workflow (scheduled
+  or Run workflow), which re-signs when rules differ.
+- Sequences: `registry.json` → `v2.<manifest path>.last_allocated`, reserved and
+  pushed before signing, never reused; merges reject superseded reservations and
+  non-increasing sequences.
+- Keys: Windows v2 uses the Windows epoch secret through OpenSSL. Mac v2 uses
+  `SPARKLE_ED25519_PRIVATE_KEY` only through the pinned official signer on stdin
+  (the Sparkle secret can be a 32-byte seed or the legacy 96-byte expanded key,
+  which OpenSSL cannot load), verified with OpenSSL afterwards.
+- `renew-windows-update-manifests.yml` renews Windows v1+v2, then (serially,
+  after the Windows deploy, since queued jobs in one concurrency group cancel
+  each other) Mac v2 on a macOS runner whose signing step alone receives the Mac
+  key.
+- `packaging/update-trust.json` → `sources`: ordered HTTPS origins clients try.
+  They host metadata only. Deployment writes identical v2 bytes to every source;
+  `deploy.py` refuses a source without an entry in `DEPLOY_TARGETS` (today only
+  the Pages site), and readback checks v2 bytes on each source.
 
 ## Settings and qualification
 
@@ -425,7 +490,8 @@ certificate holder names. Production signing material is never used for tests.
 
 ## Verification
 
-Run `python3 -m unittest discover -s packaging/tests -p 'test_*feed*.py'` and
+Run `python3 -m unittest discover -s packaging/tests -p 'test_*feed*.py'` (includes
+`test_feed_v2.py`; set `SPARKLE_TEST_SIGN_UPDATE` to cover the official signer) and
 `cargo test -p oink-update`. `test_mac_appcast.py` additionally tests bilingual
 Sparkle XML and the pinned native signer when `SPARKLE_TEST_SIGN_UPDATE` is set.
 All signing fixtures use public RFC 8032 test material, never production keys.

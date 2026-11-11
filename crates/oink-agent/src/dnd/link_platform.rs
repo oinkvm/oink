@@ -120,6 +120,9 @@ impl super::link::Handle {
                         return;
                     }
                     *active = None;
+                    if dropped {
+                        crate::usage_days::mark(crate::usage_days::Feature::Drag);
+                    }
                     glue.target_ended(id, epoch, dropped);
                     if !dropped {
                         let grant = glue.active_target.lock().unwrap().as_ref().map(|(_, g)| g.clone());

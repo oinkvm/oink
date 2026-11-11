@@ -1,5 +1,4 @@
 fn main() {
-    sparkle();
     println!("cargo:rerun-if-changed=native/permissions.m");
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
         cc::Build::new()
@@ -37,28 +36,4 @@ fn main() {
         "OINK_SOURCE_TREE_SHA256 must be 64 lowercase hexadecimal characters"
     );
     println!("cargo:rustc-env=OINK_DIAGNOSTIC_SOURCE_TREE_SHA256={tree}");
-}
-
-fn sparkle() {
-    println!("cargo:rerun-if-changed=native/update.m");
-    println!("cargo:rerun-if-env-changed=SPARKLE_FRAMEWORK_DIR");
-    if std::env::var_os("CARGO_FEATURE_SPARKLE").is_none()
-        || std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("macos")
-    {
-        return;
-    }
-    let directory = std::env::var("SPARKLE_FRAMEWORK_DIR")
-        .expect("Sparkle feature requires the verified Sparkle 2.9.6 distribution directory");
-    cc::Build::new()
-        .file("native/update.m")
-        .flag("-fobjc-arc")
-        .flag("-fblocks")
-        .flag("-Werror")
-        .flag("-mmacosx-version-min=14.2")
-        .flag(format!("-F{directory}"))
-        .compile("oink_update_macos");
-    println!("cargo:rustc-link-search=framework={directory}");
-    println!("cargo:rustc-link-lib=framework=Sparkle");
-    println!("cargo:rustc-link-lib=framework=AppKit");
-    println!("cargo:rustc-link-arg=-Wl,-rpath,@executable_path/../Frameworks");
 }

@@ -18,11 +18,18 @@ pub enum NativeReadOutcome {
 }
 
 static OBSERVER: OnceLock<fn(Duration, NativeReadOutcome)> = OnceLock::new();
+static PASTE_OBSERVER: OnceLock<fn()> = OnceLock::new();
 
 /// Observe returning native callbacks that read a remote representation. Called
 /// on the native thread: observers must be nonblocking. No content or identity.
 pub fn set_native_read_observer(observer: fn(Duration, NativeReadOutcome)) -> bool {
     OBSERVER.set(observer).is_ok()
+}
+
+/// Observe served native callbacks that read remote clipboard content (a paste),
+/// never drag-and-drop reads. Same thread and nonblocking rules as above.
+pub fn set_paste_observer(observer: fn()) -> bool {
+    PASTE_OBSERVER.set(observer).is_ok()
 }
 
 thread_local! {
@@ -32,6 +39,7 @@ thread_local! {
 pub(crate) struct Read {
     started: Instant,
     remote: Cell<bool>,
+    clipboard: Cell<bool>,
     outcome: Cell<NativeReadOutcome>,
     #[cfg(test)]
     clock: Option<std::sync::Arc<TestClock>>,
@@ -51,6 +59,10 @@ impl Read {
     }
     pub(crate) fn timed_out(&self) {
         self.outcome.set(NativeReadOutcome::TimedOut);
+    }
+    /// The remote content belongs to a clipboard offer, not a drag.
+    pub(crate) fn clipboard(&self) {
+        self.clipboard.set(true);
     }
     pub(crate) fn cancelled(&self) {
         if self.outcome.get() != NativeReadOutcome::TimedOut {
@@ -90,6 +102,7 @@ impl Callback {
         let read = Rc::new(Read {
             started: Instant::now(),
             remote: Cell::new(false),
+            clipboard: Cell::new(false),
             outcome: Cell::new(NativeReadOutcome::Failed),
             #[cfg(test)]
             clock: TEST_CLOCK.with_borrow(Clone::clone),
@@ -114,6 +127,13 @@ impl Drop for Callback {
             if let Some(observer) = OBSERVER.get() {
                 observer(elapsed, outcome);
             }
+            if outcome == NativeReadOutcome::Served && self.read.clipboard.get() {
+                if let Some(observer) = PASTE_OBSERVER.get() {
+                    observer();
+                }
+                #[cfg(test)]
+                TEST_PASTES.set(TEST_PASTES.get() + 1);
+            }
             #[cfg(test)]
             TEST_OUTCOMES.with_borrow_mut(|outcomes| outcomes.push((elapsed, outcome)));
         }
@@ -124,6 +144,7 @@ impl Drop for Callback {
 thread_local! {
     static TEST_CLOCK: RefCell<Option<std::sync::Arc<TestClock>>> = const { RefCell::new(None) };
     pub(crate) static TEST_OUTCOMES: RefCell<Vec<(Duration, NativeReadOutcome)>> = const { RefCell::new(Vec::new()) };
+    pub(crate) static TEST_PASTES: Cell<u32> = const { Cell::new(0) };
 }
 #[cfg(test)]
 #[derive(Default)]

@@ -36,7 +36,7 @@ def fetch(url, limit, path, attempt, role, expected):
     return raw
 
 
-def verify(expected, previous, error='deployment_digest'):
+def verify(expected, previous, error='deployment_digest', base=None):
     """A cache-busted probe diagnoses visibility; it can NEVER accept a deploy.
 
     Only a complete round of exact canonical responses (including required
@@ -52,7 +52,7 @@ def verify(expected, previous, error='deployment_digest'):
         for path, raw in expected.items():
             if time.monotonic() - start > BUDGET_SECONDS:
                 raise ValueError(error)
-            url = feed.BASE + path
+            url = (base or feed.BASE) + path
             old = previous.get(path)
             limit = max(feed.MAX_FEED, len(raw or b''), len(old or b''))
             actual = fetch(url, limit, path, attempt, 'canonical', raw)

@@ -9,8 +9,8 @@ const mock=vi.hoisted(()=>({update:vi.fn(),query:vi.fn(),fail:vi.fn(),openUrl:vi
 vi.mock('./PackageDrop',async()=>({...await vi.importActual<typeof import('./PackageDrop')>('./PackageDrop'),usePackageDropReceiver:(_platform:string,receive:(path:string)=>void)=>{mock.receive=receive;}}));
 vi.mock('../api/client',()=>({api:{update:mock.update},shell:{openUrl:mock.openUrl}}));
 vi.mock('../api/store',()=>({agent:{query:mock.query,fail:mock.fail},useAgent:()=>({update:mock.status,boot:mock.boot})}));
-const candidate={build:31,version:'0.1.1',size:1,published_at:null,severity:'normal',notes:{en:'Fixes','zh-Hans':'修复'}};
-const base:UpdateStatus={current_build:30,version:'0.1.0',checks_enabled:true,phase:'ready',candidate,checked_at:null,next_check:null,deferred_until:null,blockers:[],progress:100,error:null,scope:'user',can_change_policy:true};
+const candidate={build:31,version:'0.1.1',size:1,published_at:null,severity:'normal',notes:{en:'Fixes','zh-Hans':'修复'},kind:'normal' as const,notice:null};
+const base:UpdateStatus={current_build:30,version:'0.1.0',checks_enabled:true,channel:'stable',update_channel:null,install_after_download:true,phase:'ready',candidate,checked_at:null,next_check:null,deferred_until:null,blockers:[],progress:100,error:null,failed_build:null,critical_prompted_build:null,scope:'user',can_change_policy:true};
 beforeEach(()=>{
   setLanguage('en');vi.clearAllMocks();
   mock.boot=null;
@@ -33,26 +33,23 @@ it('stays closed until a trigger opens it in the main window',()=>{
   expect(dialog()).toBeNull();
   act(()=>openUpdateDialog());
   expect(dialog()?.getAttribute('aria-modal')).toBe('true');
-  expect(within(dialog()!).getByText('Update to 0.1.1 (31)')).toBeTruthy();
+  expect(within(dialog()!).getByText('Update to 0.1.1')).toBeTruthy();
 });
 
-it.each([
-  ['0.3.0-inhouse.45','0.3.0'],
-  ['0.3.0-inhouse.123abcde','0.3.0'],
-  ['0.3.0-beta.1','0.3.0-beta.1'],
-])('shows candidate version %s with its separate build number', (version,display)=>{
-  mock.status={...base,candidate:{...candidate,version,build:45}};
+// The full version names the package; the numeric build is never shown.
+it.each(['0.3.6-inhouse.2','0.4.0-beta.1','0.3.6'])('shows candidate version %s without its build number', version=>{
+  mock.status={...base,candidate:{...candidate,version,build:306002}};
   mainWindow();act(()=>openUpdateDialog());
-  expect(within(dialog()!).getByRole('heading').textContent).toBe(`Update to ${display} (45)`);
+  expect(within(dialog()!).getByRole('heading').textContent).toBe(`Update to ${version}`);
 });
 
 it.each([
-  ['zh-Hans','升级到 0.3.0 (45)'],
-  ['en','Update to 0.3.0 (45)'],
-  ['ja','0.3.0 (45) にアップデート'],
-  ['ko','0.3.0 (45) 버전으로 업데이트'],
-])('localizes the version/build title in %s', (language,title)=>{
-  setLanguage(language);mock.status={...base,candidate:{...candidate,version:'0.3.0-inhouse.45',build:45}};
+  ['zh-Hans','升级到 0.3.6-inhouse.2'],
+  ['en','Update to 0.3.6-inhouse.2'],
+  ['ja','0.3.6-inhouse.2 にアップデート'],
+  ['ko','0.3.6-inhouse.2 버전으로 업데이트'],
+])('localizes the version title in %s', (language,title)=>{
+  setLanguage(language);mock.status={...base,candidate:{...candidate,version:'0.3.6-inhouse.2',build:306002}};
   mainWindow();act(()=>openUpdateDialog());
   expect(within(dialog()!).getByRole('heading').textContent).toBe(title);
 });
@@ -84,7 +81,7 @@ it('shows a local inspection IPC rejection in the dialog instead of retaining Ve
   mainWindow();act(()=>mock.receive!('C:\\Oink44.msi'));
   await waitFor(()=>expect(within(dialog()!).getByRole('status').textContent).toBe('Update failed'));
   expect(within(dialog()!).getByRole('alert').textContent).toContain('Could not complete the update');
-  expect(buttons()).toEqual(['Close']);expect(mock.fail).not.toHaveBeenCalled();
+  expect(buttons()).toEqual(['Releases','Close']);expect(mock.fail).not.toHaveBeenCalled();
   act(()=>mock.receive!('C:\\Oink-new.msi'));
   await waitFor(()=>expect(within(dialog()!).queryByRole('alert')).toBeNull());
   expect(within(dialog()!).getByRole('status').textContent).toBe('Verifying');
@@ -93,27 +90,29 @@ it('shows the verification deadline as a terminal dialog error',()=>{
   mock.boot={platform:'windows'};mock.status={...base,phase:'failed',candidate:null,error:'verification_timeout'};
   mainWindow();act(()=>openUpdateDialog());
   expect(within(dialog()!).getByRole('alert').textContent).toBe('Package verification timed out. Oink is still running; please retry.');
-  expect(buttons()).toEqual(['Close']);
+  expect(buttons()).toEqual(['Releases','Close']);
 });
 
 describe('phase content and button labels',()=>{
   // [phase, status text, buttons left to right, extra status fields]
+  // The releases link leads every row; an offered candidate is described by its title and notes.
   const cases:[UpdatePhase,string,string[],Partial<UpdateStatus>?][]=[
-    ['checking','Checking',['Close'],{candidate:null,progress:null}],
+    ['checking','Checking',['Releases','Close'],{candidate:null,progress:null}],
     // Idle says nothing: it does not mean an update is ready, nor that a check ran.
-    ['idle','',['Close'],{candidate:null,progress:null,checked_at:1_800_000_000}],
-    ['available','Update available',['Cancel','Download update'],{progress:null}],
-    ['downloading','Downloading',['Hide','Cancel download'],{progress:42}],
-    ['verifying','Verifying',['Hide','Cancel download'],{progress:100}],
-    ['ready','',['Cancel','Restart to update']],
-    ['quiescing','Preparing update',['Close']],
-    ['installing','Installing',['Close']],
-    ['awaiting_reboot','Waiting for system restart',['Close']],
-    ['installer_busy','Installer is busy',['Close']],
-    ['committed','Update installed',['Close']],
-    ['rolled_back','Previous version restored',['Close']],
-    ['repair_required','Installation repair required',['Close']],
-    ['failed','Update failed',['Close'],{error:'network'}],
+    ['idle','',['Releases','Close'],{candidate:null,progress:null,checked_at:1_800_000_000}],
+    ['available','',['Releases','Skip This Version','Cancel','Download'],{progress:null}],
+    ['downloading','',['Releases','Hide','Cancel download'],{progress:42}],
+    ['verifying','Verifying',['Releases','Hide','Cancel download'],{progress:100}],
+    ['ready','',['Releases','Cancel','Restart to update']],
+    ['quiescing','Preparing update',['Releases','Close']],
+    ['installing','Installing',['Releases','Close']],
+    ['awaiting_reboot','Waiting for system restart',['Releases','Close']],
+    ['installer_busy','Installer is busy',['Releases','Close']],
+    ['committed','Update installed',['Releases','Close']],
+    ['rolled_back','Previous version restored',['Releases','Close']],
+    ['repair_required','Installation repair required',['Releases','Close']],
+    // A failed check keeps no candidate and is retried from here.
+    ['failed','',['Releases','Close','Check for updates'],{candidate:null,error:'network'}],
   ];
   it.each(cases)('%s',(phase,text,labels,extra)=>{
     mock.status={...base,phase,...extra};
@@ -123,16 +122,45 @@ describe('phase content and button labels',()=>{
     expect(buttons()).toEqual(labels);
     expect(new Set(buttons()).size).toBe(labels.length);
     if(mock.status.candidate)expect(within(dialog()!).getByText('Fixes')).toBeTruthy();
-    if(phase==='failed')expect(within(dialog()!).getByRole('alert').textContent).toBe('Could not complete the update. Retry or install from the releases page.');
+    if(phase==='failed')expect(within(dialog()!).getByRole('alert').textContent).toBe("Couldn't check for updates");
   });
   it('manual builds offer the releases page',()=>{
     mock.status={...base,phase:'disabled',candidate:null,progress:null};
     mainWindow();act(()=>openUpdateDialog());
     expect(within(dialog()!).getByText('Download and install updates manually for this version.')).toBeTruthy();
-    expect(buttons()).toEqual(['Cancel','View releases']);
-    fireEvent.click(screen.getByRole('button',{name:'View releases'}));
-    expect(mock.openUrl).toHaveBeenCalledWith('https://github.com/oinkvm/oink/releases');
+    expect(buttons()).toEqual(['Releases','Close']);
+    fireEvent.click(screen.getByRole('button',{name:'Releases'}));
+    expect(mock.openUrl).toHaveBeenCalledWith('https://github.com/oinkvm/oink/releases/latest');
   });
+});
+
+// Issue 45: the failure text tells the user to retry or use the releases page;
+// both must be possible from the dialog, also after quitting and reopening Oink.
+it('a failed check or download can be checked again from the dialog',async()=>{
+  mock.status={...base,phase:'failed',candidate:null,error:'network'};
+  mock.update.mockResolvedValue({...base,phase:'checking',candidate:null,error:null});
+  const view=mainWindow();act(()=>openUpdateDialog());
+  fireEvent.click(screen.getByRole('button',{name:'Check for updates'}));
+  await waitFor(()=>expect(mock.update).toHaveBeenCalledWith({type:'check'}));
+  expect(mock.update).toHaveBeenCalledTimes(1);
+  // Nothing newer was found: the dialog says so instead of going blank.
+  mock.status={...base,phase:'idle',candidate:null,error:null};
+  view.rerender(<OinkProvider defaultMotion="reduced"><div className="win"><UpgradeButton/><UpgradeDialog container={null}/></div></OinkProvider>);
+  expect(within(dialog()!).getByRole('status').textContent).toBe('Oink is up to date');
+  expect(within(dialog()!).queryByRole('alert')).toBeNull();
+  expect(buttons()).toEqual(['Releases','Close']);
+});
+it.each([['stable','https://github.com/oinkvm/oink/releases/latest'],['beta','https://github.com/oinkvm/oink/releases']] as const)('the releases link of the %s channel',(channel,url)=>{
+  mock.status={...base,phase:'failed',candidate:null,error:'network',channel};
+  mainWindow();act(()=>openUpdateDialog());
+  fireEvent.click(screen.getByRole('button',{name:'Releases'}));
+  expect(mock.openUrl).toHaveBeenCalledWith(url);
+  expect(mock.update).not.toHaveBeenCalled();
+});
+it('an idle dialog that was not checked from here still says nothing',()=>{
+  mock.status={...base,phase:'idle',candidate:null,error:null};
+  mainWindow();act(()=>openUpdateDialog());
+  expect(within(dialog()!).queryByRole('status')).toBeNull();
 });
 
 it('Hide leaves the download running and Cancel download aborts it',async()=>{
@@ -147,12 +175,14 @@ it('Hide leaves the download running and Cancel download aborts it',async()=>{
   await waitFor(()=>expect(mock.update).toHaveBeenCalledExactlyOnceWith({type:'cancel'}));
 });
 
-it('the title-bar pill downloads directly when available and opens the dialog when ready',async()=>{
+it('the title-bar pill opens the dialog so the notes are read before downloading',()=>{
   mock.status={...base,phase:'available',progress:null};
   const view=mainWindow();
-  fireEvent.click(screen.getByRole('button',{name:'Update to 0.1.1 (31)'}));
-  await waitFor(()=>expect(mock.update).toHaveBeenCalledExactlyOnceWith({type:'download'}));
-  expect(dialog()).toBeNull();
+  fireEvent.click(screen.getByRole('button',{name:'Update to 0.1.1'}));
+  expect(dialog()).toBeTruthy();
+  expect(within(dialog()!).getByText('Fixes')).toBeTruthy();
+  expect(mock.update).not.toHaveBeenCalled();
+  act(()=>closeUpdateDialog());
   mock.status={...base,phase:'ready'};
   view.rerender(<OinkProvider defaultMotion="reduced"><div className="win"><UpgradeButton/><UpgradeDialog container={null}/></div></OinkProvider>);
   fireEvent.click(screen.getByRole('button',{name:'Complete update'}));
@@ -233,7 +263,7 @@ it('consumes a restored failure when dismissed so a later candidate can become R
   view.rerender(<OinkProvider defaultMotion="reduced"><div className="win"><UpgradeButton/><UpgradeDialog container={null}/></div></OinkProvider>);
   fireEvent.click(screen.getByRole('button',{name:'Complete update'}));
   expect(within(screen.getByRole('dialog')).queryByText('Update failed')).toBeNull();
-  expect(within(screen.getByRole('dialog')).getByText('Update to 0.1.1 (31)')).toBeTruthy();
+  expect(within(screen.getByRole('dialog')).getByText('Update to 0.1.1')).toBeTruthy();
 });
 
 // Native URLs, received File Provider paths and materialized promises all use
@@ -256,7 +286,7 @@ it('uses the same ready dialog and notes for a restored local candidate',()=>{
   mock.boot={platform:'windows'};
   mock.status={...base,phase:'ready',candidate:{...base.candidate!,local_package:true}};
   openUpdateDialog();render(<UpgradeDialog container={document.body}/>);
-  expect(screen.getByRole('dialog').textContent).toContain('Update to 0.1.1 (31)');
+  expect(screen.getByRole('dialog').textContent).toContain('Update to 0.1.1');
   expect(screen.getByText('Fixes')).toBeTruthy();
   expect(screen.queryByText(/Windows requests administrator/)).toBeNull();
   expect(screen.getByText(/Oink cannot authenticate this local Windows package/)).toBeTruthy();
@@ -316,4 +346,73 @@ it('a pointer click inside the local Ready dialog sends Install without dismissi
   expect(mock.update).toHaveBeenCalledTimes(1);
   expect(within(host).getByRole('status').textContent).toBe('Update failed');
   expect(mock.fail).not.toHaveBeenCalled();view.unmount();host.remove();
+});
+
+describe('feed rules',()=>{
+  const dialogText=()=>dialog()!.textContent;
+  it('skipping a normal update records the build and closes',async()=>{
+    mock.status={...base,phase:'available',progress:null};
+    mainWindow();act(()=>openUpdateDialog());
+    fireEvent.click(screen.getByRole('button',{name:'Skip This Version'}));
+    await waitFor(()=>expect(mock.update).toHaveBeenCalledExactlyOnceWith({type:'skip',expected_build:31}));
+    await waitFor(()=>expect(dialog()).toBeNull());
+  });
+  it('a manual-only candidate shows its notes and the releases route but no download',()=>{
+    mock.status={...base,phase:'available',progress:null,candidate:{...candidate,kind:'manual'}};
+    mainWindow();act(()=>openUpdateDialog());
+    expect(within(dialog()!).getByRole('alert').textContent).toBe('This version is too old to update automatically. Download the update from the releases page.');
+    expect(within(dialog()!).getByText('Fixes')).toBeTruthy();
+    expect(buttons()).toEqual(['Releases','Close']);
+    expect(within(dialog()!).queryByRole('checkbox')).toBeNull();
+  });
+  it('a critical candidate has a notice before its notes and cannot be skipped',()=>{
+    mock.status={...base,phase:'available',progress:null,critical_prompted_build:31,candidate:{...candidate,kind:'critical',notice:{en:'Security fix','zh-Hans':'安全修复'}}};
+    mainWindow();act(()=>openUpdateDialog());
+    expect(buttons()).toEqual(['Releases','Cancel','Download']);
+    expect(dialogText().indexOf('Security fix')).toBeLessThan(dialogText().indexOf('Fixes'));
+  });
+  it('the title-bar pill of a critical update nudges',()=>{
+    mock.status={...base,phase:'available',progress:null,critical_prompted_build:31,candidate:{...candidate,kind:'critical',notice:null}};
+    mainWindow();
+    expect(document.querySelector('.upgrade--critical')).not.toBeNull();
+  });
+  it('an unprompted critical update opens its dialog once and records it',async()=>{
+    mock.status={...base,phase:'available',progress:null,candidate:{...candidate,kind:'critical',notice:null}};
+    mainWindow();
+    await waitFor(()=>expect(dialog()).not.toBeNull());
+    await waitFor(()=>expect(mock.update).toHaveBeenCalledExactlyOnceWith({type:'prompted',expected_build:31}));
+  });
+  it('a prompted or normal update does not open by itself',()=>{
+    mock.status={...base,phase:'available',progress:null};
+    mainWindow();
+    expect(dialog()).toBeNull();
+    cleanup();
+    mock.status={...base,phase:'available',progress:null,critical_prompted_build:31,candidate:{...candidate,kind:'critical',notice:null}};
+    mainWindow();
+    expect(dialog()).toBeNull();
+    expect(mock.update).not.toHaveBeenCalled();
+  });
+  it('a failed download of this build says so above its notes and offers the download again',async()=>{
+    mock.status={...base,phase:'failed',progress:null,error:'network',failed_build:31};
+    mainWindow();act(()=>openUpdateDialog());
+    expect(within(dialog()!).getByRole('alert').textContent).toBe('Download failed. Check your network connection and try again, or download the package from the releases page and drag it into this window to install.');
+    expect(buttons()).toEqual(['Releases','Cancel','Download']);
+    fireEvent.click(screen.getByRole('button',{name:'Download'}));
+    await waitFor(()=>expect(mock.update).toHaveBeenCalledExactlyOnceWith({type:'download'}));
+  });
+  it('a failure of another build is not shown for this candidate',()=>{
+    mock.status={...base,phase:'failed',progress:null,error:'network',failed_build:30};
+    mainWindow();act(()=>openUpdateDialog());
+    expect(within(dialog()!).queryByRole('alert')).toBeNull();
+    expect(within(dialog()!).queryByRole('status')).toBeNull();
+    expect(buttons()).toEqual(['Releases','Cancel','Download']);
+  });
+  it('install after download is on by default and sends the stored preferences back with the change',async()=>{
+    mock.status={...base,phase:'available',progress:null,update_channel:'beta',channel:'beta'};
+    mainWindow();act(()=>openUpdateDialog());
+    const box=within(dialog()!).getByRole('checkbox',{name:'Install automatically after downloading'}) as HTMLInputElement;
+    expect(box.checked).toBe(true);
+    fireEvent.click(box);
+    await waitFor(()=>expect(mock.update).toHaveBeenCalledExactlyOnceWith({type:'set_preferences',preferences:{checks_enabled:true,update_channel:'beta',install_after_download:false}}));
+  });
 });

@@ -251,6 +251,7 @@ impl Node {
                                 group.sleep();
                             } else {
                                 group.wake();
+                                crate::usage_days::system_resumed();
                             }
                         }
                         if let Some(state) = pending_power

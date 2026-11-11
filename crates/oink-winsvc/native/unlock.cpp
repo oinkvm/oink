@@ -759,57 +759,141 @@ static LSTATUS setValue(const std::wstring &key, const wchar_t *name,
   }
   return e;
 }
-static bool eraseVault() {
-  PWSTR path = nullptr;
-  if (FAILED(SHGetKnownFolderPath(FOLDERID_ProgramData, 0, nullptr, &path)))
-    return false;
-  auto directory = std::wstring(path) + L"\\OinkAutoUnlock";
-  CoTaskMemFree(path);
-  if (absent(directory))
-    return true;
+static std::wstring providerKey() {
+  return std::wstring(L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Authen"
+                      L"tication\\Credential Providers\\") +
+         ProviderId;
+}
+static std::wstring classKey() {
+  return std::wstring(L"SOFTWARE\\Classes\\CLSID\\") + ProviderId;
+}
+// Uninstall steps, reported with the failing object so the installer log says
+// which one failed (oink_winsvc maps the numbers to text; keep them in sync).
+enum UnregisterStep : DWORD {
+  UnregisterIdentity = 1,
+  UnregisterProgramData = 2,
+  UnregisterVaultOpen = 3,
+  UnregisterVaultUnsafe = 4,
+  UnregisterVaultList = 5,
+  UnregisterVaultEntry = 6,
+  UnregisterVaultFile = 7,
+  UnregisterVaultDirectory = 8,
+  UnregisterProviderKey = 9,
+  UnregisterClassKey = 10,
+};
+struct UnregisterFailure {
+  DWORD *step;
+  wchar_t *object;
+  DWORD capacity;
+  DWORD fail(UnregisterStep s, const std::wstring &what, DWORD error) const {
+    *step = s;
+    if (capacity)
+      wcsncpy_s(object, capacity, what.c_str(), _TRUNCATE);
+    return error ? error : ERROR_GEN_FAILURE;
+  }
+};
+static DWORD eraseVault(const std::wstring &directory,
+                        const UnregisterFailure &out) {
+  DWORD attributes = GetFileAttributesW(directory.c_str());
+  if (attributes == INVALID_FILE_ATTRIBUTES) {
+    DWORD error = GetLastError();
+    if (error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND)
+      return 0; // Never enabled, or already erased.
+    return out.fail(UnregisterVaultOpen, directory, error);
+  }
   Handle d(CreateFileW(
       directory.c_str(), READ_CONTROL | FILE_READ_ATTRIBUTES,
       FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
       FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
-  if (d.h == INVALID_HANDLE_VALUE || !privateHandle(d.h))
-    return false;
+  if (d.h == INVALID_HANDLE_VALUE)
+    return out.fail(UnregisterVaultOpen, directory, GetLastError());
+  // Same pinned-directory rule as the service: never delete through a link
+  // or from a directory someone other than SYSTEM could have populated.
+  if (!privateHandle(d.h))
+    return out.fail(UnregisterVaultUnsafe, directory, ERROR_ACCESS_DENIED);
   WIN32_FIND_DATAW data{};
   HANDLE search = FindFirstFileW((directory + L"\\*").c_str(), &data);
-  bool ok = true;
-  if (search != INVALID_HANDLE_VALUE) {
-    do {
-      if (!wcscmp(data.cFileName, L".") || !wcscmp(data.cFileName, L".."))
-        continue;
-      if (data.dwFileAttributes &
-          (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) {
-        ok = false;
-        continue;
-      }
-      ok = remove(directory + L"\\" + data.cFileName) && ok;
-    } while (FindNextFileW(search, &data));
-    FindClose(search);
-  }
+  if (search == INVALID_HANDLE_VALUE)
+    return out.fail(UnregisterVaultList, directory, GetLastError());
+  DWORD error = 0;
+  do {
+    if (!wcscmp(data.cFileName, L".") || !wcscmp(data.cFileName, L".."))
+      continue;
+    auto entry = directory + L"\\" + data.cFileName;
+    if (data.dwFileAttributes &
+        (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) {
+      error = out.fail(UnregisterVaultEntry, entry, ERROR_ACCESS_DENIED);
+      break;
+    }
+    if (!remove(entry)) {
+      error = out.fail(UnregisterVaultFile, entry, GetLastError());
+      break;
+    }
+  } while (FindNextFileW(search, &data));
+  if (!error && GetLastError() != ERROR_NO_MORE_FILES)
+    error = out.fail(UnregisterVaultList, directory, GetLastError());
+  FindClose(search);
+  if (error)
+    return error;
   CloseHandle(d.h);
   d.h = nullptr;
-  return ok && RemoveDirectoryW(directory.c_str());
+  if (!RemoveDirectoryW(directory.c_str()))
+    return out.fail(UnregisterVaultDirectory, directory, GetLastError());
+  return 0;
 }
-extern "C" DWORD oink_unlock_register(const wchar_t *dll, bool removeProvider) {
+static DWORD deleteTree(HKEY hive, const std::wstring &key, UnregisterStep step,
+                        const UnregisterFailure &out) {
+  LSTATUS e = RegDeleteTreeW(hive, key.c_str());
+  if (e == ERROR_SUCCESS || e == ERROR_FILE_NOT_FOUND)
+    return 0; // Already unregistered (for example removed by hand) is done.
+  return out.fail(step, key, static_cast<DWORD>(e));
+}
+// Removal below a caller-chosen vault directory and registry root, so tests
+// can exercise it on a scratch tree. Returns 0, or the Win32 error of the
+// first failing step with *step and object naming it.
+extern "C" DWORD oink_unlock_unregister_under(HKEY hive, const wchar_t *vault,
+                                              DWORD *step, wchar_t *object,
+                                              DWORD capacity) {
+  const UnregisterFailure out{step, object, capacity};
+  *step = 0;
+  if (capacity)
+    object[0] = 0;
+  if (DWORD e = eraseVault(vault, out))
+    return e;
+  if (DWORD e = deleteTree(hive, providerKey(), UnregisterProviderKey, out))
+    return e;
+  return deleteTree(hive, classKey(), UnregisterClassKey, out);
+}
+// Uninstall: erase the vault, then remove this provider's registration.
+// No session-0 requirement here, unlike registration: Windows Installer runs
+// the deferred, non-impersonating uninstall action as LocalSystem but in the
+// session of the msiexec client (session 1 for an uninstall started from the
+// desktop; session 0 only for one started from a service or ssh). Requiring
+// session 0 failed every desktop uninstall (issue #46). The caller has
+// already verified the protected installed image.
+extern "C" DWORD oink_unlock_unregister(DWORD *step, wchar_t *object,
+                                        DWORD capacity) {
+  const UnregisterFailure out{step, object, capacity};
+  *step = 0;
+  if (capacity)
+    object[0] = 0;
+  if (!system())
+    return out.fail(UnregisterIdentity, L"", ERROR_ACCESS_DENIED);
+  PWSTR programData = nullptr;
+  HRESULT hr =
+      SHGetKnownFolderPath(FOLDERID_ProgramData, 0, nullptr, &programData);
+  if (FAILED(hr))
+    return out.fail(UnregisterProgramData, L"", HRESULT_CODE(hr));
+  auto vault = std::wstring(programData) + L"\\OinkAutoUnlock";
+  CoTaskMemFree(programData);
+  return oink_unlock_unregister_under(HKEY_LOCAL_MACHINE, vault.c_str(), step,
+                                      object, capacity);
+}
+extern "C" DWORD oink_unlock_register(const wchar_t *dll) {
   if (!system() || session() != 0)
     return ERROR_ACCESS_DENIED;
-  auto cp = std::wstring(L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Authen"
-                         L"tication\\Credential Providers\\") +
-            ProviderId;
-  auto cls = std::wstring(L"SOFTWARE\\Classes\\CLSID\\") + ProviderId;
-  if (removeProvider) {
-    if (!eraseVault())
-      return ERROR_ACCESS_DENIED;
-    auto a = RegDeleteTreeW(HKEY_LOCAL_MACHINE, cp.c_str()),
-         b = RegDeleteTreeW(HKEY_LOCAL_MACHINE, cls.c_str());
-    return (a == 0 || a == ERROR_FILE_NOT_FOUND) &&
-                   (b == 0 || b == ERROR_FILE_NOT_FOUND)
-               ? 0
-               : ERROR_ACCESS_DENIED;
-  }
+  auto cp = providerKey();
+  auto cls = classKey();
   DWORD e = setValue(cls + L"\\InprocServer32", nullptr, dll);
   if (!e)
     e = setValue(cls + L"\\InprocServer32", L"ThreadingModel", L"Apartment");

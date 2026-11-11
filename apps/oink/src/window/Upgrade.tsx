@@ -1,5 +1,5 @@
 import { useEffect, useState, useSyncExternalStore } from 'react';
-import { Button, Dialog, Icon, Tooltip, toast } from 'oink-ui';
+import { Button, Checkbox, Dialog, Icon, Tooltip, toast } from 'oink-ui';
 import type { DialogProps } from 'oink-ui';
 import { usePackageDrag, usePackageDropReceiver } from './PackageDrop';
 import { ProgressFill } from './ProgressFill';
@@ -8,6 +8,7 @@ import { api, shell } from '../api/client';
 import { ApiFailure } from '../api/transport';
 import { problemText } from '../i18n';
 import { agent, useAgent } from '../api/store';
+import { preferencesWith } from '../api/update';
 import type { UpdateCommand, UpdatePhase, UpdateBlocker, UpdateError, UpdateStatus } from '../api/update';
 import { tr, useLanguage } from '../i18n';
 import type { MessageKey } from '../i18n';
@@ -43,6 +44,8 @@ export const openUpdateDialog=()=>setDialogOpen(true);
 export const closeUpdateDialog=()=>setDialogOpen(false);
 const subscribe=(listener:()=>void)=>{listeners.add(listener);return()=>{listeners.delete(listener);};};
 const useDialogOpen=()=>useSyncExternalStore(subscribe,()=>dialogOpen);
+const subscribeVisibility=(listener:()=>void)=>{document.addEventListener('visibilitychange',listener);return()=>document.removeEventListener('visibilitychange',listener);};
+const useWindowVisible=()=>useSyncExternalStore(subscribeVisibility,()=>!document.hidden);
 
 function useUpdateCommand() {
   const [pending,setPending]=useState(false);
@@ -55,16 +58,17 @@ function useUpdateCommand() {
   return {pending,send,failed,reason};
 }
 const inProgress=(phase:UpdatePhase|undefined)=>phase==='downloading'||phase==='verifying';
-const dialogTitle=(candidate:UpdateStatus['candidate']|undefined)=>candidate?tr('升级到 {0} ({1})', candidate.version.replace(/-inhouse\.(?:[0-9a-f]{8}|[0-9]+)$/,''), candidate.build):tr('更新 Oink');
+const dialogTitle=(candidate:UpdateStatus['candidate']|undefined)=>candidate?tr('升级到 {0}', candidate.version):tr('更新 Oink');
 
 // Verification (Sparkle extraction) reports its own progress from zero; the
 // download is complete by then, so the bar stays full until Ready.
 const shownProgress=(phase:UpdatePhase|undefined,progress:number|null|undefined)=>phase==='verifying'?100:Math.max(0,Math.min(100,Math.round(progress??0)));
 
-/** Title-bar indicator: an Update pill, or the download progress, which reopens the dialog. */
+/** Title-bar indicator: an Update pill, or the download progress. Both open the dialog, so the notes are read before downloading. */
 export function UpgradeButton() {
-  const {update}=useAgent();const {send}=useUpdateCommand();
+  const {update}=useAgent();
   const progress=inProgress(update?.phase);
+  const critical=update?.candidate?.kind==='critical';
   const ready=update?.phase==='ready';
   const title=dialogTitle(update?.candidate);
   const shown=shownProgress(update?.phase,update?.progress);
@@ -73,7 +77,7 @@ export function UpgradeButton() {
   // committed states do not advertise another update.
   if (!update?.candidate || ['disabled', 'idle', 'committed'].includes(update.phase)) return null;
   return <Tooltip interactive={false} placement="bottom" content={progress?progressText:ready?tr('完成升级'):title}>
-    {progress?<button type="button" className="upgrade upgrade--bar" aria-label={progressText} onClick={openUpdateDialog}><ProgressFill value={shown}>{update?.phase==='verifying'?tr('校验中'):`${shown}%`}</ProgressFill></button>:<Button variant="accent" size="sm" className="upgrade upgrade--pill" aria-label={ready?tr('完成升级'):title} onClick={()=>{if(update?.phase==='available')void send({type:'download'});else openUpdateDialog();}}>{ready?<Icon name="check"/>:tr('更新')}</Button>}
+    {progress?<button type="button" className="upgrade upgrade--bar" aria-label={progressText} onClick={openUpdateDialog}><ProgressFill value={shown}>{update?.phase==='verifying'?tr('校验中'):`${shown}%`}</ProgressFill></button>:<Button variant="accent" size="sm" className={critical&&!ready?'upgrade upgrade--pill upgrade--critical':'upgrade upgrade--pill'} aria-label={ready?tr('完成升级'):title} onClick={openUpdateDialog}>{ready?<Icon name="check"/>:tr('更新')}</Button>}
   </Tooltip>;
 }
 
@@ -91,11 +95,18 @@ const localErrors:Partial<Record<UpdateError,MessageKey>>={
   not_writable:'无法在无本机授权的情况下替换此位置的 Oink。',elevation:'管理员授权已取消或失败，Oink 仍在运行。',
 };
 
+const RELEASES='https://github.com/oinkvm/oink/releases';
+// GitHub's latest-release page skips pre-releases, which the beta channel offers.
+const releasesPage=(channel:UpdateStatus['channel']|undefined)=>channel==='beta'?RELEASES:`${RELEASES}/latest`;
+const openReleases=(channel:UpdateStatus['channel']|undefined)=>{void shell.openUrl(releasesPage(channel)).catch(()=>agent.fail('unavailable'));};
+
 /** The update flow as a modal inside the main window. */
 export function UpgradeDialog({container}:{container:HTMLElement|null}) {
   const {update,boot}=useAgent();const language=useLanguage();const open=useDialogOpen();const {pending,send:command,failed:rejected,reason}=useUpdateCommand();
   const [restoredFailure,setRestoredFailure]=useState(false);
   const [localFile,setLocalFile]=useState(false);
+  // The user started a check from this dialog; its outcome is shown here even when nothing is found.
+  const [rechecked,setRechecked]=useState(false);
   const dragging=usePackageDrag();
   usePackageDropReceiver(boot?.platform==='windows'?'win':'mac',path=>{
     setLocalFile(true);setRestoredFailure(false);openUpdateDialog();
@@ -108,29 +119,75 @@ export function UpgradeDialog({container}:{container:HTMLElement|null}) {
   const discardLocal=()=>{
     if(localPackage&&(update?.phase==='ready'||update?.phase==='failed')) {setLocalFile(false);void send({type:'cancel'});}
   };
-  const dismissDialog=()=>{discardLocal();setRestoredFailure(false);closeUpdateDialog();};
-  const changeOpen=(value:boolean)=>{if(!value){discardLocal();setRestoredFailure(false);}setDialogOpen(value);};
+  const dismissDialog=()=>{discardLocal();setRestoredFailure(false);setRechecked(false);closeUpdateDialog();};
+  const changeOpen=(value:boolean)=>{if(!value){discardLocal();setRestoredFailure(false);setRechecked(false);}setDialogOpen(value);};
   useEffect(()=>{if(boot?.open_update_failure){setRestoredFailure(true);openUpdateDialog();}},[boot?.open_update_failure]);
+  // A critical update opens its dialog by itself once, the first time the
+  // window is visible with it; the backend shows the window at launch.
+  const visible=useWindowVisible();
+  const unprompted=update?.candidate?.kind==='critical'&&!update.candidate.local_package&&update.critical_prompted_build!==update.candidate.build?update.candidate.build:null;
+  useEffect(()=>{
+    if(unprompted===null||!visible)return;
+    openUpdateDialog();
+    void command({type:'prompted',expected_build:unprompted});
+  },[unprompted,visible]);
   const manual=update?.phase==='disabled';
   const progress=inProgress(update?.phase)&&!failed;
   const ready=update?.phase==='ready';
-  const action=failed?null:manual?<Button variant="accent" leading={<Icon name="external"/>} onClick={()=>{void shell.openUrl('https://github.com/oinkvm/oink/releases').catch(()=>agent.fail('unavailable'));}}>{tr('查看发布版本')}</Button>
-    :update?.phase==='available'?<Button variant="accent" loading={pending} onClick={()=>{void send({type:'download'});}}>{tr('下载更新')}</Button>
+  const candidate=update?.candidate??null;
+  const kind=localPackage?'normal':candidate?.kind??'normal';
+  // A failed download keeps its candidate: the dialog offers the same build
+  // again. The failure line belongs to that build only.
+  const downloadFailed=!failed&&!localPackage&&update?.phase==='failed'&&!!candidate&&update.failed_build===candidate.build;
+  const retryDownload=!failed&&!localPackage&&update?.phase==='failed'&&!!candidate&&kind!=='manual'&&!(update.error&&localErrors[update.error]);
+  // A failed check has no candidate: retry the check from here.
+  const recoverable=!failed&&!localPackage&&update?.phase==='failed'&&!candidate&&!(update.error&&localErrors[update.error]);
+  const offered=!localPackage&&!!candidate&&(update?.phase==='available'||retryDownload);
+  const action=failed||kind==='manual'?null:recoverable?<Button variant="accent" loading={pending} onClick={()=>{setRechecked(true);void send({type:'check'});}}>{tr('检查更新')}</Button>
+    :offered?<Button variant="accent" loading={pending} onClick={()=>{void send({type:'download'});}}>{tr('下载')}</Button>
     :ready&&update.candidate?<Button variant="accent" loading={pending} onClick={()=>{void send({type:'install',expected_build:update.candidate!.build});}}>{tr('重启升级')}</Button>
     :progress&&!localPackage?<Button loading={pending} onClick={()=>{void send({type:'cancel'});}}><ProgressFill value={shownProgress(update?.phase,update?.progress)}>{tr('取消下载')}</ProgressFill></Button>:null;
+  // Skipping only silences automatic checks for this build; a critical or
+  // manual-only route has no skip.
+  const skippable=offered&&kind==='normal'&&update?.phase==='available';
   // Closing a local confirmation discards its private staged copy. A running
   // feed download continues in the background (the title-bar indicator reopens the dialog), so it reads
   // Hide next to Cancel download; without an action there is nothing to cancel.
-  const dismiss=progress?tr('隐藏'):action?tr('取消'):tr('关闭');
-  return <Dialog {...({contained:true} as Partial<DialogProps>)} open={open&&!dragging} onOpenChange={changeOpen} container={container} size={400} title={dialogTitle(update?.candidate)} actions={<>
-    <Button onClick={dismissDialog}>{dismiss}</Button>
-    {action}
-  </>}>
-    {/* Idle has no status line: it neither means an update is ready nor that a check ran. */}
-    {failed?<p role="status">{updatePhaseText('failed')}</p>:manual?<p>{tr('此版本需要手动下载并安装更新。')}</p>:!update?<p role="status">{tr('正在读取…')}</p>:update.phase!=='idle'&&update.phase!=='ready'&&<p role="status">{updatePhaseText(update.phase)}</p>}
+  const dismiss=progress?tr('隐藏'):action&&!recoverable?tr('取消'):tr('关闭');
+  const installAfterDownload=update?.install_after_download??true;
+  const offersAutoInstall=!localPackage&&!!candidate&&kind!=='manual'&&(offered||progress);
+  const setInstallAfterDownload=(value:boolean)=>{
+    if(!update)return;
+    void send({type:'set_preferences',preferences:preferencesWith(update,{install_after_download:value})});
+  };
+  const errorLine=downloadFailed?tr('下载失败，请检查网络连接后重试，或前往发布页手动下载安装包后拖拽进窗口安装。')
+    :kind==='manual'&&candidate?tr('版本过低，请前往发布页手动下载更新。')
+    // A network failure that belongs to another build is history: the candidate now offered has not failed.
+    :!localPackage&&candidate&&update?.error==='network'&&update.failed_build!==candidate.build?null
+    :recoverable&&update?.error==='network'?tr('查询新版本失败')
+    :failed||update?.error&&update.error!=='not_configured'?(reason&&!localErrors[reason as UpdateError]?problemText(reason):tr(localErrors[(reason??update?.error) as UpdateError]||'无法完成更新，请重试或前往发布页面下载安装。'))
+    :null;
+  const notice=kind==='critical'&&candidate?.notice?releaseNotesForLanguage(candidate.notice,language):null;
+  return <Dialog {...({contained:true} as Partial<DialogProps>)} open={open&&!dragging} onOpenChange={changeOpen} container={container} size={520} className="upgrade-dialog" title={dialogTitle(update?.candidate)} actions={<div className="upgrade-footer">
+    <div className="upgrade-footer__row">
+      <Button variant="ghost" size="sm" className="upgrade-footer__link" leading={<Icon name="external"/>} onClick={()=>openReleases(update?.channel)}>{tr('发布页')}</Button>
+      <span className="upgrade-footer__actions">
+        {skippable&&<Button onClick={()=>{void send({type:'skip',expected_build:candidate!.build});closeUpdateDialog();}}>{tr('跳过此版本')}</Button>}
+        <Button onClick={dismissDialog}>{dismiss}</Button>
+        {action}
+      </span>
+    </div>
+    {offersAutoInstall&&<Checkbox className="upgrade-footer__auto" checked={installAfterDownload} onChange={setInstallAfterDownload}>{tr('下载完成后自动安装')}</Checkbox>}
+  </div>}>
+    {errorLine&&<p role="alert" className="upgrade-error">{errorLine}</p>}
+    {/* Idle has no status line unless the user just checked from here: by itself it neither means an update is ready nor that a check ran.
+        An offered candidate is described by the title and notes; a download by its progress button. */}
+    {failed?<p role="status">{updatePhaseText('failed')}</p>:recoverable||kind==='manual'&&candidate?null:manual?<p>{tr('此版本需要手动下载并安装更新。')}</p>:!update?<p role="status">{tr('正在读取…')}</p>:update.phase==='idle'?rechecked&&!update.candidate&&<p role="status">{tr('已是最新版本')}</p>:!offered&&!['ready','available','downloading'].includes(update.phase)&&<p role="status">{updatePhaseText(update.phase)}</p>}
     {!!update?.blockers.length&&<ul>{update.blockers.map(b=><li key={b}>{blockerText(b)}</li>)}</ul>}
-    {(failed||update?.error&&update.error!=='not_configured')&&<p role="alert">{reason&&!localErrors[reason as UpdateError]?problemText(reason):tr(localErrors[(reason??update?.error) as UpdateError]||'无法完成更新，请重试或前往发布页面下载安装。')}</p>}
-    {update?.candidate?.notes&&<ul className="upgrade-notes">{releaseNotesForLanguage(update.candidate.notes,language).split('\n').filter(line=>line.trim()).map((line,i)=><li key={i}>{line}</li>)}</ul>}
+    {(notice||update?.candidate?.notes)&&<div className="upgrade-notes-box">
+      {notice&&<p className="upgrade-notice">{notice}</p>}
+      {update?.candidate?.notes&&<ul className="upgrade-notes">{releaseNotesForLanguage(update.candidate.notes,language).split('\n').filter(line=>line.trim()).map((line,i)=><li key={i}>{line}</li>)}</ul>}
+    </div>}
     {localPackage&&ready&&boot?.platform==='windows'&&<p>{tr('Oink 无法验证此本地 Windows 安装包的发布者。请仅在信任此文件时继续。')}</p>}
     {ready&&<p>{tr('安装会立即中断输入、音频和文件共享，并重启 Oink。')}</p>}
   </Dialog>;

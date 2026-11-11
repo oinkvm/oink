@@ -264,11 +264,14 @@ class PublishedRelease(unittest.TestCase):
         self.prepare()
         self.assertEqual((self.output_path / old_name).read_bytes(), self.msi)
 
-    def test_live_draft_prerelease_or_release_event_is_rejected_before_signing(self):
-        for field in ['draft', 'prerelease']:
-            self.live[field] = True
-            with self.assertRaisesRegex(ValueError, 'release_not_public'): self.prepare()
-            self.live[field] = False
+    def test_live_draft_or_release_event_is_rejected_before_signing(self):
+        self.live['draft'] = True
+        with self.assertRaisesRegex(ValueError, 'release_not_public'): self.prepare()
+        self.live['draft'] = False
+        # A vX.Y.Z prerelease is a beta publication of the same MSI.
+        self.live['prerelease'] = True
+        self.prepare()
+        self.live['prerelease'] = False
         self.event.update(action='published', release=copy.deepcopy(self.live))
         with patch.dict(os.environ, GITHUB_EVENT_NAME='release'):
             with self.assertRaisesRegex(ValueError, 'published_release_required'): self.prepare()

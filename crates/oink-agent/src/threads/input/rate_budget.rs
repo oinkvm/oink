@@ -32,6 +32,8 @@ impl RateBudget {
     fn interval(&self) -> Option<Duration> {
         match self.frequency {
             EventFrequency::Hz125 => Some(Duration::from_millis(8)),
+            EventFrequency::Hz250 => Some(Duration::from_millis(4)),
+            EventFrequency::Hz500 => Some(Duration::from_millis(2)),
             EventFrequency::Unlimited => None,
         }
     }
@@ -87,5 +89,28 @@ mod tests {
             budget.ready_at(now + Duration::from_millis(8)),
             now + Duration::from_millis(16)
         );
+    }
+
+    #[test]
+    fn faster_limits_refill_at_their_own_interval() {
+        for (frequency, interval) in [
+            (EventFrequency::Hz125, 8),
+            (EventFrequency::Hz250, 4),
+            (EventFrequency::Hz500, 2),
+        ] {
+            let now = Instant::now();
+            let mut budget = RateBudget::default();
+            budget.reset(frequency, now);
+            budget.consume(now);
+            budget.consume(now);
+            assert_eq!(budget.ready_at(now), now + Duration::from_millis(interval));
+        }
+        let now = Instant::now();
+        let mut budget = RateBudget::default();
+        budget.reset(EventFrequency::Unlimited, now);
+        for _ in 0..10 {
+            budget.consume(now);
+        }
+        assert_eq!(budget.ready_at(now), now);
     }
 }

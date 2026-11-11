@@ -1,23 +1,22 @@
-Oink 0.3.5 adds sync unlock and a Quicker compatibility mode, and fixes several bugs and usability issues.
+Oink 0.3.6 improves automatic updates and fixes Oink becoming unresponsive on Windows after running in the background for a long time.
 
 ## New
 
-- Sync unlock: after you unlock one computer by hand, the other locked computers in the group unlock too. Turn on "Unlock other devices too" under General in Settings; it is off by default.
-- Clipboard deduplication: copying the same content several times in a row syncs it only once, so Oink doesn't interfere with other clipboard sync tools. You can turn it off under Clipboard in Settings.
-- New "Quicker compatibility mode" on Windows: when it is on, Quicker works normally while this computer is being controlled. Turn it on under Input in Settings.
-- On Windows, you can upgrade by double-clicking the MSI while Oink is running, and Oink restarts automatically when the installation finishes.
+- Reworked automatic updates.
+- On Mac, verification after dragging in the installer is faster.
+- The pointer event rate limit offers more levels to choose from.
+- New "Switch pointer position" shortcut: it moves the pointer to the next device in the online device list. It is off by default.
+- The device list shows devices in one order shared by the whole group, and you can drag online devices to reorder them.
 
 ## Fixes
 
-- Resolutions in the display arrangement now show the screens' actual pixels.
-- Fixed not being able to choose an audio output when a device in the group is offline.
-- Fixed automatic unlock not skipping a Windows computer after "Only allow Windows Hello sign-in" is turned on.
-- Fixed a clipboard-related crash on Mac.
-- Fixed an occasional crash on Windows.
+- Fixed the Oink background on Windows no longer responding after being idle for a long time, which made the device list, speakers and microphones unavailable.
+- Fixed uninstalling failing on Windows (#46).
+- Fixed moving the mouse briefly entering game mode on Windows while a full-screen program hides the pointer.
 
 ## Compatibility
 
-- 0.3.5 works with 0.3.0 and later.
+- 0.3.6 works with 0.3.0 and later.
 
 ## Downloads
 

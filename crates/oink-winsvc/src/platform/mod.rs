@@ -99,7 +99,7 @@ pub fn run() -> io::Result<()> {
     let args: Vec<_> = std::env::args().skip(1).collect();
     match args.as_slice() {
         [] => broker::run(),
-        [arg] if arg == "--unregister-credential-provider" => auto_unlock::register(true),
+        [arg] if arg == "--unregister-credential-provider" => auto_unlock::unregister(),
         [arg, pid] if arg == "--helper" => server::run(pid.parse().map_err(|_| denied())?, None),
         [arg, encoded] if arg == "--routed-helper" => {
             use base64::Engine;

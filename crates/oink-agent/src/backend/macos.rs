@@ -169,10 +169,6 @@ define_class!(
         }
         #[unsafe(method(applicationShouldTerminate:))]
         fn should_terminate(&self, _app: &NSApplication) -> objc2_app_kit::NSApplicationTerminateReply {
-            if crate::update::installation_termination() {
-                crate::update::request_native_termination();
-                return objc2_app_kit::NSApplicationTerminateReply::TerminateLater;
-            }
             crate::update::request_quit();
             objc2_app_kit::NSApplicationTerminateReply::TerminateCancel
         }
@@ -361,10 +357,6 @@ fn run_application(
 pub(super) fn stop_loop() {
     let mtm = MainThreadMarker::new().expect("AppKit main thread");
     let app = NSApplication::sharedApplication(mtm);
-    if crate::update::termination_waiting() {
-        app.replyToApplicationShouldTerminate(true);
-        return;
-    }
     app.stop(None);
     // AppKit stop is observed on its next event. A local application event wakes
     // the event loop; this does not inject keyboard or mouse input into the system.

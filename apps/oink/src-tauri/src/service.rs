@@ -174,9 +174,23 @@ pub fn check_backend_ownership(data_dir: &Path) -> Result<(), String> {
     }
 }
 
-/// One subscription for the UI's lifetime. There is no reconnect or spawn path here.
-pub fn follow(api: &RemoteApi, connected: impl FnOnce(&ServiceInfo), ended: impl FnOnce(EventsEnd)) {
-    ended(api.follow_events(connected));
+/// Follows the backend for the UI's lifetime. There is no spawn path here and
+/// no reconnect to a backend that went away. The one exception is a backend
+/// that is still running and dropped this subscription for falling behind:
+/// subscribe again and let `resubscribed` reload every view, as the IPC
+/// contract describes. Exiting instead left the user with no UI at all.
+pub fn follow(
+    api: &RemoteApi,
+    connected: impl FnOnce(&ServiceInfo),
+    resubscribed: impl Fn(&ServiceInfo),
+    ended: impl FnOnce(EventsEnd),
+) {
+    let mut end = api.follow_events(connected);
+    while end == EventsEnd::Lagged {
+        tracing::warn!("backend dropped a lagging event subscription; subscribing again");
+        end = api.follow_events(&resubscribed);
+    }
+    ended(end);
 }
 
 /// Explicit reopen waits for both roles before creating their replacements.

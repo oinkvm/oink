@@ -13,7 +13,7 @@ import subprocess
 import sys
 from provenance import ROOT, source_inventory, source_tree_sha256
 from identity import IDENTITY
-from versioning import local_source_commit, release_version
+from versioning import local_source_commit, package_build, release_version
 import package_notes
 
 
@@ -22,7 +22,7 @@ def main():
     p.add_argument('--platform', choices=['macos', 'windows'], required=True)
     p.add_argument('--arch', choices=['arm64', 'x64'], default='arm64', help='Mac package architecture')
     p.add_argument('--output-root', type=Path, required=True)
-    p.add_argument('--build', type=int, default=1)
+    p.add_argument('--sequence', type=int, required=True, help='n of the packaged version: build = major*10^7 + minor*10^5 + patch*10^3 + n')
     p.add_argument('--windows-update-test-feed', help='TEST ONLY: compile a literal HTTP loopback feed and TEST public key')
     versions = p.add_mutually_exclusive_group()
     versions.add_argument('--source-commit', help='Full source commit; required for local source archives')
@@ -54,10 +54,9 @@ def main():
     a.output_root = a.output_root.resolve()
     if a.output_root.is_relative_to(ROOT):
         p.error('package output must be outside the source tree')
-    if not 1 <= a.build < 2**31:
-        p.error('build must be in 1..2147483647')
     try:
         commit = None if a.public_version else local_source_commit(a.source_commit)
+        a.build = package_build(a.sequence, commit is not None)
         version = release_version(IDENTITY['version'], commit, a.build)
     except ValueError as error:
         p.error(str(error))
@@ -96,8 +95,6 @@ def main():
         common += ['--windows-update-test-feed', a.windows_update_test_feed]
     command = [sys.executable, str(ROOT / 'build-support/build.py'), '--target', target,
                '--source-inventory', str(snapshot), '--symbols-output', str(output / 'symbols.noindex'), *common]
-    if macos:
-        command += ['--sparkle-cache', str(a.tool_cache)]
     if a.windows_update_test_fail_health:
         command += ['--windows-update-test-fail-health']
     subprocess.run(command, cwd=ROOT, check=True)
@@ -105,7 +102,7 @@ def main():
     command = [sys.executable, str(ROOT / 'packaging' / a.platform / 'build.py'),
                '--binaries', str(binaries), '--output', str(output), '--update-notes-file', str(notes_file), *common]
     if macos:
-        command += ['--arch', a.arch, '--sparkle-cache', str(a.tool_cache), '--notary-timeout', str(a.notary_timeout)]
+        command += ['--arch', a.arch, '--tool-cache', str(a.tool_cache), '--notary-timeout', str(a.notary_timeout)]
         for flag, value in [('--signing-fingerprint', a.signing_fingerprint),
                             ('--notary-profile', a.notary_profile), ('--notary-keychain', a.notary_keychain)]:
             if value:

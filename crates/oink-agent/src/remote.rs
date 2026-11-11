@@ -3,8 +3,9 @@
 //! - 请求：每次调用从连接池取一条连接（没有就按 `ipc.json` 新建），一行请求、一行应答。连接断开时返回
 //!   [`ApiError::Unavailable`]，不重试（请求可能已经执行）。
 //! - 事件：[`RemoteApi::follow_events`] 在调用线程上保持一条订阅连接，把事件分发给 [`AgentApi::subscribe`]
-//!   注册的回调，直到连接结束；返回结束的原因，界面随之退出，不重连、不重新拉起后台。
-//!   订阅回调跨重连保留。
+//!   注册的回调，直到连接结束；返回结束的原因。后台仍在运行、只是因积压断开这条订阅时
+//!   （[`EventsEnd::Lagged`]），界面重新订阅并重新拉取全部状态；其它原因界面随之退出，
+//!   不重连、不重新拉起后台。订阅回调跨重连保留。
 //! - 每次新建连接都重新读 `ipc.json`：服务进程重启后地址与令牌会变。
 
 use crate::ipc::LocalStream;
@@ -37,7 +38,7 @@ pub enum EventsEnd {
     BuildMismatch,
     /// 服务进程告知它正在按请求退出（`oink-agent stop`、界面「退出 Oink」、安装脚本）。
     Stopping,
-    /// 服务进程仍在运行，但断开了这条订阅（界面积压太多）；界面仍按订阅结束退出。
+    /// 服务进程仍在运行，但断开了这条订阅（界面积压太多）；界面重新订阅并重新拉取全部状态。
     Lagged,
     /// 没有预告就断开（服务进程崩溃或被结束），或连不上。
     Lost(String),
@@ -526,6 +527,9 @@ impl AgentApi for RemoteApi {
     }
     fn set_member_address(&self, device: DeviceKey, address: String) -> ApiResult<()> {
         self.call(Request::SetMemberAddress { device, address })
+    }
+    fn move_device_order(&self, device: DeviceKey, placement: crate::api::DeviceOrderPlacement) -> ApiResult<()> {
+        self.call(Request::MoveDeviceOrder { device, placement })
     }
     fn nearby(&self) -> ApiResult<pairing::NearbySnapshot> {
         self.call(Request::Nearby)

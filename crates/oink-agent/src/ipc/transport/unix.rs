@@ -84,6 +84,36 @@ impl Drop for Listener {
         let _ = std::fs::remove_file(&self.socket);
     }
 }
+/// Whether the client of one accepted connection has closed its end.
+#[derive(Debug)]
+pub(crate) struct Peer(std::os::fd::OwnedFd);
+pub(crate) fn peer(stream: &AsyncStream) -> io::Result<Peer> {
+    use std::os::fd::AsFd;
+    stream.as_fd().try_clone_to_owned().map(Peer)
+}
+impl Peer {
+    pub(crate) fn closed(&self) -> bool {
+        use std::os::fd::AsRawFd;
+        let mut byte = 0u8;
+        // SAFETY: live socket and a one-byte buffer; MSG_PEEK consumes nothing.
+        let read = unsafe {
+            libc::recv(
+                self.0.as_raw_fd(),
+                (&raw mut byte).cast(),
+                1,
+                libc::MSG_PEEK | libc::MSG_DONTWAIT,
+            )
+        };
+        // 0 is the peer's orderly close. Unread data or "would block" mean it
+        // is still there; any other error means the connection is gone.
+        read == 0
+            || (read < 0
+                && !matches!(
+                    io::Error::last_os_error().kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                ))
+    }
+}
 pub(crate) fn connect(path: &str, _pid: u32, timeout: Duration) -> io::Result<Stream> {
     use std::os::fd::{AsRawFd, OwnedFd};
     let socket = socket2::Socket::new(socket2::Domain::UNIX, socket2::Type::STREAM, None)?;

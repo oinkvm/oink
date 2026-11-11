@@ -15,12 +15,11 @@ pub(super) fn open(node: &Node, path: &str) -> ApiResult<UpdateStatus> {
         ) {
             return Err(api_error(Error::Busy));
         }
+        // A dropped package replaces any feed candidate and stops its check or download.
+        #[cfg(not(windows))]
+        state.supersede();
         state.local_mode = true;
         state.local = None;
-        #[cfg(not(windows))]
-        {
-            state.ready = false;
-        }
         state.status.phase = Phase::Verifying;
         state.status.candidate = None;
         state.status.error = None;
@@ -29,8 +28,6 @@ pub(super) fn open(node: &Node, path: &str) -> ApiResult<UpdateStatus> {
         node.emit(ApiEvent::UpdateStatusChanged(status));
         tracing::info!(phase = "local_verification_started", "local package verification");
     }
-    #[cfg(target_os = "macos")]
-    crate::backend::on_main(super::native::cancel);
     #[cfg(target_os = "macos")]
     let staged = super::local_mac::stage(Path::new(path));
     #[cfg(windows)]
@@ -71,10 +68,6 @@ pub(super) fn open(node: &Node, path: &str) -> ApiResult<UpdateStatus> {
         )?;
         state.status.candidate = Some(staged.package.candidate());
         state.local = Some(staged);
-        #[cfg(not(windows))]
-        {
-            state.ready = true;
-        }
         Ok(())
     });
     state.status.error = result.err();
@@ -121,7 +114,6 @@ pub(super) fn install(node: &Node, expected: u64) -> ApiResult<UpdateStatus> {
     #[cfg(target_os = "macos")]
     {
         let staged = state.local.take().unwrap();
-        state.ready = false;
         state.status.phase = Phase::Quiescing;
         state.installing = true;
         let node = node.clone();
@@ -193,6 +185,9 @@ fn copy_input_with(
     if count == 0 {
         return Err(Error::Limit);
     }
+    // Windows hands the copy to the SYSTEM installer service. On macOS it is a
+    // private scratch copy mounted within seconds and never needed after a crash.
+    #[cfg(windows)]
     output.sync_all().map_err(|_| Error::Storage)?;
     Ok(count)
 }

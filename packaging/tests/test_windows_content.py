@@ -21,6 +21,9 @@ IDENTITY = {**json.loads((ROOT / 'packaging/identity.json').read_text()), 'versi
 BUILDER_SPEC = importlib.util.spec_from_file_location('windows_packager', ROOT / 'packaging/windows/build.py')
 B = importlib.util.module_from_spec(BUILDER_SPEC)
 BUILDER_SPEC.loader.exec_module(B)
+from identity import encode_build
+BUILD = encode_build('0.1.0', 1)
+MSI_VERSION = B.windows_product_version(BUILD)
 
 
 class MsiContent(unittest.TestCase):
@@ -30,7 +33,7 @@ class MsiContent(unittest.TestCase):
         self.assertEqual(versions, sorted(set(versions)))
         self.assertEqual(B.windows_product_version(1), '0.0.1')
         self.assertEqual(B.windows_product_version(2), '0.0.2')
-        for build in (0, -1, 2147483648, True, '2'):
+        for build in (0, -1, 2147483648, True, '2', 306000):
             with self.assertRaises(ValueError):
                 B.windows_product_version(build)
 
@@ -55,9 +58,9 @@ class MsiContent(unittest.TestCase):
             ET.SubElement(xml, 'File', Name=name, Id=name)
             (extracted / 'File' / name).write_text(json.dumps({
                 'source_tree_sha256': 'a' * 64,
-                'version': '0.1.0', 'build': 1}))
+                'version': '0.1.0', 'build': BUILD}))
         ET.SubElement(xml, 'File', Name='report-manifest.json', Id='report')
-        write_manifest(extracted / 'File/report', 'a' * 64, '0.1.0', 1,
+        write_manifest(extracted / 'File/report', 'a' * 64, '0.1.0', BUILD,
                        [('agent', extracted / 'File/ui'), ('agent', extracted / 'File/agent'),
                         ('ui_rust', extracted / 'File/ui')])
         ET.SubElement(xml, 'ServiceInstall', Name='OinkInput', Account='LocalSystem', Start='auto')
@@ -71,7 +74,7 @@ class MsiContent(unittest.TestCase):
         arp_key = r'Software\Microsoft\Windows\CurrentVersion\Uninstall\[ProductCode]'
         upgrade = '{' + IDENTITY['windows']['upgrade_code'] + '}'
         acl.update({
-            'Property': [['ProductVersion', '0.0.1']],
+            'Property': [['ProductVersion', MSI_VERSION]],
             'Registry': [['ArpDisplayVersion', '2', arp_key, 'DisplayVersion', '0.1.0', 'InstallRoot']],
             'Component': [['InstallRoot', '', 'INSTALLFOLDER', '260', '', 'InstallRootKey'],
                           ['MaintenanceRoot', '', 'MAINTENANCEFOLDER', '256', '', '']],
@@ -83,8 +86,8 @@ class MsiContent(unittest.TestCase):
                 ('RemoveExistingProducts', 6501), ('InstallFinalize', 6600), ('StartServices', 6502),
                 ('CheckProtectedState', 1502), ('StopServices', 1900), ('CheckQuiescence', 1901),
                 ('CostFinalize', 1000), ('InstallValidate', 1400), ('SetARPINSTALLLOCATION', 1001), ('DeleteServices', 2000), ('RemoveFiles', 3500)]],
-            'Upgrade': [[upgrade, '', '0.0.1', '', '1', '', 'WIX_UPGRADE_DETECTED'],
-                        [upgrade, '0.0.1', '', '', '2', '', 'WIX_DOWNGRADE_DETECTED']],
+            'Upgrade': [[upgrade, '', MSI_VERSION, '', '1', '', 'WIX_UPGRADE_DETECTED'],
+                        [upgrade, MSI_VERSION, '', '', '2', '', 'WIX_DOWNGRADE_DETECTED']],
         })
         acl['InstallExecuteSequence'].append(['CleanupMaintenance', 'REMOVE~="ALL" AND NOT UPGRADINGPRODUCTCODE', '6599'])
         acl['InstallExecuteSequence'].append(['CleanupUserData', 'REMOVE~="ALL" AND NOT UPGRADINGPRODUCTCODE', '6598'])
@@ -438,7 +441,7 @@ class MsiContent(unittest.TestCase):
                     ('InstallExecuteSequence', 3, 1, 'NOT Installed'),
                     ('InstallExecuteSequence', 3, 2, '5000'),
                     ('InstallExecuteSequence', 3, 2, '6700'),
-                    ('Upgrade', 0, 2, '0.0.2'),
+                    ('Upgrade', 0, 2, B.windows_product_version(BUILD + 1)),
                     ('Upgrade', 0, 4, '513'),
                     ('Upgrade', 1, 4, '0')]:
                 with self.subTest(table=table, field=field, value=value):
@@ -452,14 +455,19 @@ class MsiContent(unittest.TestCase):
             root = Path(temp)
             xml, extracted, tables = self.fixture(root)
             display = f"{IDENTITY['inhouse_version']}-inhouse.1"
+            build = encode_build(IDENTITY['inhouse_version'], 1)
             for name in ('installed.json', 'oink-build.json'):
                 path = extracted / 'File' / name
                 receipt = json.loads(path.read_text())
-                receipt.update(version=display)
+                receipt.update(version=display, build=build)
                 if name == 'oink-build.json':
                     receipt['source_commit'] = '0123abcd' * 5
                 path.write_text(json.dumps(receipt))
             tables['Registry'][0][4] = display
+            tables['Property'][0][1] = tables['Upgrade'][0][2] = tables['Upgrade'][1][1] = B.windows_product_version(build)
+            write_manifest(extracted / 'File/report', 'a' * 64, display, build,
+                           [('agent', extracted / 'File/ui'), ('agent', extracted / 'File/agent'),
+                            ('ui_rust', extracted / 'File/ui')])
             manifest = root / 'decompiled.wxs'
             ET.ElementTree(xml).write(manifest)
             C.verify_msi(manifest, extracted, IDENTITY, tables)

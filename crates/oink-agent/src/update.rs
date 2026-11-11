@@ -6,6 +6,8 @@ use crate::{
 mod local;
 #[cfg(target_os = "macos")]
 pub mod local_mac;
+#[cfg(not(windows))]
+mod online;
 pub mod presentation;
 use oink_foundation::maintenance;
 pub use oink_update::policy::Phase;
@@ -19,8 +21,8 @@ use std::{
 const INPUT_PREPARATION_BUDGET: Duration = Duration::from_secs(6);
 const AUDIO_PREPARATION_BUDGET: Duration = Duration::from_secs(3);
 // One absolute Mac preparation deadline: 3s input reply + 3s fence + 3s
-// current audio cleanup + two 8s provider commands. Each step uses its remainder;
-// the approval itself is retained until Sparkle finishes or dismisses it.
+// current audio cleanup + two 8s provider commands. Each step uses its remainder
+// until the replacement helper acknowledges readiness.
 #[cfg(target_os = "macos")]
 const PREPARATION_BUDGET: Duration = INPUT_PREPARATION_BUDGET
     .saturating_add(AUDIO_PREPARATION_BUDGET)
@@ -36,11 +38,11 @@ pub(crate) struct Controller {
     local: Option<local::Staged>,
     local_mode: bool,
     #[cfg(not(windows))]
-    pub ready: bool,
-    #[cfg(not(windows))]
     installing: bool,
-    #[cfg(all(target_os = "macos", feature = "sparkle"))]
-    pub restored_result: bool,
+    #[cfg(not(windows))]
+    restored_result: bool,
+    #[cfg(not(windows))]
+    online: online::Online,
     #[cfg(windows)]
     wake: Option<std::sync::mpsc::SyncSender<()>>,
 }
@@ -64,6 +66,9 @@ impl Controller {
                 .unwrap_or(0),
             version: oink_update::RELEASE_VERSION.into(),
             checks_enabled: false,
+            channel: policy.preferences.channel(),
+            update_channel: policy.preferences.update_channel,
+            install_after_download: policy.preferences.install_after_download,
             phase: Phase::Disabled,
             candidate: None,
             checked_at: None,
@@ -72,8 +77,11 @@ impl Controller {
             blockers: vec![],
             progress: None,
             error: error.or(Some(Error::NotConfigured)),
+            failed_build: None,
+            critical_prompted_build: policy.critical_prompted_build,
             scope: if cfg!(windows) { Scope::Machine } else { Scope::User },
-            can_change_policy: !cfg!(windows),
+            // The Windows service also accepts the user's preferences unelevated.
+            can_change_policy: true,
         };
         let restored = presentation::outcome(dir, status.current_build);
         if let Some(result) = restored {
@@ -86,7 +94,7 @@ impl Controller {
         Self {
             #[cfg(windows)]
             wake: None,
-            #[cfg(all(target_os = "macos", feature = "sparkle"))]
+            #[cfg(not(windows))]
             restored_result: restored.is_some(),
             #[cfg(not(windows))]
             policy,
@@ -94,55 +102,35 @@ impl Controller {
             local: None,
             local_mode: false,
             #[cfg(not(windows))]
-            ready: false,
-            #[cfg(not(windows))]
             installing: false,
+            #[cfg(not(windows))]
+            online: online::Online::default(),
         }
     }
+    /// Starts a check unless one is running or a download owns the candidate;
+    /// returns the generation the result must still match.
     #[cfg(not(windows))]
-    fn begin_check(&mut self) -> Result<bool, Error> {
+    fn begin_check(&mut self) -> Result<Option<u64>, Error> {
         if self.status.error == Some(Error::NotConfigured) {
             return Err(Error::NotConfigured);
         }
-        if matches!(
-            self.status.phase,
-            Phase::Checking | Phase::Available | Phase::Downloading | Phase::Verifying | Phase::Ready
-        ) {
-            return Ok(false);
+        if self.local_mode
+            || matches!(
+                self.status.phase,
+                Phase::Checking
+                    | Phase::Downloading
+                    | Phase::Verifying
+                    | Phase::Ready
+                    | Phase::Quiescing
+                    | Phase::Installing
+            )
+        {
+            return Ok(None);
         }
+        self.online.generation += 1;
         self.status.phase = Phase::Checking;
         self.status.error = None;
-        Ok(true)
-    }
-    #[cfg(not(windows))]
-    fn begin_install(&mut self, expected_build: u64) -> Result<(), Error> {
-        if self.installing {
-            return Err(Error::Transaction);
-        }
-        if !self.ready
-            || self.status.phase != Phase::Ready
-            || self.status.candidate.as_ref().map(|c| c.build) != Some(expected_build)
-        {
-            return Err(Error::Policy);
-        }
-        self.installing = true;
-        self.status.phase = Phase::Quiescing;
-        self.status.error = None;
-        self.status.blockers.clear();
-        Ok(())
-    }
-    #[cfg(all(not(windows), any(feature = "sparkle", test)))]
-    fn dismissed(&mut self) {
-        self.ready = false;
-        if self.installing {
-            self.installing = false;
-            if self.status.phase != Phase::Committed {
-                self.status.phase = Phase::Failed;
-                self.status.error = Some(Error::Transaction);
-            }
-        } else if self.status.phase != Phase::Failed {
-            self.status.phase = Phase::Idle;
-        }
+        Ok(Some(self.online.generation))
     }
     #[cfg(not(windows))]
     fn save(&self, dir: &Path) -> Result<(), Error> {
@@ -200,7 +188,6 @@ impl Node {
                     state.status.progress = None;
                     #[cfg(not(windows))]
                     {
-                        state.ready = false;
                         state.status.phase = Phase::Idle;
                     }
                     #[cfg(not(windows))]
@@ -208,7 +195,7 @@ impl Node {
                         let status = state.status.clone();
                         drop(state);
                         self.emit(ApiEvent::UpdateStatusChanged(status.clone()));
-                        // OpenLocal already disarmed the feed continuation. A
+                        // OpenLocal already superseded the feed candidate. A
                         // local cancellation must also work in manual-only builds.
                         return Ok(status);
                     }
@@ -246,25 +233,22 @@ impl Node {
             match command {
                 Command::OpenLocal { .. } => unreachable!("handled before platform dispatch"),
                 Command::Check => {
-                    if state.begin_check().map_err(api_error)? {
-                        crate::backend::on_main(native::check);
+                    if let Some(generation) = state.begin_check().map_err(api_error)? {
+                        online::spawn_check(self, generation, oink_update::catalog::Check::Manual);
                     }
                 }
                 Command::Download => {
-                    if state.status.candidate.is_none() {
-                        return Err(api_error(Error::Policy));
+                    if let Some(download) = state.begin_download().map_err(api_error)? {
+                        online::spawn_download(self, download);
                     }
-                    crate::backend::on_main(native::download);
                 }
                 Command::Install { expected_build } => {
-                    state.begin_install(expected_build).map_err(api_error)?;
-                    if presentation::begin(self.data_dir(), state.status.current_build, expected_build).is_err() {
-                        state.installing = false;
-                        state.status.phase = Phase::Ready;
-                        return Err(api_error(Error::Storage));
+                    // A downloaded feed package is staged exactly like a dropped DMG.
+                    if state.status.candidate.as_ref().is_none_or(|c| c.local_package) {
+                        return Err(api_error(Error::Policy));
                     }
-                    #[cfg(target_os = "macos")]
-                    native::install_clicked();
+                    drop(state);
+                    return local::install(self, expected_build);
                 }
                 Command::SetPreferences { preferences } => {
                     let previous = state.policy.clone();
@@ -274,9 +258,20 @@ impl Node {
                         return Err(api_error(error));
                     }
                     state.status.checks_enabled = preferences.checks_enabled;
-                    state.status.candidate = None;
-                    state.ready = false;
-                    crate::backend::on_main(move || native::preferences(preferences));
+                    state.status.channel = preferences.channel();
+                    state.status.update_channel = preferences.update_channel;
+                    state.status.install_after_download = preferences.install_after_download;
+                    // Another channel's candidate never carries over; its check
+                    // only offers builds above the installed one, never a downgrade.
+                    if previous.preferences.channel() != preferences.channel() {
+                        state.supersede();
+                        if let Ok(Some(generation)) = state.begin_check() {
+                            online::spawn_check(self, generation, oink_update::catalog::Check::Automatic);
+                        }
+                    } else if preferences.checks_enabled && !previous.preferences.checks_enabled {
+                        state.schedule_now();
+                    }
+                    state.publish_schedule();
                 }
                 Command::Defer { choice } => {
                     let previous = state.policy.clone();
@@ -286,11 +281,15 @@ impl Node {
                         return Err(api_error(error));
                     }
                     state.status.deferred_until = state.policy.deferred_until;
-                    state.ready = false;
-                    crate::backend::on_main(native::cancel);
                 }
                 Command::Skip { expected_build } => {
-                    if state.status.candidate.as_ref().map(|c| c.build) != Some(expected_build) {
+                    // Only a normal update can be skipped.
+                    if state
+                        .status
+                        .candidate
+                        .as_ref()
+                        .is_none_or(|c| c.build != expected_build || c.kind != oink_update::catalog::Kind::Normal)
+                    {
                         return Err(api_error(Error::Policy));
                     }
                     let previous = state.policy.clone();
@@ -299,24 +298,27 @@ impl Node {
                         state.policy = previous;
                         return Err(api_error(error));
                     }
-                    state.ready = false;
-                    crate::backend::on_main(native::cancel);
+                    state.supersede();
+                }
+                Command::Prompted { expected_build } => {
+                    if state.status.candidate.as_ref().map(|c| c.build) != Some(expected_build) {
+                        return Err(api_error(Error::Policy));
+                    }
+                    let previous = state.policy.clone();
+                    state.policy.critical_prompted_build = Some(expected_build);
+                    if let Err(error) = state.save(self.data_dir()) {
+                        state.policy = previous;
+                        return Err(api_error(error));
+                    }
+                    state.status.critical_prompted_build = Some(expected_build);
                 }
                 Command::Cancel => {
-                    if state.installing {
-                        return Err(api_error(Error::Transaction));
-                    }
-                    state.ready = false;
-                    crate::backend::on_main(native::cancel);
+                    state.cancel_download();
                 }
             }
             let status = state.status.clone();
             drop(state);
             self.emit(ApiEvent::UpdateStatusChanged(status.clone()));
-            if status.phase == Phase::Quiescing {
-                let node = self.clone();
-                std::thread::spawn(move || install_candidate(node));
-            }
             Ok(status)
         }
     }
@@ -448,29 +450,8 @@ impl Drop for Prepared {
         }
     }
 }
-// The live Prepared value is the sole approval. It retains the input fence,
-// closed admission and provider suspension until replacement or an abort.
-#[cfg(not(windows))]
-static APPROVED: std::sync::Mutex<Option<Prepared>> = std::sync::Mutex::new(None);
 #[cfg(target_os = "macos")]
 mod mac_provider;
-#[cfg(not(windows))]
-static TERMINATION_WAITING: AtomicBool = AtomicBool::new(false);
-#[cfg(not(windows))]
-pub(crate) fn installation_termination() -> bool {
-    APPROVED.lock().unwrap().is_some()
-}
-#[cfg(not(windows))]
-pub(crate) fn termination_waiting() -> bool {
-    TERMINATION_WAITING.swap(false, Ordering::AcqRel)
-}
-#[cfg(not(windows))]
-pub(crate) fn request_native_termination() {
-    TERMINATION_WAITING.store(true, Ordering::Release);
-    if let Ok(node) = crate::backend::node() {
-        node.request_stop();
-    }
-}
 #[cfg(windows)]
 mod windows;
 #[cfg(windows)]
@@ -481,21 +462,7 @@ pub(crate) fn attach(node: &Node) {
 }
 #[cfg(not(windows))]
 pub(crate) fn attach(node: &Node) {
-    let weak = std::sync::Arc::downgrade(&node.inner);
-    let preferences = lock(&node.inner.update).policy.preferences.clone();
-    crate::backend::on_main(move || native::start(preferences));
-    std::thread::spawn(move || {
-        loop {
-            std::thread::sleep(Duration::from_secs(1));
-            let Some(_inner) = weak.upgrade() else {
-                break;
-            };
-            if QUIT_REQUESTED.load(Ordering::Acquire) {
-                crate::backend::on_main(try_quit);
-                continue;
-            }
-        }
-    });
+    online::attach(node);
 }
 
 #[cfg(not(windows))]
@@ -509,10 +476,6 @@ fn install_failure(node: &Node, error: Error, blockers: Vec<Blocker>) {
     let status = state.status.clone();
     drop(state);
     node.emit(ApiEvent::UpdateStatusChanged(status));
-    reopen_failed_install(node);
-}
-#[cfg(not(windows))]
-fn reopen_failed_install(node: &Node) {
     if presentation::outcome(node.data_dir(), lock(&node.inner.update).status.current_build).is_some() {
         std::thread::spawn(|| {
             if let Err(error) = crate::backend::show_ui() {
@@ -521,105 +484,10 @@ fn reopen_failed_install(node: &Node) {
         });
     }
 }
-#[cfg(not(windows))]
-fn install_candidate(node: Node) {
-    let mut token = match node.prepare_for_update() {
-        Ok(token) => token,
-        Err(blockers) => {
-            install_failure(&node, Error::Busy, blockers);
-            return;
-        }
-    };
-    #[cfg(target_os = "macos")]
-    let parent = match std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(Path::to_owned))
-    {
-        Some(parent) => parent,
-        None => {
-            install_failure(&node, Error::Storage, vec![Blocker::IntegrationUnavailable]);
-            return;
-        }
-    };
-    #[cfg(target_os = "macos")]
-    let provider = match close_mac_clients(&token, &parent) {
-        Ok(provider) => provider,
-        Err(error) => {
-            install_failure(&node, error, vec![Blocker::IntegrationUnavailable]);
-            return;
-        }
-    };
-    #[cfg(target_os = "macos")]
-    {
-        token.provider = Some(provider);
-        native::quiesce_done();
-    }
-    crate::backend::on_main(move || {
-        let node = token.node.clone();
-        if token.validate().is_ok() {
-            *APPROVED.lock().unwrap() = Some(token);
-            if native::install() {
-                if let Some(token) = APPROVED.lock().unwrap().as_ref()
-                    && let Ok(input) = token.node.input_thread()
-                {
-                    input.send(crate::threads::input::InputCommand::CommitUpdate {
-                        generation: token.generation,
-                    });
-                }
-                return;
-            }
-            installation_failed();
-        }
-        install_failure(&node, Error::Busy, vec![Blocker::IntegrationUnavailable]);
-    });
-}
 
-#[cfg(all(target_os = "macos", feature = "sparkle"))]
-mod native;
-#[cfg(not(all(target_os = "macos", feature = "sparkle")))]
-mod native {
-    #[cfg(not(windows))]
-    use super::Preferences;
-    #[cfg(not(windows))]
-    pub fn start(_: Preferences) {}
-    #[cfg(not(windows))]
-    pub fn check() {}
-    #[cfg(not(windows))]
-    pub fn download() {}
-    pub fn cancel() {}
-    #[cfg(not(windows))]
-    pub fn install() -> bool {
-        false
-    }
-    #[cfg(target_os = "macos")]
-    pub fn install_clicked() {}
-    #[cfg(target_os = "macos")]
-    pub fn quiesce_done() {}
-    #[cfg(not(windows))]
-    pub fn preferences(_: Preferences) {}
-    pub fn quit_allowed() -> bool {
-        true
-    }
-}
-pub(crate) fn cancel_before_quit() -> bool {
-    if native::quit_allowed() {
-        true
-    } else {
-        native::cancel();
-        false
-    }
-}
-
-static QUIT_REQUESTED: AtomicBool = AtomicBool::new(false);
+static QUITTING: AtomicBool = AtomicBool::new(false);
 pub(crate) fn request_quit() {
-    QUIT_REQUESTED.store(true, Ordering::Release);
-    crate::backend::on_main(try_quit);
-}
-fn try_quit() {
-    if !QUIT_REQUESTED.load(Ordering::Acquire) || !cancel_before_quit() {
-        return;
-    }
-    if !QUIT_REQUESTED.swap(false, Ordering::AcqRel) {
+    if QUITTING.swap(true, Ordering::AcqRel) {
         return;
     }
     std::thread::spawn(|| {
@@ -647,38 +515,21 @@ fn try_quit() {
                 }
             }
         }
+        QUITTING.store(false, Ordering::Release);
     });
 }
-/// Reopen is initiated off the AppKit thread; cancellation must be acknowledged
-/// before another process is launched or the current host is shut down.
 #[cfg(not(windows))]
 pub(crate) fn prepare_reopen(node: &Node) -> ApiResult<Prepared> {
-    let (reply, wait) = std::sync::mpsc::sync_channel(1);
-    crate::backend::on_main(move || {
-        let _ = reply.send(cancel_before_quit());
-    });
-    if wait.recv_timeout(Duration::from_secs(3)) != Ok(true) {
-        return Err(api_error(Error::Busy));
-    }
     node.prepare_for_update().map_err(|_| api_error(Error::Busy))
-}
-
-#[cfg(not(windows))]
-fn installation_failed() {
-    if let Some(token) = APPROVED.lock().unwrap().take() {
-        // Drop may run the bounded provider reconnect. Keep it off AppKit;
-        // Prepared reopens admission and aborts the input fence afterwards.
-        std::thread::spawn(move || drop(token));
-    }
 }
 
 #[cfg(target_os = "macos")]
 fn close_mac_clients(token: &Prepared, parent: &Path) -> Result<mac_provider::Suspension, Error> {
     token.validate().map_err(|_| Error::Busy)?;
-    // Unix mapped executables do not lock their containing app directory.
-    // Sparkle 2.9.6 SUPlainInstaller swaps/renames the bundle and waits for its
-    // target host itself. Other users, CLI commands and manager invocations are
-    // not replacement blockers. Close our UI by its existing event contract.
+    // Unix mapped executables do not lock their containing app directory; the
+    // replacement helper swaps the bundle atomically. Other users, CLI commands
+    // and manager invocations are not replacement blockers. Close our UI by its
+    // existing event contract.
     let provider = mac_provider::Suspension::prepare(parent.join("oink-file-provider"), token.expires, &|| {
         token.validate().is_ok()
     })?;
@@ -748,7 +599,6 @@ mod tests {
         {
             let mut state = lock(&node.inner.update);
             state.local_mode = true;
-            state.ready = true;
             state.status.phase = Phase::Ready;
             state.status.error = None;
             state.status.candidate = Some(Candidate {
@@ -759,6 +609,8 @@ mod tests {
                 published_at: None,
                 severity: oink_update::feed::Severity::Normal,
                 notes: Some(oink_update::feed::ReleaseNotes::from_json(br#"{"en":"Local fixes"}"#).unwrap()),
+                kind: oink_update::catalog::Kind::Normal,
+                notice: None,
             });
         }
         let server = runtime.block_on(Server::start(node.clone())).unwrap();
@@ -790,40 +642,28 @@ mod tests {
 
     #[cfg(not(windows))]
     #[test]
-    fn manual_check_clears_old_failure_and_joins_the_existing_result() {
+    fn manual_check_clears_old_failure_and_joins_a_running_check_or_download() {
         let dir = tempfile::tempdir().unwrap();
         let mut controller = Controller::load(dir.path());
         controller.status.phase = Phase::Failed;
         controller.status.error = Some(Error::Signature);
-        assert_eq!(controller.begin_check(), Ok(true));
+        let first = controller.begin_check().unwrap().unwrap();
         assert_eq!(controller.status.phase, Phase::Checking);
         assert_eq!(controller.status.error, None);
-        assert_eq!(controller.begin_check(), Ok(false));
-        for phase in [Phase::Available, Phase::Downloading, Phase::Verifying, Phase::Ready] {
+        assert_eq!(controller.begin_check(), Ok(None));
+        for phase in [Phase::Downloading, Phase::Verifying, Phase::Ready] {
             controller.status.phase = phase;
-            assert_eq!(controller.begin_check(), Ok(false));
+            assert_eq!(controller.begin_check(), Ok(None));
             assert_eq!(controller.status.phase, phase);
         }
-        controller.status.phase = Phase::Idle;
-        assert_eq!(controller.begin_check(), Ok(true));
-    }
-
-    #[cfg(not(windows))]
-    #[test]
-    fn silent_native_dismissal_after_approval_ends_the_install_attempt() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut controller = Controller::load(dir.path());
-        controller.installing = true;
-        controller.ready = true;
-        controller.status.phase = Phase::Installing;
-        controller.dismissed();
-        assert!(
-            !controller.installing,
-            "dismissal must release the attempt even without an error callback"
-        );
-        assert!(!controller.ready);
-        assert_eq!(controller.status.phase, Phase::Failed);
-        assert_eq!(controller.status.error, Some(Error::Transaction));
+        // An offered candidate is refreshed: a newer build may have appeared.
+        for phase in [Phase::Idle, Phase::Available] {
+            controller.status.phase = phase;
+            assert!(controller.begin_check().unwrap().unwrap() > first);
+        }
+        controller.status.phase = Phase::Failed;
+        controller.local_mode = true;
+        assert_eq!(controller.begin_check(), Ok(None), "a dropped package owns the dialog");
     }
 
     #[cfg(target_os = "macos")]
@@ -984,32 +824,6 @@ mod tests {
 
     #[cfg(not(windows))]
     #[test]
-    fn explicit_ready_install_starts_once_without_activity_or_idle_waiting() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut controller = Controller::load(dir.path());
-        controller.ready = true;
-        controller.status.phase = Phase::Ready;
-        controller.status.error = None;
-        controller.status.candidate = Some(Candidate {
-            local_package: false,
-            build: 31,
-            version: "0.1.1".into(),
-            size: 1,
-            published_at: None,
-            severity: oink_update::feed::Severity::Normal,
-            notes: serde_json::from_value(serde_json::json!({"en":"Fixes","zh-Hans":"修复"})).unwrap(),
-        });
-        controller.status.blockers = vec![Blocker::Audio, Blocker::RemoteInput, Blocker::Locked];
-        assert_eq!(controller.begin_install(32), Err(Error::Policy));
-        controller.begin_install(31).unwrap();
-        assert_eq!(controller.status.phase, Phase::Quiescing);
-        assert!(controller.status.blockers.is_empty());
-        assert_eq!(controller.begin_install(31), Err(Error::Transaction));
-        assert!(serde_json::to_value(&controller.status).unwrap().get("mode").is_none());
-    }
-
-    #[cfg(not(windows))]
-    #[test]
     fn legacy_preferences_files_preserve_checks_and_drop_channel_on_save() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("updates.json");
@@ -1025,7 +839,7 @@ mod tests {
                 let saved: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
                 assert_eq!(
                     saved["preferences"],
-                    serde_json::json!({"checks_enabled": checks_enabled})
+                    serde_json::json!({"checks_enabled": checks_enabled, "update_channel": null, "install_after_download": true})
                 );
             }
         }

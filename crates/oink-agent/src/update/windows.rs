@@ -2,7 +2,7 @@ use super::*;
 use oink_update::ipc::{Reply, Request};
 pub(super) fn status() -> ApiResult<UpdateStatus> {
     match oink_winsvc::update::request(Request::Query).map_err(api_error)? {
-        Reply::Status { status } => Ok(status),
+        Reply::Status { status } => Ok(*status),
         Reply::Error { error } => Err(api_error(error)),
         _ => Err(api_error(Error::Transaction)),
     }
@@ -10,6 +10,7 @@ pub(super) fn status() -> ApiResult<UpdateStatus> {
 pub(super) fn command(node: &Node, command: Command) -> ApiResult<UpdateStatus> {
     match oink_winsvc::update::request(Request::Command { command }).map_err(api_error)? {
         Reply::Status { status } => {
+            let status = *status;
             let mut state = lock(&node.inner.update);
             state.status = status.clone();
             if let Some(wake) = &state.wake {
@@ -138,6 +139,7 @@ pub(super) fn attach(node: &Node) {
                     }
                 }
                 Ok(Reply::Status { status }) => {
+                    let status = *status;
                     if health_mode {
                         prepared = None;
                         health_mode = false;

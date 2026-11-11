@@ -1,9 +1,9 @@
-name: Seed published stable release feeds
+name: Seed published release feeds
 on:
   workflow_dispatch:
     inputs:
       release_tag:
-        description: Already-published stable release tag (for example v0.1.1)
+        description: Already-published release tag; a prerelease (vX.Y.Z or vX.Y.Z-beta.K) publishes to beta, a public vX.Y.Z to stable
         required: true
         type: string
       platform:
@@ -28,7 +28,7 @@ jobs:
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
-      - name: Require a live published stable release and validate trusted update notes
+      - name: Require a live published release (its prerelease flag selects the channel) and validate trusted update notes
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ inputs.release_tag }}

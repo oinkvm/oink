@@ -11,7 +11,9 @@ import os
 from pathlib import Path
 import re
 import feed
+import feed_v2
 import published_release
+import rules
 
 
 def release_context(config):
@@ -29,7 +31,7 @@ def release_context(config):
 def minimum_updater_schema(version):
     # The bridge and all earlier public packages must remain selectable by
     # capability-1 clients. New Windows releases require archive inspection.
-    match = re.fullmatch(r'(0|[1-9][0-9]*)[.](0|[1-9][0-9]*)[.](0|[1-9][0-9]*)', version)
+    match = re.fullmatch(r'(0|[1-9][0-9]*)[.](0|[1-9][0-9]*)[.](0|[1-9][0-9]*)(?:-beta[.][1-9][0-9]*)?', version)
     feed.require(match is not None, 'release_version')
     return 1 if tuple(map(int, match.groups())) <= (0, 2, 2) else 2
 
@@ -55,7 +57,8 @@ def sign_package(config, folder, output):
                  0 < asset['size'] <= feed.MAX_PACKAGE, 'asset')
     raw = (folder / asset['name']).read_bytes()
     feed.require(len(raw) == asset['size'] and feed.digest(raw) == asset['sha256'], 'asset_digest')
-    annotations = published_release.update_notes()
+    # The channel is the live prerelease flag at signing time (published_release).
+    annotations = published_release.annotations(published_release.published(tag))
     package = {'url': f'https://github.com/{config["repository"]}/releases/download/{tag}/{asset["name"]}',
                'length': len(raw), 'sha256': feed.digest(raw), 'keyId': epoch['epoch'],
                'ed25519': feed.sign(raw, epoch['epoch'], epoch['public_key'])}
@@ -84,27 +87,47 @@ def register(config, state, record_path, now):
     epoch = next(e for e in config['windows'] if e['epoch'] == record['release']['package']['keyId'])
     # A retry after sequence reservation may have a different workflow run ID.
     # Reuse the exact approved release; never append/re-sign a changed build.
-    known = {h for slot in reg['feeds'][epoch['epoch']].values() for h in slot['records']}
+    # The one allowed change is promotion: a build registered from a
+    # prerelease (beta) whose release is now public moves to stable once.
+    known = {h for slot in reg['feeds'][epoch['epoch']].values() for h in slot['records'] + slot.get('v2_records', [])}
+    promoted = None
     for existing_hash in sorted(known):
         existing = feed.read(state / 'records' / f'{existing_hash}.json')
-        if existing['release']['build'] == record['release']['build']:
-            feed.require(existing['published'] is True and existing['release'] == record['release'], 'release_build_changed')
+        if existing['release']['build'] != record['release']['build']:
+            continue
+        feed.require(existing['published'] is True, 'release_build_changed')
+        if existing['release'] == record['release']:
             record, record_hash = existing, existing_hash
             raw = feed.encode(existing)
             break
+        feed.require(existing['release']['channel'] == 'beta' and record['release']['channel'] == 'stable' and
+                     existing['release'] == {**record['release'], 'channel': 'beta'}, 'release_build_changed')
+        promoted = existing_hash
     feed.write(state / 'records' / f'{record_hash}.json', raw)
+    beta = record['release']['channel'] == 'beta'
+    if promoted:
+        # The stable record replaces the beta-only entry: a build appears once
+        # in every catalog (clients reject duplicate builds).
+        for slot in reg['feeds'][epoch['epoch']].values():
+            if promoted in slot.get('v2_records', []):
+                slot['v2_records'].remove(promoted)
     for channel in epoch['channels']:
-        if channel == 'stable' and record['release']['channel'] != 'stable': continue
+        if channel == 'stable' and beta: continue
         slot = reg['feeds'][epoch['epoch']][channel]
-        builds = [feed.read(state / 'records' / f'{h}.json')['release']['build'] for h in slot['records']]
-        if record_hash not in slot['records']:
+        # Beta releases never enter v1 feeds (<= 0.3.5 clients): the beta
+        # slot lists them separately, and only v2 beta manifests read that list.
+        key = 'v2_records' if beta else 'records'
+        hashes = slot.setdefault(key, [])
+        builds = [feed.read(state / 'records' / f'{h}.json')['release']['build'] for h in hashes]
+        if record_hash not in hashes:
             feed.require(not builds or record['release']['build'] > max(builds), 'release_not_monotonic')
-            slot['records'].append(record_hash)
+            hashes.append(record_hash)
         # Validate public HTTPS asset/hash/signature before changing the registry.
-        feed.catalog(state, slot, config, epoch, channel)
+        feed.catalog(state, {'records': hashes}, config, epoch, channel)
     feed.write(state / 'site' / 'windows' / 'releases' / str(record['release']['build']) / 'release.json', raw)
     feed.write(state / 'registry.json', reg)
     feed.allocate(state, config, now, allow_catalog_change=True)
+    feed_v2.allocate(state, 'windows', config, rules.load(), now, release_build=record['release']['build'])
 
 
 def main():

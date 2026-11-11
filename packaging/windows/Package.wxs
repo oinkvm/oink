@@ -212,11 +212,14 @@
          No Restart Manager force-close or process kill. -->
     <CustomAction Id="PrepareUserSessions" BinaryRef="InstallerCA" DllEntry="PrepareUserSessions" Execute="immediate" Return="check" />
     <!-- OinkInput registers only its own CLSID on startup. Uninstall asks the
-         protected SYSTEM service image to remove it before any payload is removed.
+         protected SYSTEM service image to remove it and the auto unlock vault
+         before any payload is removed. The DLL action runs the image and copies
+         its exit code and stderr (the failing step) into the MSI log; an EXE
+         action logged only "error code 1" (issue #46). Fatal: a failed removal
+         rolls back instead of leaving the provider or the vault behind.
          Upgrade keeps registration pointing at the stable MSI-owned DLL path. -->
-    <CustomAction Id="UnregisterCredentialProvider" FileRef="ServiceExe"
-                  ExeCommand="--unregister-credential-provider" Execute="deferred"
-                  Impersonate="no" Return="check" />
+    <CustomAction Id="UnregisterCredentialProvider" BinaryRef="InstallerCA" DllEntry="UnregisterCredentialProvider"
+                  Execute="deferred" Impersonate="no" Return="check" />
     <InstallExecuteSequence>
       <Custom Action="UnregisterCredentialProvider" Before="RemoveFiles"
               Condition='REMOVE~="ALL" AND NOT UPGRADINGPRODUCTCODE' />

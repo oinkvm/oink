@@ -220,6 +220,10 @@ pub enum EventFrequency {
     /// Two-event burst capacity, refilling one event every 8 ms. Ordering barriers flush early.
     #[default]
     Hz125,
+    /// The same bucket refilling every 4 ms.
+    Hz250,
+    /// The same bucket refilling every 2 ms.
+    Hz500,
     /// Send every source motion immediately, without coalescing.
     Unlimited,
 }

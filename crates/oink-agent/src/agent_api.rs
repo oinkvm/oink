@@ -725,8 +725,11 @@ pub(crate) fn default_hotkeys() -> Vec<Hotkey> {
         device: None,
         profile: None,
         keys: keys.iter().map(|s| s.to_string()).collect(),
-        // Window opening and microphone mute are opt-in.
-        enabled: !matches!(a, HotkeyAction::OpenWindow | HotkeyAction::ToggleMicrophoneMute),
+        // Window opening, microphone mute and next-device movement are opt-in.
+        enabled: !matches!(
+            a,
+            HotkeyAction::OpenWindow | HotkeyAction::ToggleMicrophoneMute | HotkeyAction::MovePointerNext
+        ),
     };
     vec![
         k(HotkeyAction::LockFocus, &["Ctrl", "Alt", "L"]),
@@ -738,6 +741,7 @@ pub(crate) fn default_hotkeys() -> Vec<Hotkey> {
         k(HotkeyAction::OpenWindow, &["Ctrl", "Alt", "A"]),
         k(HotkeyAction::ToggleGameMode, &["Ctrl", "Alt", "G"]),
         k(HotkeyAction::ToggleMicrophoneMute, &["Ctrl", "Alt", "M"]),
+        k(HotkeyAction::MovePointerNext, &["Ctrl", "Alt", "N"]),
     ]
 }
 
@@ -893,6 +897,14 @@ impl AgentApi for Node {
     }
     fn set_member_address(&self, device: DeviceKey, address: String) -> ApiResult<()> {
         self.link_config()?.set_member_address(device.0, address)
+    }
+    fn move_device_order(&self, device: DeviceKey, placement: crate::api::DeviceOrderPlacement) -> ApiResult<()> {
+        use oink_network::device_order::Placement;
+        let placement = match placement {
+            crate::api::DeviceOrderPlacement::Above(anchor) => Placement::Above(anchor.0),
+            crate::api::DeviceOrderPlacement::After(anchor) => Placement::After(anchor.0),
+        };
+        self.link_config()?.move_device_order(device.0, placement)
     }
     fn nearby(&self) -> ApiResult<pairing::NearbySnapshot> {
         Ok((*self.link_config()?.nearby()).clone())

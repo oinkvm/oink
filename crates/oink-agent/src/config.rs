@@ -1122,7 +1122,9 @@ mod tests {
             h.enabled
                 == !matches!(
                     h.action,
-                    crate::api::HotkeyAction::ToggleMicrophoneMute | crate::api::HotkeyAction::OpenWindow
+                    crate::api::HotkeyAction::ToggleMicrophoneMute
+                        | crate::api::HotkeyAction::OpenWindow
+                        | crate::api::HotkeyAction::MovePointerNext
                 )
         }));
         assert!(s.show_status_icon);

@@ -3,7 +3,7 @@ on:
   workflow_call:
     inputs:
       release_tag:
-        description: Published stable release; never a draft or arbitrary artifact
+        description: Published release (prerelease = beta, otherwise stable); never a draft or arbitrary artifact
         required: true
         type: string
     secrets:
@@ -38,9 +38,13 @@ jobs:
     if: needs.gate.outputs.enabled == 'true'
     runs-on: macos-15
     environment: release
-    timeout-minutes: 20
+    timeout-minutes: 30
     permissions:
       contents: read
+    # Reserves v2 manifest sequences in the shared state before signing them.
+    concurrency:
+      group: oink-update-feed-publish
+      cancel-in-progress: false
     outputs:
       build: ${{ steps.sign.outputs.build }}
     steps:
@@ -53,7 +57,7 @@ jobs:
         with:
           ref: update-feed-state
           path: feed-state
-          persist-credentials: false
+          token: ${{ secrets.UPDATE_FEED_WRITER_TOKEN }}
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: '3.14.6'
@@ -67,13 +71,27 @@ jobs:
           # Same CloudKit HTTP/3 workaround as package signing; this VM only.
           echo 'block return out quick proto udp from any to any port 443' | sudo pfctl -f -
           sudo pfctl -E
-      - name: Verify published source/native package; sign archive and stable appcast
+      - name: Verify published source/native packages; sign DMG and v2 release record (plus archive and v1 appcasts when stable)
         id: sign
         env:
           GH_TOKEN: ${{ github.token }}
           SPARKLE_ED25519_PRIVATE_KEY: ${{ secrets.SPARKLE_ED25519_PRIVATE_KEY }}
           RELEASE_TAG: ${{ inputs.release_tag }}
         run: python build-support/update/mac_release.py --release-tag "$RELEASE_TAG" --tool-cache "$RUNNER_TEMP/sparkle"
+      - name: Durably reserve Mac v2 manifest sequences
+        env:
+          RELEASE_BUILD: ${{ steps.sign.outputs.build }}
+        run: |
+          cp -R mac-input/site/mac feed-state/site/
+          python build-support/update/feed_v2.py allocate --platform mac --release-build "$RELEASE_BUILD"
+          python build-support/update/reserve.py
+      - name: Sign reserved Mac v2 manifests
+        env:
+          SPARKLE_ED25519_PRIVATE_KEY: ${{ secrets.SPARKLE_ED25519_PRIVATE_KEY }}
+        run: |
+          python build-support/update/feed_v2.py sign --platform mac --tool-cache "$RUNNER_TEMP/sparkle"
+          mkdir -p mac-input/site/mac/v2
+          cp -R feed-state/site/mac/v2/. mac-input/site/mac/v2/
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: signed-macos-feed

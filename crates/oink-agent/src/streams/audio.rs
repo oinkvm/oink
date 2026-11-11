@@ -593,6 +593,7 @@ impl ForwardTable {
         started: Instant,
         kind: MediaKind,
     ) -> std::sync::Arc<dyn Fn(&oink_audio::source::Packet) -> bool + Send + Sync> {
+        let speaker = kind == MediaKind::Speaker;
         std::sync::Arc::new(move |packet| {
             let table = table.load();
             let mut sent = false;
@@ -603,6 +604,9 @@ impl ForwardTable {
                 {
                     sent |= destination.packets.post(&bytes[..len]).is_ok();
                 }
+            }
+            if speaker && sent && !packet.silent && !packet.sleep {
+                crate::usage_days::mark(crate::usage_days::Feature::Speaker);
             }
             sent
         })
@@ -1004,6 +1008,9 @@ impl MediaReader {
                     }
                     if !silent {
                         self.activity_pending.store(true, Ordering::Release);
+                        if self.kind == MediaKind::Speaker {
+                            crate::usage_days::mark(crate::usage_days::Feature::Speaker);
+                        }
                     }
                     let mut packet = oink_audio::sink::Packet {
                         burst,
@@ -1306,18 +1313,24 @@ mod direct_media_tests {
         output.set_packet_writer(write);
         for sequence in 1..=100 {
             let now = Instant::now();
-            encoder.supply(
-                &[0.1; 240],
-                oink_audio::source::Stamp {
-                    first_sample_at: None,
-                    callback_at: Some(now),
-                    delivered_at: now,
-                    source_frame_position: None,
-                    discontinuity: false,
-                },
-            );
+            let sent = crate::usage_days::captured(|| {
+                encoder.supply(
+                    &[0.1; 240],
+                    oink_audio::source::Stamp {
+                        first_sample_at: None,
+                        callback_at: Some(now),
+                        delivered_at: now,
+                        source_frame_position: None,
+                        discontinuity: false,
+                    },
+                )
+            });
+            assert_eq!(sent, [crate::usage_days::Feature::Speaker]);
             assert!(output.try_recv().is_none(), "ordinary packet handoff stays empty");
-            let (playing, received) = read();
+            let mut result = None;
+            let played = crate::usage_days::captured(|| result = Some(read()));
+            assert_eq!(played, [crate::usage_days::Feature::Speaker]);
+            let (playing, received) = result.unwrap();
             assert!(playing);
             let received = received.unwrap();
             assert_eq!(received.sequence, sequence);

@@ -3,15 +3,15 @@ import { afterEach, beforeAll, beforeEach, expect, it, vi } from 'vitest';
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { useState } from 'react';
 import { OinkProvider } from 'oink-ui';
-import { UpdateCheck, UpdatePreferences } from './UpdatePreferences';
+import { UpdateChannel, UpdateCheck, UpdatePreferences } from './UpdatePreferences';
 import type { UpdateStatus } from '../api/update';
 import { setLanguage } from '../i18n';
 const mock = vi.hoisted(()=>({update:vi.fn(),open:vi.fn(),openUrl:vi.fn(),fail:vi.fn(),query:vi.fn(),openDialog:vi.fn()}));
 vi.mock('../api/client',()=>({api:{update:mock.update},shell:{open:mock.open,openUrl:mock.openUrl}}));
 vi.mock('../api/store',()=>({agent:{query:mock.query,fail:mock.fail}}));
 vi.mock('../window/Upgrade',()=>({openUpdateDialog:mock.openDialog}));
-const status:UpdateStatus = {current_build:30,version:'0.1.1',checks_enabled:true,
-  phase:'idle',candidate:null,checked_at:null,next_check:null,deferred_until:null,blockers:[],progress:null,error:null,scope:'user',can_change_policy:true};
+const status:UpdateStatus = {current_build:30,version:'0.1.1',checks_enabled:true,channel:'stable',update_channel:null,install_after_download:true,
+  phase:'idle',candidate:null,checked_at:null,next_check:null,deferred_until:null,blockers:[],progress:null,error:null,failed_build:null,critical_prompted_build:null,scope:'user',can_change_policy:true};
 beforeAll(()=>{
   Object.defineProperty(window,'matchMedia',{value:()=>({matches:true,addEventListener(){},removeEventListener(){}})});
   vi.stubGlobal('ResizeObserver',class{observe(){}unobserve(){}disconnect(){}});
@@ -36,7 +36,7 @@ const check=(initial:UpdateStatus)=>{
 const button=()=>screen.getByRole('button',{name:'Check for updates'});
 const result=()=>document.querySelector('[data-update-result]')?.textContent??'';
 const checked={...status,checked_at:1_800_000_000};
-const available={...checked,phase:'available' as const,candidate:{build:31,version:'0.1.2',size:1,published_at:null,severity:'normal',notes:{en:'Fixes','zh-Hans':'修复'}}};
+const available={...checked,phase:'available' as const,candidate:{build:31,version:'0.1.2',size:1,published_at:null,severity:'normal',notes:{en:'Fixes','zh-Hans':'修复'},kind:'normal' as const,notice:null}};
 // Click and wait for the reply: the backend has moved to Checking.
 const start=async()=>{
   mock.update.mockResolvedValue({...status,phase:'checking'});
@@ -103,14 +103,14 @@ it('an update that is already pending opens the dialog from the reply',async()=>
 it('shows a failed check inline without a dialog',async()=>{
   check(status);await start();
   act(()=>publish({...status,phase:'failed',error:'network'}));
-  expect(result()).toBe('Update failed');
+  expect(result()).toBe("Couldn't check for updates");
   expect(mock.openDialog).not.toHaveBeenCalled();
 });
 it('shows a rejected check command inline',async()=>{
   check(status);
   mock.update.mockRejectedValue(new Error('network'));
   fireEvent.click(button());
-  await waitFor(()=>expect(result()).toBe('Update failed'));
+  await waitFor(()=>expect(result()).toBe("Couldn't check for updates"));
   expect(button()).toHaveProperty('disabled',false);
   expect(mock.openDialog).not.toHaveBeenCalled();
 });
@@ -128,7 +128,7 @@ it('keeps a manual download route for disabled versions',async()=>{
 it('saves the exact persisted policy through typed IPC without optimistic changes',async()=>{
   show(status);
   fireEvent.click(screen.getByRole('switch',{name:'Automatically check for updates'}));
-  await waitFor(()=>expect(mock.update).toHaveBeenCalledWith({type:'set_preferences',preferences:{checks_enabled:false}}));
+  await waitFor(()=>expect(mock.update).toHaveBeenCalledWith({type:'set_preferences',preferences:{checks_enabled:false,update_channel:null,install_after_download:true}}));
   expect(screen.getByRole('switch')).toHaveProperty('checked',true);
 });
 it('disables unauthorized machine policy changes',()=>{
@@ -142,5 +142,16 @@ it('shows only the automatic-check switch without its own label',()=>{
   expect(screen.getByRole('switch',{name:'Automatically check for updates'})).toBeTruthy();
   expect(screen.queryByRole('combobox')).toBeNull();
   expect(screen.queryByText('Install automatically when idle')).toBeNull();
+  expect(container.textContent).toBe('');
+});
+
+it('the channel choice is saved with the other stored preferences and defaults to the package channel',async()=>{
+  render(<OinkProvider defaultMotion="reduced"><UpdateChannel status={{...status,channel:'beta',update_channel:null}} label="Update channel"/></OinkProvider>);
+  expect(screen.getByRole('radio',{name:'Beta'}).getAttribute('aria-checked')).toBe('true');
+  fireEvent.click(screen.getByRole('radio',{name:'Stable'}));
+  await waitFor(()=>expect(mock.update).toHaveBeenCalledWith({type:'set_preferences',preferences:{checks_enabled:true,update_channel:'stable',install_after_download:true}}));
+});
+it('builds without in-app updates have no channel choice',()=>{
+  const {container}=render(<OinkProvider defaultMotion="reduced"><UpdateChannel status={{...status,phase:'disabled'}} label="Update channel"/></OinkProvider>);
   expect(container.textContent).toBe('');
 });

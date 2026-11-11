@@ -2,12 +2,14 @@ use super::super::{Handle, security, token};
 use super::*;
 use base64::{Engine, engine::general_purpose::STANDARD};
 use oink_update::{
-    feed::{self, Selection, VerifiedManifest},
+    WINDOWS_EPOCH,
+    catalog::{self, Check, Expected, Kind, Outcome, Platform, VerifiedCatalog},
+    feed::{self, Channel},
+    fetch,
     ipc::{Reply, Request},
     trust::Roots,
 };
 use std::{
-    io::Read,
     sync::{Arc, Mutex, atomic::Ordering},
     time::{Duration, Instant},
 };
@@ -32,6 +34,9 @@ fn registered_sessions(
     Ok(active)
 }
 const VERIFICATION_BUDGET: Duration = Duration::from_secs(120);
+/// Automatic checks: after a successful check, and after a failed one.
+const CHECK_INTERVAL: Duration = Duration::from_secs(24 * 3600);
+const RETRY_INTERVAL: Duration = Duration::from_secs(2 * 3600);
 
 pub(super) struct State {
     status: UpdateStatus,
@@ -43,7 +48,14 @@ pub(super) struct State {
     shutdown: bool,
     prepared_at: Option<Instant>,
     verification_started: Option<Instant>,
-    last_check: Option<Instant>,
+    /// When the next automatic check is due; none until an Oink launch.
+    next_check: Option<Instant>,
+    /// The queued check is manual: it also offers a skipped build.
+    manual_check: bool,
+    /// The check the engine is running.
+    running_check: Option<Check>,
+    /// Bumped only when a new check replaces a queued or running one.
+    check_revision: u64,
     revision: u64,
     wake: Option<Arc<super::super::wake::Event>>,
 }
@@ -68,40 +80,206 @@ impl State {
             self.queued = None;
             self.status.phase = Phase::Failed;
             self.status.error = Some(Error::VerificationTimeout);
+            // A download that timed out in verification failed for its build.
+            self.status.failed_build = self.status.candidate.as_ref().map(|c| c.build);
             tracing::warn!("package verification timed out before session drain");
         }
     }
 
-    fn request_check(&mut self) {
-        // Check is asynchronous: callers share Checking and its eventual result.
-        // A duplicate must not change the revision checked by the active fetch.
-        if self.status.phase != Phase::Checking && self.queued != Some(Command::Check) {
-            self.revision = self.revision.wrapping_add(1);
-            self.queued = Some(Command::Check);
+    /// Checks are asynchronous: callers share a queued or running check and its
+    /// result. Only a manual check replaces an automatic one, because it also
+    /// offers a skipped build.
+    fn request_check(&mut self, check: Check) {
+        let current = if self.queued == Some(Command::Check) {
+            Some(if self.manual_check {
+                Check::Manual
+            } else {
+                Check::Automatic
+            })
+        } else {
+            self.running_check
+        };
+        if current.is_none_or(|current| current == Check::Automatic && check == Check::Manual) {
+            self.restart_check(check);
         }
         self.status.phase = Phase::Checking;
         self.status.error = None;
+    }
+    /// Queues a check whose result replaces any check queued or running now.
+    fn restart_check(&mut self, check: Check) {
+        self.check_revision = self.check_revision.wrapping_add(1);
+        self.queued = Some(Command::Check);
+        self.manual_check = check == Check::Manual;
+        self.status.phase = Phase::Checking;
+        self.status.error = None;
+    }
+    /// A backend registers once per launch of Oink, and every launch checks
+    /// once. This service outlives the app, so a failure (issue #45: the
+    /// network was down) is also retried then instead of at the next timer.
+    fn launched(&mut self, now: Instant) {
+        if self.policy.policy.preferences.checks_enabled {
+            self.next_check = Some(now);
+        }
+    }
+    /// When the next automatic check may start, if one is scheduled.
+    fn automatic_due(&self, feed_enabled: bool, pending: bool) -> Option<Instant> {
+        // A check would replace a package that is downloading or ready.
+        let busy = matches!(
+            self.status.phase,
+            Phase::Downloading | Phase::Verifying | Phase::Ready | Phase::Quiescing | Phase::Installing
+        );
+        (feed_enabled
+            && self.policy.policy.preferences.checks_enabled
+            && self.transaction.is_none()
+            && !pending
+            && !busy)
+            .then_some(self.next_check)
+            .flatten()
+    }
+    /// The next command for the engine, with the kind of check it starts.
+    fn next_command(&mut self, now: Instant, feed_enabled: bool) -> Option<(Command, Check)> {
+        if let Some(command) = self.queued.take() {
+            let check = if std::mem::take(&mut self.manual_check) {
+                Check::Manual
+            } else {
+                Check::Automatic
+            };
+            return Some((command, check));
+        }
+        self.automatic_due(feed_enabled, false)
+            .is_some_and(|at| now >= at)
+            .then_some((Command::Check, Check::Automatic))
+    }
+    /// A check finished: the next automatic one is due a day after a success
+    /// and two hours after a failure (no source verified).
+    fn checked(&mut self, ok: bool, now: Instant) {
+        let after = if ok { CHECK_INTERVAL } else { RETRY_INTERVAL };
+        self.next_check = Some(now + after);
+        self.status.next_check = self
+            .policy
+            .policy
+            .preferences
+            .checks_enabled
+            .then(|| super::now() + after.as_secs() as i64);
+    }
+    fn apply_catalog(
+        &mut self,
+        catalog: VerifiedCatalog,
+        envelope: Vec<u8>,
+        channel: Channel,
+        windows_build: u32,
+        check: Check,
+    ) -> Result<Option<Selected>, Error> {
+        let plan = catalog.plan(&catalog::Selection {
+            installed_build: self.status.current_build,
+            successful_build: self.policy.successful_build,
+            quarantine: &self.policy.quarantine,
+            channel,
+            os: os_version(windows_build),
+            skipped_build: self.policy.policy.skipped_build,
+            check,
+        });
+        let (plan, error) = match plan {
+            Ok(plan) => (Some(plan), None),
+            Err(Outcome::UpToDate) => (None, None),
+            Err(Outcome::OsUnsupported) => (None, Some(Error::OsUnsupported)),
+        };
+        let mut candidate = None;
+        let mut selected = None;
+        let watermark = catalog.watermark().clone();
+        if let Some(plan) = plan {
+            feed::verify_version(&plan.release.version, &self.status.version)?;
+            let release = transaction_release(&plan.release)?;
+            candidate = Some(Candidate {
+                local_package: false,
+                build: release.build,
+                version: release.version.clone(),
+                size: release.package.length,
+                published_at: None,
+                severity: if plan.kind == Kind::Critical {
+                    feed::Severity::Critical
+                } else {
+                    feed::Severity::Normal
+                },
+                notes: Some(release.notes.clone()),
+                kind: plan.kind,
+                notice: plan.notice,
+            });
+            selected = Some(Selected {
+                catalog: Some(catalog),
+                envelope,
+                channel,
+                kind: plan.kind,
+                release,
+                prepared: None,
+            });
+        }
+        self.policy.watermarks.insert(catalog_watermark(channel), watermark);
+        self.status.checked_at = Some(now());
+        self.status.error = error;
+        if self.status.failed_build != candidate.as_ref().map(|c| c.build) {
+            self.status.failed_build = None;
+        }
+        self.status.phase = if candidate.is_some() {
+            Phase::Available
+        } else if error.is_some() {
+            Phase::Failed
+        } else {
+            Phase::Idle
+        };
+        self.status.candidate = candidate;
+        Ok(selected)
+    }
+    /// Only an offered candidate that is not manual-only can be downloaded.
+    fn admit_download(&self) -> Result<(), Error> {
+        match &self.status.candidate {
+            Some(candidate) if candidate.kind != Kind::Manual => Ok(()),
+            _ => Err(Error::Policy),
+        }
+    }
+    /// A failed download keeps its candidate (and the title-bar button) and
+    /// remembers the build the failure belongs to.
+    fn download_failed(&mut self, build: u64, error: Error) {
+        self.status.phase = Phase::Failed;
+        self.status.error = Some(error);
+        self.status.progress = None;
+        self.status.failed_build = Some(build);
+    }
+    fn download_ready(&mut self, build: u64) {
+        self.status.phase = Phase::Ready;
+        self.status.progress = None;
+        if self.status.failed_build == Some(build) {
+            self.status.failed_build = None;
+        }
+    }
+    /// Applies preferences that are already saved. Another channel's catalog
+    /// decides what is offered (never an older build), so that checks again.
+    fn apply_preferences(&mut self, preferences: Preferences) {
+        let old = std::mem::replace(&mut self.policy.policy.preferences, preferences.clone());
+        self.status.checks_enabled = preferences.checks_enabled;
+        self.status.channel = preferences.channel();
+        self.status.update_channel = preferences.update_channel;
+        self.status.install_after_download = preferences.install_after_download;
+        if preferences.channel() != old.channel() {
+            self.revision = self.revision.wrapping_add(1);
+            self.status.candidate = None;
+            self.status.failed_build = None;
+            self.restart_check(Check::Automatic);
+        } else if preferences.checks_enabled && !old.checks_enabled {
+            self.request_check(Check::Automatic);
+        }
+        if !preferences.checks_enabled {
+            self.status.next_check = None;
+        }
     }
     fn new() -> Result<Self, Error> {
         let receipt = installed()?;
         let policy = policy()?;
         let configured = oink_update::trust::compiled().is_ok();
-        let status = UpdateStatus {
-            current_build: receipt.build,
-            version: receipt.version,
-            checks_enabled: configured && policy.policy.preferences.checks_enabled,
-            phase: if configured { Phase::Idle } else { Phase::Disabled },
-            candidate: None,
-            checked_at: None,
-            next_check: None,
-            deferred_until: policy.policy.deferred_until,
-            blockers: Vec::new(),
-            progress: None,
-            error: (!configured).then_some(Error::NotConfigured),
-            scope: Scope::Machine,
-            can_change_policy: false,
-        };
-        Ok(Self {
+        Ok(Self::with(initial_status(receipt, &policy, configured), policy))
+    }
+    fn with(status: UpdateStatus, policy: MachinePolicy) -> Self {
+        Self {
             status,
             policy,
             queued: None,
@@ -111,10 +289,39 @@ impl State {
             shutdown: false,
             prepared_at: None,
             verification_started: None,
-            last_check: None,
+            next_check: None,
+            manual_check: false,
+            running_check: None,
+            check_revision: 0,
             revision: 0,
             wake: None,
-        })
+        }
+    }
+}
+fn initial_status(receipt: msi::Receipt, policy: &MachinePolicy, configured: bool) -> UpdateStatus {
+    let preferences = &policy.policy.preferences;
+    UpdateStatus {
+        current_build: receipt.build,
+        version: receipt.version,
+        checks_enabled: configured && preferences.checks_enabled,
+        channel: preferences.channel(),
+        update_channel: preferences.update_channel,
+        install_after_download: preferences.install_after_download,
+        phase: if configured { Phase::Idle } else { Phase::Disabled },
+        candidate: None,
+        checked_at: None,
+        next_check: None,
+        deferred_until: policy.policy.deferred_until,
+        blockers: Vec::new(),
+        progress: None,
+        error: (!configured).then_some(Error::NotConfigured),
+        failed_build: None,
+        critical_prompted_build: policy.policy.critical_prompted_build,
+        scope: Scope::Machine,
+        // Every pipe client is the authenticated interactive user of its own
+        // session running installed Oink. Oink has one user, who changes the
+        // update preferences without elevation.
+        can_change_policy: true,
     }
 }
 fn transaction_phase(journal: &oink_update::transaction::Journal) -> Phase {
@@ -239,6 +446,11 @@ pub(super) fn dispatch(state: &Arc<Mutex<State>>, id: u32, process: &Handle, req
                         quiesced: None,
                     },
                 );
+                // The same backend registers again after a pipe failure; only a
+                // new process is a launch.
+                if !known && !pending() {
+                    state.launched(Instant::now());
+                }
                 return Ok(Reply::Registered);
             }
             Request::Poll { transaction } => {
@@ -347,27 +559,26 @@ pub(super) fn dispatch(state: &Arc<Mutex<State>>, id: u32, process: &Handle, req
                 ) {
                     return Err(Error::Busy);
                 }
-                if !matches!(command, Command::Check) {
+                // Check, Prompted, Download and preference changes leave a
+                // download or preparation in progress alone (see their arms).
+                if !matches!(
+                    command,
+                    Command::Check | Command::Prompted { .. } | Command::SetPreferences { .. } | Command::Download
+                ) {
                     state.revision = state.revision.wrapping_add(1);
                 }
                 match command {
                     Command::OpenLocal { .. } => return Err(Error::Policy),
                     Command::SetPreferences { preferences } => {
-                        if !super::pipe::elevated(process) {
-                            return Err(Error::Policy);
-                        }
-                        if preparing {
+                        // Authenticated interactive callers only (pipe::peer);
+                        // no elevation: these are the one user's preferences.
+                        if preparing && preferences.channel() != state.policy.policy.preferences.channel() {
                             abort(&mut state)?;
                         }
-                        let old = state.policy.clone();
-                        state.policy.policy.preferences = preferences.clone();
-                        if let Err(e) = save_policy(&state.policy) {
-                            state.policy = old;
-                            return Err(e);
-                        }
-                        state.status.checks_enabled = preferences.checks_enabled;
-                        state.status.candidate = None;
-                        state.queued = preferences.checks_enabled.then_some(Command::Check);
+                        let mut policy = state.policy.clone();
+                        policy.policy.preferences = preferences.clone();
+                        save_policy(&policy)?;
+                        state.apply_preferences(preferences);
                     }
                     Command::Defer { choice } => {
                         if preparing {
@@ -378,7 +589,10 @@ pub(super) fn dispatch(state: &Arc<Mutex<State>>, id: u32, process: &Handle, req
                         state.status.deferred_until = state.policy.policy.deferred_until;
                     }
                     Command::Skip { expected_build } => {
-                        if state.status.candidate.as_ref().map(|c| c.build) != Some(expected_build) {
+                        // Critical and manual updates cannot be skipped.
+                        if state.status.candidate.as_ref().map(|c| (c.build, c.kind))
+                            != Some((expected_build, Kind::Normal))
+                        {
                             return Err(Error::Policy);
                         }
                         if preparing {
@@ -386,6 +600,14 @@ pub(super) fn dispatch(state: &Arc<Mutex<State>>, id: u32, process: &Handle, req
                         }
                         state.policy.policy.skipped_build = Some(expected_build);
                         save_policy(&state.policy)?;
+                    }
+                    Command::Prompted { expected_build } => {
+                        if state.status.candidate.as_ref().map(|c| c.build) != Some(expected_build) {
+                            return Err(Error::Policy);
+                        }
+                        state.policy.policy.critical_prompted_build = Some(expected_build);
+                        save_policy(&state.policy)?;
+                        state.status.critical_prompted_build = Some(expected_build);
                     }
                     Command::Install { expected_build } => {
                         if state.status.phase != Phase::Ready
@@ -400,8 +622,12 @@ pub(super) fn dispatch(state: &Arc<Mutex<State>>, id: u32, process: &Handle, req
                         state.status.error = None;
                         state.queued = Some(Command::Install { expected_build });
                     }
-                    Command::Check => state.request_check(),
-                    Command::Download => state.queued = Some(Command::Download),
+                    Command::Check => state.request_check(Check::Manual),
+                    Command::Download => {
+                        state.admit_download()?;
+                        state.revision = state.revision.wrapping_add(1);
+                        state.queued = Some(Command::Download);
+                    }
                     Command::Cancel => {
                         abort(&mut state)?;
                         state.queued = Some(Command::Cancel);
@@ -409,9 +635,9 @@ pub(super) fn dispatch(state: &Arc<Mutex<State>>, id: u32, process: &Handle, req
                 }
             }
         }
-        let mut status = state.status.clone();
-        status.can_change_policy = super::pipe::elevated(process);
-        Ok(Reply::Status { status })
+        Ok(Reply::Status {
+            status: Box::new(state.status.clone()),
+        })
     })();
     if wake && let Some(send) = &state.wake {
         send.signal();
@@ -446,21 +672,12 @@ fn command_admitted(command: &Command, preparing: bool, active: bool) -> bool {
         || (preparing
             && matches!(
                 command,
-                Command::SetPreferences { .. } | Command::Defer { .. } | Command::Skip { .. } | Command::Cancel
+                Command::SetPreferences { .. }
+                    | Command::Defer { .. }
+                    | Command::Skip { .. }
+                    | Command::Prompted { .. }
+                    | Command::Cancel
             ))
-}
-fn scheduled_command(
-    queued: Option<Command>,
-    policy: &Policy,
-    last_check: Option<Instant>,
-    feed_enabled: bool,
-) -> Option<Command> {
-    queued.or_else(|| {
-        (feed_enabled
-            && policy.preferences.checks_enabled
-            && last_check.is_none_or(|at| at.elapsed() >= Duration::from_secs(24 * 3600)))
-        .then_some(Command::Check)
-    })
 }
 pub(super) fn serve() {
     let Some(events) = super::super::broker::events() else {
@@ -573,142 +790,95 @@ impl Drop for Endpoint {
         let _ = self.join();
     }
 }
-pub(super) fn http(url: &str, length: u64, package: bool) -> Result<Vec<u8>, Error> {
-    let policy = if package {
-        reqwest::redirect::Policy::custom(|attempt| {
-            if feed::validate_redirect(attempt.url().as_str(), attempt.previous().len()).is_ok() {
-                attempt.follow()
-            } else {
-                attempt.stop()
-            }
-        })
-    } else {
-        reqwest::redirect::Policy::none()
-    };
-    let client = reqwest::blocking::Client::builder()
-        .https_only(!cfg!(feature = "test-feed"))
-        .redirect(policy)
-        .connect_timeout(Duration::from_secs(10))
-        .timeout(Duration::from_secs(60))
-        .user_agent("Oink-updater/1")
-        .build()
-        .map_err(|_| Error::Network)?;
-    let response = client.get(url).send().map_err(|_| Error::Network)?;
-    if response.status() != reqwest::StatusCode::OK || response.content_length().is_some_and(|n| n > length) {
-        return Err(Error::Network);
-    }
-    let mut bytes = Vec::new();
-    response
-        .take(length + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|_| Error::Network)?;
-    if bytes.len() as u64 > length {
-        return Err(Error::Limit);
-    }
-    Ok(bytes)
-}
 struct Selected {
-    manifest: Option<VerifiedManifest>,
+    /// None for an elevated local package.
+    catalog: Option<VerifiedCatalog>,
     envelope: Vec<u8>,
+    channel: Channel,
+    kind: Kind,
     release: Release,
     prepared: Option<worker::PreparedPackage>,
 }
-fn check_feed(state: &Arc<Mutex<State>>, roots: &Roots) -> Result<Option<Selected>, Error> {
-    let (policy, installed, revision) = {
-        let mut state = state.lock().unwrap();
-        state.status.phase = Phase::Checking;
-        state.last_check = Some(Instant::now());
-        (state.policy.clone(), state.status.current_build, state.revision)
+/// The catalog of `channel` from the first source whose copy fully verifies,
+/// with its exact bytes for the install worker to verify again.
+fn fetch_catalog(
+    trust: &feed::Trust<'_>,
+    sources: &[String],
+    channel: Channel,
+    seen: &feed::Watermark,
+    now: i64,
+    get: impl FnMut(&str) -> Result<Vec<u8>, Error>,
+) -> Result<(VerifiedCatalog, Vec<u8>), Error> {
+    let expected = Expected {
+        platform: Platform::Windows,
+        architecture: ARCH,
+        channel,
     };
-    let envelope = http(&feed::manifest_url(), feed::MAX_FEED as u64, false)?;
-    let seen = policy.watermarks.get("stable").cloned().unwrap_or_default();
-    let manifest = feed::verify_manifest(&envelope, &roots.feed(), &seen, now())?;
-    let os_build = worker::windows_build()?;
-    let release = manifest
-        .select(&Selection {
-            windows_build: os_build,
-            architecture: "x64",
-            installed_build: installed,
-            successful_build: policy.successful_build,
-            quarantine: &policy.quarantine,
-        })?
-        .cloned();
-    if let Some(release) = &release {
-        feed::verify_version(&release.version, &state.lock().unwrap().status.version)?;
-    }
+    fetch::first_verified(
+        sources,
+        &catalog::path(Platform::Windows, WINDOWS_EPOCH, ARCH, channel),
+        get,
+        |bytes| Ok((catalog::verify(bytes, trust, &expected, seen, now)?, bytes.to_vec())),
+    )
+}
+fn check_feed(state: &Arc<Mutex<State>>, roots: &Roots, check: Check) -> Result<Option<Selected>, Error> {
+    let (channel, seen, revision) = {
+        let state = state.lock().unwrap();
+        let channel = state.policy.policy.preferences.channel();
+        let seen = state.policy.watermarks.get(&catalog_watermark(channel)).cloned();
+        (channel, seen.unwrap_or_default(), state.check_revision)
+    };
+    let sources = oink_update::trust::sources()?;
+    let (catalog, envelope) = fetch_catalog(&roots.feed(), &sources, channel, &seen, now(), |url| {
+        fetch::get(url, feed::MAX_FEED as u64, false, &mut |_, _| {})
+    })?;
+    let windows_build = worker::windows_build()?;
     let mut state = state.lock().unwrap();
-    if state.revision != revision {
+    if state.check_revision != revision {
         return Err(Error::Busy);
     }
-    state
-        .policy
-        .watermarks
-        .insert("stable".into(), manifest.watermark().clone());
+    let selected = state.apply_catalog(catalog, envelope, channel, windows_build, check)?;
     save_policy(&state.policy)?;
-    state.status.checked_at = Some(now());
-    state.status.next_check = Some(now() + 24 * 3600);
-    state.status.error = if release.is_none()
-        && manifest.manifest().releases.iter().any(|r| {
-            r.build > installed.max(policy.successful_build)
-                && r.architecture == "x64"
-                && r.minimum_windows_build > os_build
-        }) {
-        Some(Error::OsUnsupported)
-    } else {
-        None
-    };
-    state.status.candidate = release.as_ref().map(|release| Candidate {
-        local_package: false,
-        build: release.build,
-        version: release.version.clone(),
-        size: release.package.length,
-        published_at: None,
-        severity: release.severity,
-        notes: Some(release.notes.clone()),
-    });
-    state.status.phase = if release.is_some() {
-        Phase::Available
-    } else if state.status.error.is_some() {
-        Phase::Failed
-    } else {
-        Phase::Idle
-    };
-    Ok(release.map(|release| Selected {
-        manifest: Some(manifest),
-        envelope,
-        release,
-        prepared: None,
-    }))
+    Ok(selected)
 }
 fn download(selected: &mut Selected, roots: &Roots, state: &Arc<Mutex<State>>) -> Result<(), Error> {
-    if let Some(manifest) = &selected.manifest {
-        manifest.ensure_fresh(now())?;
-    }
+    let catalog = selected.catalog.as_ref().ok_or(Error::Policy)?;
+    catalog.ensure_fresh(now())?;
     let package = &selected.release.package;
-    let bytes = http(&package.url, package.length, true)?;
+    let mut shown = None;
+    let bytes = fetch::get(&package.url, package.length, true, &mut |received, _| {
+        let percent = (received.min(package.length) * 100 / package.length) as u8;
+        if shown != Some(percent) {
+            shown = Some(percent);
+            let mut state = state.lock().unwrap();
+            if state.status.phase == Phase::Downloading {
+                state.status.progress = Some(percent);
+            }
+        }
+    })?;
     feed::verify_package(&bytes, package, &roots.feed())?;
     let directory = protected::maintenance().map_err(|_| Error::Storage)?.join("downloads");
     protected::directory(&directory).map_err(|_| Error::Storage)?;
     protected::write(&directory.join("candidate.msi"), &bytes)?;
-    {
+    let installed = {
         let mut current = state.lock().unwrap();
         current.status.phase = Phase::Verifying;
+        current.status.progress = None;
         current.verification_started = Some(Instant::now());
-    }
-    let installed = state.lock().unwrap().status.current_build;
-    let previous = selected
-        .manifest
-        .as_ref()
-        .ok_or(Error::Policy)?
-        .manifest()
+        current.status.current_build
+    };
+    let previous = catalog
+        .catalog()
         .releases
         .iter()
         .find(|r| r.build == installed)
-        .cloned();
+        .map(transaction_release)
+        .transpose()?;
     selected.prepared = Some(worker::prepare_package(
         selected.release.clone(),
         previous,
         &selected.envelope,
+        selected.channel,
         &worker::PackageTrust::Feed(roots.clone()),
         false,
     )?);
@@ -722,7 +892,7 @@ fn engine(state: Arc<Mutex<State>>, wake: Arc<super::super::wake::Event>) {
         tracing::error!("update engine cannot subscribe to maintenance storage");
         return;
     };
-    // In-house builds disable the feed gate. Their elevated local approvals
+    // Without compiled release trust the feed is off. Elevated local approvals
     // still need a live engine, package inspection, recovery and health checks.
     let roots = oink_update::trust::compiled();
     tracing::info!(feed_enabled = roots.is_ok(), "Windows local update engine running");
@@ -780,7 +950,7 @@ fn engine(state: Arc<Mutex<State>>, wake: Arc<super::super::wake::Event>) {
             state.status.error = error;
             // Preserve the durable install outcome for the relaunched UI;
             // an automatic check must not immediately replace it with Idle.
-            state.last_check = Some(Instant::now());
+            state.next_check = Some(Instant::now() + CHECK_INTERVAL);
             cleanup_needed = true;
             selected = None;
         }
@@ -802,13 +972,16 @@ fn engine(state: Arc<Mutex<State>>, wake: Arc<super::super::wake::Event>) {
                 }
                 let release = package.release();
                 let local_trust = worker::PackageTrust::Local(oink_update::trust::local_packages()?);
-                let prepared = worker::prepare_package(release.clone(), None, &[], &local_trust, true)?;
+                let prepared =
+                    worker::prepare_package(release.clone(), None, &[], Channel::default(), &local_trust, true)?;
                 let mut current = state.lock().unwrap();
                 current.expire_verification(Instant::now());
                 verification_current(&current, revision)?;
                 selected = Some(Selected {
-                    manifest: None,
+                    catalog: None,
                     envelope: vec![],
+                    channel: Channel::default(),
+                    kind: Kind::Normal,
                     release,
                     prepared: Some(prepared),
                 });
@@ -835,39 +1008,76 @@ fn engine(state: Arc<Mutex<State>>, wake: Arc<super::super::wake::Event>) {
             if state.transaction.is_some() || pending() {
                 None
             } else {
-                let queued = state.queued.take();
-                scheduled_command(queued, &state.policy.policy, state.last_check, roots.is_ok()).map(|command| {
-                    if command == Command::Check {
-                        // Publish background admission under the same lock, so a
-                        // manual check arriving before HTTP starts joins it too.
-                        state.status.phase = Phase::Checking;
-                        state.status.error = None;
-                    }
-                    (command, state.revision)
-                })
+                state
+                    .next_command(Instant::now(), roots.is_ok())
+                    .map(|(command, check)| {
+                        if command == Command::Check {
+                            // Publish background admission under the same lock, so a
+                            // manual check arriving before HTTP starts joins it too.
+                            state.running_check = Some(check);
+                            state.status.phase = Phase::Checking;
+                            state.status.error = None;
+                        }
+                        (command, check, state.revision, state.check_revision)
+                    })
             }
         };
-        let command_revision = command.as_ref().map(|(_, revision)| *revision);
+        // A result only counts while nothing replaced its command: checks by a
+        // newer check, everything else by the command revision.
+        let gate = command
+            .as_ref()
+            .map(|(command, _, revision, check_revision)| (*command == Command::Check, *revision, *check_revision));
+        let mut failed_download = None;
         let result = (|| {
-            if let Some((command, revision)) = command {
+            if let Some((command, check, revision, check_revision)) = command {
                 match command {
                     Command::Check => {
-                        selected = None;
-                        selected = check_feed(&state, roots.as_ref().map_err(|e| *e)?)?;
+                        // A failed check keeps an offered candidate downloadable.
+                        if state.lock().unwrap().status.candidate.is_none() {
+                            selected = None;
+                        }
+                        let checked = roots
+                            .as_ref()
+                            .map_err(|e| *e)
+                            .and_then(|roots| check_feed(&state, roots, check));
+                        {
+                            let mut state = state.lock().unwrap();
+                            state.running_check = None;
+                            if state.check_revision == check_revision {
+                                state.checked(checked.is_ok(), Instant::now());
+                            }
+                        }
+                        selected = checked?;
                     }
                     Command::Download => {
-                        let candidate = selected.as_mut().ok_or(Error::Policy)?;
+                        let offered = state.lock().unwrap().status.candidate.as_ref().map(|c| c.build);
+                        let candidate = selected
+                            .as_mut()
+                            .filter(|s| Some(s.release.build) == offered && s.kind != Kind::Manual)
+                            .ok_or(Error::Policy)?;
+                        let build = candidate.release.build;
                         if candidate.prepared.is_none() {
+                            failed_download = Some(build);
                             // Only this engine starts staging. Join any background
                             // collection before touching a new artifact, without
                             // holding State or delaying UI/status requests.
                             let _ = finish_housekeeping(&mut housekeeping);
-                            state.lock().unwrap().status.phase = Phase::Downloading;
+                            {
+                                // A new attempt replaces the previous failure;
+                                // otherwise Ready would still carry its error.
+                                let mut state = state.lock().unwrap();
+                                state.status.phase = Phase::Downloading;
+                                state.status.error = None;
+                                state.status.progress = Some(0);
+                            }
                             download(candidate, roots.as_ref().map_err(|e| *e)?, &state)?;
                             let current = state.lock().unwrap();
                             verification_current(&current, revision)?;
                         }
-                        state.lock().unwrap().status.phase = Phase::Ready;
+                        failed_download = None;
+                        let mut state = state.lock().unwrap();
+                        state.verification_started = None;
+                        state.download_ready(build);
                     }
                     Command::Install { expected_build } => {
                         let candidate = selected.as_ref().ok_or(Error::Policy)?;
@@ -883,6 +1093,7 @@ fn engine(state: Arc<Mutex<State>>, wake: Arc<super::super::wake::Event>) {
                         state.status.phase = Phase::Idle;
                         state.status.candidate = None;
                         state.status.error = None;
+                        state.status.progress = None;
                         state.status.blockers.clear();
                     }
                     _ => {}
@@ -892,9 +1103,20 @@ fn engine(state: Arc<Mutex<State>>, wake: Arc<super::super::wake::Event>) {
         })();
         if let Err(error) = result {
             let mut state = state.lock().unwrap();
-            if command_revision.is_none_or(|revision| state.revision == revision) {
-                state.status.error = Some(error);
-                state.status.phase = Phase::Failed;
+            let current = gate.is_none_or(|(check, revision, check_revision)| {
+                if check {
+                    state.check_revision == check_revision
+                } else {
+                    state.revision == revision
+                }
+            });
+            if current {
+                if let Some(build) = failed_download {
+                    state.download_failed(build, error);
+                } else {
+                    state.status.error = Some(error);
+                    state.status.phase = Phase::Failed;
+                }
             }
         }
         if housekeeping.as_ref().is_some_and(|task| task.thread.is_finished()) {
@@ -944,9 +1166,7 @@ fn engine(state: Arc<Mutex<State>>, wake: Arc<super::super::wake::Event>) {
     let _ = finish_housekeeping(&mut housekeeping);
 }
 fn engine_deadline(state: &State, now: Instant, feed_enabled: bool, pending: bool) -> Option<Instant> {
-    let check =
-        (feed_enabled && state.policy.policy.preferences.checks_enabled && state.transaction.is_none() && !pending)
-            .then(|| state.last_check.map_or(now, |at| at + Duration::from_secs(24 * 3600)));
+    let check = state.automatic_due(feed_enabled, pending).map(|at| at.max(now));
     let verification = (state.status.phase == Phase::Verifying)
         .then_some(state.verification_started.map(|at| at + VERIFICATION_BUDGET))
         .flatten();
@@ -984,8 +1204,8 @@ fn finish_housekeeping(task: &mut Option<Cleanup>) -> Option<Result<(), Error>> 
     Some(result)
 }
 fn prepare(state: &Arc<Mutex<State>>, selected: &Selected, expected_revision: u64) -> Result<(), Error> {
-    if let Some(manifest) = &selected.manifest {
-        manifest.ensure_fresh(now())?;
+    if let Some(catalog) = &selected.catalog {
+        catalog.ensure_fresh(now())?;
     }
     let sessions = super::pipe::sessions().map_err(|_| Error::Busy)?;
     let (registrations, revision) = {
@@ -1079,15 +1299,309 @@ fn transaction_matches(state: &State, tx: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use super::super::test_catalog as fixture;
     use super::*;
+    use serde_json::json;
+    const BETA: Channel = Channel::Beta;
+    fn receipt() -> msi::Receipt {
+        msi::Receipt {
+            schema: 1,
+            product: "Oink".into(),
+            source_tree_sha256: "a".repeat(64),
+            version: "0.3.5".into(),
+            build: 305001,
+            architecture: "x64".into(),
+            minimum_os: "10.0.17763".into(),
+            minimum_windows_build: 17763,
+            updater_included: true,
+            collector_included: false,
+            protocol_baseline: 1,
+            upgrade_code: String::new(),
+            components: vec![],
+            signature: String::new(),
+        }
+    }
+    fn preferences(checks_enabled: bool, channel: Channel, install_after_download: bool) -> Preferences {
+        Preferences {
+            checks_enabled,
+            update_channel: Some(channel),
+            install_after_download,
+        }
+    }
+    fn check_state() -> State {
+        let mut policy = MachinePolicy::default();
+        policy.policy.preferences = preferences(true, BETA, true);
+        State::with(initial_status(receipt(), &policy, true), policy)
+    }
+    fn offer(state: &mut State, payload: &serde_json::Value, check: Check) -> Option<Selected> {
+        let catalog = fixture::verified(payload, BETA).unwrap();
+        state
+            .apply_catalog(catalog, fixture::envelope(payload), BETA, 26200, check)
+            .unwrap()
+    }
     #[test]
-    fn disabled_feed_does_not_schedule_checks_but_runs_explicit_local_install() {
-        let policy = Policy::default();
-        assert!(scheduled_command(None, &policy, None, false).is_none());
+    fn the_first_source_whose_catalog_verifies_is_used() {
+        let public = fixture::public();
+        let trust = fixture::trust(&public);
+        let sources = ["https://a.example", "https://b.example", "https://c.example"].map(String::from);
+        let good = fixture::envelope(&fixture::payload());
+        let mut stale = fixture::payload();
+        stale["sequence"] = json!(4);
+        let stale = fixture::envelope(&stale);
+        let fresh = fixture::verified(&fixture::payload(), BETA).unwrap();
+        let seen = fresh.watermark().clone();
+        let mut asked = vec![];
+        let (catalog, bytes) = fetch_catalog(&trust, &sources, BETA, &seen, fixture::NOW, |url| {
+            asked.push(url.to_owned());
+            match url.split('/').nth(2) {
+                Some("a.example") => Err(Error::Network),
+                Some("b.example") => Ok(stale.clone()),
+                _ => Ok(good.clone()),
+            }
+        })
+        .unwrap();
         assert_eq!(
-            scheduled_command(Some(Command::Install { expected_build: 44 }), &policy, None, false),
-            Some(Command::Install { expected_build: 44 })
+            asked[0],
+            "https://a.example/windows/v2/win-2026-01/x64/beta/manifest.json"
         );
+        assert_eq!(asked.len(), 3);
+        assert_eq!((catalog.catalog().sequence, bytes), (5, good.clone()));
+        // A verification failure is reported in preference to network failures.
+        let fetch = |channel, seen: &feed::Watermark, bytes: &Vec<u8>| {
+            fetch_catalog(&trust, &sources, channel, seen, fixture::NOW, |url| {
+                if url.starts_with("https://b.") {
+                    Ok(bytes.clone())
+                } else {
+                    Err(Error::Network)
+                }
+            })
+            .map(|_| ())
+        };
+        assert_eq!(fetch(BETA, &seen, &stale), Err(Error::Replay));
+        assert_eq!(
+            fetch(Channel::Stable, &feed::Watermark::default(), &good),
+            Err(Error::Policy)
+        );
+        assert_eq!(fetch(BETA, &seen, &good), Ok(()));
+        let offline = fetch_catalog(&trust, &sources, BETA, &seen, fixture::NOW, |_| Err(Error::Network));
+        assert_eq!(offline.map(|_| ()), Err(Error::Network));
+    }
+    #[test]
+    fn catalog_plans_become_candidates_with_their_kind_and_notice() {
+        let mut state = check_state();
+        let mut p = fixture::payload();
+        p["rules"] = json!([
+            {"installed":[305000,305999],"kind":"critical","target":306002,"notice":{"en":"Security fix"}},
+            {"installed":[0,2147483647],"kind":"normal","target":"latest"}
+        ]);
+        let selected = offer(&mut state, &p, Check::Automatic).unwrap();
+        assert_eq!(
+            (selected.release.build, selected.kind, selected.channel),
+            (306002, Kind::Critical, BETA)
+        );
+        let candidate = state.status.candidate.clone().unwrap();
+        assert_eq!(
+            (
+                candidate.build,
+                candidate.kind,
+                candidate.severity,
+                candidate.local_package
+            ),
+            (306002, Kind::Critical, feed::Severity::Critical, false)
+        );
+        assert_eq!(candidate.notice.unwrap().for_language("en"), "Security fix");
+        assert_eq!(candidate.notes.unwrap().for_language("zh-Hans"), "修复");
+        assert_eq!(state.status.phase, Phase::Available);
+        assert!(state.status.checked_at.is_some());
+        assert_eq!(state.policy.watermarks[&catalog_watermark(BETA)].sequence, 5);
+        assert!(!state.policy.watermarks.contains_key("stable"));
+        assert_eq!(state.admit_download(), Ok(()));
+        // Manual-only updates are shown with their notes but never downloaded.
+        p["rules"] = json!([{"installed":[0,2147483647],"kind":"manual","target":"latest"}]);
+        assert_eq!(offer(&mut state, &p, Check::Automatic).unwrap().kind, Kind::Manual);
+        let candidate = state.status.candidate.clone().unwrap();
+        assert_eq!(
+            (candidate.build, candidate.kind, candidate.notice),
+            (307001, Kind::Manual, None)
+        );
+        assert_eq!(state.admit_download(), Err(Error::Policy));
+        // A skipped normal update is silent for automatic checks only.
+        state.policy.policy.skipped_build = Some(307001);
+        assert!(offer(&mut state, &fixture::payload(), Check::Automatic).is_none());
+        assert_eq!((state.status.phase, &state.status.candidate), (Phase::Idle, &None));
+        assert_eq!(state.admit_download(), Err(Error::Policy));
+        assert!(offer(&mut state, &fixture::payload(), Check::Manual).is_some());
+        // A release this installation is routed to may need a newer Windows.
+        let mut p = fixture::payload();
+        for release in p["releases"].as_array_mut().unwrap() {
+            release["minimumOs"] = json!("10.0.30000");
+        }
+        assert!(offer(&mut state, &p, Check::Manual).is_none());
+        assert_eq!(
+            (state.status.phase, state.status.error, &state.status.candidate),
+            (Phase::Failed, Some(Error::OsUnsupported), &None)
+        );
+    }
+    #[test]
+    fn a_failed_download_stays_attached_to_its_build() {
+        let mut state = check_state();
+        offer(&mut state, &fixture::payload(), Check::Automatic).unwrap();
+        state.download_failed(307001, Error::Network);
+        assert_eq!(
+            (state.status.phase, state.status.error, state.status.failed_build),
+            (Phase::Failed, Some(Error::Network), Some(307001))
+        );
+        assert_eq!(state.status.candidate.as_ref().map(|c| c.build), Some(307001));
+        assert_eq!(state.admit_download(), Ok(()));
+        // The same build offered again still carries its failure.
+        offer(&mut state, &fixture::payload(), Check::Automatic).unwrap();
+        assert_eq!(
+            (state.status.phase, state.status.failed_build),
+            (Phase::Available, Some(307001))
+        );
+        state.download_ready(307001);
+        assert_eq!((state.status.phase, state.status.failed_build), (Phase::Ready, None));
+        state.download_failed(307001, Error::Signature);
+        // Another build replaces the failure.
+        state.policy.quarantine.insert(307001);
+        offer(&mut state, &fixture::payload(), Check::Automatic).unwrap();
+        assert_eq!(state.status.candidate.as_ref().map(|c| c.build), Some(306002));
+        assert_eq!(state.status.failed_build, None);
+        // So does a verification that never finished.
+        state.status.phase = Phase::Verifying;
+        state.verification_started = Some(Instant::now() - VERIFICATION_BUDGET);
+        state.expire_verification(Instant::now());
+        assert_eq!(state.status.failed_build, Some(306002));
+    }
+    #[test]
+    fn automatic_checks_run_at_launch_then_daily_or_two_hours_after_a_failure() {
+        let now = Instant::now();
+        let mut state = check_state();
+        // Nothing runs until Oink launches.
+        assert_eq!(state.automatic_due(true, false), None);
+        assert_eq!(state.next_command(now, true), None);
+        state.launched(now);
+        assert_eq!(state.automatic_due(true, false), Some(now));
+        assert_eq!(state.automatic_due(false, false), None);
+        assert_eq!(state.automatic_due(true, true), None);
+        assert_eq!(state.next_command(now, true), Some((Command::Check, Check::Automatic)));
+        state.checked(true, now);
+        assert_eq!(state.next_check, Some(now + CHECK_INTERVAL));
+        assert!(state.status.next_check.is_some());
+        assert_eq!(
+            state.next_command(now + CHECK_INTERVAL - Duration::from_secs(1), true),
+            None
+        );
+        assert_eq!(engine_deadline(&state, now, true, false), Some(now + CHECK_INTERVAL));
+        assert!(state.next_command(now + CHECK_INTERVAL, true).is_some());
+        state.checked(false, now);
+        assert_eq!(engine_deadline(&state, now, true, false), Some(now + RETRY_INTERVAL));
+        // Another launch checks again at once.
+        state.launched(now);
+        assert_eq!(
+            engine_deadline(&state, now + Duration::from_secs(5), true, false),
+            Some(now + Duration::from_secs(5))
+        );
+        // A package downloading or ready to install is not replaced.
+        for phase in [Phase::Downloading, Phase::Verifying, Phase::Ready, Phase::Quiescing] {
+            state.status.phase = phase;
+            assert_eq!(state.automatic_due(true, false), None, "{phase:?}");
+            assert_eq!(state.next_command(now, true), None);
+        }
+        // With automatic checks off a launch checks nothing; manual checks run.
+        let mut off = check_state();
+        off.policy.policy.preferences.checks_enabled = false;
+        off.launched(now);
+        assert_eq!(off.automatic_due(true, false), None);
+        off.request_check(Check::Manual);
+        assert_eq!(off.next_command(now, true), Some((Command::Check, Check::Manual)));
+        off.checked(true, now);
+        assert_eq!(off.status.next_check, None);
+        // A disabled feed still runs an explicit local install.
+        off.queued = Some(Command::Install { expected_build: 44 });
+        assert_eq!(
+            off.next_command(now, false),
+            Some((Command::Install { expected_build: 44 }, Check::Automatic))
+        );
+    }
+    #[test]
+    fn manual_checks_join_automatic_ones_or_replace_them_to_show_a_skipped_build() {
+        let now = Instant::now();
+        let mut state = check_state();
+        state.status.error = Some(Error::Network);
+        state.request_check(Check::Automatic);
+        assert_eq!((state.status.phase, state.status.error), (Phase::Checking, None));
+        let automatic = state.check_revision;
+        state.request_check(Check::Automatic);
+        assert_eq!(state.check_revision, automatic);
+        state.request_check(Check::Manual);
+        let manual = state.check_revision;
+        assert_ne!(manual, automatic);
+        for check in [Check::Automatic, Check::Manual] {
+            state.request_check(check);
+            assert_eq!(state.check_revision, manual);
+        }
+        assert_eq!(state.next_command(now, true), Some((Command::Check, Check::Manual)));
+        // The engine is running the manual check: later requests share it.
+        state.running_check = Some(Check::Manual);
+        state.request_check(Check::Manual);
+        assert_eq!((state.check_revision, &state.queued), (manual, &None));
+        state.running_check = Some(Check::Automatic);
+        state.request_check(Check::Automatic);
+        assert_eq!((state.check_revision, &state.queued), (manual, &None));
+        state.request_check(Check::Manual);
+        assert_ne!(state.check_revision, manual);
+        assert_eq!(state.queued, Some(Command::Check));
+        // Checks never invalidate a download or preparation.
+        assert_eq!(state.revision, 0);
+    }
+    #[test]
+    fn the_user_changes_preferences_and_a_new_channel_checks_again() {
+        let mut state = check_state();
+        assert!(state.status.can_change_policy);
+        offer(&mut state, &fixture::payload(), Check::Automatic).unwrap();
+        state.download_failed(307001, Error::Network);
+        // The update dialog's checkbox keeps the offer and any download.
+        state.apply_preferences(preferences(true, BETA, false));
+        assert!(!state.status.install_after_download);
+        assert_eq!(state.status.failed_build, Some(307001));
+        assert!(state.status.candidate.is_some());
+        assert_eq!((state.revision, &state.queued), (0, &None));
+        state.apply_preferences(preferences(true, Channel::Stable, false));
+        assert_eq!(
+            (state.status.channel, state.status.update_channel),
+            (Channel::Stable, Some(Channel::Stable))
+        );
+        assert_eq!((&state.status.candidate, state.status.failed_build), (&None, None));
+        assert_eq!(
+            (state.status.phase, &state.queued),
+            (Phase::Checking, &Some(Command::Check))
+        );
+        assert_ne!(state.revision, 0);
+        // A running check of the old channel no longer counts.
+        let revision = state.check_revision;
+        state.running_check = Some(Check::Automatic);
+        state.queued = None;
+        state.apply_preferences(preferences(true, BETA, false));
+        assert_ne!(state.check_revision, revision);
+        // Back on stable, a beta installation is not downgraded.
+        let mut stable = fixture::payload();
+        stable["channel"] = json!("stable");
+        stable["releases"].as_array_mut().unwrap().pop();
+        let catalog = fixture::verified(&stable, Channel::Stable).unwrap();
+        state.status.current_build = 307001;
+        state.status.version = "0.3.7".into();
+        let selected = state
+            .apply_catalog(catalog, vec![], Channel::Stable, 26200, Check::Manual)
+            .unwrap();
+        assert!(selected.is_none());
+        assert_eq!(state.status.phase, Phase::Idle);
+        // Turning automatic checks on checks once.
+        let mut off = check_state();
+        off.apply_preferences(preferences(false, BETA, true));
+        assert_eq!((off.status.checks_enabled, &off.queued), (false, &None));
+        off.apply_preferences(preferences(true, BETA, true));
+        assert_eq!((off.status.checks_enabled, &off.queued), (true, &Some(Command::Check)));
     }
     #[test]
     fn stalled_verification_fails_and_late_preparation_cannot_install() {
@@ -1112,60 +1626,26 @@ mod tests {
         state.revision += 1;
         assert_eq!(verification_current(&state, revision), Err(Error::Busy));
     }
-    fn check_state() -> State {
-        State {
-            status: UpdateStatus {
-                current_build: 1,
-                version: "0.1.1".into(),
-                checks_enabled: true,
-                phase: Phase::Idle,
-                candidate: None,
-                checked_at: None,
-                next_check: None,
-                deferred_until: None,
-                blockers: Vec::new(),
-                progress: None,
-                error: None,
-                scope: Scope::Machine,
-                can_change_policy: false,
-            },
-            policy: MachinePolicy::default(),
-            queued: None,
-            local_approval: None,
-            registrations: BTreeMap::new(),
-            transaction: None,
-            shutdown: false,
-            prepared_at: None,
-            verification_started: None,
-            last_check: None,
-            revision: 0,
-            wake: None,
-        }
-    }
     #[test]
     fn idle_engine_has_no_poll_but_real_business_deadlines_remain() {
         let now = Instant::now();
         let mut state = check_state();
+        assert_eq!(engine_deadline(&state, now, true, false), None);
+        state.next_check = Some(now + CHECK_INTERVAL);
         assert_eq!(engine_deadline(&state, now, false, false), None);
-        state.policy.policy.preferences.checks_enabled = true;
-        state.last_check = Some(now);
-        assert_eq!(
-            engine_deadline(&state, now, true, false),
-            Some(now + Duration::from_secs(24 * 3600))
-        );
         state.transaction = Some("private-test".into());
         state.prepared_at = Some(now);
         assert_eq!(
-            engine_deadline(&state, now, false, true),
+            engine_deadline(&state, now, true, true),
             Some(now + Duration::from_secs(20))
         );
         state.shutdown = true;
-        assert_eq!(engine_deadline(&state, now, false, true), None);
+        assert_eq!(engine_deadline(&state, now, true, true), None);
         state.transaction = None;
         state.status.phase = Phase::Verifying;
         state.verification_started = Some(now);
         assert_eq!(
-            engine_deadline(&state, now, false, false),
+            engine_deadline(&state, now, true, false),
             Some(now + VERIFICATION_BUDGET)
         );
     }
@@ -1188,49 +1668,6 @@ mod tests {
         assert!(!local_admitted(true, false, false, Phase::Verifying));
         assert!(!local_admitted(true, false, false, Phase::Quiescing));
         assert!(!local_admitted(true, false, false, Phase::Installing));
-    }
-    #[test]
-    fn manual_checks_are_not_throttled_after_a_recent_result() {
-        let mut state = check_state();
-        state.last_check = Some(Instant::now());
-        state.status.error = Some(Error::Network);
-        state.policy.policy.preferences.checks_enabled = false;
-        state.request_check();
-        assert_eq!(state.status.phase, Phase::Checking);
-        assert_eq!(state.status.error, None);
-        assert_eq!(state.queued, Some(Command::Check));
-        assert_eq!(state.revision, 1);
-        assert!(scheduled_command(None, &state.policy.policy, state.last_check, true).is_none());
-    }
-    #[test]
-    fn manual_checks_join_a_queued_or_in_flight_check_without_invalidating_its_result() {
-        let mut state = check_state();
-        state.request_check();
-        let revision = state.revision;
-        state.request_check();
-        assert_eq!(state.revision, revision);
-        assert_eq!(state.queued, Some(Command::Check));
-        assert_eq!(state.status.phase, Phase::Checking);
-        // A policy-triggered check can be queued while an old error is visible.
-        state.status.phase = Phase::Failed;
-        state.status.error = Some(Error::Network);
-        state.request_check();
-        assert_eq!(state.revision, revision);
-        assert_eq!(state.status.phase, Phase::Checking);
-        assert_eq!(state.status.error, None);
-        // The engine consumes the command before fetching outside the lock.
-        state.queued = None;
-        state.last_check = Some(Instant::now());
-        let status = state.status.clone();
-        state.request_check();
-        assert_eq!(state.revision, revision);
-        assert_eq!(state.queued, None);
-        assert_eq!(state.status, status);
-        // Both observers read the same completed status, with no queued refetch.
-        state.status.phase = Phase::Idle;
-        state.status.checked_at = Some(123);
-        assert_eq!(state.status.error, None);
-        assert_eq!(state.queued, None);
     }
     #[test]
     fn sessions_without_oink_and_exited_registrations_do_not_block_install() {
@@ -1263,31 +1700,6 @@ mod tests {
         assert_eq!(queried, [2, 3]);
     }
     #[test]
-    fn background_checks_and_quit_deferrals_never_create_install_intent() {
-        let now = Instant::now();
-        for choice in [
-            DeferChoice::Hour,
-            DeferChoice::Tomorrow,
-            DeferChoice::NextQuit,
-            DeferChoice::Indefinitely,
-        ] {
-            let mut policy = Policy::default();
-            policy.defer(choice, 100);
-            policy.skipped_build = Some(2);
-            assert!(scheduled_command(None, &policy, Some(now), true).is_none());
-            assert!(matches!(
-                scheduled_command(None, &policy, None, true),
-                Some(Command::Check)
-            ));
-            policy.preferences.checks_enabled = false;
-            assert!(scheduled_command(None, &policy, None, true).is_none());
-            assert!(matches!(
-                scheduled_command(Some(Command::Install { expected_build: 2 }), &policy, Some(now), true),
-                Some(Command::Install { expected_build: 2 })
-            ));
-        }
-    }
-    #[test]
     fn a_failed_attempt_keeps_a_durable_clear_result() {
         let mut journal = oink_update::transaction::Journal::new("a".repeat(32), 1, 2, "b".repeat(64)).unwrap();
         journal.stage = oink_update::transaction::Stage::RolledBack;
@@ -1308,6 +1720,7 @@ mod tests {
                 choice: DeferChoice::Hour,
             },
             Command::Skip { expected_build: 2 },
+            Command::Prompted { expected_build: 2 },
         ] {
             assert!(command_admitted(&command, true, true));
             assert!(!command_admitted(&command, false, true));
@@ -1319,7 +1732,7 @@ mod tests {
 
 #[cfg(all(test, feature = "test-feed"))]
 #[test]
-fn loopback_check_verifies_the_signed_map_and_selects_ui_language() {
+fn loopback_fetch_verifies_the_signed_map_and_selects_ui_language() {
     use std::io::{Read, Write};
     let body = include_bytes!("notes-loopback-test.json");
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1338,10 +1751,11 @@ fn loopback_check_verifies_the_signed_map_and_selects_ui_language() {
         .unwrap();
         stream.write_all(body).unwrap();
     });
-    let bytes = http(
+    let bytes = fetch::get(
         &format!("http://{address}/windows/v1/win-2026-01/stable/manifest.json"),
         feed::MAX_FEED as u64,
         false,
+        &mut |_, _| {},
     )
     .unwrap();
     server.join().unwrap();
@@ -1363,7 +1777,7 @@ fn loopback_check_verifies_the_signed_map_and_selects_ui_language() {
     .unwrap();
     let quarantine = Default::default();
     let release = manifest
-        .select(&Selection {
+        .select(&feed::Selection {
             windows_build: 22000,
             architecture: "x64",
             installed_build: 32,

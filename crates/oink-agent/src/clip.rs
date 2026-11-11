@@ -1133,6 +1133,12 @@ impl Task {
         {
             return;
         }
+        // Windows never fetches clipboard files ahead of demand (model::automatic_pull
+        // admits file roots only for Mac targets): a stored delivery is a paste.
+        #[cfg(windows)]
+        if matches!(value.phase, content::TransferPhase::Stored) {
+            crate::usage_days::mark(crate::usage_days::Feature::Paste);
+        }
         let phase = Self::transfer_phase(value.phase);
         let Some(mut status) = self.status(id, phase, None) else {
             return;

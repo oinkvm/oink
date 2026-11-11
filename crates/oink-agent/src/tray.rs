@@ -124,6 +124,7 @@ mod tests {
                 live_boot: Some([1; 16]),
                 facts: None,
                 capabilities: vec![],
+                order: None,
             }],
             screen_shared: vec![],
             focus: FocusObservation::default(),

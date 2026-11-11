@@ -208,9 +208,7 @@ function npmPlatforms(p) {
 }
 const native=json('licenses/native-inventory.json');
 for (const c of native.components) {
-  const packagingPin = c.name==='Sparkle'
-    ? ['build-support/sparkle.py','VERSION','SHA256']
-    : c.id==='native:WixToolset.UI.wixext@5.0.2'
+  const packagingPin = c.id==='native:WixToolset.UI.wixext@5.0.2'
       ? ['packaging/windows/build.py','WIX_VERSION','UI_SHA256']
       : c.id==='native:WixToolset.Firewall.wixext@5.0.2'
       ? ['packaging/windows/build.py','WIX_VERSION','FIREWALL_SHA256']

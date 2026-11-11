@@ -1,7 +1,7 @@
 use crate::{group_state::State, wire_identity as wire};
 use oink_foundation::DeviceId;
 use oink_protocol::v1::{
-    self, RawValue, dto, retained,
+    self, RawValue, dto,
     schema::{WireDto, WireValue},
 };
 use std::collections::{BTreeMap, BTreeSet};
@@ -10,17 +10,9 @@ use std::collections::{BTreeMap, BTreeSet};
 pub const REGISTER_KIND: u32 = 0x1301;
 
 impl State {
-    fn slot_register(&self) -> v1::Result<Option<dto::Register>> {
-        Ok(self
-            .wire()
-            .registers()?
-            .0
-            .into_iter()
-            .find(|r| r.kind() == Ok(REGISTER_KIND)))
-    }
     /// Only current membership incarnations appear; offline members retain slots.
     pub fn pointer_slots(&self) -> v1::Result<BTreeMap<DeviceId, Option<u8>>> {
-        let Some(register) = self.slot_register()? else {
+        let Some(register) = self.register(REGISTER_KIND)? else {
             return Ok(BTreeMap::new());
         };
         if register.deleted()? {
@@ -65,7 +57,7 @@ impl State {
             }
             slots.insert(member.device, slot);
         }
-        let current = self.slot_register()?;
+        let current = self.register(REGISTER_KIND)?;
         let retained = current
             .as_ref()
             .map(|r| dto::PointerShortcutSlots::from_raw(r.value()?)?.entries())
@@ -90,39 +82,7 @@ impl State {
                 dto::PointerShortcutSlot::from_raw(raw).map(|e| e.write())
             })
             .collect::<v1::Result<Vec<_>>>()?;
-        let value: v1::RawMap = [(1, RawValue::Array(entries))].into();
-        if current.as_ref().is_some_and(|r| r.value() == Ok(value.clone())) {
-            return Ok(self.clone());
-        }
-        let register = if let Some(current) = current {
-            retained::edit_register(&current, &current.version()?, wire::device(writer), |raw| {
-                raw.insert(1, value[&1].clone());
-                Ok(())
-            })?
-        } else {
-            let version = dto::ConfigVersion::from_raw([(1, 1u64.write()), (3, wire::device(writer).write())].into())?;
-            let mut raw = [
-                (1, REGISTER_KIND.write()),
-                (3, version.write()),
-                (4, RawValue::Map(value)),
-            ]
-            .into();
-            let digest = retained::register_digest(&raw)?;
-            raw.insert(6, digest.write());
-            dto::Register::from_raw(raw)?
-        };
-        let mut registers = self
-            .wire()
-            .registers()?
-            .0
-            .into_iter()
-            .filter(|r| r.kind() != Ok(REGISTER_KIND))
-            .collect::<Vec<_>>();
-        registers.push(register);
-        registers.sort_by_key(|r| r.kind().expect("validated kind"));
-        let mut raw = self.wire().raw().clone();
-        raw.insert(2, RawValue::Array(registers.iter().map(WireValue::write).collect()));
-        Self::verify(dto::GroupState::from_raw(raw)?, self.roster().anchor())
+        self.put_register(REGISTER_KIND, writer, [(1, RawValue::Array(entries))].into())
     }
 }
 

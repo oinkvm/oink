@@ -77,6 +77,8 @@ impl Package {
             published_at: None,
             severity: feed::Severity::Normal,
             notes: self.notes.clone(),
+            kind: crate::catalog::Kind::Normal,
+            notice: None,
         }
     }
     pub fn release(&self) -> feed::Release {

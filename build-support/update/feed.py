@@ -177,6 +177,7 @@ class NoRedirects(urllib.request.HTTPRedirectHandler):
 def trust(platform='windows'):
     config = read(ROOT / 'packaging/update-trust.json')
     require(config['schema'] == 1 and config['repository'] == 'oinkvm/oink', 'trust_schema')
+    sources(config)
     if platform == 'windows':
         require(config['windows'], 'platform_state')
         for epoch in config['windows']:
@@ -197,6 +198,16 @@ def trust(platform='windows'):
     else:
         raise ValueError('platform')
     return config
+
+
+def sources(config):
+    """Ordered v2 metadata origins (clients try them in order). deploy.py maps each to a target."""
+    origins = config['sources']
+    require(type(origins) is list and 1 <= len(origins) <= 8 and len(set(origins)) == len(origins) and
+            all(type(o) is str and re.fullmatch(
+                r'https://[a-z0-9]([a-z0-9-]*[a-z0-9])?([.][a-z0-9]([a-z0-9-]*[a-z0-9])?)+', o) for o in origins),
+            'trust_sources')
+    return origins
 
 
 def manifest(raw, epoch, channel, allow_expired=False, now=None):
@@ -341,24 +352,37 @@ def verify_packages(state, config):
             require(obj['releases'] == releases, 'signed_catalog_changed')
 
 
-def monitor(config, seen_path):
-    if not config["windows"]:
-        print("Windows feed disabled; expiry monitor skipped.")
+def monitor(config, seen_path, mac_config=None, now=None):
+    """Expiry/replay monitor for Windows v1 and every v2 manifest on every source."""
+    import feed_v2
+    mac_config = trust('mac') if mac_config is None else mac_config
+    checks = [(BASE, relative(e['epoch'], c), lambda raw, now, e=e, c=c: manifest(raw, e, c, True, now))
+              for e in config['windows'] for c in e['channels']]
+    for platform, platform_config in (('windows', config), ('mac', mac_config)):
+        if not (config['windows'] if platform == 'windows' else mac_config['mac']['enabled']):
+            continue
+        for epoch, key, arch, channel in feed_v2.slots(platform, platform_config):
+            for origin in sources(platform_config):
+                checks.append((origin + '/', feed_v2.relative(platform, epoch, arch, channel),
+                               lambda raw, now, a=(platform, epoch, key, arch, channel, platform_config['repository']):
+                                   feed_v2.verify_manifest(raw, *a, True, now)))
+    if not checks:
+        print("Update feeds disabled; expiry monitor skipped.")
         return
-    now = int(dt.datetime.now(dt.timezone.utc).timestamp())
+    now = int(dt.datetime.now(dt.timezone.utc).timestamp()) if now is None else now
     seen = read(seen_path) if seen_path.exists() else {}
     level = 0
-    for epoch in config['windows']:
-        for channel in epoch['channels']:
-            path = relative(epoch['epoch'], channel)
-            raw = download(BASE + path, MAX_FEED)
-            obj = manifest(raw, epoch, channel, True, now)
-            previous = seen.get(path, {'sequence': 0, 'hash': ''})
-            require(obj['sequence'] >= previous['sequence'] and
-                    (obj['sequence'] != previous['sequence'] or digest(raw) == previous['hash']), 'monitor_replay')
-            remaining = timestamp(obj['expiresAt']) - now
-            level = max(level, 2 if remaining <= 7 * 86400 else 1 if remaining <= 14 * 86400 else 0)
-            seen[path] = {'sequence': obj['sequence'], 'hash': digest(raw)}
+    for base, path, parse in checks:
+        raw = download(base + path, MAX_FEED)
+        obj = parse(raw, now)
+        # v1 keys stay bare paths; v2 keys name their source.
+        name = path if '/v1/' in path else base + path
+        previous = seen.get(name, {'sequence': 0, 'hash': ''})
+        require(obj['sequence'] >= previous['sequence'] and
+                (obj['sequence'] != previous['sequence'] or digest(raw) == previous['hash']), 'monitor_replay')
+        remaining = timestamp(obj['expiresAt']) - now
+        level = max(level, 2 if remaining <= 7 * 86400 else 1 if remaining <= 14 * 86400 else 0)
+        seen[name] = {'sequence': obj['sequence'], 'hash': digest(raw)}
     heartbeat = read_public_heartbeat()
     require(-300 <= now - timestamp(heartbeat['checked_at']) <= 48 * 3600, 'heartbeat_stale')
     write(seen_path, seen)

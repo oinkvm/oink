@@ -13272,6 +13272,10 @@
     [
       4865,
       "PointerShortcutSlots"
+    ],
+    [
+      4866,
+      "DeviceOrder"
     ]
   ],
   "reserved_capabilities": [
@@ -14216,6 +14220,40 @@
         }
       ],
       "name": "PointerShortcutSlot"
+    },
+    {
+      "fields": [
+        {
+          "absence": "required",
+          "key": 1,
+          "name": "entries",
+          "shape": "List<DeviceOrderEntry,16>"
+        }
+      ],
+      "name": "DeviceOrder"
+    },
+    {
+      "fields": [
+        {
+          "absence": "required",
+          "key": 1,
+          "name": "device",
+          "shape": "DeviceId"
+        },
+        {
+          "absence": "required",
+          "key": 2,
+          "name": "membership_epoch",
+          "shape": "u64"
+        },
+        {
+          "absence": "required",
+          "key": 3,
+          "name": "order",
+          "shape": "i64"
+        }
+      ],
+      "name": "DeviceOrderEntry"
     },
     {
       "fields": [

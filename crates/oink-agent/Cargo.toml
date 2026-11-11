@@ -8,9 +8,6 @@ license.workspace = true
 publish.workspace = true
 repository.workspace = true
 
-[features]
-sparkle = []
-
 [dependencies]
 zeroize = "1.8"
 oink-update = { path = "../oink-update" }
@@ -57,6 +54,8 @@ socket2 = "0.6"
 libc = "0.2"
 
 [target.'cfg(target_os = "macos")'.dependencies]
+# Online updates: signed v2 catalogs and DMGs over HTTPS.
+oink-update = { path = "../oink-update", features = ["http"] }
 notify = "8"
 objc2 = "0.6"
 objc2-foundation = "0.3"
@@ -104,6 +103,7 @@ oink-network = { workspace = true, features = ["test-support"] }
 resvg = { version = "0.45.1", default-features = false }
 oink-test-support = { path = "../../tests/support" }
 tokio = { workspace = true, features = ["test-util"] }
+ed25519-dalek = "2.2"
 
 # 例子 aim_selftest：主线程跑 AppKit 的事件循环（叠加层窗口要收到鼠标事件）
 [target.'cfg(target_os = "macos")'.dev-dependencies]

@@ -2201,6 +2201,7 @@ fn speaker_card(
             live_boot: Some(nonce),
             facts: Some(facts),
             capabilities: vec!["oink.device-options/1".into(), "oink.device-resources/1".into()],
+            order: None,
         }],
         screen_shared: vec![],
         focus: FocusObservation::default(),

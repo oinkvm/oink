@@ -19,6 +19,7 @@ with patch.object(sys, 'path', [str(SCRIPTS), *sys.path]):
     SPEC = importlib.util.spec_from_file_location('release_builder', SCRIPTS / 'build.py')
     B = importlib.util.module_from_spec(SPEC)
     SPEC.loader.exec_module(B)
+from versioning import package_build
 
 
 class ReleaseBuild(unittest.TestCase):
@@ -32,7 +33,8 @@ class ReleaseBuild(unittest.TestCase):
         self.assertEqual(B.release_build('2147483647', {}), 2147483647)
 
     def test_missing_invalid_or_conflicting_build_fails_before_commands(self):
-        cases = [(None, {}), ('17', {'RELEASE_BUILD': '16'}),
+        # A build outside the manifest version's range (17 is not a 0.x.y build of it) fails like a bad number.
+        cases = [(None, {}), ('17', {}), ('17', {'RELEASE_BUILD': '16'}),
                  (None, {'OINK_RELEASE_BUILD': '16', 'RELEASE_BUILD': '17'})]
         for value in ['', '0', '-1', '1.5', '2147483648', 'x', ' 17', '1_000']:
             cases.extend([(value, {}), (None, {'RELEASE_BUILD': value}),
@@ -61,6 +63,7 @@ class ReleaseBuild(unittest.TestCase):
         for target, commit, origin, fail_health in cases:
             with self.subTest(target=target, commit=commit), tempfile.TemporaryDirectory() as temp:
                 root = Path(temp)
+                build = package_build(17, commit is not None)
                 output = root / 'target' / target / 'release'
                 output.mkdir(parents=True)
                 windows = 'windows' in target
@@ -77,20 +80,18 @@ class ReleaseBuild(unittest.TestCase):
                     {'id': 'registry', 'name': 'external-cache-preserved'},
                 ]}
                 argv = ['build.py', '--target', target, '--source-tree-sha256', 'a' * 64, '--version', B.IDENTITY['version']]
-                argv += ['--build', '17']
+                argv += ['--build', str(build)]
                 if commit:
                     argv += ['--source-commit', commit]
-                argv += [] if windows else ['--sparkle-cache', str(root / 'sparkle')]
                 if origin:
                     argv += ['--windows-update-test-feed', origin]
                 if fail_health:
                     argv += ['--windows-update-test-fail-health']
-                with patch.dict(os.environ, {'RELEASE_BUILD': '17', 'CARGO_HOME': str(root / 'cargo-home')}, clear=True), \
+                with patch.dict(os.environ, {'RELEASE_BUILD': str(build), 'CARGO_HOME': str(root / 'cargo-home')}, clear=True), \
                         patch.object(sys, 'argv', argv), patch.object(B, 'ROOT', root), \
                         patch.object(B, 'source_tree_sha256', return_value='a' * 64), patch.object(B.platform, 'system', return_value='Windows' if windows else 'Darwin'), \
                         patch.object(B, 'run') as run, \
                         patch.object(B.subprocess, 'check_output', return_value=json.dumps(metadata)) as read, \
-                        patch.object(B, 'prepare_sparkle', return_value=root / 'sparkle'), \
                         patch('macos_imports.verify_imports') as imports, \
                         patch('windows_credential_provider.build') as provider, \
                         patch('windows_version.set_display_version', return_value=True) as resources:
@@ -98,9 +99,9 @@ class ReleaseBuild(unittest.TestCase):
                 calls = run.call_args_list
                 self.assertEqual(len(calls), 4)
                 for call in [*calls, *read.call_args_list]:
-                    self.assertEqual(call.kwargs['env']['OINK_RELEASE_BUILD'], '17')
-                    self.assertEqual(call.kwargs['env']['RELEASE_BUILD'], '17')
-                    self.assertEqual(call.kwargs['env']['OINK_RELEASE_VERSION'], B.release_version(B.IDENTITY['version'], commit, 17))
+                    self.assertEqual(call.kwargs['env']['OINK_RELEASE_BUILD'], str(build))
+                    self.assertEqual(call.kwargs['env']['RELEASE_BUILD'], str(build))
+                    self.assertEqual(call.kwargs['env']['OINK_RELEASE_VERSION'], B.release_version(B.IDENTITY['version'], commit, build))
                     self.assertEqual(call.kwargs['env']['OINK_SOURCE_COMMIT'], commit or '')
                 self.assertEqual(calls[2].args[:2], ('cargo', 'clean'))
                 self.assertIn('--release', calls[2].args)
@@ -118,8 +119,7 @@ class ReleaseBuild(unittest.TestCase):
                 self.assertEqual(list(forwarded), expected_packages)
                 self.assertFalse(any(call.args[:2] == ('cargo', 'build') for call in calls))
                 features = calls[3].args[calls[3].args.index('--features') + 1]
-                expected_features = 'custom-protocol' if windows else 'custom-protocol,oink-agent/sparkle'
-                self.assertEqual(features, expected_features + (',oink-winsvc/test-feed' if origin else ''))
+                self.assertEqual(features, 'custom-protocol' + (',oink-winsvc/test-feed' if origin else ''))
                 flags = calls[3].kwargs['env']['CARGO_ENCODED_RUSTFLAGS']
                 self.assertIn('--remap-path-prefix=', flags)
                 self.assertEqual(calls[3].kwargs['env']['CARGO_PROFILE_RELEASE_DEBUG'], '1')
@@ -137,16 +137,16 @@ class ReleaseBuild(unittest.TestCase):
                         B.IDENTITY['macos_minimum'])
                     self.assertEqual(calls[3].kwargs['env']['CARGO_PROFILE_RELEASE_SPLIT_DEBUGINFO'], 'packed')
                 record = json.loads((output / 'release-build.json').read_text())
-                self.assertEqual(record['version'], B.release_version(B.IDENTITY['version'], commit, 17))
+                self.assertEqual(record['version'], B.release_version(B.IDENTITY['version'], commit, build))
                 self.assertEqual(record['source_commit'], commit)
                 self.assertEqual(record['update_test_feed'], origin)
                 self.assertEqual(record['update_test_fail_health'], fail_health)
-                self.assertEqual(record['build'], 17)
+                self.assertEqual(record['build'], build)
                 self.assertIs(type(record['build']), int)
 
     def test_changed_sources_rejected_after_unified_build(self):
         argv = ['build.py', '--target', 'x86_64-pc-windows-msvc',
-                '--source-tree-sha256', 'a' * 64, '--build', '17']
+                '--source-tree-sha256', 'a' * 64, '--build', str(package_build(17, False))]
         metadata = {'workspace_members': [], 'packages': []}
         with tempfile.TemporaryDirectory() as temp, \
                 patch.dict(os.environ, {'CARGO_TARGET_DIR': temp, 'CARGO_HOME': temp}, clear=True), \

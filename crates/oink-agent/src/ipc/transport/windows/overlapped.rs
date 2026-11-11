@@ -1,73 +1,206 @@
 //! One owned operation per native pipe I/O. No cached EOF crosses a connection
 //! lease, unlike reusing a Mio named-pipe stream after DisconnectNamedPipe.
+//!
+//! Completions arrive on a completion port owned by the listener and are taken
+//! by one thread that never leaves it. Do not move this back onto thread-pool
+//! waits (`CreateThreadpoolWait` on a per-operation event), which is what
+//! 0.3.3–0.3.5 did:
+//! - The process default pool drops all its workers after 67 s idle and relies
+//!   on the kernel to create one when a wait fires. A wait that is signaled by
+//!   an operation completing at once and then torn down microseconds later,
+//!   repeated while the pool has no worker, leaves the pool with no worker and
+//!   no thread creation for later signaled waits until something posts work to
+//!   it from user mode. Windows 11 25H2 (26200.9711), 2026-11-10: the backend's
+//!   IPC stopped accepting and reading for hours; reproduced standalone in a
+//!   few hundred cycles. No public description of this behaviour was found.
+//! - A dedicated thread blocked on our own port does not depend on thread
+//!   creation, idle timeouts, or what other code does to a shared pool.
+//! - Operations that complete at once queue nothing (skip-on-success), so
+//!   there is nothing to arm and cancel on the common path.
 use super::*;
-use std::{fmt, task::Waker};
+use std::{cell::UnsafeCell, fmt, task::Waker};
+
+// FILE_SKIP_COMPLETION_PORT_ON_SUCCESS | FILE_SKIP_SET_EVENT_ON_HANDLE
+// https://learn.microsoft.com/windows/win32/api/winbase/nf-winbase-setfilecompletionnotificationmodes
+const NOTIFICATION_MODES: u8 = 1 | 2;
 
 #[derive(Default)]
-struct Signal {
-    ready: AtomicBool,
-    waker: Mutex<Option<Waker>>,
+struct Outstanding {
+    closing: bool,
+    /// Operations the kernel still owes this port a completion for.
+    count: usize,
 }
-struct Wait {
-    raw: PTP_WAIT,
-    signal: Box<Signal>,
+pub(super) struct Port {
+    handle: File,
+    outstanding: Mutex<Outstanding>,
 }
-impl Wait {
-    fn new(event: HANDLE) -> io::Result<Self> {
-        let mut signal = Box::<Signal>::default();
-        // SAFETY: boxed context stays at this address until callbacks have been
-        // disarmed and joined in Drop. The callback only signals a Tokio waker.
-        let raw = unsafe { CreateThreadpoolWait(Some(wake), ptr::from_mut(&mut *signal).cast(), ptr::null()) };
-        if raw == 0 {
+impl fmt::Debug for Port {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PipeCompletionPort").finish_non_exhaustive()
+    }
+}
+impl Port {
+    pub(super) fn new() -> io::Result<Arc<Self>> {
+        // SAFETY: creates a new port; one thread ever waits on it.
+        let handle = unsafe { CreateIoCompletionPort(INVALID_HANDLE_VALUE, ptr::null_mut(), 0, 1) };
+        if handle.is_null() {
             return Err(io::Error::last_os_error());
         }
-        // SAFETY: event outlives this registration; null timeout means no polling.
+        let port = Arc::new(Self {
+            // SAFETY: unique handle returned by CreateIoCompletionPort.
+            handle: unsafe { File::from_raw_handle(handle) },
+            outstanding: Mutex::default(),
+        });
+        let thread = port.clone();
+        std::thread::Builder::new()
+            .name("oink-ipc-completions".into())
+            .spawn(move || thread.run())?;
+        Ok(port)
+    }
+    pub(super) fn attach(&self, pipe: &File) -> io::Result<()> {
+        // SAFETY: both handles are live; association lasts for the pipe handle's life.
         unsafe {
-            SetThreadpoolWait(raw, event, ptr::null());
+            if CreateIoCompletionPort(pipe.as_raw_handle(), self.handle.as_raw_handle(), 0, 0).is_null()
+                || SetFileCompletionNotificationModes(pipe.as_raw_handle(), NOTIFICATION_MODES) == 0
+            {
+                return Err(io::Error::last_os_error());
+            }
         }
-        Ok(Self { raw, signal })
+        Ok(())
     }
-    fn ready(&self, cx: &Context<'_>) -> bool {
-        *self.signal.waker.lock().unwrap_or_else(|e| e.into_inner()) = Some(cx.waker().clone());
-        self.signal.ready.load(Ordering::Acquire)
+    /// No operation starts after this. The thread leaves once every operation
+    /// already issued has handed its completion back.
+    pub(super) fn close(&self) {
+        self.outstanding.lock().unwrap_or_else(|e| e.into_inner()).closing = true;
+        self.nudge();
     }
-}
-unsafe extern "system" fn wake(_: PTP_CALLBACK_INSTANCE, context: *mut c_void, _: PTP_WAIT, _: u32) {
-    // SAFETY: Wait::drop joins callbacks before freeing this boxed context.
-    let signal = unsafe { &*context.cast::<Signal>() };
-    signal.ready.store(true, Ordering::Release);
-    let waker = signal.waker.lock().unwrap_or_else(|e| e.into_inner()).take();
-    if let Some(waker) = waker {
-        waker.wake();
+    pub(super) fn closing(&self) -> bool {
+        self.outstanding.lock().unwrap_or_else(|e| e.into_inner()).closing
     }
-}
-impl Drop for Wait {
-    fn drop(&mut self) {
-        // SAFETY: no mutex is held while joining this tiny callback. Disarm and
-        // drain before freeing either context or event; Close alone is not a join.
-        // https://learn.microsoft.com/windows/win32/api/threadpoolapiset/nf-threadpoolapiset-waitforthreadpoolwaitcallbacks
+    fn nudge(&self) {
+        // SAFETY: live port; a null OVERLAPPED marks a wake-up, never an operation.
         unsafe {
-            SetThreadpoolWait(self.raw, ptr::null_mut(), ptr::null());
-            WaitForThreadpoolWaitCallbacks(self.raw, 1);
-            CloseThreadpoolWait(self.raw);
+            PostQueuedCompletionStatus(self.handle.as_raw_handle(), 0, 0, ptr::null());
+        }
+    }
+    fn begin(&self) -> io::Result<()> {
+        let mut outstanding = self.outstanding.lock().unwrap_or_else(|e| e.into_inner());
+        if outstanding.closing {
+            return Err(io::Error::new(io::ErrorKind::NotConnected, "local IPC listener closed"));
+        }
+        outstanding.count += 1;
+        Ok(())
+    }
+    fn settle(&self) -> bool {
+        let mut outstanding = self.outstanding.lock().unwrap_or_else(|e| e.into_inner());
+        outstanding.count -= 1;
+        outstanding.closing && outstanding.count == 0
+    }
+    fn run(&self) {
+        loop {
+            let (mut bytes, mut key, mut overlapped) = (0, 0, ptr::null_mut());
+            // SAFETY: live port and valid outputs; blocks until a completion or wake-up.
+            let ok = unsafe {
+                GetQueuedCompletionStatus(
+                    self.handle.as_raw_handle(),
+                    &mut bytes,
+                    &mut key,
+                    &mut overlapped,
+                    INFINITE,
+                )
+            };
+            let error = io::Error::last_os_error();
+            if overlapped.is_null() {
+                if ok == 0 {
+                    tracing::error!(%error, os_error = ?error.raw_os_error(), "native IPC completion port failed");
+                    return;
+                }
+                let outstanding = self.outstanding.lock().unwrap_or_else(|e| e.into_inner());
+                if outstanding.closing && outstanding.count == 0 {
+                    return;
+                }
+                continue;
+            }
+            // SAFETY: every OVERLAPPED queued to this port is the first field of
+            // a `Shared` whose reference was leaked to the kernel in `submit`.
+            let shared = unsafe { Arc::from_raw(overlapped.cast::<Shared>().cast_const()) };
+            let result = if ok != 0 {
+                Ok(bytes as usize)
+            } else {
+                shared.error(error)
+            };
+            shared.complete(result);
+            drop(shared);
+            if self.settle() {
+                return;
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    Connect,
+    Read,
+    Write,
+}
+#[derive(Default)]
+struct Completion {
+    result: Option<io::Result<usize>>,
+    waker: Option<Waker>,
+}
+// The port returns the OVERLAPPED address; it must be this allocation's address.
+#[repr(C)]
+struct Shared {
+    overlapped: UnsafeCell<OVERLAPPED>,
+    buffer: UnsafeCell<Vec<u8>>,
+    // Keeps the handle open until the kernel has handed the completion back.
+    pipe: Arc<File>,
+    kind: Kind,
+    completion: Mutex<Completion>,
+}
+// SAFETY: the kernel owns `overlapped` and the buffer's bytes from submission
+// until the completion is dequeued. Rust reads the buffer only afterwards and
+// only through the single `Operation`; everything else is behind the mutex.
+unsafe impl Send for Shared {}
+// SAFETY: as above.
+unsafe impl Sync for Shared {}
+impl Shared {
+    fn error(&self, error: io::Error) -> io::Result<usize> {
+        match (self.kind, error.raw_os_error().map(|code| code as u32)) {
+            (Kind::Read, Some(ERROR_BROKEN_PIPE)) | (Kind::Connect, Some(ERROR_PIPE_CONNECTED)) => Ok(0),
+            _ => Err(error),
+        }
+    }
+    fn finish(&self) -> io::Result<usize> {
+        if self.kind == Kind::Connect {
+            return Ok(0);
+        }
+        let mut count = 0;
+        // SAFETY: the API reported synchronous completion of this operation.
+        if unsafe { GetOverlappedResult(self.pipe.as_raw_handle(), self.overlapped.get(), &mut count, 0) } == 0 {
+            self.error(io::Error::last_os_error())
+        } else {
+            Ok(count as usize)
+        }
+    }
+    fn complete(&self, result: io::Result<usize>) {
+        let waker = {
+            let mut completion = self.completion.lock().unwrap_or_else(|e| e.into_inner());
+            completion.result = Some(result);
+            completion.waker.take()
+        };
+        if let Some(waker) = waker {
+            waker.wake();
         }
     }
 }
 
 pub(super) struct Operation {
-    pipe: Arc<File>,
-    overlapped: Box<OVERLAPPED>,
-    // The wait must be dropped before its event. Its context is separately boxed.
-    wait: Wait,
-    _event: File,
-    pub(super) buffer: Vec<u8>,
+    shared: Arc<Shared>,
     pending: bool,
     result: Option<io::Result<usize>>,
-    read: bool,
 }
-// SAFETY: OVERLAPPED and buffer allocations stay pinned when this owner moves;
-// only the callback's atomics/mutex cross threads. Poll/cancel require &mut self.
-unsafe impl Send for Operation {}
 impl fmt::Debug for Operation {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("PipeOperation")
@@ -76,122 +209,109 @@ impl fmt::Debug for Operation {
     }
 }
 impl Operation {
-    fn new(pipe: Arc<File>, buffer: Vec<u8>, read: bool) -> io::Result<Self> {
-        // SAFETY: private manual-reset event, no inherited handle.
-        let event = unsafe { CreateEventW(ptr::null(), 1, 0, ptr::null()) };
-        if event.is_null() {
-            return Err(io::Error::last_os_error());
-        }
-        // SAFETY: unique handle returned by CreateEventW.
-        let event = unsafe { File::from_raw_handle(event) };
-        let wait = Wait::new(event.as_raw_handle())?;
-        let overlapped = Box::new(OVERLAPPED {
-            hEvent: event.as_raw_handle(),
-            ..Default::default()
-        });
-        Ok(Self {
+    fn submit(port: &Port, pipe: Arc<File>, buffer: Vec<u8>, kind: Kind) -> io::Result<Self> {
+        port.begin()?;
+        let shared = Arc::new(Shared {
+            overlapped: UnsafeCell::new(OVERLAPPED::default()),
+            buffer: UnsafeCell::new(buffer),
             pipe,
-            overlapped,
-            wait,
-            _event: event,
-            buffer,
-            pending: false,
-            result: None,
-            read,
-        })
-    }
-    pub(super) fn connect(pipe: Arc<File>) -> io::Result<Self> {
-        let mut op = Self::new(pipe, Vec::new(), false)?;
-        // SAFETY: owned handle, pinned OVERLAPPED drained on every drop path.
-        let ok = unsafe { ConnectNamedPipe(op.pipe.as_raw_handle(), &mut *op.overlapped) };
-        let error = io::Error::last_os_error();
-        if ok != 0 || error.raw_os_error() == Some(ERROR_PIPE_CONNECTED as i32) {
-            op.result = Some(Ok(0));
-        } else if error.raw_os_error() == Some(ERROR_IO_PENDING as i32) {
-            op.pending = true;
-        } else {
-            op.result = Some(Err(error));
-        }
-        Ok(op)
-    }
-    pub(super) fn read(pipe: Arc<File>, size: usize) -> io::Result<Self> {
-        Self::transfer(pipe, vec![0; size], true)
-    }
-    pub(super) fn write(pipe: Arc<File>, bytes: &[u8]) -> io::Result<Self> {
-        Self::transfer(pipe, bytes.to_vec(), false)
-    }
-    fn transfer(pipe: Arc<File>, buffer: Vec<u8>, read: bool) -> io::Result<Self> {
-        let mut op = Self::new(pipe, buffer, read)?;
-        // SAFETY: this operation owns both buffer and pinned OVERLAPPED until
-        // completion/cancellation; sizes are bounded by the AsyncStream adapter.
+            kind,
+            completion: Mutex::default(),
+        });
+        // The kernel holds this reference until the port thread takes the
+        // completion. It is leaked before the call: the completion can be
+        // dequeued before the call returns.
+        let kernel = Arc::into_raw(shared.clone());
+        let handle = shared.pipe.as_raw_handle();
+        let overlapped = shared.overlapped.get();
+        // SAFETY: owned handle; OVERLAPPED and buffer stay at these addresses
+        // and are untouched by Rust until the completion is handed back.
         let ok = unsafe {
-            if read {
-                ReadFile(
-                    op.pipe.as_raw_handle(),
-                    op.buffer.as_mut_ptr(),
-                    op.buffer.len() as u32,
+            let buffer = &mut *shared.buffer.get();
+            match kind {
+                Kind::Connect => ConnectNamedPipe(handle, overlapped),
+                Kind::Read => ReadFile(
+                    handle,
+                    buffer.as_mut_ptr(),
+                    buffer.len() as u32,
                     ptr::null_mut(),
-                    &mut *op.overlapped,
-                )
-            } else {
-                WriteFile(
-                    op.pipe.as_raw_handle(),
-                    op.buffer.as_ptr(),
-                    op.buffer.len() as u32,
+                    overlapped,
+                ),
+                Kind::Write => WriteFile(
+                    handle,
+                    buffer.as_ptr(),
+                    buffer.len() as u32,
                     ptr::null_mut(),
-                    &mut *op.overlapped,
-                )
+                    overlapped,
+                ),
             }
         };
-        if ok != 0 {
-            op.result = Some(op.finish());
+        let error = io::Error::last_os_error();
+        let result = if ok != 0 {
+            Some(shared.finish())
+        } else if error.raw_os_error() == Some(ERROR_IO_PENDING as i32) {
+            None
         } else {
-            let error = io::Error::last_os_error();
-            if error.raw_os_error() == Some(ERROR_IO_PENDING as i32) {
-                op.pending = true;
-            } else {
-                op.result = Some(op.error(error));
+            Some(shared.error(error))
+        };
+        if result.is_some() {
+            // Finished or refused at once: nothing is queued to the port, so
+            // its reference comes straight back.
+            // SAFETY: `kernel` came from Arc::into_raw above and no completion
+            // will ever reconstruct it.
+            drop(unsafe { Arc::from_raw(kernel) });
+            if port.settle() {
+                port.nudge();
             }
         }
-        Ok(op)
+        Ok(Self {
+            shared,
+            pending: result.is_none(),
+            result,
+        })
     }
-    fn error(&self, error: io::Error) -> io::Result<usize> {
-        if self.read && error.raw_os_error() == Some(ERROR_BROKEN_PIPE as i32) {
-            Ok(0)
-        } else {
-            Err(error)
-        }
+    pub(super) fn connect(port: &Port, pipe: Arc<File>) -> io::Result<Self> {
+        Self::submit(port, pipe, Vec::new(), Kind::Connect)
     }
-    fn finish(&self) -> io::Result<usize> {
-        let mut count = 0;
-        // SAFETY: either the API completed synchronously or the event signaled.
-        if unsafe { GetOverlappedResult(self.pipe.as_raw_handle(), &*self.overlapped, &mut count, 0) } == 0 {
-            self.error(io::Error::last_os_error())
-        } else {
-            Ok(count as usize)
-        }
+    pub(super) fn read(port: &Port, pipe: Arc<File>, size: usize) -> io::Result<Self> {
+        Self::submit(port, pipe, vec![0; size], Kind::Read)
+    }
+    pub(super) fn write(port: &Port, pipe: Arc<File>, bytes: &[u8]) -> io::Result<Self> {
+        Self::submit(port, pipe, bytes.to_vec(), Kind::Write)
     }
     pub(super) fn poll(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<usize>> {
         if let Some(result) = self.result.take() {
             return Poll::Ready(result);
         }
-        if !self.wait.ready(cx) {
-            return Poll::Pending;
+        let mut completion = self.shared.completion.lock().unwrap_or_else(|e| e.into_inner());
+        match completion.result.take() {
+            Some(result) => {
+                self.pending = false;
+                Poll::Ready(result)
+            }
+            None => {
+                completion.waker = Some(cx.waker().clone());
+                Poll::Pending
+            }
         }
-        self.pending = false;
-        Poll::Ready(self.finish())
+    }
+    /// The bytes of a finished read.
+    pub(super) fn into_buffer(self) -> Vec<u8> {
+        assert!(!self.pending, "pipe operation buffer taken before completion");
+        // SAFETY: the operation completed, so the kernel no longer writes here
+        // and this is the only reader.
+        unsafe { std::mem::take(&mut *self.shared.buffer.get()) }
     }
 }
 impl Drop for Operation {
     fn drop(&mut self) {
         if self.pending {
-            // CancelIoEx alone is not completion. Drain before releasing the
-            // buffer, OVERLAPPED, pipe or the callback's wait event.
-            // SAFETY: live pinned operation and owned buffer/pipe.
+            // Request cancellation only. The completion (aborted, or the real
+            // one if it won the race) still reaches the port thread, which
+            // frees the OVERLAPPED and buffer; nothing blocks a runtime worker.
+            // SAFETY: live handle and the OVERLAPPED the kernel still owns.
             unsafe {
-                CancelIoEx(self.pipe.as_raw_handle(), &*self.overlapped);
-                let mut count = 0;
-                GetOverlappedResult(self.pipe.as_raw_handle(), &*self.overlapped, &mut count, 1);
+                CancelIoEx(self.shared.pipe.as_raw_handle(), self.shared.overlapped.get());
             }
         }
     }

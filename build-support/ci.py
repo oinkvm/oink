@@ -4,11 +4,8 @@ import argparse
 import json
 import os
 from pathlib import Path
-import platform
 import subprocess
 import sys
-from sparkle import prepare
-import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -69,28 +66,6 @@ def main():
             # Product packaging retains its normal thin-LTO profile.
             environment.update(CARGO_PROFILE_RELEASE_LTO='false', CARGO_PROFILE_RELEASE_CODEGEN_UNITS='16', CARGO_PROFILE_RELEASE_DEBUG='0')
         subprocess.run(['cargo', *args], cwd=ROOT, env=environment, check=True)
-    if platform.system() == 'Darwin' and 'oink-agent' in selected:
-        with tempfile.TemporaryDirectory(prefix='oink-ci-sparkle-') as cache:
-            environment = os.environ.copy()
-            environment['SPARKLE_FRAMEWORK_DIR'] = str(prepare(Path(cache)))
-            environment.update(CARGO_PROFILE_RELEASE_LTO='false', CARGO_PROFILE_RELEASE_CODEGEN_UNITS='16', CARGO_PROFILE_RELEASE_DEBUG='0')
-            # Compile the native bridge here. The release workflow exercises the
-            # real embedded framework loader in its mandatory signed smoke.
-            subprocess.run(['cargo', 'check', '--release', '--locked', '-p', 'oink-agent', '--features', 'sparkle'],
-                           cwd=ROOT, env=environment, check=True)
-            # Run the production bridge's isolated continuation/feed tests in
-            # the selected architecture (Rosetta executes x86 tests on ARM).
-            arch = {'x86_64-apple-darwin': 'x86_64', 'aarch64-apple-darwin': 'arm64'}.get(
-                environment.get('CARGO_BUILD_TARGET'), platform.machine())
-            native = Path(cache) / 'update-tests'
-            subprocess.run(['xcrun', 'clang', '-target', f'{arch}-apple-macos14.2',
-                            '-fobjc-arc', '-fblocks', '-Werror',
-                            '-F' + environment['SPARKLE_FRAMEWORK_DIR'],
-                            '-framework', 'AppKit', '-framework', 'Sparkle',
-                            '-Wl,-rpath,' + environment['SPARKLE_FRAMEWORK_DIR'],
-                            str(ROOT / 'crates/oink-agent/native/update-tests.m'), '-o', str(native)],
-                           cwd=ROOT, env=environment, check=True)
-            subprocess.run([str(native)], cwd=ROOT, env=environment, check=True)
 
 
 if __name__ == '__main__':

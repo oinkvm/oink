@@ -106,7 +106,7 @@ jobs:
           python -m unittest discover -s packaging/tests -v
       - name: Compile and inspect Windows MSI without installation
         if: runner.os == 'Windows'
-        run: python build-support/package.py --public-version --platform windows --build 28 --output-root "${{ runner.temp }}/package-check"
+        run: python build-support/package.py --public-version --platform windows --sequence 1 --output-root "${{ runner.temp }}/package-check"
       - name: Dependency policy
         shell: bash
         run: |

@@ -37,6 +37,7 @@ export const api = {
   connectionQuality: () => call<T.ConnectionQuality>("connection_quality"),
   memberAddresses: (device: string) => call<string[]>('member_addresses', {device}),
   setMemberAddress: (device: string,address: string) => call<null>('set_member_address', {device,address}),
+  moveDeviceOrder: (device: string, placement: import('../devices/reorder').Placement) => call<null>('move_device_order', { device, placement }),
   updateStatus: () => call<import('./update').UpdateStatus>('query_update_status'),
   update: (command: import('./update').UpdateCommand) => call<import('./update').UpdateStatus>('update', { command }),
   lockFocusTo: (device: string) => call<null>('lock_focus_to', { device }),

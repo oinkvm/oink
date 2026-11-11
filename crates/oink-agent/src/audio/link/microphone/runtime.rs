@@ -334,6 +334,10 @@ impl Runtime {
         if !permitted && self.source.active() {
             self.retire_source(owner);
         }
+        // Leases exist only for accepted remote demand and are renewed while it lasts.
+        if permitted && self.source.active() {
+            crate::usage_days::mark(crate::usage_days::Feature::Microphone);
+        }
         if !self.source.active() || !permitted {
             self.capture = None;
             self.encoded = None;
@@ -452,8 +456,12 @@ impl Runtime {
             }) {
                 self.stop_receiving(owner);
             }
-            if self.demand.active && self.receiving.is_none() && self.fault.is_none() {
-                self.begin_receiving(owner, peer, now);
+            if self.demand.active && self.fault.is_none() {
+                // A local application holds the virtual microphone open while a remote one is shared.
+                crate::usage_days::mark(crate::usage_days::Feature::Microphone);
+                if self.receiving.is_none() {
+                    self.begin_receiving(owner, peer, now);
+                }
             }
             self.receive(owner, now);
             if self

@@ -107,6 +107,7 @@ impl Owner {
         let next = self
             .state
             .reconcile_pointer_slots(self.identity.id())
+            .and_then(|state| state.reconcile_device_order(self.identity.id()))
             .map_err(internal)?;
         if next.digest().map_err(internal)? != self.state.digest().map_err(internal)? {
             self.commit(next)?;
@@ -408,6 +409,7 @@ impl Owner {
             group: self.state.roster().anchor().group,
             roster_digest: self.state.roster().digest().map_err(internal)?,
             pointer_slots: self.state.pointer_slots().map_err(internal)?,
+            device_order: self.state.device_order().map_err(internal)?,
             members: members.clone(),
             layout: layout.clone(),
             owners: drawing_owners.clone(),
@@ -880,6 +882,23 @@ impl Owner {
             self.links.retire_for_departure(*id);
         }
         self.fresh_after_revocation()
+    }
+    pub(crate) fn move_device_order(
+        &mut self,
+        device: DeviceId,
+        placement: oink_network::device_order::Placement,
+    ) -> ApiResult<()> {
+        let (oink_network::device_order::Placement::Above(anchor)
+        | oink_network::device_order::Placement::After(anchor)) = placement;
+        let order = self.state.device_order().map_err(internal)?;
+        if anchor == device || !order.contains_key(&device) || !order.contains_key(&anchor) {
+            return Err(ApiError::NotMember);
+        }
+        let next = self
+            .state
+            .move_device(self.identity.id(), device, placement)
+            .map_err(internal)?;
+        self.commit(next)
     }
     pub(crate) fn member_addresses(&self, device: DeviceId) -> ApiResult<Vec<String>> {
         if !self.state.roster().contains(device) {

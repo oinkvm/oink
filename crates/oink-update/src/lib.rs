@@ -2,7 +2,9 @@
 //! No production trust-root override or installer commands. Local package paths
 //! require Apple authentication or independently verified Windows elevation.
 pub mod barrier;
+pub mod catalog;
 pub mod feed;
+pub mod fetch;
 pub mod ipc;
 pub mod local;
 pub mod package;
@@ -77,3 +79,54 @@ pub const RELEASE_VERSION: &str = match option_env!("OINK_RELEASE_VERSION") {
     Some(version) => version,
     None => env!("CARGO_PKG_VERSION"),
 };
+
+/// What kind of package this binary belongs to, from its display version.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PackageKind {
+    Public,
+    /// Any other pre-release, such as `0.4.0-beta.1`.
+    Beta,
+    /// `0.3.6-inhouse.2`: no automatic checks unless the user turns them on.
+    InHouse,
+}
+impl PackageKind {
+    pub fn of(version: &str) -> Self {
+        if version.contains("-inhouse.") {
+            Self::InHouse
+        } else if version.contains('-') {
+            Self::Beta
+        } else {
+            Self::Public
+        }
+    }
+    pub fn default_channel(self) -> feed::Channel {
+        match self {
+            Self::Public => feed::Channel::Stable,
+            Self::Beta | Self::InHouse => feed::Channel::Beta,
+        }
+    }
+    pub fn checks_by_default(self) -> bool {
+        self != Self::InHouse
+    }
+}
+pub fn package_kind() -> PackageKind {
+    PackageKind::of(RELEASE_VERSION)
+}
+
+#[cfg(test)]
+mod package_kind_tests {
+    use super::*;
+    #[test]
+    fn package_kind_sets_channel_and_automatic_check_defaults() {
+        for (version, kind, channel, checks) in [
+            ("0.3.6", PackageKind::Public, feed::Channel::Stable, true),
+            ("0.4.0-beta.1", PackageKind::Beta, feed::Channel::Beta, true),
+            ("0.3.6-inhouse.2", PackageKind::InHouse, feed::Channel::Beta, false),
+        ] {
+            let actual = PackageKind::of(version);
+            assert_eq!(actual, kind);
+            assert_eq!(actual.default_channel(), channel);
+            assert_eq!(actual.checks_by_default(), checks);
+        }
+    }
+}

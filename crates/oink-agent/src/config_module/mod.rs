@@ -77,6 +77,8 @@ pub struct AppliedState {
     pub group: GroupId,
     pub roster_digest: [u8; 32],
     pub pointer_slots: BTreeMap<DeviceId, Option<u8>>,
+    /// Group-wide device list order; sort with `oink_network::device_order::sort_key`.
+    pub device_order: BTreeMap<DeviceId, i64>,
     pub members: Vec<DeviceId>,
     pub layout: Arc<Layout>,
     /// Drawing preferences include retained offline owners; routing uses RouterLayout.
@@ -406,6 +408,13 @@ impl ConfigModule {
         )
     }
 
+    pub fn move_device_order(
+        &self,
+        device: DeviceId,
+        placement: oink_network::device_order::Placement,
+    ) -> ApiResult<()> {
+        self.call(move |owner| owner.move_device_order(device, placement))
+    }
     pub fn remove_member(&self, device: DeviceId) -> ApiResult<()> {
         self.call(move |owner| owner.remove_member(device, None))
     }

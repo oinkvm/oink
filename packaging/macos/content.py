@@ -40,8 +40,9 @@ def verify_update_transport(info):
     # Never ship a production app capable of relaxing URLSession's TLS policy.
     if 'NSAppTransportSecurity' in info:
         raise RuntimeError('ATS exceptions are forbidden in production Mac packages')
-    if 'SUFeedURL' in info and not info['SUFeedURL'].startswith('https://updates.oink.hachiwii.com/'):
-        raise RuntimeError('Unexpected Sparkle feed URL in production Mac package')
+    # No Sparkle runs in the app. Only its public key stays, for <=0.3.5 clients.
+    if any(key.startswith('SU') and key != 'SUPublicEDKey' for key in info):
+        raise RuntimeError('Sparkle configuration in production Mac package')
 
 
 def verify_audio_capture_host(info, entitlements, backend):
@@ -147,7 +148,7 @@ def verify_app(app, identity, architecture='arm64'):
     metadata = json.loads((app / 'Contents/Resources' / identity['metadata_file']).read_text())
     from provenance import ROOT
     trust = json.loads((ROOT / 'packaging/update-trust.json').read_bytes())['mac']
-    expected_policy = 'sparkle' if trust['enabled'] else 'manual-only'
+    expected_policy = 'feed-v2' if trust['enabled'] else 'manual-only'
     if (metadata['update_policy'] != expected_policy or len(metadata['source_tree_sha256']) != 64 or
             info.get('SUPublicEDKey') != trust['public_key'] or
             (trust['enabled'] and not trust['public_key'])):
@@ -167,8 +168,8 @@ def verify_app(app, identity, architecture='arm64'):
             (helper / 'Contents/Resources/report-manifest.json').read_bytes() !=
             (app / 'Contents/Resources/report-manifest.json').read_bytes()):
         raise RuntimeError('Mac crash report manifest differs from shipped images')
-    if not (app / 'Contents/Frameworks/Sparkle.framework').is_dir():
-        raise RuntimeError('Sparkle.framework missing')
+    if (app / 'Contents/Frameworks').exists():
+        raise RuntimeError('Mac app must not embed frameworks (Sparkle was removed)')
     verify_microphone(app, metadata['source_tree_sha256'], mac['team_id'])
     verify_signature(app, mac['team_id'])
     return components

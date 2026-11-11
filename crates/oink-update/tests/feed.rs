@@ -126,6 +126,8 @@ fn release_notes_are_bounded_and_preserved_in_candidates() {
         published_at: None,
         severity: Severity::Normal,
         notes: Some(notes.clone()),
+        kind: oink_update::catalog::Kind::Normal,
+        notice: None,
     };
     let value = serde_json::to_value(&candidate).unwrap();
     assert_eq!(value["notes"], payload()["releases"][0]["notes"]);

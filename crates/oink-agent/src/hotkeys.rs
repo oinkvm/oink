@@ -54,6 +54,7 @@ pub(crate) fn effective(saved: Option<Vec<Hotkey>>, slots: &BTreeMap<DeviceId, O
         HotkeyAction::LockEscape,
         HotkeyAction::ToggleMicrophoneMute,
         HotkeyAction::LockRemoteWindows,
+        HotkeyAction::MovePointerNext,
     ] {
         if !saved.iter().any(|h| h.action == action) {
             saved.push(
@@ -228,6 +229,21 @@ pub(crate) fn bindings(list: &[Hotkey]) -> Vec<HotkeyBinding> {
     out
 }
 
+/// The online device after `current` in group order, wrapping around. `online`
+/// includes this device; a focus device that is not online starts from its own
+/// position in the order. None when no other online device exists.
+pub(crate) fn next_device(online: &[DeviceId], order: &BTreeMap<DeviceId, i64>, current: DeviceId) -> Option<DeviceId> {
+    let key = |device: DeviceId| oink_network::device_order::sort_key(order, device);
+    let mut list = online.to_vec();
+    list.sort_by_key(|device| key(*device));
+    let next = list
+        .iter()
+        .find(|device| key(**device) > key(current))
+        .or(list.first())
+        .copied()?;
+    (next != current).then_some(next)
+}
+
 fn shared_microphone(view: &crate::device_cards::DeviceCardsView) -> Option<&crate::device_cards::MicrophoneCard> {
     view.cards
         .iter()
@@ -281,6 +297,23 @@ impl Node {
             input.send(crate::threads::input::InputCommand::Hotkeys(b));
             *applied = Some(list.to_vec());
         }
+    }
+
+    fn next_pointer_device(&self) -> Option<DeviceId> {
+        let config = self.link_config().ok()?;
+        let online = config
+            .members()
+            .members
+            .iter()
+            .filter(|m| m.is_self || m.online)
+            .map(|m| m.device)
+            .collect::<Vec<_>>();
+        let current = self
+            .input_status()
+            .ok()
+            .and_then(|status| status.group_focus.holder)
+            .unwrap_or(self.id());
+        next_device(&online, &config.applied().device_order, current)
     }
 
     fn toggle_shared_microphone_mute(&self) -> crate::api::ApiResult<()> {
@@ -366,6 +399,16 @@ impl Node {
         let r = match action {
             HotkeyAction::MovePointerTo | HotkeyAction::SwitchLayout | HotkeyAction::LockEscape => Ok(()),
             HotkeyAction::LockRemoteWindows => Ok(()), // Router captured and dispatched the exact target.
+            HotkeyAction::MovePointerNext => {
+                // Same landing and handoff as the per-device move shortcuts.
+                if let Some(target) = self.next_pointer_device()
+                    && let Ok(input) = self.input_thread()
+                {
+                    tracing::info!("hotkey: move the pointer to the next online device");
+                    input.send(crate::threads::input::InputCommand::MovePointerTo(target));
+                }
+                Ok(())
+            }
             HotkeyAction::LockFocus => {
                 // The router already requested the toggle at physical key-down,
                 // using that exact focus epoch. This event is notification only.
@@ -692,7 +735,12 @@ mod tests {
         assert!(
             configured(None)
                 .iter()
-                .filter(|h| !matches!(h.action, HotkeyAction::ToggleMicrophoneMute | HotkeyAction::OpenWindow))
+                .filter(|h| {
+                    !matches!(
+                        h.action,
+                        HotkeyAction::ToggleMicrophoneMute | HotkeyAction::OpenWindow | HotkeyAction::MovePointerNext
+                    )
+                })
                 .all(|h| h.enabled)
         );
         assert_eq!(configured(None), crate::agent_api::default_hotkeys());
@@ -770,6 +818,36 @@ mod tests {
         let slots = [(a, Some(0))].into();
         let saved = vec![hk(HotkeyAction::LockFocus, &["Alt", "Ctrl", "1"], true)];
         assert!(validate(&effective(Some(saved), &slots)).is_ok());
+    }
+
+    #[test]
+    fn next_device_follows_group_order_wraps_includes_self_and_skips_offline() {
+        let [me, b, c, d] = [1, 2, 3, 4].map(|i| DeviceId([i; 32]));
+        let order: BTreeMap<_, _> = [(b, 0), (me, 1), (c, 2), (d, 3)].into();
+        let online = [c, me, b];
+        assert_eq!(next_device(&online, &order, b), Some(me));
+        assert_eq!(next_device(&online, &order, me), Some(c));
+        // d is offline: c wraps to the first online device.
+        assert_eq!(next_device(&online, &order, c), Some(b));
+        // A focus device that just went offline continues from its own position.
+        assert_eq!(next_device(&online, &order, d), Some(b));
+        let tied: BTreeMap<_, _> = [(b, 0), (me, 0), (c, 0)].into();
+        assert_eq!(next_device(&online, &tied, me), Some(b));
+        assert_eq!(next_device(&online, &tied, b), Some(c));
+        assert_eq!(next_device(&[me], &order, me), None);
+        assert_eq!(next_device(&[me], &order, b), Some(me));
+        let defaults = effective(None, &BTreeMap::new());
+        let next = defaults
+            .iter()
+            .find(|h| h.action == HotkeyAction::MovePointerNext)
+            .unwrap();
+        assert!(!next.enabled);
+        assert_eq!(next.keys, ["Ctrl", "Alt", "N"]);
+        assert!(validate(&defaults).is_ok());
+        let mut on = next.clone();
+        on.enabled = true;
+        assert_eq!(bindings(&[on])[0].action, "move_pointer_next");
+        assert!(effective(Some(vec![]), &BTreeMap::new()).iter().any(|h| h == next));
     }
 
     #[test]

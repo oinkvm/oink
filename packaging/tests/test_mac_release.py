@@ -44,8 +44,27 @@ class MacReleaseTests(unittest.TestCase):
             for k in path[:-1]: slot = slot[k]
             slot[path[-1]] = value
             with self.subTest(path=path), self.assertRaises(ValueError): M.validate_release(bad, notes, 'v0.1.1', COMMIT, TREE)
-        for change in [dict(channel='beta'), dict(notes={'en':'missing Chinese'})]:
+        for change in [dict(channel='alpha'), dict(notes={'en':'missing Chinese'})]:
             with self.assertRaises(ValueError): M.validate_release(record, {**notes,**change}, 'v0.1.1', COMMIT, TREE)
+
+    def test_v2_record_binds_the_signed_notarized_dmg(self):
+        record = self.record()
+        dmg = dict(name='Oink-0.1.1-macos-arm64.dmg', size=40, sha256='e'*64)
+        record['artifacts'].append(dmg)
+        record['platforms']['macos'].update(artifacts=[*record['platforms']['macos']['artifacts'], dmg],
+                                            minimum_os='14.2', protocol_baseline=1)
+        self.assertEqual(M.artifact(record, 'macos', 'dmg'), dmg)
+        url = 'https://github.com/oinkvm/oink/releases/download/v0.1.1/' + dmg['name']
+        signature = base64.b64encode(b's'*64).decode()
+        v2 = M.v2_record(record, 'macos', 'arm64', 'v0.1.1', NOTES, 'stable', dmg, url, signature, 'mac-2026-01')
+        path = 'mac/releases/30/arm64.json'
+        self.assertEqual(M.feed_v2.mac_record(M.feed.encode(v2), path, 'oinkvm/oink'), v2)
+        self.assertEqual(v2['release']['package'], dict(url=url, length=40, sha256='e'*64, keyId='mac-2026-01', ed25519=signature))
+        self.assertEqual(v2['release']['minimumUpdaterSchema'], 3)
+        with self.assertRaisesRegex(ValueError, 'mac_qualification'):
+            M.feed_v2.mac_record(M.feed.encode(v2), 'mac/releases/30/x64.json', 'oinkvm/oink')
+        record['platforms']['macos']['artifacts'].append(dict(dmg, name='Second.dmg'))
+        with self.assertRaisesRegex(ValueError, 'dmg_required'): M.artifact(record, 'macos', 'dmg')
 
     def test_legacy_asset_names_remain_valid(self):
         record = self.record()
@@ -64,20 +83,23 @@ class MacReleaseTests(unittest.TestCase):
                        GITHUB_REF='refs/heads/main',GITHUB_REPOSITORY='oinkvm/oink')
             with patch.dict(os.environ,env), patch.object(M,'command',return_value=json.dumps(release).encode()):
                 M.published('v0.1.1')
-            for change in [dict(draft=True), dict(prerelease=True), dict(published_at=None)]:
+            for change in [dict(draft=True), dict(prerelease=None), dict(published_at=None)]:
                 with patch.dict(os.environ,env), patch.object(M,'command',return_value=json.dumps({**release,**change}).encode()):
                     with self.assertRaisesRegex(ValueError,'release_not_public'): M.published('v0.1.1')
+            # A vX.Y.Z prerelease is published to beta (promoted later).
+            with patch.dict(os.environ,env), patch.object(M,'command',return_value=json.dumps({**release,'prerelease':True}).encode()):
+                self.assertEqual(M.published_release.channel(M.published('v0.1.1')), 'beta')
 
     def test_candidate_reads_default_branch_notes_and_ignores_legacy_bound_asset(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             annotations = dict(channel='stable', severity='critical', notes=NOTES)
-            M.feed.write(root / '.github/update-notes.json', annotations)
+            M.feed.write(root / '.github/update-notes.json', dict(severity='critical', notes=NOTES))
             record = self.record()
             # Legacy releases may list a hash-bound notes asset. Never request it.
             record['artifacts'].append(dict(name='update.json', size=99, sha256='d'*64))
             config = dict(repository='oinkvm/oink', mac=dict(enabled=True, public_key=PUBLIC, epoch='mac-2026-01'))
-            with patch.object(M, 'published'), patch.object(M.feed, 'ROOT', root), \
+            with patch.object(M, 'published', return_value=dict(prerelease=False)), patch.object(M.feed, 'ROOT', root), \
                  patch.object(M.feed, 'trust', return_value=config), \
                  patch.object(M, 'tag_source', return_value=(COMMIT, TREE, config['mac'])), \
                  patch.object(M.feed, 'download', return_value=M.feed.encode(record)) as download, \
@@ -89,9 +111,26 @@ class MacReleaseTests(unittest.TestCase):
                 download.assert_called_once_with(
                     'https://github.com/oinkvm/oink/releases/download/v0.1.1/release.json', M.feed.MAX_FEED, redirects=True)
 
-                M.feed.write(root / '.github/update-notes.json', {**annotations, 'channel': 'beta'})
-                with self.assertRaisesRegex(ValueError, 'stable_annotations_required'):
+                # The channel is the live flag; a committed channel is rejected.
+                M.feed.write(root / '.github/update-notes.json', annotations)
+                with self.assertRaisesRegex(ValueError, 'release_annotations_required'):
                     M.candidate(root/'state', root/'output', root/'cache', 'v0.1.1')
+
+    def test_sparkle_free_builds_skip_only_the_sparkle_checks_and_beta_needs_no_zip(self):
+        notes = dict(channel='stable', severity='normal', notes=NOTES)
+        record = self.record()
+        record['build'] = record['platforms']['macos']['build'] = M.SPARKLE_FREE_BUILD + 1
+        del record['platforms']['macos']['sparkle']
+        self.assertEqual(M.validate_release(record, notes, 'v0.1.1', COMMIT, TREE)['name'], 'Oink-0.1.1-macos-arm64.zip')
+        record['build'] = record['platforms']['macos']['build'] = M.SPARKLE_FREE_BUILD - 1
+        with self.assertRaises(KeyError): M.validate_release(record, notes, 'v0.1.1', COMMIT, TREE)
+        record['platforms']['macos']['sparkle'] = dict(public_key_configured=False)
+        with self.assertRaisesRegex(ValueError, 'notarized_signed_package_required'):
+            M.validate_release(record, notes, 'v0.1.1', COMMIT, TREE)
+        record = self.record()
+        record['version'] = record['platforms']['macos']['version'] = '0.1.1-beta.1'
+        record['platforms']['macos']['artifacts'] = []
+        self.assertIsNone(M.validate_release(record, {**notes, 'channel': 'beta'}, 'v0.1.1-beta.1', COMMIT, TREE))
 
     def test_new_item_preserves_older_notes_archive_and_has_no_beta_channel(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -138,6 +177,78 @@ class MacReleaseTests(unittest.TestCase):
                 self.assertEqual(M.feed_site.appcast(path.read_bytes(),config,'stable')[0]['length'],archive.stat().st_size)
                 path.write_bytes(path.read_bytes().replace(b'Test update',b'Tampered update'))
                 with self.assertRaises(ValueError):M.feed_site.appcast(path.read_bytes(),config,'stable',True)
+
+
+class MacPromotionTests(unittest.TestCase):
+    """candidate() of one vX.Y.Z build: prerelease (beta) first, then promoted to stable."""
+    DMG = b'notarized TEST dmg bytes'
+    SIGNATURE = base64.b64encode(b's' * 64).decode()
+
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.runs = 0
+
+    def record(self):
+        zip_asset = dict(name='Oink-0.3.6-macos-arm64.zip', size=20, sha256='c' * 64)
+        dmg = dict(name='Oink-0.3.6-macos-arm64.dmg', size=len(self.DMG), sha256=M.feed.digest(self.DMG))
+        common = dict(version='0.3.6', build=306001, built_commit=COMMIT, source_tree_sha256=TREE)
+        mac = dict(**common, source_commit=None, team_id='893V37X2CW', notarized=True, architecture='arm64',
+                   notarization={k: dict(status='Accepted', stapled=True) for k in ['app', 'dmg']},
+                   launch_smoke=dict(status='passed', signed=True, seconds=10), minimum_os='14.2',
+                   protocol_baseline=1, artifacts=[zip_asset, dmg])
+        return dict(schema=1, product='Oink', **common, platforms=dict(macos=mac), artifacts=[zip_asset, dmg])
+
+    def candidate(self, state, prerelease, notes=NOTES):
+        """One publisher run against `state` (the deployed site); returns (output, v1 signer mock)."""
+        self.runs += 1
+        M.feed.write(self.root / '.github/update-notes.json', dict(severity='normal', notes=notes))
+        (state / 'site/mac').mkdir(parents=True, exist_ok=True)
+        config = dict(repository='oinkvm/oink', mac=dict(enabled=True, public_key=PUBLIC, epoch='mac-2026-01'))
+        record = self.record()
+        download = lambda url, limit, redirects=False: M.feed.encode(record) if url.endswith('/release.json') else self.DMG
+        output = self.root / f'output-{self.runs}'
+        with patch.object(M, 'published', return_value=dict(prerelease=prerelease)), \
+                patch.object(M.feed, 'ROOT', self.root), patch.object(M.feed, 'trust', return_value=config), \
+                patch.object(M, 'tag_source', return_value=(COMMIT, TREE, config['mac'])), \
+                patch.object(M.feed, 'download', side_effect=download), \
+                patch.object(M.feed_site, 'state_info', return_value={'platforms': {'mac': {'catalog': {}}}}), \
+                patch.object(M.feed_site, 'verify_platform'), patch.object(M, 'prepare', return_value=self.root), \
+                patch.object(M, 'verify_dmg'), patch.object(M, 'sign', return_value=self.SIGNATURE), \
+                patch.object(M, 'sign_v1') as v1:
+            self.assertEqual(M.candidate(state, output, self.root / 'cache', 'v0.3.6'), 306001)
+        return output, v1
+
+    def published_record(self, output):
+        return M.feed.read(output / 'site/mac/releases/306001/arm64.json')
+
+    def test_prerelease_is_beta_only_and_promotion_rewrites_the_same_record_to_stable(self):
+        beta, v1 = self.candidate(self.root / 'empty', prerelease=True)
+        v1.assert_not_called()
+        record = self.published_record(beta)
+        self.assertEqual(record['release']['channel'], 'beta')
+        self.assertEqual(record['release']['tag'], 'v0.3.6')
+
+        stable, v1 = self.candidate(beta, prerelease=False)
+        v1.assert_called_once()
+        promoted = self.published_record(stable)
+        self.assertEqual(promoted, {**record, 'release': {**record['release'], 'channel': 'stable'}})
+        self.assertEqual(sorted(p.relative_to(stable).as_posix() for p in (stable / 'site/mac/releases').rglob('*.json')),
+                         ['site/mac/releases/306001/arm64.json'])
+
+    def test_promotion_mismatches_and_republication_are_rejected(self):
+        beta, _ = self.candidate(self.root / 'empty', prerelease=True)
+        with self.assertRaisesRegex(ValueError, 'release_build_changed'):
+            self.candidate(beta, prerelease=False, notes={**NOTES, 'en': 'Edited after the prerelease'})
+        with self.assertRaisesRegex(ValueError, 'release_not_monotonic'):
+            self.candidate(beta, prerelease=True)
+        stable, _ = self.candidate(beta, prerelease=False)
+        with self.assertRaisesRegex(ValueError, 'release_not_monotonic'):
+            self.candidate(stable, prerelease=False)
+        # Never stable -> beta.
+        with self.assertRaisesRegex(ValueError, 'release_build_changed'):
+            self.candidate(stable, prerelease=True)
 
 
 if __name__ == '__main__':unittest.main()

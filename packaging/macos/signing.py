@@ -70,6 +70,15 @@ def verify_published_app(app, team):
         raise RuntimeError('Published app Team ID mismatch')
 
 
+def verify_published_dmg(dmg, team):
+    # Gatekeeper's open-with-primary-signature assessment checks the disk
+    # image's own Developer ID signature and its stapled notarization ticket.
+    private_run('spctl', '-a', '-t', 'open', '--context', 'context:primary-signature', dmg)
+    details = private_run('codesign', '-dvv', dmg).stderr
+    if f'TeamIdentifier={team}' not in details:
+        raise RuntimeError('Published disk image Team ID mismatch')
+
+
 def ticket_operation(operation, path, timeout=120):
     # Both staple AND validate contact Apple's ticket service (stapler(1)).
     # Accepted can precede ticket availability; EX_NOHOST also covers an

@@ -11,8 +11,17 @@ enum Toggle {
     Off,
 }
 pub fn run(args: Args) -> anyhow::Result<()> {
+    // Change only automatic checks; the channel and install-after-download
+    // choices go back to the service as they are stored.
+    let status = match oink_winsvc::update::request(oink_update::ipc::Request::Query)? {
+        oink_update::ipc::Reply::Status { status } => status,
+        oink_update::ipc::Reply::Error { error } => return Err(error.into()),
+        _ => anyhow::bail!("unexpected update service reply"),
+    };
     let preferences = Preferences {
         checks_enabled: matches!(args.checks, Toggle::On),
+        update_channel: status.update_channel,
+        install_after_download: status.install_after_download,
     };
     let reply = oink_winsvc::update::request(oink_update::ipc::Request::Command {
         command: Command::SetPreferences { preferences },

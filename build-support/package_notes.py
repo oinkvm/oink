@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import unicodedata
 from update.feed import validate_notes
+from identity import decode_build
 
 MAX_FILE = 128 * 1024
 MAX_TEXT = 16 * 1024
@@ -45,6 +46,17 @@ def read(path, build, source_commit, root=None):
     return value
 
 
+def inhouse_label(label, build, commit):
+    """Encoded builds end in their sequence; builds below 100000 predate encoding and carried the
+    whole build or a commit prefix."""
+    if build < 100_000:
+        return label.endswith(('-inhouse.' + str(build), '-inhouse.' + commit[:8]))
+    try:
+        return label == '%s-inhouse.%d' % decode_build(build)
+    except ValueError:
+        return False
+
+
 def previous_record(output_root, build, explicit=None):
     paths = [Path(explicit)] if explicit else Path(output_root).rglob('release.json')
     records = []
@@ -57,7 +69,7 @@ def previous_record(output_root, build, explicit=None):
             continue
         number = value.get('build');commit = value.get('source_commit');label = value.get('version', '')
         if (type(number) is int and 0 < number < build and isinstance(commit, str) and
-                SHA.fullmatch(commit) and isinstance(label, str) and label.endswith(('-inhouse.' + str(number), '-inhouse.' + commit[:8]))):
+                SHA.fullmatch(commit) and isinstance(label, str) and inhouse_label(label, number, commit)):
             records.append({'build':number, 'version':label, 'source_commit':commit})
         elif explicit:
             raise ValueError('previous in-house release must have a lower build and matching in-house label')

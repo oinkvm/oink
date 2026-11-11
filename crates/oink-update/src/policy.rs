@@ -1,30 +1,58 @@
-use crate::{Error, barrier::Blocker, feed::Severity};
+use crate::{
+    Error,
+    barrier::Blocker,
+    catalog::Kind,
+    feed::{Channel, ReleaseNotes, Severity, Watermark},
+};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(from = "StoredPreferences")]
 pub struct Preferences {
     pub checks_enabled: bool,
+    /// `None` follows the package: beta and in-house builds default to beta.
+    pub update_channel: Option<Channel>,
+    pub install_after_download: bool,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct StoredPreferences {
     checks_enabled: bool,
+    #[serde(default)]
+    update_channel: Option<Channel>,
+    #[serde(default = "install_after_download")]
+    install_after_download: bool,
     // Oink 0.1.1–0.1.3 wrote this field. Accept and ignore it (including beta)
     // so upgrading preserves checks_enabled; new preferences never write it.
     #[serde(default, rename = "channel")]
     _legacy_channel: serde::de::IgnoredAny,
 }
+fn install_after_download() -> bool {
+    true
+}
 impl From<StoredPreferences> for Preferences {
     fn from(stored: StoredPreferences) -> Self {
         Self {
             checks_enabled: stored.checks_enabled,
+            update_channel: stored.update_channel,
+            install_after_download: stored.install_after_download,
         }
     }
 }
 impl Default for Preferences {
     fn default() -> Self {
-        Self { checks_enabled: true }
+        Self {
+            checks_enabled: crate::package_kind().checks_by_default(),
+            update_channel: None,
+            install_after_download: true,
+        }
+    }
+}
+impl Preferences {
+    pub fn channel(&self) -> Channel {
+        self.update_channel
+            .unwrap_or_else(|| crate::package_kind().default_channel())
     }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -45,6 +73,12 @@ pub struct Policy {
     pub next_quit: bool,
     pub indefinitely: bool,
     pub skipped_build: Option<u64>,
+    /// The critical update whose dialog was already opened automatically.
+    #[serde(default)]
+    pub critical_prompted_build: Option<u64>,
+    /// macOS: replay watermark of the last verified v2 catalog, per channel.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub watermarks: BTreeMap<String, Watermark>,
 }
 fn policy_schema<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<u32, D::Error> {
     let schema = u32::deserialize(deserializer)?;
@@ -62,6 +96,8 @@ impl Default for Policy {
             next_quit: false,
             indefinitely: false,
             skipped_build: None,
+            critical_prompted_build: None,
+            watermarks: BTreeMap::new(),
         }
     }
 }
@@ -110,13 +146,23 @@ pub struct Candidate {
     pub size: u64,
     pub published_at: Option<i64>,
     pub severity: Severity,
-    pub notes: Option<crate::feed::ReleaseNotes>,
+    pub notes: Option<ReleaseNotes>,
+    #[serde(default)]
+    pub kind: Kind,
+    /// Shown before the notes of a critical update.
+    #[serde(default)]
+    pub notice: Option<ReleaseNotes>,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UpdateStatus {
     pub current_build: u64,
     pub version: String,
     pub checks_enabled: bool,
+    /// The channel in effect; `update_channel` is the stored choice (`None`
+    /// follows the package), which preference changes send back unchanged.
+    pub channel: Channel,
+    pub update_channel: Option<Channel>,
+    pub install_after_download: bool,
     pub phase: Phase,
     pub candidate: Option<Candidate>,
     pub checked_at: Option<i64>,
@@ -125,6 +171,9 @@ pub struct UpdateStatus {
     pub blockers: Vec<Blocker>,
     pub progress: Option<u8>,
     pub error: Option<Error>,
+    /// The build whose download failed; the failure is not shown for another build.
+    pub failed_build: Option<u64>,
+    pub critical_prompted_build: Option<u64>,
     pub scope: Scope,
     pub can_change_policy: bool,
 }
@@ -132,13 +181,27 @@ pub struct UpdateStatus {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Command {
-    OpenLocal { path: String },
+    OpenLocal {
+        path: String,
+    },
     Check,
     Download,
-    Install { expected_build: u64 },
-    Defer { choice: DeferChoice },
-    Skip { expected_build: u64 },
-    SetPreferences { preferences: Preferences },
+    Install {
+        expected_build: u64,
+    },
+    Defer {
+        choice: DeferChoice,
+    },
+    Skip {
+        expected_build: u64,
+    },
+    /// The UI opened the dialog of this critical update by itself.
+    Prompted {
+        expected_build: u64,
+    },
+    SetPreferences {
+        preferences: Preferences,
+    },
     Cancel,
 }
 
@@ -182,12 +245,15 @@ impl ReadyState {
 mod tests {
     use super::*;
     #[test]
-    fn production_preferences_have_checks_only() {
-        let preferences = Preferences::default();
-        assert!(preferences.checks_enabled);
+    fn preferences_reject_unknown_modes_and_keep_older_files() {
+        let preferences = Preferences {
+            checks_enabled: true,
+            update_channel: None,
+            install_after_download: true,
+        };
         assert_eq!(
             serde_json::to_value(&preferences).unwrap(),
-            serde_json::json!({"checks_enabled":true})
+            serde_json::json!({"checks_enabled":true,"update_channel":null,"install_after_download":true})
         );
         for mode in ["automatic", "notify"] {
             assert!(
@@ -198,6 +264,18 @@ mod tests {
             );
         }
         assert!(serde_json::from_str::<Command>(r#"{"type":"automatic"}"#).is_err());
+        let older: Preferences = serde_json::from_value(serde_json::json!({"checks_enabled":false})).unwrap();
+        assert_eq!(
+            older,
+            Preferences {
+                checks_enabled: false,
+                update_channel: None,
+                install_after_download: true
+            }
+        );
+        let beta: Preferences =
+            serde_json::from_value(serde_json::json!({"checks_enabled":true,"update_channel":"beta"})).unwrap();
+        assert_eq!(beta.channel(), Channel::Beta);
     }
     #[test]
     fn legacy_channel_is_ignored_without_changing_checks() {
@@ -209,10 +287,7 @@ mod tests {
                 .unwrap();
                 let preferences: Preferences = crate::feed::strict_json(&bytes).unwrap();
                 assert_eq!(preferences.checks_enabled, checks_enabled);
-                assert_eq!(
-                    serde_json::to_value(preferences).unwrap(),
-                    serde_json::json!({"checks_enabled": checks_enabled})
-                );
+                assert_eq!(preferences.update_channel, None);
             }
         }
     }
@@ -221,6 +296,17 @@ mod tests {
         let mut policy = Policy::default();
         policy.defer(DeferChoice::Hour, 5);
         policy.skipped_build = Some(2);
+        policy.critical_prompted_build = Some(3);
+        let unsaved = serde_json::to_value(&policy).unwrap();
+        assert!(unsaved.get("watermarks").is_none(), "older files keep their shape");
+        policy.watermarks.insert(
+            Channel::Beta.as_str().into(),
+            Watermark {
+                sequence: 4,
+                payload_sha256: "a".repeat(64),
+                last_verified_unix: 5,
+            },
+        );
         let saved: Policy = serde_json::from_slice(&serde_json::to_vec(&policy).unwrap()).unwrap();
         assert_eq!(saved, policy);
     }

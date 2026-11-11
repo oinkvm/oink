@@ -591,6 +591,9 @@ async fn real_pairing_is_explicit_directional_and_undo_removes_only_the_peer() {
     );
     assert_eq!(nodes[0].group.applied().pointer_slots[&nodes[1].identity.id()], Some(0));
     assert_eq!(nodes[0].group.applied().pointer_slots[&nodes[0].identity.id()], Some(1));
+    // The joining device is appended after the target group's members.
+    let order = [(nodes[1].identity.id(), 0), (nodes[0].identity.id(), 1)].into();
+    assert!(until(|| nodes.iter().all(|n| n.group.applied().device_order == order)).await);
     assert!(nodes.iter().all(|node| node.group.nearby().rows.is_empty()));
     let event = nodes[0]
         .group
@@ -835,6 +838,41 @@ async fn display_geometry_and_owner_facts_converge_without_replicating_pause() {
     .unwrap();
     assert!(nodes[0].group.applied().paused);
     assert!(!nodes[1].group.applied().paused);
+    stop(&nodes).await;
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn device_order_moves_reach_every_member_and_concurrent_moves_converge() {
+    use oink_network::device_order::Placement;
+    let nodes = start(same_group(3)).await;
+    assert!(until(|| ready(&nodes)).await);
+    let [a, b, c] = [0, 1, 2].map(|i| nodes[i].identity.id());
+    let converged =
+        |expected: &BTreeMap<DeviceId, i64>| nodes.iter().all(|n| &n.group.applied().device_order == expected);
+    assert!(until(|| converged(&[(a, 0), (b, 1), (c, 2)].into())).await);
+    nodes[1].group.move_device_order(c, Placement::Above(a)).unwrap();
+    assert!(until(|| converged(&[(c, -1), (a, 0), (b, 1)].into())).await);
+    // B − 1 is taken by c: every device at or below it shifts down by one.
+    nodes[2].group.move_device_order(b, Placement::Above(a)).unwrap();
+    assert!(until(|| converged(&[(c, -2), (b, -1), (a, 0)].into())).await);
+    assert!(matches!(
+        nodes[0].group.move_device_order(a, Placement::After(a)),
+        Err(ApiError::NotMember)
+    ));
+    // Simultaneous writers: whole-list last writer wins, identically everywhere.
+    nodes[0].group.hold_incoming_config_states(true);
+    nodes[1].group.hold_incoming_config_states(true);
+    nodes[0].group.move_device_order(a, Placement::Above(c)).unwrap();
+    nodes[1].group.move_device_order(c, Placement::After(a)).unwrap();
+    nodes[0].group.hold_incoming_config_states(false);
+    nodes[1].group.hold_incoming_config_states(false);
+    assert!(
+        until(|| {
+            let first = nodes[0].group.applied().device_order.clone();
+            converged(&first)
+                && (first == [(a, -3), (c, -2), (b, -1)].into() || first == [(b, -1), (a, 0), (c, 1)].into())
+        })
+        .await
+    );
     stop(&nodes).await;
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

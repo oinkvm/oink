@@ -7,15 +7,21 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
-from identity import IDENTITY
+from identity import IDENTITY, encode_build
 from provenance import digest, source_tree_sha256
 
 
-def inputs(build, environment):
-    if not re.fullmatch(r'[0-9]+', build) or not 28 <= int(build) < 2**31:
-        raise ValueError('reserve a monotonically increasing build in 28..2147483647')
+def release_build(sequence):
+    """The public release is build n of the manifest version (identity.encode_build)."""
+    if not re.fullmatch(r'[1-9][0-9]{0,2}', sequence or ''):
+        raise ValueError('build sequence must be an integer in 1..999')
     if not re.fullmatch(r'[0-9]+\.[0-9]+\.[0-9]+', IDENTITY['version']):
         raise ValueError('public release requires a stable product version')
+    return encode_build(IDENTITY['version'], int(sequence))
+
+
+def inputs(sequence, environment):
+    release_build(sequence)
     # Mirrors Endpoint::parse; reject an inert release without exposing its DSN.
     if not re.fullmatch(r'https://[a-fA-F0-9]{32}@o[0-9]+\.ingest\.de\.sentry\.io/[0-9]+', environment.get('OINK_REPORT_DSN', '')):
         raise ValueError('OINK_REPORT_DSN must be the EU reporting DSN')
@@ -125,7 +131,7 @@ def publish(directory, commit, notes):
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('operation', choices=['inputs', 'locate', 'stage', 'assemble', 'publish'])
-    p.add_argument('--build', default=os.environ.get('BUILD', '31'))
+    p.add_argument('--sequence', default=os.environ.get('SEQUENCE'), help='n of the manifest version; build = major*10^7 + minor*10^5 + patch*10^3 + n')
     p.add_argument('--commit', default=os.environ.get('GITHUB_SHA'))
     p.add_argument('--packages', type=Path)
     p.add_argument('--platform', choices=['macos', 'windows'])
@@ -134,15 +140,15 @@ def main():
     p.add_argument('--notes', type=Path, default=Path('.github/release-notes.txt'))
     a = p.parse_args()
     if a.operation == 'inputs':
-        enabled = inputs(a.build, os.environ)
+        enabled = inputs(a.sequence, os.environ)
         with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
             f.write('sign_windows=' + str(enabled).lower() + '\n')
     elif a.operation == 'locate':
         print(locate(a.packages, a.platform).parent)
     elif a.operation == 'stage':
-        stage(a.packages, a.output, a.platform, int(a.build), a.commit)
+        stage(a.packages, a.output, a.platform, release_build(a.sequence), a.commit)
     elif a.operation == 'assemble':
-        assemble(a.downloads, a.output, int(a.build), a.commit)
+        assemble(a.downloads, a.output, release_build(a.sequence), a.commit)
     else:
         publish(a.output, a.commit, a.notes)
 

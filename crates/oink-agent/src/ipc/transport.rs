@@ -15,7 +15,7 @@ mod platform;
 #[cfg(windows)]
 #[path = "transport/windows.rs"]
 mod platform;
-pub(crate) use platform::{AsyncStream, Listener};
+pub(crate) use platform::{AsyncStream, Listener, peer};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Owner {
@@ -239,6 +239,22 @@ mod tests {
         drop(listener);
         tokio::task::yield_now().await;
         assert!(address.probe().is_err());
+    }
+    #[tokio::test]
+    async fn peer_is_closed_only_once_the_client_has_left() {
+        use tokio::io::AsyncReadExt;
+        let directory = tempfile::tempdir().unwrap();
+        let listener = Listener::bind(directory.path(), "peer").unwrap();
+        let mut client = listener.address().connect(Duration::from_secs(1)).unwrap();
+        client.write_all(b"x").unwrap();
+        let (mut stream, ()) = listener.accept().await.unwrap();
+        let peer = peer(&stream).unwrap();
+        assert!(!peer.closed(), "a connected client with unread data");
+        let mut byte = [0];
+        stream.read_exact(&mut byte).await.unwrap();
+        assert!(!peer.closed(), "a connected client that is waiting");
+        drop(client);
+        assert!(peer.closed());
     }
     #[cfg(unix)]
     #[tokio::test]

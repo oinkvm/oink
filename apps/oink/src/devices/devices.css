@@ -319,3 +319,14 @@ button.dev__accessibility { cursor: pointer; }
 
 /* Optical alignment includes the microphone badge; preserve the shared layout gap. */
 .dev-ico[data-glyph="microphone"] { translate: -2.5px; }
+
+/* Online rows reorder by press-and-drag; the line marks the drop slot in the 4px gap. */
+.devs__list > li { position: relative; }
+.devs__list > li[data-drop]::before {
+  content: ""; position: absolute; left: 10px; right: 10px; z-index: 2; height: 2px; border-radius: 1px;
+  background: var(--ok-accent); pointer-events: none;
+}
+.devs__list > li[data-drop="above"]::before { top: -3px; }
+.devs__list > li[data-drop="below"]::before { bottom: -3px; }
+.devs__list > li[data-dragging] > .dev { opacity: .55; }
+.devs__list[data-reordering], .devs__list[data-reordering] * { cursor: grabbing; user-select: none; }

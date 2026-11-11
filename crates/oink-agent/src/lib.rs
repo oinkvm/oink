@@ -36,6 +36,7 @@ pub mod prelogin;
 mod projection;
 pub mod remote;
 pub mod telemetry;
+mod usage_days;
 mod wallpaper;
 #[cfg(any(windows, test))]
 mod windows_permissions;

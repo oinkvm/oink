@@ -21,7 +21,6 @@ class AffectedSelection(unittest.TestCase):
         with patch.object(sys, 'argv', ['ci.py']), \
                 patch.object(CI.subprocess, 'check_output', return_value=json.dumps(self.metadata())), \
                 patch.object(CI.subprocess, 'run') as run, \
-                patch.object(CI.platform, 'system', return_value='Windows'), \
                 contextlib.redirect_stdout(io.StringIO()):
             CI.main()
         commands = [call.args[0] for call in run.call_args_list]

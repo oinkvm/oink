@@ -334,7 +334,11 @@ pub const RESERVED_MESSAGES: &[(u16, &str)] = &[
 ];
 pub const RESERVED_STREAMS: &[(u16, &str)] = &[(6, "K0"), (7, "A0: 已退役，不得复用")];
 pub const RESERVED_CAPABILITIES: &[&str] = &["oink.calibration/1", "oink.aim/1", "oink.input.application-focus/1"];
-pub const REGISTER_KINDS: &[(u32, &str)] = &[(2, "LayoutValue"), (0x1301, "PointerShortcutSlots")];
+pub const REGISTER_KINDS: &[(u32, &str)] = &[
+    (2, "LayoutValue"),
+    (0x1301, "PointerShortcutSlots"),
+    (0x1302, "DeviceOrder"),
+];
 pub const RESERVED_REGISTERS: &[u32] = &[1, 3, 4, 5, 6, 7, 8];
 pub const RESERVED_ENUM_VALUES: &[(&str, &[u32])] = &[
     ("ApplicationFocusActionKind", &[0, 1, 2, 3, 4, 5, 6, 7]),

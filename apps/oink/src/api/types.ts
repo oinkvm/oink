@@ -182,9 +182,9 @@ export interface ScrollSettings { speed: number }
 export type PointerReference = { type: "last_screen" } | { type: "fixed"; display: string };
 export type PointerScaling = "physical" | "proportional";
 export interface PointerSettings { reference: PointerReference; scaling: PointerScaling; drag_across_devices: boolean }
-export type HotkeyAction = "switch_layout" | "lock_remote_windows" | "toggle_microphone_mute" | "lock_escape" | "lock_focus" | "return_pointer_home" | "toggle_sharing" | "open_window" | "toggle_game_mode" | "pause_all" | "move_pointer_to";
+export type HotkeyAction = "switch_layout" | "lock_remote_windows" | "toggle_microphone_mute" | "lock_escape" | "lock_focus" | "return_pointer_home" | "toggle_sharing" | "open_window" | "toggle_game_mode" | "pause_all" | "move_pointer_to" | "move_pointer_next";
 export interface Hotkey { action: HotkeyAction; device?: DeviceKey; profile?: string; keys: string[]; enabled: boolean }
-export type EventFrequency = "hz125" | "unlimited";
+export type EventFrequency = "hz125" | "hz250" | "hz500" | "unlimited";
 export interface KeySupport { macos: number[]; windows: number[] }
 export interface InputSettings {
   /** Read-only recovery chord provided by the router. */

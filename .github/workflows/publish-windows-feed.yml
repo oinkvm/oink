@@ -78,13 +78,14 @@ jobs:
         with:
           name: published-windows-update-input
           path: release-input
-      - name: Sign verified published Windows package
+      - name: Sign verified published Windows package (channel = live prerelease flag)
         env:
+          GH_TOKEN: ${{ github.token }}
           OINK_SOURCE_TREE_SHA256: ${{ needs.prepare.outputs.source_tree_sha256 }}
           OINK_RELEASE_TAG: ${{ inputs.release_tag }}
           WINDOWS_UPDATE_ED25519_PEM_WIN_2026_01: ${{ secrets.WINDOWS_UPDATE_ED25519_PEM_WIN_2026_01 }}
         run: python3 build-support/update/release.py sign-package
-      - name: Register immutable public asset and reserve Windows sequences
+      - name: Register immutable public asset and reserve Windows v1 and v2 sequences
         env:
           OINK_PUBLISHED_BUILD: ${{ needs.prepare.outputs.build }}
         run: |
@@ -95,6 +96,7 @@ jobs:
           WINDOWS_UPDATE_ED25519_PEM_WIN_2026_01: ${{ secrets.WINDOWS_UPDATE_ED25519_PEM_WIN_2026_01 }}
         run: |
           python3 build-support/update/feed.py sign
+          python3 build-support/update/feed_v2.py sign --platform windows
           python3 build-support/update/feed_site.py candidate --platform windows --output windows-candidate
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:

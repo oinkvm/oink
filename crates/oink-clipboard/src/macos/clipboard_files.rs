@@ -227,6 +227,10 @@ impl FileUrls {
         // task is held while waiting. The helper and network run independently.
         let budget =
             content::native_read::remote_read().ok_or_else(|| content::unavailable(Unavailable::ReadFailed))?;
+        // A drag proxy only waits for preparation; reading one URL is a paste.
+        if node.is_some() {
+            budget.clipboard();
+        }
         #[cfg(test)]
         {
             let shared = self.shared.clone();

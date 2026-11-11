@@ -2,62 +2,6 @@
   "schemaVersion": 1,
   "components": [
     {
-      "id": "native:Sparkle@2.9.6",
-      "name": "Sparkle",
-      "version": "2.9.6",
-      "ecosystem": "native",
-      "repository": "https://github.com/sparkle-project/Sparkle",
-      "source": {
-        "url": "https://github.com/sparkle-project/Sparkle/tree/ac2def288cbff5cfc7df3ffef6abdf45b72bcb0a",
-        "integrity": "git:ac2def288cbff5cfc7df3ffef6abdf45b72bcb0a"
-      },
-      "licenseExpression": "MIT AND BSD-2-Clause AND Zlib",
-      "selectedLicense": "MIT AND BSD-2-Clause AND Zlib",
-      "licenseFiles": [
-        {
-          "path": "licenses/native/Sparkle-2.9.6-LICENSE.txt",
-          "sha256": "389a4e4e9a32f059775b13a06e25a591445ba229d2838d26dd3e7c0c45127cfe"
-        }
-      ],
-      "modified": false,
-      "scope": [
-        "runtime"
-      ],
-      "platforms": [
-        "macos-arm64",
-        "macos-x64"
-      ],
-      "archive": {
-        "url": "https://github.com/sparkle-project/Sparkle/releases/download/2.9.6/Sparkle-2.9.6.tar.xz",
-        "sha256": "52bf9e88cdd972fc0c81501377a880e90d47031bd8ca5462488f843e2609e192"
-      },
-      "includedComponents": [
-        {
-          "name": "bsdiff/bspatch",
-          "version": "4.3",
-          "license": "BSD-2-Clause"
-        },
-        {
-          "name": "sais-lite",
-          "version": "2010-08-07",
-          "license": "MIT"
-        },
-        {
-          "name": "orlp/ed25519",
-          "version": "vendored in Sparkle 2.9.6",
-          "license": "Zlib"
-        },
-        {
-          "name": "SUSignatureVerifier.m",
-          "version": "Sparkle 2.9.6",
-          "license": "BSD-2-Clause"
-        }
-      ],
-      "packagePatterns": [
-        "**/Sparkle.framework/**"
-      ]
-    },
-    {
       "id": "native:Opus@1.6.1 (opusic-sys 0.7.5 vendor)",
       "name": "Opus",
       "version": "1.6.1 (opusic-sys 0.7.5 vendor)",

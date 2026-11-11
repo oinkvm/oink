@@ -158,6 +158,7 @@ fn backend_disappearance_ends_ui_subscription_without_restart() {
             oink_ui::service::follow(
                 &follower,
                 |_| connected_tx.send(()).unwrap(),
+                |_| {},
                 |end| ended_tx.send(end).unwrap(),
             )
         });
@@ -195,6 +196,7 @@ fn ui_disappearance_keeps_backend_available() {
         oink_ui::service::follow(
             &follower,
             |_| tx.send(()).unwrap(),
+            |_| {},
             |end| assert_eq!(end, EventsEnd::Cancelled),
         )
     });
@@ -337,6 +339,7 @@ fn process_fixture() {
                     oink_agent::ipc::Client::connect(&dir).unwrap().ui_ready().unwrap();
                     std::fs::write(dir.join("ui-ready"), []).unwrap();
                 },
+                |_| {},
                 |end| {
                     assert!(matches!(
                         end,

@@ -42,6 +42,23 @@ class PackageNotesTests(unittest.TestCase):
             path.write_text(json.dumps({**record, 'version':label}))
             with self.assertRaises(ValueError):
                 notes.previous_record(self.root, 44, path)
+    def test_previous_accepts_sequence_labels_of_encoded_builds(self):
+        commit = '0123abcd' * 5
+        path = self.root / 'previous.json'
+        record = {'build':306002, 'version':'0.3.6-inhouse.2', 'source_commit':commit}
+        path.write_text(json.dumps(record))
+        self.assertEqual(notes.previous_record(self.root, 306003, path), record)
+        for label in ('0.3.5-inhouse.2', '0.3.6-inhouse.3', '0.3.6-inhouse.306002', '0.3.6-inhouse.002'):
+            path.write_text(json.dumps({**record, 'version':label}))
+            with self.subTest(label=label), self.assertRaises(ValueError):
+                notes.previous_record(self.root, 306003, path)
+        # The first encoded build follows the last build of the old global counter.
+        out = self.root / 'packages'
+        for name, value in (('old', {'build':113, 'version':'0.3.5-inhouse.113', 'source_commit':commit}),
+                            ('new', record)):
+            (out / name).mkdir(parents=True); (out / name / 'release.json').write_text(json.dumps(value))
+        self.assertEqual(notes.previous_record(out, 306001)['build'], 113)
+        self.assertEqual(notes.previous_record(out, 306003), record)
 
     def test_public_uses_all_committed_approved_languages(self):
         self.commit('feat: initial')

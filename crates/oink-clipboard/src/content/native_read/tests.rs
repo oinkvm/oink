@@ -105,6 +105,9 @@ pub(crate) struct Harness {
 }
 impl Harness {
     pub(crate) fn new(platform: ClipPlatform, partial: bool) -> Self {
+        Self::with_demand(platform, partial, Demand::Clipboard)
+    }
+    fn with_demand(platform: ClipPlatform, partial: bool, demand: Demand) -> Self {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
@@ -138,7 +141,7 @@ impl Harness {
             inventory,
             platform,
             Arc::new(Transport(link.clone())),
-            Demand::Clipboard,
+            demand,
             runtime.handle().clone(),
         )
         .unwrap();
@@ -232,4 +235,32 @@ fn sibling_reads_share_the_callback_deadline() {
     let callback = Callback::begin();
     assert!(harness.remote.open(RepresentationId(1)).is_ok());
     callback.served();
+}
+
+#[test]
+fn only_served_clipboard_reads_report_a_paste() {
+    let holder = oink_foundation::content::Holder {
+        device: DeviceId([7; 32]),
+        epoch: 1,
+    };
+    for (demand, served, pastes) in [
+        (Demand::Clipboard, true, 1),
+        (Demand::Clipboard, false, 0),
+        (Demand::Hover(holder), true, 0),
+        (Demand::Drop(holder), true, 0),
+    ] {
+        let harness = Harness::with_demand(ClipPlatform::Mac, false, demand);
+        harness.link.answer.store(true, Ordering::Release);
+        let before = TEST_PASTES.get();
+        {
+            let callback = Callback::begin();
+            assert!(harness.remote.open(RepresentationId(1)).is_ok());
+            if served {
+                callback.served();
+            }
+        }
+        // A served callback that never touched remote content is not a paste.
+        Callback::begin().served();
+        assert_eq!(TEST_PASTES.get() - before, pastes, "{demand:?} served={served}");
+    }
 }
