@@ -23,16 +23,23 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # Only Windows x64 and Mac arm64 block a release. Every other target
+          # (Mac x64 now, later ones such as Windows arm64) still runs and is
+          # reported, but its failure does not fail the run.
           - os: macos-15
             target: aarch64-apple-darwin
             jobs: '2'
+            blocking: true
           - os: macos-15-intel
             target: x86_64-apple-darwin
             jobs: '2'
+            blocking: false
           - os: windows-2022
             target: x86_64-pc-windows-msvc
             jobs: '4'
+            blocking: true
     runs-on: ${{ matrix.os }}
+    continue-on-error: ${{ !matrix.blocking }}
     timeout-minutes: 120
     env:
       CARGO_BUILD_TARGET: ${{ matrix.target }}

@@ -317,6 +317,11 @@ pub struct InputStatus {
     /// Exact host still holding Left, used to revoke asynchronous URL preparation.
     pub dnd_host_pending: Option<(oink_foundation::content::ClipId, u64)>,
     pub paused: bool,
+    /// This device's own pause (user, remote request, emergency, backlog) as this
+    /// thread applied it. Every pause decision is applied here before it is
+    /// published in the local Facts. Unlike `paused`, it leaves out sleep and
+    /// missing control permission.
+    pub local_paused: bool,
     /// Safety epoch: every local or received emergency invalidates older resumes.
     pub emergency_sequence: u64,
     /// Local triggers only; received C0 emergencies must never become new group events.
@@ -484,6 +489,35 @@ impl InputThread {
     }
     pub fn status(&self) -> Arc<InputStatus> {
         self.shared.status.load()
+    }
+    /// The native step of `apply_pause_request`: the device-control owner applies
+    /// its decision here and waits for the fence before publishing it.
+    #[cfg(test)]
+    pub(crate) fn apply_owner_pause_for_test(&self, paused: bool) {
+        let (reply, result) = std::sync::mpsc::sync_channel(1);
+        self.send(InputCommand::ApplyOwnerPause {
+            paused,
+            expected_emergency_sequence: self.status().emergency_sequence,
+            reply,
+        });
+        result
+            .recv_timeout(std::time::Duration::from_secs(3))
+            .expect("native owner fenced the pause")
+            .expect("native owner accepted the pause");
+    }
+    /// Wait until the native owner has consumed every command sent before this
+    /// one (a pending state batch is queued ahead of any later action).
+    #[cfg(all(test, debug_assertions))]
+    pub(crate) fn flush_commands_for_test(&self) {
+        let (reply, result) = std::sync::mpsc::sync_channel(1);
+        self.send(InputCommand::DndWatchdogSnapshotForTest(reply));
+        result
+            .recv_timeout(std::time::Duration::from_secs(3))
+            .expect("native owner consumed its queue");
+    }
+    #[cfg(test)]
+    pub(crate) fn input_safety_for_test(&self) -> oink_input::session_gate::InputSafety {
+        self.backend.input_safety()
     }
     #[cfg(all(test, debug_assertions, target_os = "macos"))]
     pub(crate) fn pending_drag_for_test(&self, id: oink_foundation::content::ClipId, epoch: u64) {

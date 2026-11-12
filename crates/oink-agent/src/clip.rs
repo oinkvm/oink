@@ -33,6 +33,8 @@ mod health_tests;
 #[cfg(all(test, debug_assertions))]
 mod native_transfer_tests;
 #[cfg(all(test, debug_assertions))]
+mod pause_tests;
+#[cfg(all(test, debug_assertions))]
 mod promise_tests;
 mod runtime;
 #[cfg(all(test, debug_assertions))]
@@ -161,6 +163,15 @@ impl ClipHandle {
         if self.shared.paused.swap(paused, Ordering::AcqRel) != paused {
             self.reconfigure();
         }
+    }
+    /// A group-state change (layout, members, this device's pause publication).
+    /// It only wakes the clipboard to re-read the owner's pause decision. The
+    /// device-control owner records each decision and pauses or resumes the
+    /// clipboard directly before it publishes it (an emergency only after the
+    /// native safety fence), so the published pause can be older than the
+    /// clipboard's state while other group-state changes keep arriving.
+    pub(crate) fn config_state_changed(&self, node: &crate::node::Node) {
+        self.set_paused(node.fully_paused());
     }
     fn reconfigure(&self) {
         let active = self.shared.enabled.load(Ordering::Acquire) && !self.shared.paused.load(Ordering::Acquire);

@@ -207,8 +207,11 @@ impl InjectHandle {
         receive
     }
 
+    /// The worker sets `stopped` after its last native call and then only wakes
+    /// the input owner and returns. That wake is the owner's last chance to see
+    /// this state, so it must not also wait for the thread to have finished.
     pub(crate) fn detached(&self) -> bool {
-        self.stopped() && self.join.as_ref().is_none_or(|join| join.is_finished())
+        self.stopped()
     }
     pub(crate) fn take_backlog_trigger(&self) -> bool {
         self.backlog_trigger.swap(false, std::sync::atomic::Ordering::AcqRel)
@@ -255,9 +258,11 @@ impl InjectHandle {
         if !self.suspended() {
             return Ok(true);
         }
-        if !self.stopped() || self.join.as_ref().is_some_and(|join| !join.is_finished()) {
+        if !self.stopped() {
             return Ok(false);
         }
+        // A stopped worker has finished all native work; joining waits only
+        // for its final wake and return (see `detached`).
         if let Some(old) = self.join.take() {
             let _ = old.join();
         }
@@ -1598,6 +1603,44 @@ mod tests {
         waiting.recv().unwrap();
         assert_eq!(backend.injection_sessions(), 2);
         assert_eq!(backend.take_injected(), vec![fresh]);
+    }
+
+    /// The input owner republishes detachment, and retries resume, only when
+    /// the worker wakes it. The worker's last wake must therefore already see
+    /// it detached and resumable; nothing wakes the owner after the thread exits.
+    #[test]
+    fn the_last_wake_of_a_suspended_worker_observes_detachment_and_allows_resume() {
+        use super::*;
+        use oink_input::InputBackend;
+        use std::sync::{Arc, Mutex, mpsc};
+        let backend = Arc::new(oink_test_support::input::FakeInput::new());
+        let mut handle = start_with_backend(backend.clone(), Box::new(|_| {})).unwrap();
+        let (woke, wakes) = mpsc::channel();
+        let (release, released) = mpsc::channel::<()>();
+        let released = Mutex::new(released);
+        handle.set_wake(Arc::new(move || {
+            // Hold the worker inside its wake, as a preempted worker would be.
+            let _ = woke.send(());
+            let _ = released.lock().unwrap().recv();
+        }));
+        backend.set_input_paused(true);
+        handle.suspend();
+        loop {
+            wakes.recv().unwrap();
+            if handle.stopped() {
+                // Only the exit wake follows the stopped flag.
+                break;
+            }
+            release.send(()).unwrap();
+        }
+        assert!(handle.detached(), "the exit wake must observe the detached worker");
+        backend.set_input_paused(false);
+        // The owner's retry on that same wake must start the fresh session.
+        std::thread::scope(|scope| {
+            scope.spawn(|| release.send(()).unwrap());
+            assert!(handle.resume().unwrap());
+        });
+        assert!(!handle.suspended());
     }
 
     #[test]

@@ -35,7 +35,8 @@ pub(crate) fn start_link_runtime(
             config.settings.clipboard.unwrap_or_else(default_settings),
         )
     };
-    let paused = group.applied().paused;
+    // The owner's decision, not its publication (see `ClipHandle::config_state_changed`).
+    let paused = node.fully_paused();
     let data_dir = node.cache_dir();
     std::fs::create_dir_all(&data_dir)?;
     let clock = clock::Clock::load(node.data_dir().join("clipboard-clock.json"))?;
@@ -209,7 +210,7 @@ impl Task {
                     });
                 },
                 change=changes.next()=>match change {
-                    Some(ConfigChange::State{..})=>handle.set_paused(group.applied().paused),
+                    Some(ConfigChange::State{..})=>handle.config_state_changed(&node),
                     Some(ConfigChange::Facts{device,capabilities_changed})=>self.streams.facts_changed(device,capabilities_changed),
                     Some(_)=>{},None=>break,
                 },

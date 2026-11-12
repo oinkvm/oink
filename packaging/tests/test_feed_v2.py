@@ -181,13 +181,28 @@ class StateTests(unittest.TestCase):
         return stable[2], beta[2]
 
     def deploy(self, platform, state=None, revision=0, deployed=None):
-        """Merge a candidate signed in `state` into `deployed` (default: the same state)."""
+        """Merge a candidate signed in `state` into `deployed` (default: the same state).
+
+        A separate `deployed` is the state branch after reserve.py: the merge
+        then runs through deploy.prepare like the deploy job, which first
+        verifies that branch as the rollback snapshot.
+        """
         state = state or self.state
-        candidate = self.root / f'{platform}-candidate-{revision}'
-        feed_site.candidate(state, platform, candidate)
-        output = self.root / f'{platform}-next-{revision}'
-        feed_site.merge(deployed or state, candidate, output, revision)
-        return output
+        job = self.root / f'{platform}-deploy-{revision}'
+        feed_site.candidate(state, platform, job / 'candidate-state')
+        if deployed is None:
+            feed_site.merge(state, job / 'candidate-state', job / 'next-state', revision)
+            return job / 'next-state'
+        import deploy
+        cwd = os.getcwd()
+        os.chdir(job)
+        try:
+            with patch.object(deploy, 'STATE', deployed), patch.object(deploy, 'git', return_value='a' * 40), \
+                    patch.dict(os.environ, {'PLATFORM': platform}):
+                deploy.prepare()
+        finally:
+            os.chdir(cwd)
+        return job / 'next-state'
 
     def signing_checkout(self, deployed, name):
         """The publisher's own checkout of the deployed state branch."""
@@ -272,7 +287,9 @@ class StateTests(unittest.TestCase):
         feed_v2.sign_plans(self.state, 'windows', self.config)
         deployed = self.deploy('windows')
         h, _, _ = self.record(306003, 'beta')
+        # register's writes in the publisher's checkout: record, per-build site record, record lists.
         shutil.copy(self.state / 'records' / f'{h}.json', deployed / 'records' / f'{h}.json')
+        feed.write(deployed / 'site/windows/releases/306003/release.json', (self.state / 'records' / f'{h}.json').read_bytes())
         reg = feed.registry(deployed)
         reg['feeds'][EPOCH['epoch']]['beta']['records'].append(h)
         feed.write(deployed / 'registry.json', reg)
@@ -410,6 +427,72 @@ class StateTests(unittest.TestCase):
                              {c: {k: s[k] for k in ('records', 'v2_records') if k in s} for c, s in before[epoch].items()})
             with self.assertRaisesRegex(ValueError, 'release_build_changed'):
                 register(promoted, self.v036('beta', 6))
+
+    def test_promotion_retry_deploys_both_platforms_over_a_pending_windows_reservation(self):
+        """seed-update-feeds for v0.3.6 after the prerelease flag was cleared (both platforms).
+
+        Each Windows publication's reserve.py pushes its record lists before the
+        deploy jobs run, so every deploy of that dispatch verifies a branch whose
+        Windows reservation is ahead of the deployed manifests. A first attempt
+        whose deployment failed leaves its reservation behind; the retry starts
+        from that branch and must neither reuse its sequences nor fail on it.
+        """
+        import release as hooks
+        stable, legacy_beta = self.windows_state()
+        self.install('mac', 2)
+        epoch = EPOCH['epoch']
+        v2_paths = {c: feed_v2.relative('windows', epoch, 'x64', c) for c in ('stable', 'beta')}
+        register = lambda state, path: hooks.register(self.config, state, path, NOW)
+        with patch.dict(os.environ, {'OINK_PUBLISHED_BUILD': '306003'}):
+            register(self.state, self.v036('beta', 3))
+            feed.sign_plans(self.state, self.config)
+            feed_v2.sign_plans(self.state, 'windows', self.config)
+            branch = self.deploy('windows')
+            beta_record = (branch / 'site/windows/releases/306003/release.json').read_bytes()
+
+            # The failed attempt: its reservation reached the branch, nothing was deployed.
+            failed = self.signing_checkout(branch, 'failed-signing')
+            register(failed, self.v036('stable', 4))
+            self.reserve(failed, branch)
+            reserved = feed.registry(branch)
+            # The deployed snapshot is still the beta publication, and still valid.
+            feed_site.verify_all(branch)
+
+            # The retry: a fresh publisher checkout of that branch.
+            signing = self.signing_checkout(branch, 'retry-signing')
+            register(signing, self.v036('stable', 5))
+            self.reserve(signing, branch)
+            feed.sign_plans(signing, self.config)
+            feed_v2.sign_plans(signing, 'windows', self.config)
+            # The Mac deploy job verifies the whole branch, Windows reservation included.
+            branch = self.deploy('mac', self.signing_checkout(branch, 'mac-signing'), 1, branch)
+            promoted = self.deploy('windows', signing, 2, branch)
+
+        signed = self.manifests(promoted)
+        self.assertEqual([(r['build'], r['channel']) for r in signed['stable']['releases']],
+                         [(306001, 'stable'), (306003, 'stable')])
+        self.assertEqual([(r['build'], r['channel']) for r in signed['beta']['releases']],
+                         [(306001, 'stable'), (306002, 'beta'), (306003, 'stable')])
+        for channel in ('stable', 'beta'):
+            # One past the failed attempt's reservation: never reused.
+            self.assertEqual(signed[channel]['sequence'], reserved['v2'][v2_paths[channel]]['last_allocated'] + 1)
+            v1 = feed.manifest((promoted / 'site' / feed.relative(epoch, channel)).read_bytes(), EPOCH, channel)
+            self.assertEqual(v1['sequence'], reserved['feeds'][epoch][channel]['last_allocated'] + 1)
+            self.assertEqual([r['build'] for r in v1['releases']], [306001, 306003] if channel == 'stable' else
+                             [306001, 306002, 306003])
+        feed_site.verify_all(promoted)
+
+        # A deployed record that its signed manifests do not list is still rejected,
+        # even when the platform file list was rewritten to match it.
+        tampered = self.signing_checkout(promoted, 'tampered')
+        feed.write(tampered / 'site/windows/releases/306003/release.json', beta_record)
+        with self.assertRaisesRegex(ValueError, 'platform_digest'):
+            feed_site.verify_all(tampered)
+        reg = feed.registry(tampered)
+        reg['platforms']['windows']['files']['windows/releases/306003/release.json'] = feed.digest(beta_record)
+        feed.write(tampered / 'registry.json', reg)
+        with self.assertRaisesRegex(ValueError, 'signed_catalog_changed'):
+            feed_site.verify_all(tampered)
 
     def test_v2_promotion_accepts_only_the_channel_flip_of_the_published_build(self):
         _, beta = release(306002, 'beta')

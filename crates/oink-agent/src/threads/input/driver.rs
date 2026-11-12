@@ -531,6 +531,7 @@ impl Driver {
             && status.dnd_active == (router.dnd_state_name() != "idle")
             && status.dnd_host_pending == router.dnd_host_pending()
             && status.paused == router.paused()
+            && status.local_paused == self.paused
             && status.emergency_sequence == self.emergency_sequence
             && status.injection_detached == self.inject.detached()
             && status.locked_device == router.locked_device()
@@ -592,6 +593,7 @@ impl Driver {
             dnd_active: self.adapter.router().dnd_state_name() != "idle",
             dnd_host_pending: self.adapter.router().dnd_host_pending(),
             paused: self.adapter.router().paused(),
+            local_paused: self.paused,
             emergency_sequence: self.emergency_sequence,
             local_emergency_sequence: self.local_emergency_sequence,
             locked_device: self.adapter.router().locked_device(),

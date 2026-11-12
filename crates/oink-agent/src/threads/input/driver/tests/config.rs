@@ -109,7 +109,11 @@ async fn start() -> Vec<Running> {
     }
     nodes
 }
-fn pause(config: &ConfigModule, paused: bool) {
+/// The device-control owner's order (`apply_pause_request`): the native owner
+/// applies the decision first, then the owner publishes it in its local facts.
+fn pause(node: &Running, paused: bool) {
+    node.input.apply_owner_pause_for_test(paused);
+    let config = &node.config;
     let facts = config.local_facts();
     let old = facts.pause().unwrap().unwrap();
     let pause = dto::LocalPauseState::from_raw(
@@ -229,7 +233,7 @@ async fn config_capability_changes_and_reader_resend_drive_the_real_input_manage
         other => panic!("focus opening expected, got {other:?}"),
     };
     let old_instances: Vec<_> = nodes.iter().map(|node| instance(&node.input)).collect();
-    pause(&nodes[0].config, true);
+    pause(&nodes[0], true);
     until(&mut nodes, |nodes| {
         nodes[0].input.status().paused
             && peer_status(nodes, 0).outbound.is_none()
@@ -240,7 +244,7 @@ async fn config_capability_changes_and_reader_resend_drive_the_real_input_manage
     assert!(nodes.iter().all(|node| node.links.links().ready_count() == 1));
     assert_ne!(instance(&nodes[0].input), old_instances[0]);
     assert_eq!(instance(&nodes[1].input), old_instances[1]);
-    pause(&nodes[0].config, false);
+    pause(&nodes[0], false);
     until(&mut nodes, |nodes| (0..2).all(|n| peer_status(nodes, n).online)).await;
     for (n, before) in before_pause.iter().enumerate() {
         assert!(

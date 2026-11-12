@@ -258,6 +258,8 @@ impl InputStreams {
         let touchpad_contacts = input.touchpad_contacts();
         let paused = config.applied().paused;
         input.send(InputCommand::Controllable(controllable));
+        // The initial state starts capture; later transitions have their own
+        // writers (see `pause_changed`).
         input.send(InputCommand::Paused(paused));
         Self {
             links,
@@ -333,11 +335,7 @@ impl InputStreams {
                     // The platform observer owns active native input geometry.
                     // Config facts also retain OS-disabled screens for the editor.
                     Some(crate::config_module::ConfigChange::LocalDisplays) => self.input.wake()(),
-                    Some(_) => {
-                        self.input.wake()(); // Apply the shared layout even when native capability stays None (Mac source).
-                        self.refresh_contacts();
-                        self.pause_changed(self.config.applied().paused);
-                    },
+                    Some(_) => self.config_state_changed(),
                     None => break,
                 },
                 notice = notices.next() => match notice {
@@ -439,6 +437,24 @@ impl InputStreams {
                     wait_release = observed.is_some_and(|s| s.releasing),
                     "Input opening timed out; reconnecting link");
         }
+    }
+    /// Any config change other than peer Facts and local displays: group state,
+    /// members, local publications (including this device's pause), controls.
+    fn config_state_changed(&mut self) {
+        self.input.wake()(); // Apply the shared layout even when native capability stays None (Mac source).
+        self.refresh_contacts();
+        self.pause_changed(self.local_paused());
+    }
+    /// This device's pause as the native owner applied it. Every pause decision
+    /// is applied there first and published in the local Facts later: the
+    /// device-control owner waits for the native fence before it publishes, an
+    /// emergency or backlog pause starts there and is published only after the
+    /// native safety fence. Unrelated config changes arrive in between, and the
+    /// emergency notice and the publications are separate queues, so the
+    /// published value can be older than the native decision. It is only a
+    /// wake-up to read this one.
+    fn local_paused(&self) -> bool {
+        self.input.status().local_paused
     }
     fn refresh_contacts(&mut self) {
         let contacts = self.input.touchpad_contacts();
@@ -575,7 +591,9 @@ impl InputStreams {
                 }
             }
             InputNotice::EmergencyPause => {
-                self.pause_changed(true);
+                // The native owner published its pause before this notice. Read
+                // it rather than assume it: a resume may have followed since.
+                self.pause_changed(self.local_paused());
                 // The configuration owner consumes the input owner's local emergency sequence and publishes one C0 event.
             }
         }
@@ -702,8 +720,13 @@ impl StreamModule for InputStreams {
         if self.paused == paused {
             return;
         }
+        // Only the stream machines follow the pause here. The native owner
+        // already applied this transition: the device-control owner sends it
+        // there (fenced) before publishing it, and emergencies and backlog
+        // pauses start there. The task reads it back (`local_paused`) later,
+        // so the value can be older than the owner's next decision; sending it
+        // back would re-pause a resumed device or resume a paused one.
         self.paused = paused;
-        self.input.send(InputCommand::Paused(paused));
         self.poll();
     }
     fn facts_changed(&mut self, peer: DeviceId, capabilities_changed: bool) {

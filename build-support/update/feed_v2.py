@@ -8,9 +8,10 @@ existing Sparkle key through the pinned official sign_update: the secret may be
 Sparkle's 32-byte seed or its legacy 96-byte expanded key, which OpenSSL cannot
 load. Every signature is verified with OpenSSL before it is written.
 
-Windows releases derive from the registered v1 records (the same signed MSI
-package objects); Mac releases come from public per-build records under
-mac/releases/. Rules come from packaging/update-rules.json (rules.py).
+Releases come from the public per-build records in the site, which only a
+merged candidate changes: windows/releases/ (the registered v1 records, the same
+signed MSI package objects) and mac/releases/. Rules come from
+packaging/update-rules.json (rules.py).
 No command accepts a private key, URL, epoch override or release catalog on argv.
 """
 import argparse
@@ -124,19 +125,31 @@ def verify_manifest(raw, platform, epoch, public_key, arch, channel, repository,
     return obj
 
 
-def windows_releases(state, reg, epoch, channel):
-    """v2 views of the registered v1 records: identical signed MSI package objects."""
+def windows_releases(state, epoch):
+    """v2 views of the per-build Windows records in the site: identical signed MSI package objects.
+
+    Like Mac, the catalog comes from site/windows/releases/<build>/release.json,
+    which only a merged candidate changes (its digests are in the platform file
+    list). Never from registry['feeds']: reserve.py commits a publication's
+    record lists (v1 catalog and merge fence) before the deployment, so those
+    lists describe the pending reservation, not the deployed snapshot that
+    verify_snapshot checks. The publisher's register writes the new record into
+    its own site checkout before allocating, so allocation sees it there.
+    """
     result = []
-    slot = reg['feeds'][epoch][channel]
-    # v2_records: beta releases kept out of the v1 beta manifest.
-    for record_hash in slot['records'] + (slot.get('v2_records', []) if channel == 'beta' else []):
-        feed.require(re.fullmatch('[0-9a-f]{64}', record_hash), 'record_hash')
-        raw = (state / 'records' / f'{record_hash}.json').read_bytes()
-        feed.require(feed.digest(raw) == record_hash, 'record_digest')
+    folder = state / 'site/windows/releases'
+    for name, raw in sorted(_files(folder).items()) if folder.exists() else ():
+        match = re.fullmatch(r'([1-9][0-9]*)/release[.]json', name)
+        feed.require(match is not None, 'windows_feed_path')
+        record_hash = feed.digest(raw)
+        feed.require((state / 'records' / f'{record_hash}.json').read_bytes() == raw, 'record_digest')
         record = feed.loads(raw)
         feed.require(record['schema'] == 1 and record['approved'] is True and record['published'] is True, 'unapproved_record')
         r = record['release']
+        feed.require(r['build'] == int(match[1]), 'record_digest')
         feed.require(r['architecture'] == 'x64', 'release_architecture')
+        if r['package']['keyId'] != epoch:
+            continue  # signed for another key epoch's feeds (register picks the epoch by keyId)
         result.append({'build': r['build'], 'version': r['version'], 'tag': r['tag'],
                        'channel': r.get('channel', 'stable'), 'sourceTreeSha256': r['sourceTreeSha256'],
                        'minimumOs': f'10.0.{r["minimumWindowsBuild"]}', 'protocolBaseline': r['protocolBaseline'],
@@ -173,9 +186,9 @@ def _files(folder):
     return feed_site.files(folder)
 
 
-def catalog(state, reg, platform, config, epoch, arch, channel):
+def catalog(state, platform, config, epoch, arch, channel):
     if platform == 'windows':
-        releases = windows_releases(state, reg, epoch, channel)
+        releases = windows_releases(state, epoch)
     else:
         releases = [r['release'] for r in mac_records(state, config['repository']).values() if r['architecture'] == arch]
     releases = sorted((r for r in releases if channel == 'beta' or r['channel'] == 'stable'), key=lambda r: r['build'])
@@ -210,7 +223,7 @@ def allocate(state, platform, config, rules, at, release_build=None):
     plans = []
     for epoch, key, arch, channel in slots(platform, config):
         path = relative(platform, epoch, arch, channel)
-        releases = catalog(state, reg, platform, config, epoch, arch, channel)
+        releases = catalog(state, platform, config, epoch, arch, channel)
         builds = {r['build'] for r in releases}
         rule_compiler.validate(rules, builds)
         slot = v2.setdefault(path, {'last_allocated': 0})
@@ -286,7 +299,7 @@ def verify_snapshot(state, platform, config, at=None):
         obj = verify_manifest((state / 'site' / path).read_bytes(), platform, epoch, key, arch, channel,
                               config['repository'], at=at)
         feed.require(path in v2 and obj['sequence'] <= v2[path]['last_allocated'], 'deployment_sequence')
-        feed.require(obj['releases'] == catalog(state, reg, platform, config, epoch, arch, channel), 'signed_catalog_changed')
+        feed.require(obj['releases'] == catalog(state, platform, config, epoch, arch, channel), 'signed_catalog_changed')
 
 
 def sequence(raw):
