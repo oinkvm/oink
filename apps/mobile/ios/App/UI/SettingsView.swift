@@ -453,7 +453,7 @@ private struct MainSettings: View {
 
     private var versionText: String {
         let info = Bundle.main.infoDictionary
-        let version = info?["CFBundleShortVersionString"] as? String ?? "—"
+        let version = info?["CFBundleGetInfoString"] as? String ?? info?["CFBundleShortVersionString"] as? String ?? "—"
         let build = info?["CFBundleVersion"] as? String ?? ""
         return build.isEmpty ? version : "\(version) (\(build))"
     }

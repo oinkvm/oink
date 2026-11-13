@@ -638,7 +638,8 @@ final class CoreSession: ObservableObject {
                     // PCs draw the iPhone or iPad badge from this fact.
                     formFactor: UIDevice.current.userInterfaceIdiom == .pad ? .tablet : .phone,
                     // PCs list this phone with the version Settings → About shows.
-                    appVersion: Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String)
+                    appVersion: Bundle.main.infoDictionary?["CFBundleGetInfoString"] as? String
+                        ?? Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String)
                 #if OINK_MAIN_APP
                 if profile == .mobile, try initializeMobileGroup(config: config, identitySeed: seed) == .replaced {
                     groupReplaced = true

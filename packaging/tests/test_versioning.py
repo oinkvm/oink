@@ -53,11 +53,11 @@ class PhoneVersions(unittest.TestCase):
     def test_command_line_for_gradle_and_xcodebuild(self):
         build = encode_build(INHOUSE, 3)
         script = str(ROOT / 'build-support/mobile_version.py')
-        gradle = subprocess.run([sys.executable, script, str(build)], capture_output=True, text=True, check=True)
+        gradle = subprocess.run([sys.executable, script, '--channel', 'beta', str(build)], capture_output=True, text=True, check=True)
         self.assertEqual(json.loads(gradle.stdout),
-                         {'build': build, 'version_name': f'{INHOUSE}-inhouse.3', 'marketing_version': INHOUSE})
-        xcode = subprocess.run([sys.executable, script, '--xcode', str(build)], capture_output=True, text=True, check=True)
-        self.assertEqual(xcode.stdout.split(), [f'MARKETING_VERSION={INHOUSE}', f'CURRENT_PROJECT_VERSION={build}'])
+                         {'build': build, 'version_name': f'{INHOUSE}-beta.3', 'marketing_version': INHOUSE})
+        xcode = subprocess.run([sys.executable, script, '--channel', 'beta', '--xcode', str(build)], capture_output=True, text=True, check=True)
+        self.assertEqual(xcode.stdout.split(), [f'MARKETING_VERSION={INHOUSE}', f'CURRENT_PROJECT_VERSION={build}', f'OINK_DISPLAY_VERSION={INHOUSE}-beta.3'])
         refused = subprocess.run([sys.executable, script, '306002' if INHOUSE != '0.3.6' else '400001'],
                                  capture_output=True, text=True)
         self.assertEqual(refused.returncode, 1)
@@ -238,7 +238,12 @@ class LocalVersions(unittest.TestCase):
             with self.subTest(public=public), tempfile.TemporaryDirectory() as temp:
                 build = encode_build(IDENTITY['version'] if public else INHOUSE, 17)
                 argv = ['package.py', '--platform', 'windows', '--sequence', '17', '--output-root', temp]
-                argv += ['--public-version'] if public else ['--source-commit', COMMIT]
+                if public:
+                    argv += ['--public-version']
+                else:
+                    receipt = dict(schema=1, channel='inhouse', repository='oinkvm/oink', workflow='ci.yml', ref='refs/heads/0.4', version=INHOUSE, sequence=17, build=build, source_commit=COMMIT, request_id='a'*32, run_id=1)
+                    path = Path(temp)/'reservation.json'; path.write_text(json.dumps(receipt))
+                    argv = ['package.py', '--platform', 'windows', '--output-root', temp, '--build-reservation', str(path), '--source-commit', COMMIT]
                 with patch.object(sys, 'argv', argv), patch.object(module.platform, 'system', return_value='Windows'), \
                         patch.object(module.platform, 'machine', return_value='AMD64'), \
                         patch.object(module, 'local_source_commit', return_value=COMMIT) as resolve, \

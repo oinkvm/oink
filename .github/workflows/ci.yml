@@ -1,13 +1,22 @@
 name: Build and test
+run-name: ${{ inputs.reserve_only && format('Oink build reservation {0}', inputs.request_id) || format('Build {0}', github.ref_name) }}
 on:
   pull_request:
   push:
     branches: [main, '0.4']
   workflow_dispatch:
+    inputs:
+      reserve_only:
+        description: Reserve a shared number for a local in-house build; do not compile
+        type: boolean
+        default: false
+      request_id:
+        description: Random reservation request id (local helper)
+        type: string
 permissions:
   contents: read
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ci-${{ inputs.reserve_only && github.run_id || github.ref }}
   cancel-in-progress: true
 env:
   # Branch builds compile products without invoking the full test/policy suite.
@@ -21,6 +30,7 @@ env:
   CMAKE_POLICY_VERSION_MINIMUM: '3.5'
 jobs:
   platforms:
+    if: github.ref != 'refs/heads/0.4' && !inputs.reserve_only
     strategy:
       fail-fast: false
       matrix:
@@ -135,7 +145,8 @@ jobs:
           cargo deny check
 
   android:
-    if: github.ref == 'refs/heads/0.4' || github.base_ref == '0.4'
+    needs: beta-plan
+    if: github.ref == 'refs/heads/0.4' && !inputs.reserve_only
     strategy:
       fail-fast: false
       matrix:
@@ -149,7 +160,9 @@ jobs:
     runs-on: ubuntu-24.04
     continue-on-error: ${{ !matrix.blocking }}
     timeout-minutes: 90
+    environment: release
     env:
+      OINK_PACKAGE_CHANNEL: beta
       MOBILE_PROFILE: debug
       MOBILE_ANDROID_ABIS: ${{ matrix.abi }}
       CARGO_BUILD_JOBS: '2'
@@ -181,10 +194,178 @@ jobs:
         run: cargo install cargo-ndk --version 4.1.2 --locked
       - name: Build Rust core and Kotlin bindings
         run: bash build-support/mobile/build-android.sh
-      - name: Assemble debug APK (no release signing credentials)
-        run: bash apps/mobile/android/gradlew -p apps/mobile/android --no-daemon :app:assembleDebug -PoinkBuild=400008 -PoinkAbis=${{ matrix.abi }}
+      - name: Restore the existing in-house Android signing key
+        env:
+          OINK_ANDROID_KEYSTORE_BASE64: ${{ secrets.OINK_ANDROID_KEYSTORE_BASE64 }}
+          OINK_ANDROID_KEYSTORE_PASSWORD: ${{ secrets.OINK_ANDROID_KEYSTORE_PASSWORD }}
+          OINK_ANDROID_KEY_ALIAS: ${{ secrets.OINK_ANDROID_KEY_ALIAS }}
+          OINK_ANDROID_KEY_PASSWORD: ${{ secrets.OINK_ANDROID_KEY_PASSWORD }}
+        run: python3 build-support/android_signing.py prepare
+      - name: Assemble APK signed by the existing in-house key
+        env:
+          OINK_ANDROID_KEYSTORE_PASSWORD: ${{ secrets.OINK_ANDROID_KEYSTORE_PASSWORD }}
+          OINK_ANDROID_KEY_ALIAS: ${{ secrets.OINK_ANDROID_KEY_ALIAS }}
+          OINK_ANDROID_KEY_PASSWORD: ${{ secrets.OINK_ANDROID_KEY_PASSWORD }}
+        run: bash apps/mobile/android/gradlew -p apps/mobile/android --no-daemon :app:assembleDebug -PoinkBuild=${{ needs.beta-plan.outputs.build }} -PoinkChannel=beta -PoinkAbis=${{ matrix.abi }}
+      - name: Verify APK version and ABI and stage installer
+        run: python3 build-support/beta_draft.py stage --target android-${{ matrix.abi }} --apk apps/mobile/android/app/build/outputs/apk/debug/app-debug.apk --aapt2 "$ANDROID_HOME/build-tools/37.0.0/aapt2" --output "$RUNNER_TEMP/beta"
+      - name: Verify the APK has the same signing certificate as in-house
+        run: python3 build-support/android_signing.py verify --apk apps/mobile/android/app/build/outputs/apk/debug/app-debug.apk --apksigner "$ANDROID_HOME/build-tools/37.0.0/apksigner" --output "$RUNNER_TEMP/beta/android-signature.json"
+      - name: Remove ephemeral Android signing material
+        if: always()
+        run: python3 build-support/android_signing.py cleanup
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: android-debug-${{ matrix.abi }}
-          path: apps/mobile/android/app/build/outputs/apk/debug/*.apk
+          name: beta-android-${{ matrix.abi }}
+          path: ${{ runner.temp }}/beta/*
           if-no-files-found: error
+
+  beta-plan:
+    if: github.repository == 'oinkvm/oink' && github.ref == 'refs/heads/0.4'
+    runs-on: ubuntu-24.04
+    outputs:
+      sequence: ${{ steps.plan.outputs.sequence }}
+      build: ${{ steps.plan.outputs.build }}
+      version: ${{ steps.plan.outputs.version }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - name: Allocate this run's shared sequence
+        id: plan
+        env:
+          RESERVE_ONLY: ${{ inputs.reserve_only }}
+          REQUEST_ID: ${{ inputs.request_id }}
+        run: python3 build-support/beta_draft.py plan --output "$RUNNER_TEMP/reservation"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: inputs.reserve_only
+        with:
+          name: build-reservation
+          path: ${{ runner.temp }}/reservation/build-reservation.json
+          if-no-files-found: error
+
+  desktop-packages:
+    needs: beta-plan
+    if: github.repository == 'oinkvm/oink' && github.ref == 'refs/heads/0.4' && !inputs.reserve_only
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15
+            platform: macos
+            arch: arm64
+            target: aarch64-apple-darwin
+            package: macos-arm64
+            jobs: '2'
+            blocking: true
+          - os: macos-15-intel
+            platform: macos
+            arch: x64
+            target: x86_64-apple-darwin
+            package: macos-x64
+            jobs: '2'
+            blocking: false
+          - os: windows-2022
+            platform: windows
+            arch: x64
+            target: x86_64-pc-windows-msvc
+            package: windows-x64
+            jobs: '4'
+            blocking: true
+    runs-on: ${{ matrix.os }}
+    continue-on-error: ${{ !matrix.blocking }}
+    timeout-minutes: 120
+    environment: release
+    env:
+      CARGO_BUILD_JOBS: ${{ matrix.jobs }}
+      OINK_PACKAGE_CHANNEL: beta
+      OINK_REPORT_REGION: eu
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f
+        with:
+          toolchain: '1.99.0'
+          components: rustfmt
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          key: beta-${{ matrix.target }}
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.14.6'
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
+        with:
+          node-version: '24.14.1'
+          cache: npm
+          cache-dependency-path: package-lock.json
+      - uses: actions/cache@0400d5f644dc74513175e3cd8d07132dd4860809 # v4
+        with:
+          path: |
+            ~/.cargo/bin/cargo-about*
+            ${{ runner.temp }}/package-tools
+          key: release-tools-${{ runner.os }}-${{ runner.arch }}-rust1.99.0-about0.9.2-wix5.0.2-sparkle2.9.6
+      - name: Pin build tools and check formatting
+        shell: bash
+        run: |
+          if [[ "$RUNNER_OS" == macOS ]]; then test "$(uname -m)" = "${{ matrix.arch == 'arm64' && 'arm64' || 'x86_64' }}"; fi
+          npm install --global npm@11.11.0
+          if ! cargo about --version 2>/dev/null | grep -q '0.9.2$'; then cargo install cargo-about --version 0.9.2 --locked --features cli; fi
+          cargo fmt --all --check
+          npm ci
+          npm run -w apps/oink typecheck
+      - name: Prepare existing Mac signing and notarization credentials
+        if: runner.os == 'macOS'
+        env:
+          MACOS_CERTIFICATE_P12: ${{ secrets.MACOS_CERTIFICATE_P12 }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          MACOS_SIGNING_FINGERPRINT: ${{ vars.MACOS_SIGNING_FINGERPRINT }}
+          APPLE_NOTARY_KEY_P8: ${{ secrets.APPLE_NOTARY_KEY_P8 }}
+          APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
+          APPLE_NOTARY_ISSUER: ${{ secrets.APPLE_NOTARY_ISSUER }}
+        run: python packaging/macos/ci-keychain.py
+      - name: Use TCP for Apple ticket delivery on hosted Macs
+        if: runner.os == 'macOS' && runner.environment == 'github-hosted'
+        shell: bash
+        run: |
+          echo 'block return out quick proto udp from any to any port 443' | sudo pfctl -f -
+          sudo pfctl -E
+      - name: Build and audit beta installers (without full test suites)
+        shell: bash
+        env:
+          OINK_REPORT_DSN: ${{ secrets.OINK_REPORT_DSN }}
+          MACOS_SIGNING_FINGERPRINT: ${{ vars.MACOS_SIGNING_FINGERPRINT }}
+          SEQUENCE: ${{ needs.beta-plan.outputs.sequence }}
+        run: |
+          args=()
+          if [[ "$RUNNER_OS" == macOS ]]; then
+            args+=(--arch "${{ matrix.arch }}" --notary-profile release-notary --notary-keychain "$RUNNER_TEMP/release-signing/signing.keychain-db" --notary-timeout 1200)
+          fi
+          python build-support/package.py --beta --platform "${{ matrix.platform }}" --sequence "$SEQUENCE" --output-root "$RUNNER_TEMP/packages" --tool-cache "$RUNNER_TEMP/package-tools" "${args[@]}"
+          python build-support/beta_draft.py stage --target "${{ matrix.package }}" --packages "$RUNNER_TEMP/packages" --output "$RUNNER_TEMP/beta"
+      - name: Remove ephemeral signing material
+        if: always() && runner.os == 'macOS'
+        run: python packaging/macos/ci-keychain.py cleanup
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: beta-${{ matrix.package }}
+          path: ${{ runner.temp }}/beta/*
+          if-no-files-found: error
+
+  beta-draft:
+    needs: [beta-plan, desktop-packages, android]
+    if: ${{ !cancelled() && github.repository == 'oinkvm/oink' && github.ref == 'refs/heads/0.4' && !inputs.reserve_only && needs.beta-plan.result == 'success' && needs.desktop-packages.result == 'success' }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: beta-*
+          path: ${{ runner.temp }}/downloaded
+      - name: Verify source/version/integrity and create only a draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 build-support/beta_draft.py publish --downloads "$RUNNER_TEMP/downloaded" --output "$RUNNER_TEMP/draft"

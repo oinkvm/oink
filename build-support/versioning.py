@@ -1,5 +1,6 @@
 """Display labels and numeric builds: a build encodes the version it packages (identity.encode_build)."""
 import re
+import os
 import subprocess
 from identity import IDENTITY, decode_build, encode_build
 from provenance import ROOT, product_source
@@ -17,9 +18,10 @@ def inhouse_version():
     return inhouse
 
 
-def package_build(sequence, inhouse):
+def package_build(sequence, inhouse, channel=None):
     """In-house packages number inhouse_version's builds; public ones the manifest version's."""
-    return encode_build(inhouse_version() if inhouse else IDENTITY['version'].split('-')[0], sequence)
+    channel = channel or os.environ.get('OINK_PACKAGE_CHANNEL')
+    return encode_build(inhouse_version() if inhouse or channel == 'beta' else IDENTITY['version'].split('-')[0], sequence)
 
 
 def encoded_sequence(version, build):
@@ -36,10 +38,22 @@ def inhouse_label(build):
     return f'{version}-inhouse.{encoded_sequence(version, build)}'
 
 
-def release_version(base, source_commit, build):
+def beta_label(build):
+    version = inhouse_version()
+    return f'{version}-beta.{encoded_sequence(version, build)}'
+
+
+def release_version(base, source_commit, build, channel=None):
     """Display label of a package; rejects a build that does not encode the labelled version."""
     if not re.fullmatch(r'[0-9]+\.[0-9]+\.[0-9]+(?:-beta\.[0-9]+)?', base):
         raise ValueError('packages require a stable or beta.N base version')
+    channel = channel or os.environ.get('OINK_PACKAGE_CHANNEL')
+    if channel == 'beta':
+        if source_commit is not None:
+            raise ValueError('beta packages cannot use an in-house source label')
+        return beta_label(build)
+    if channel not in (None, '', 'inhouse'):
+        raise ValueError('unknown package channel')
     if source_commit is not None:
         validate_source_commit(source_commit)
         return inhouse_label(build)

@@ -22,10 +22,12 @@ def main():
     p.add_argument('--platform', choices=['macos', 'windows'], required=True)
     p.add_argument('--arch', choices=['arm64', 'x64'], default='arm64', help='Mac package architecture')
     p.add_argument('--output-root', type=Path, required=True)
-    p.add_argument('--sequence', type=int, required=True, help='n of the packaged version: build = major*10^7 + minor*10^5 + patch*10^3 + n')
+    p.add_argument('--sequence', type=int, help='n of the packaged version: build = major*10^7 + minor*10^5 + patch*10^3 + n')
+    p.add_argument('--build-reservation', type=Path, help='Shared CI reservation for local 0.4 in-house builds')
     p.add_argument('--windows-update-test-feed', help='TEST ONLY: compile a literal HTTP loopback feed and TEST public key')
     versions = p.add_mutually_exclusive_group()
     versions.add_argument('--source-commit', help='Full source commit; required for local source archives')
+    versions.add_argument('--beta', action='store_true', help='CI-only beta display version from the shared workflow sequence')
     versions.add_argument('--public-version', action='store_true', help='Use the canonical manifest version for public releases')
     p.add_argument('--update-notes-file', type=Path, help='Generated in-house notes sidecar for source archives')
     p.add_argument('--previous-inhouse-release', type=Path, help='Previous completed in-house release.json (otherwise discover under output root)')
@@ -39,6 +41,10 @@ def main():
     p.add_argument('--windows-update-test-fail-health', action='store_true', help='TEST ONLY: withhold candidate health proof for rollback qualification')
     p.add_argument('--run-native-tests', action='store_true', help='Run Windows C++/PowerShell tests explicitly')
     a = p.parse_args()
+    if a.beta:
+        if os.environ.get('GITHUB_REPOSITORY') != 'oinkvm/oink' or os.environ.get('GITHUB_REF') != 'refs/heads/0.4':
+            p.error('--beta is restricted to the public 0.4 CI')
+        os.environ['OINK_PACKAGE_CHANNEL'] = 'beta'
     if a.windows_update_test_fail_health and not a.windows_update_test_feed:
         p.error('test health failure requires a test feed')
     from update_qualification import origin as test_origin
@@ -46,7 +52,7 @@ def main():
         test_origin(a.windows_update_test_feed)
     except ValueError as error:
         p.error(str(error))
-    if a.windows_update_test_feed and (a.platform != 'windows' or a.public_version):
+    if a.windows_update_test_feed and (a.platform != 'windows' or a.public_version or a.beta):
         p.error('test update feeds require a local Windows package, never --public-version')
     expected = 'Darwin' if a.platform == 'macos' else 'Windows'
     if platform.system() != expected or not supported_host(a.platform):
@@ -55,10 +61,21 @@ def main():
     if a.output_root.is_relative_to(ROOT):
         p.error('package output must be outside the source tree')
     try:
-        commit = None if a.public_version else local_source_commit(a.source_commit)
+        commit = None if a.public_version or a.beta else local_source_commit(a.source_commit)
+        if a.build_reservation:
+            from build_reservation import validate_receipt
+            if commit is None or a.sequence is not None:
+                raise ValueError('reservation is for local in-house builds, without --sequence')
+            receipt = json.loads(a.build_reservation.read_text())
+            validate_receipt(receipt, commit=commit)
+            a.sequence = receipt['sequence']
+        elif commit is not None and IDENTITY['inhouse_version'] == '0.4.0':
+            raise ValueError('0.4 in-house builds require --build-reservation; reserve a shared CI number first')
+        if a.sequence is None:
+            raise ValueError('build sequence or reservation required')
         a.build = package_build(a.sequence, commit is not None)
         version = release_version(IDENTITY['version'], commit, a.build)
-    except ValueError as error:
+    except (ValueError, OSError) as error:
         p.error(str(error))
     if a.public_version and (a.update_notes_file or a.previous_inhouse_release):
         p.error('public notes always come from the committed .github/update-notes.json')
@@ -114,7 +131,7 @@ def main():
     subprocess.run(command, cwd=ROOT, check=True)
     # Public CI uploads in its explicit workflow step; in-house packages use
     # the same uploader and retain symbols even when no token is configured.
-    if not a.public_version:
+    if not a.public_version and not a.beta:
         from upload_symbols import upload
         upload(output / 'symbols.noindex', a.tool_cache)
     print(f'Package complete: {output}')

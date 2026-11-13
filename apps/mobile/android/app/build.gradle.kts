@@ -15,7 +15,9 @@ val oinkVersion: Map<*, *>? = providers.gradleProperty("oinkBuild").orNull?.let 
         ?: if (System.getProperty("os.name").startsWith("Windows")) "python" else "python3"
     val helper = rootProject.file("../../../build-support/mobile_version.py")
     val result = providers.exec {
-        commandLine(python, helper.path, build)
+        val args = mutableListOf(python, helper.path, "--channel", providers.gradleProperty("oinkChannel").orElse("inhouse").get(), build)
+        providers.gradleProperty("oinkReservation").orNull?.let { args.addAll(listOf("--reservation", it)) }
+        commandLine(args)
         isIgnoreExitValue = true
     }
     val exit = result.result.get().exitValue
@@ -34,6 +36,20 @@ android {
         versionCode = (oinkVersion?.get("build") as Int?) ?: 1
         versionName = (oinkVersion?.get("version_name") as String?) ?: "$oinkInhouseVersion-dev"
         ndk { abiFilters += providers.gradleProperty("oinkAbis").orElse("arm64-v8a").get().split(",") }
+    }
+    // CI restores the already approved in-house key outside the checkout. Only
+    // file location is persisted to GITHUB_ENV; passwords remain masked step env.
+    val ciSigningStore = providers.environmentVariable("OINK_ANDROID_KEYSTORE_PATH").orNull
+    if (ciSigningStore != null) {
+        signingConfigs {
+            create("oinkCi") {
+                storeFile = file(ciSigningStore)
+                storePassword = providers.environmentVariable("OINK_ANDROID_KEYSTORE_PASSWORD").get()
+                keyAlias = providers.environmentVariable("OINK_ANDROID_KEY_ALIAS").get()
+                keyPassword = providers.environmentVariable("OINK_ANDROID_KEY_PASSWORD").get()
+            }
+        }
+        buildTypes.getByName("debug").signingConfig = signingConfigs.getByName("oinkCi")
     }
     externalNativeBuild { ndkBuild { path = file("src/main/cpp/Android.mk") } }
     compileOptions {

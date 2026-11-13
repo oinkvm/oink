@@ -2,6 +2,7 @@
 import argparse
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
 import shutil
@@ -86,7 +87,11 @@ def generate(root, build, source_commit, output_root, previous=None):
     root = Path(root)
     result = {'schema':1, 'kind':'inhouse' if source_commit else 'public',
               'build':build, 'source_commit':source_commit, 'previous':None}
-    if not source_commit:
+    if not source_commit and os.environ.get('OINK_PACKAGE_CHANNEL') == 'beta':
+        from versioning import beta_label
+        label = beta_label(build)
+        result['notes'] = {'en': f'CI beta build {label}.', 'zh-Hans': f'CI 测试版 {label}。', 'ja': f'CI ベータ版 {label}。', 'ko': f'CI 베타 빌드 {label}.'}
+    elif not source_commit:
         path = root / '.github/update-notes.json'
         if (root / '.git').exists():
             committed = subprocess.check_output(['git','-C',str(root),'show','HEAD:.github/update-notes.json'])

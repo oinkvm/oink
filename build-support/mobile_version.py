@@ -1,24 +1,19 @@
 #!/usr/bin/env python3
-"""Phone package version fields from a build, by the PC packages' rule (versioning.inhouse_label).
-
-    mobile_version.py <build>          JSON for Gradle: build, version_name, marketing_version
-    mobile_version.py --xcode <build>  xcodebuild settings: MARKETING_VERSION=… CURRENT_PROJECT_VERSION=…
-
-A build that does not encode inhouse_version is rejected (exit 1). Leading zeros
-are ignored: 000400001 is build 400001.
-"""
+"""PC/phone labels share versioning rules; signed/local 0.4 builds use CI reservations."""
+import argparse
 import json
+from pathlib import Path
 import re
 import sys
-
 from identity import decode_build
-from versioning import inhouse_label
+from versioning import inhouse_label, beta_label, local_source_commit
 
 
-def mobile_version(build):
-    """Android versionCode / iOS CFBundleVersion is the build; the label and marketing version follow it."""
-    label = inhouse_label(build)
-    return {'build': build, 'version_name': label, 'marketing_version': decode_build(build)[0]}
+def mobile_version(build, channel='inhouse'):
+    if channel not in ('inhouse', 'beta'):
+        raise ValueError('unknown mobile package channel')
+    return {'build': build, 'version_name': beta_label(build) if channel == 'beta' else inhouse_label(build),
+            'marketing_version': decode_build(build)[0]}
 
 
 def parse_build(text):
@@ -28,18 +23,25 @@ def parse_build(text):
 
 
 def main(argv):
-    xcode = argv[:1] == ['--xcode']
-    args = argv[1:] if xcode else argv
-    if len(args) != 1:
-        print(__doc__.strip(), file=sys.stderr)
-        return 2
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument('build', type=parse_build)
+    p.add_argument('--channel', choices=['inhouse', 'beta'], default='inhouse')
+    p.add_argument('--reservation', type=Path)
+    p.add_argument('--xcode', action='store_true')
+    a = p.parse_args(argv)
     try:
-        fields = mobile_version(parse_build(args[0]))
-    except ValueError as error:
+        fields = mobile_version(a.build, a.channel)
+        if a.channel == 'inhouse' and decode_build(a.build)[0] == '0.4.0':
+            if not a.reservation:
+                raise ValueError('new 0.4 in-house phone builds require --reservation from the shared CI counter')
+            from build_reservation import validate_receipt
+            receipt = json.loads(a.reservation.read_text())
+            validate_receipt(receipt, a.build, local_source_commit(receipt.get('source_commit')))
+    except (ValueError, OSError) as error:
         print(f'mobile_version: {error}', file=sys.stderr)
         return 1
-    if xcode:
-        print(f"MARKETING_VERSION={fields['marketing_version']} CURRENT_PROJECT_VERSION={fields['build']}")
+    if a.xcode:
+        print(f"MARKETING_VERSION={fields['marketing_version']} CURRENT_PROJECT_VERSION={fields['build']} OINK_DISPLAY_VERSION={fields['version_name']}")
     else:
         print(json.dumps(fields))
     return 0
