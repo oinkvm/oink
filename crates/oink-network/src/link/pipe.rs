@@ -1,7 +1,7 @@
 //! A relay carries stream bytes without decoding the records or their modules.
 use super::{wire, *};
 use oink_foundation::session::PathId;
-use oink_protocol::v1::frame::StreamHeader;
+use oink_protocol::v2::frame::StreamHeader;
 use std::task::{Context, Poll};
 
 pub(super) struct Pipe {

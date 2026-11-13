@@ -21,13 +21,9 @@ pub enum CardOptionEdit {
     MouseMode(SharingMode),
     KeyboardMode(SharingMode),
     ClipboardEnabled(bool),
-    ForwardingEnabled(bool),
     KeyboardDisabled(bool),
     ScreenShared(bool),
     GameModePreference(GamePreference),
-    AudioExitClaim(bool),
-    MicrophoneShareClaim(bool),
-    MicrophoneReceiveMuted(bool),
 }
 impl CardOptionEdit {
     pub fn number(&self) -> u32 {
@@ -35,21 +31,15 @@ impl CardOptionEdit {
             Self::MouseMode(_) => 1,
             Self::KeyboardMode(_) => 2,
             Self::ClipboardEnabled(_) => 3,
-            Self::ForwardingEnabled(_) => 4,
             Self::KeyboardDisabled(_) => 5,
             Self::ScreenShared(_) => 6,
             Self::GameModePreference(_) => 18,
-            Self::AudioExitClaim(_) => 20,
-            Self::MicrophoneShareClaim(_) => oink_protocol::v1::dto::LocalOption::MicrophoneShareClaim.number(),
-            Self::MicrophoneReceiveMuted(_) => oink_protocol::v1::dto::LocalOption::MicrophoneReceiveMuted.number(),
         }
     }
     pub fn command(&self) -> CardCommand {
         match self {
             Self::ScreenShared(_) => CardCommand::SetScreenMode,
             Self::GameModePreference(_) => CardCommand::SetGameMode,
-            Self::AudioExitClaim(true) => CardCommand::MakeAudioExit,
-            Self::AudioExitClaim(false) => CardCommand::ClearAudioExit,
             _ => CardCommand::SetLocalOption,
         }
     }
@@ -72,12 +62,22 @@ pub enum TokenOperation {
     /// not an icon's fixed desired operation.
     ForwardingControls,
     MicrophoneControls,
-    /// The selected exit, output generation and claim form one indivisible fence.
+    /// The selected exit, output generation and route version form one
+    /// indivisible fence.
     ExitVolume {
         output_id: String,
         output_generation: u64,
-        claim_counter: u64,
-        claim_owner: DeviceKey,
+        route_seq: u64,
+        route_author: DeviceKey,
+    },
+    /// Set `device`'s speaker mode (exit / forward / local) or microphone
+    /// mode (sender / receive / local) in the global audio configuration. The
+    /// owner is this device: it authors the change (setter decides). Leaving
+    /// the exit or sender only clears it while `device` still holds it.
+    AudioMode {
+        role: oink_audio::route::Role,
+        device: DeviceKey,
+        mode: oink_audio::route::Mode,
     },
 }
 
@@ -134,6 +134,13 @@ impl ActionTokens {
             operation: TokenOperation::Option { edit },
         });
         CardAction::Invoke { command, token }
+    }
+
+    pub fn route(&self, owner: OwnerVersion, operation: TokenOperation, command: CardCommand) -> CardAction {
+        CardAction::Invoke {
+            command,
+            token: self.issue(&TokenBinding { owner, operation }),
+        }
     }
 
     pub fn pause(&self, owner: OwnerVersion, paused: bool) -> CardAction {

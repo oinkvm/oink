@@ -188,7 +188,8 @@ unsigned oink_audio_endpoint_flags(void *opaque) {
     OinkMuteObserver *o = (__bridge OinkMuteObserver *)opaque;
     return (atomic_load(&o->revoked) ? 1u : 0u) |
         (atomic_load(&o->mute_revoked) ? 2u : 0u) |
-        (atomic_load(&o->default_changed) ? 4u : 0u);
+        (atomic_load(&o->default_changed) ? 4u : 0u) |
+        (atomic_load(&o->service_changed) ? 8u : 0u);
 }
 
 int oink_audio_endpoint_set_mute(void *opaque, bool muted, bool release_only, char *error, size_t capacity) {

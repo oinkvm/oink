@@ -202,25 +202,25 @@ pub struct GroupMigrationStatus {
     pub problem: Option<PairProblem>,
 }
 
-pub fn pair_id(value: &oink_protocol::v1::dto::PairId) -> oink_protocol::v1::Result<PairId> {
+pub fn pair_id(value: &oink_protocol::v2::dto::PairId) -> oink_protocol::v2::Result<PairId> {
     use base64::Engine;
-    use oink_protocol::v1::schema::WireDto;
+    use oink_protocol::v2::schema::WireDto;
     Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(value.encode(8192)?))
 }
-pub fn wire_pair_id(value: &str) -> oink_protocol::v1::Result<oink_protocol::v1::dto::PairId> {
+pub fn wire_pair_id(value: &str) -> oink_protocol::v2::Result<oink_protocol::v2::dto::PairId> {
     use base64::Engine;
-    use oink_protocol::v1::{ErrorCode, cbor, dto, schema::WireDto};
+    use oink_protocol::v2::{ErrorCode, cbor, dto, schema::WireDto};
     if value.len() > 11000 {
         return Err(ErrorCode::MalformedFrame.into());
     }
     let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(value)
-        .map_err(|_| oink_protocol::v1::Error::from(ErrorCode::MalformedFrame))?;
+        .map_err(|_| oink_protocol::v2::Error::from(ErrorCode::MalformedFrame))?;
     dto::PairId::from_raw(cbor::decode_map(&bytes, 8192)?)
 }
-impl TryFrom<&oink_protocol::v1::dto::PairProblem> for PairProblem {
-    type Error = oink_protocol::v1::Error;
-    fn try_from(value: &oink_protocol::v1::dto::PairProblem) -> Result<Self, Self::Error> {
+impl TryFrom<&oink_protocol::v2::dto::PairProblem> for PairProblem {
+    type Error = oink_protocol::v2::Error;
+    fn try_from(value: &oink_protocol::v2::dto::PairProblem) -> Result<Self, Self::Error> {
         Ok(Self {
             network_problem: None,
             code: value.code()?.number(),
@@ -240,7 +240,7 @@ impl TryFrom<&oink_protocol::v1::dto::PairProblem> for PairProblem {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use oink_protocol::v1::{
+    use oink_protocol::v2::{
         RawValue, dto,
         schema::{FixedBytes, WireDto, WireValue},
     };

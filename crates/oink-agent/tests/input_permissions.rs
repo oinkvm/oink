@@ -441,7 +441,7 @@ async fn missing_permissions_block_then_recover_without_restart_scenario() {
     assert!(permission_alert(&an, PermissionKind::InputMonitoring).is_some());
     assert_ne!(
         an.input_status().unwrap().resource_faults.keyboard,
-        Some(oink_protocol::v1::dto::ResourceFaultCode::CaptureUnavailable)
+        Some(oink_protocol::v2::dto::ResourceFaultCode::CaptureUnavailable)
     );
     let b2 = bn.clone();
     let aid = an.id();
@@ -500,7 +500,7 @@ async fn missing_permissions_block_then_recover_without_restart_scenario() {
     wait_for("target capture is active", 3., || an.capture_active() == Some(true)).await;
     assert_ne!(
         an.input_status().unwrap().resource_faults.keyboard,
-        Some(oink_protocol::v1::dto::ResourceFaultCode::CaptureUnavailable)
+        Some(oink_protocol::v2::dto::ResourceFaultCode::CaptureUnavailable)
     );
     let b2 = bn.clone();
     push(&b_input, to_a, || {
@@ -563,12 +563,12 @@ async fn missing_permissions_block_then_recover_without_restart_scenario() {
     changes
         .wait_for("completed native failure reaches resource status", || {
             a2.input_status().unwrap().resource_faults.keyboard
-                == Some(oink_protocol::v1::dto::ResourceFaultCode::CaptureUnavailable)
+                == Some(oink_protocol::v2::dto::ResourceFaultCode::CaptureUnavailable)
         })
         .await;
     assert_eq!(
         an.input_status().unwrap().resource_faults.keyboard,
-        Some(oink_protocol::v1::dto::ResourceFaultCode::CaptureUnavailable)
+        Some(oink_protocol::v2::dto::ResourceFaultCode::CaptureUnavailable)
     );
     assert!(an.capture_active() != Some(true));
     assert_eq!(an.overview().unwrap().service, ServiceState::Degraded);
@@ -589,7 +589,7 @@ async fn missing_permissions_block_then_recover_without_restart_scenario() {
     assert_eq!(an.overview().unwrap().service, ServiceState::Running);
     assert_ne!(
         an.input_status().unwrap().resource_faults.keyboard,
-        Some(oink_protocol::v1::dto::ResourceFaultCode::CaptureUnavailable)
+        Some(oink_protocol::v2::dto::ResourceFaultCode::CaptureUnavailable)
     );
 
     // Permission/capture recovery precedes the asynchronous new I0 opening.

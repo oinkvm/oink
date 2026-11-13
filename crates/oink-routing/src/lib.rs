@@ -9,6 +9,7 @@
 //! - [`RouterConfig`] / [`RoutingSettings`]：本机身份与用户设置；
 //! - [`hotkey`]：全局快捷键的解析与识别。
 
+pub mod adapter;
 pub mod circle;
 pub mod config;
 pub mod contacts;
@@ -22,6 +23,7 @@ pub mod layout;
 pub mod negotiation;
 pub mod router;
 pub mod simple_layout;
+pub mod wire;
 
 pub use config::{ButtonHandoff, Os, RouterConfig, RoutingSettings};
 pub use display_layout::{LayoutModel, TopologyLayout};
@@ -30,7 +32,8 @@ pub use layout::{LayoutQuery, ScreenId, ScreenPos, StepResult};
 pub use router::keyboard::{KEYBOARD_RELEASE_HOLD_US, KEYBOARD_RELEASE_KEYS};
 pub use router::{
     Delivery, DndCmd, DndEvent, DndIntegrity, DndPreparation, DndSourceEffect, DndTarget, FocusInfo, FocusLockError,
-    GameMode, GameModeStatus, GroupFocusStatus, Micros, Output, PointerCaptureObservation, Router, StatusEvent,
+    GameMode, GameModeStatus, GroupFocusStatus, MemberInput, Micros, Output, PointerBase, PointerCaptureObservation,
+    Router, StatusEvent,
 };
 pub use simple_layout::{SimpleLayout, SimpleScreen};
 

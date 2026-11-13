@@ -1,11 +1,12 @@
-//! Claim- and Boot-fenced audio preparation, independent of devices and transport.
-//! The caller supplies current authenticated Boots, the resolved claim and the
+//! Route- and Boot-fenced audio preparation, independent of devices and transport.
+//! The caller supplies current authenticated Boots, the resolved exit route
+//! version (after checking the receiver is that route's target) and the
 //! locally bound output. Cached/offline identity is never authorization here.
 use crate::negotiation::Profile;
-use oink_protocol::v1::{
+use oink_protocol::v2::{
     RawMap,
     dto::{
-        AudioPrepared, AudioPreparedAck, AudioSessionContext, Boot, ControlFailure, ExitClaimStamp, ExitVolumeState,
+        AudioPrepared, AudioPreparedAck, AudioRouteVersion, AudioSessionContext, Boot, ControlFailure, ExitVolumeState,
         ReceiverOutputBinding, SourceRouteOffer, TypedResult,
     },
     schema::{WireDto, WireValue},
@@ -50,7 +51,10 @@ pub fn volume_context(source: &Boot, state: &ExitVolumeState) -> Result<AudioSes
             (3, binding.write()),
             (
                 4,
-                version.exit_claim().map_err(|_| ControlFailure::InvalidValue)?.write(),
+                version
+                    .route_version()
+                    .map_err(|_| ControlFailure::InvalidValue)?
+                    .write(),
             ),
         ]
         .into(),
@@ -94,10 +98,7 @@ impl Source {
     pub fn prepared(&self) -> Option<&Prepared> {
         self.prepared.as_ref()
     }
-    pub fn begin(&mut self, receiver: Boot, claim: ExitClaimStamp) -> Result<&SourceRouteOffer, ControlFailure> {
-        if receiver.device_id() != claim.owner() {
-            return Err(ControlFailure::NotExit);
-        }
+    pub fn begin(&mut self, receiver: Boot, version: AudioRouteVersion) -> Result<&SourceRouteOffer, ControlFailure> {
         if receiver.device_id() == self.boot.device_id() {
             return Err(ControlFailure::NotExit);
         }
@@ -105,7 +106,7 @@ impl Source {
             (1, self.boot.write()),
             (2, next_generation()?.write()),
             (3, receiver.write()),
-            (4, claim.write()),
+            (4, version.write()),
         ]))
         .map_err(|_| ControlFailure::InvalidValue)?;
         self.prepared = None;
@@ -130,7 +131,7 @@ impl Source {
         let output = session.receiver_output().map_err(|_| ControlFailure::InvalidValue)?;
         if session.source() != offer.source()
             || session.source_route_generation() != offer.source_route_generation()
-            || session.exit_claim() != offer.exit_claim()
+            || session.route_version() != offer.route_version()
         {
             return Err(ControlFailure::RouteChanged);
         }
@@ -196,21 +197,21 @@ impl Receiver {
     pub fn prepare(
         offer: SourceRouteOffer,
         source: &Boot,
-        claim: &ExitClaimStamp,
+        version: &AudioRouteVersion,
         output: &ReceiverOutputBinding,
         profile: Profile,
     ) -> Result<Self, ControlFailure> {
         if offer.source().as_ref() != Ok(source) {
             return Err(ControlFailure::StaleBoot);
         }
-        if offer.exit_claim().as_ref() != Ok(claim) {
+        if offer.route_version().as_ref() != Ok(version) {
             return Err(ControlFailure::RouteChanged);
         }
         let receiver = output.receiver().map_err(|_| ControlFailure::InvalidValue)?;
         if offer.receiver() != Ok(receiver.clone()) {
             return Err(ControlFailure::StaleBoot);
         }
-        if receiver.device_id() != claim.owner() || receiver.device_id() == source.device_id() {
+        if receiver.device_id() == source.device_id() {
             return Err(ControlFailure::NotExit);
         }
         if output.output_id().map_err(|_| ControlFailure::InvalidValue)?.is_none() {
@@ -226,7 +227,7 @@ impl Receiver {
                     .write(),
             ),
             (3, output.write()),
-            (4, claim.write()),
+            (4, version.write()),
         ]))
         .map_err(|_| ControlFailure::InvalidValue)?;
         let wire = AudioPrepared::from_raw(RawMap::from([
@@ -267,20 +268,20 @@ impl Receiver {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::claims::Stamp;
+    use crate::route::Version;
     use oink_foundation::DeviceId;
-    fn claim(owner: u8, counter: u64) -> ExitClaimStamp {
-        Stamp {
-            owner: DeviceId([owner; 32]),
-            counter,
+    fn route_version(author: u8, stamp: u64) -> AudioRouteVersion {
+        Version {
+            author: DeviceId([author; 32]),
+            stamp,
         }
         .to_wire()
     }
     fn boot(owner: u8, nonce: u8) -> Boot {
         Boot::from_raw(
             [
-                (1, claim(owner, 1).owner().unwrap().write()),
-                (2, oink_protocol::v1::RawValue::Bytes(vec![nonce; 16])),
+                (1, route_version(owner, 1).author().unwrap().write()),
+                (2, oink_protocol::v2::RawValue::Bytes(vec![nonce; 16])),
             ]
             .into(),
         )
@@ -299,14 +300,14 @@ mod tests {
     }
     #[test]
     fn physical_volume_context_exists_without_media_and_allows_self_exit() {
-        use oink_protocol::v1::dto::{ExitVolumeStatus, ExitVolumeVersion};
+        use oink_protocol::v2::dto::{ExitVolumeStatus, ExitVolumeVersion};
         let version = ExitVolumeVersion::from_raw(
             [
                 (1, boot(2, 1).write()),
                 (3, "synthetic-output".into()),
                 (4, 7_u64.write()),
                 (5, 1_u64.write()),
-                (6, claim(2, 8).write()),
+                (6, route_version(2, 8).write()),
             ]
             .into(),
         )
@@ -325,17 +326,17 @@ mod tests {
         let next = volume_context(&boot(2, 1), &state).unwrap();
         assert_eq!(first.source().unwrap(), boot(2, 1));
         assert_eq!(first.receiver_output().unwrap(), output(2, 1, 7));
-        assert_eq!(first.exit_claim().unwrap(), claim(2, 8));
+        assert_eq!(first.route_version().unwrap(), route_version(2, 8));
         assert!(next.source_route_generation().unwrap() > first.source_route_generation().unwrap());
     }
     #[test]
-    fn no_media_before_ack_and_aba_claim_boot_and_output_generations_are_fenced() {
+    fn no_media_before_ack_and_aba_route_boot_and_output_generations_are_fenced() {
         let mut source = Source::new(boot(1, 1));
-        let old_offer = source.begin(boot(2, 1), claim(2, 1)).unwrap().clone();
+        let old_offer = source.begin(boot(2, 1), route_version(2, 1)).unwrap().clone();
         let mut receiver = Receiver::prepare(
             old_offer.clone(),
             &boot(1, 1),
-            &claim(2, 1),
+            &route_version(2, 1),
             &output(2, 1, 1),
             Profile::Opus5ms,
         )
@@ -344,8 +345,8 @@ mod tests {
         let ack = source.accept(&boot(2, 1), receiver.prepared().wire.clone()).unwrap();
         receiver.acknowledge(&boot(1, 1), &ack).unwrap();
         assert!(receiver.ready());
-        source.begin(boot(3, 1), claim(3, 2)).unwrap();
-        source.begin(boot(2, 1), claim(2, 3)).unwrap();
+        source.begin(boot(3, 1), route_version(3, 2)).unwrap();
+        source.begin(boot(2, 1), route_version(2, 3)).unwrap();
         assert_eq!(
             source
                 .accept(&boot(2, 1), receiver.prepared().wire.clone())
@@ -356,7 +357,7 @@ mod tests {
             Receiver::prepare(
                 old_offer.clone(),
                 &boot(1, 2),
-                &claim(2, 1),
+                &route_version(2, 1),
                 &output(2, 1, 1),
                 Profile::Opus5ms
             )
@@ -364,20 +365,34 @@ mod tests {
             ControlFailure::StaleBoot
         );
         assert_eq!(
-            Receiver::prepare(old_offer, &boot(1, 1), &claim(2, 1), &output(2, 2, 2), Profile::Opus5ms).unwrap_err(),
+            Receiver::prepare(
+                old_offer,
+                &boot(1, 1),
+                &route_version(2, 1),
+                &output(2, 2, 2),
+                Profile::Opus5ms
+            )
+            .unwrap_err(),
             ControlFailure::StaleBoot
         );
         let offer = source.offer().unwrap().clone();
         let fresh = Receiver::prepare(
             offer.clone(),
             &boot(1, 1),
-            &claim(2, 3),
+            &route_version(2, 3),
             &output(2, 1, 3),
             Profile::Opus5ms,
         )
         .unwrap();
         source.accept(&boot(2, 1), fresh.prepared().wire.clone()).unwrap();
-        let stale = Receiver::prepare(offer, &boot(1, 1), &claim(2, 3), &output(2, 1, 2), Profile::Opus5ms).unwrap();
+        let stale = Receiver::prepare(
+            offer,
+            &boot(1, 1),
+            &route_version(2, 3),
+            &output(2, 1, 2),
+            Profile::Opus5ms,
+        )
+        .unwrap();
         assert_eq!(
             source.accept(&boot(2, 1), stale.prepared().wire.clone()).unwrap_err(),
             ControlFailure::OutputChanged

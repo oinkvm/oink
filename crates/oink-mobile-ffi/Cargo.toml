@@ -1,0 +1,46 @@
+[package]
+name = "oink-mobile-ffi"
+description = "UniFFI facade for the Rust mobile transfer core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+repository.workspace = true
+
+[lib]
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[dependencies]
+oink-adb = { path = "../oink-adb" }
+if-addrs = "0.15"
+zeroize = "1.9"
+oink-audio.workspace = true
+oink-foundation.workspace = true
+oink-mobile-core = { path = "../oink-mobile-core" }
+oink-network.workspace = true
+oink-protocol.workspace = true
+oink-routing.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+rand = "0.8"
+tokio.workspace = true
+uniffi.workspace = true
+serde_json.workspace = true
+
+[build-dependencies]
+# The iOS os_log shim (`src/logging/os_log.c`); os_log is a C macro API.
+cc = "1"
+
+[dev-dependencies]
+tempfile = "3"
+# Virtual AEC work budget for the device-free Case A product-path test.
+oink-audio = { workspace = true, features = ["test-support"] }
+# In-process datagram pair for the capture-to-packet path test.
+oink-network = { workspace = true, features = ["test-support"] }
+# Network-layer failure injection for the session restart test.
+oink-mobile-core = { path = "../oink-mobile-core", features = ["test-support"] }
+
+[lints]
+workspace = true

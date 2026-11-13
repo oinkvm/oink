@@ -9,6 +9,7 @@ import { pairingApi } from './pairing';
 import type { PairingEvent, PairingSnapshot, NearbySnapshot } from './pairing';
 import type { LayoutProfilesState } from './layoutProfiles';
 import { createCardSignalsStore } from './cardSignals';
+import { createRoutesStore } from './routes';
 export type DurablePairingEvent = Extract<PairingEvent,{type:'pairing_failed'|'pairing_completed'}>;
 
 export type { BlockedDevice, BlockedDevicesSnapshot } from './cards';
@@ -97,6 +98,7 @@ export function reportBackendFailure(error: unknown) {
 
 export function createAgentStore() {
   const cardSignals = createCardSignalsStore();
+  const routes = createRoutesStore();
   let state = initial();
   let generation = 0;
   const listeners = new Set<() => void>();
@@ -207,6 +209,7 @@ export function createAgentStore() {
   };
   return {
     cardSignals,
+    routes,
     get: () => state,
     subscribe: (listener: () => void) => { listeners.add(listener); return () => { listeners.delete(listener); }; },
     receive, query, adopt, adoptProfiles,

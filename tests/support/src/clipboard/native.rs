@@ -198,7 +198,7 @@ pub(super) fn capture(fake: &FakeClipboard, _data: &Path) -> Result<oink_clipboa
     let mut bytes = HashMap::new();
     let mut roots = vec![];
     if let Some(marker) = fake.marker() {
-        // Like the native writers: one private format next to the content.
+        // Like the native writers: one private format on the first item.
         let id = RepresentationId(u32::MAX);
         bytes.insert(id, marker.clone());
         inventory.items.push(ContentItem {

@@ -7,12 +7,13 @@ use oink_foundation::content::ClipId;
 use oink_foundation::drag_trace::{Context as ReadContext, Trace as ReadTrace, stage as read_stage};
 use oink_foundation::{DeviceId, session::Boot};
 use oink_foundation::{clipboard::ClipPlatform, transfer::LowOptions};
-use oink_network::link::{LinkId, LinkLayer, LinkLost, LowStream, StreamId};
-use oink_protocol::{frame::StreamKind, v1::dto};
+use oink_network::link::{LinkId, LinkLayer, LinkLost, LowError, LowStream, StreamId};
+use oink_protocol::{frame::StreamKind, v2::dto};
 use std::{
     collections::HashMap,
     io,
     sync::{Arc, Mutex},
+    time::{Duration, Instant},
 };
 use tokio::sync::watch;
 
@@ -57,6 +58,64 @@ pub struct FileLinks {
     kind: StreamKind,
     state: Mutex<State>,
     log_config: Mutex<Option<crate::config_module::ConfigModule>>,
+    open_failures: Mutex<OpenFailures>,
+}
+/// Low opens the network refused before a stream existed. Callers only see
+/// `ConnectionAborted` (the file layer retries on its own schedule), so this
+/// keeps the network's own reason in the log: once per peer and reason per
+/// minute, with the number of failed attempts.
+#[derive(Debug, Default)]
+struct OpenFailures(HashMap<DeviceId, OpenFailure>);
+#[derive(Debug)]
+struct OpenFailure {
+    reason: String,
+    attempts: u64,
+    logged: Instant,
+}
+const OPEN_FAILURE_LOG_INTERVAL: Duration = Duration::from_secs(60);
+impl OpenFailures {
+    fn failed(&mut self, kind: StreamKind, peer: DeviceId, error: &LowError, now: Instant) {
+        let reason = error.to_string();
+        let entry = self
+            .0
+            .entry(peer)
+            .and_modify(|entry| {
+                if entry.reason != reason {
+                    *entry = OpenFailure {
+                        reason: reason.clone(),
+                        attempts: 0,
+                        logged: now,
+                    };
+                }
+            })
+            .or_insert_with(|| OpenFailure {
+                reason: reason.clone(),
+                attempts: 0,
+                logged: now,
+            });
+        entry.attempts += 1;
+        if entry.attempts == 1 || now.duration_since(entry.logged) >= OPEN_FAILURE_LOG_INTERVAL {
+            entry.logged = now;
+            tracing::warn!(
+                peer = %peer.short(),
+                ?kind,
+                attempts = entry.attempts,
+                %reason,
+                "Low open failed; reported to the file layer as ConnectionAborted"
+            );
+        }
+    }
+    fn opened(&mut self, kind: StreamKind, peer: DeviceId) {
+        if let Some(failure) = self.0.remove(&peer) {
+            tracing::info!(
+                peer = %peer.short(),
+                ?kind,
+                attempts = failure.attempts,
+                reason = %failure.reason,
+                "Low open succeeded after failed attempts"
+            );
+        }
+    }
 }
 impl FileLinks {
     pub fn new(links: LinkLayer, kind: StreamKind) -> Arc<Self> {
@@ -72,7 +131,23 @@ impl FileLinks {
                 ..Default::default()
             }),
             log_config: Mutex::default(),
+            open_failures: Mutex::default(),
         })
+    }
+    async fn open_low(&self, peer: DeviceId, link: LinkId, options: LowOptions) -> io::Result<LowStream> {
+        match self.links.open_low(link, self.kind, options).await {
+            Ok(stream) => {
+                self.open_failures.lock().unwrap().opened(self.kind, peer);
+                Ok(stream)
+            }
+            Err(error) => {
+                self.open_failures
+                    .lock()
+                    .unwrap()
+                    .failed(self.kind, peer, &error, Instant::now());
+                Err(io::Error::new(io::ErrorKind::ConnectionAborted, error))
+            }
+        }
     }
     pub(crate) fn set_log_config(&self, config: crate::config_module::ConfigModule) {
         *self.log_config.lock().unwrap() = Some(config);
@@ -88,7 +163,7 @@ impl FileLinks {
         self.links
             .links()
             .by_peer(peer)
-            .is_some_and(|entry| entry.link == link && entry.agreement.contains("oink.cloud-file-links/1"))
+            .is_some_and(|entry| entry.link == link && entry.opens(StreamKind::Clipboard))
     }
     pub(crate) fn peer_safe_symlinks(&self, peer: DeviceId, link: LinkId) -> bool {
         cfg!(target_os = "macos")
@@ -97,7 +172,7 @@ impl FileLinks {
                 .links
                 .links()
                 .by_peer(peer)
-                .is_some_and(|entry| entry.link == link && entry.agreement.contains("oink.files.safe-symlinks/1"))
+                .is_some_and(|entry| entry.link == link && entry.opens(StreamKind::Clipboard))
     }
     pub(crate) fn peer_exec_bits(&self, peer: DeviceId, link: LinkId) -> bool {
         cfg!(target_os = "macos")
@@ -106,7 +181,7 @@ impl FileLinks {
                 .links
                 .links()
                 .by_peer(peer)
-                .is_some_and(|entry| entry.link == link && entry.agreement.contains("oink.files.exec-bits/1"))
+                .is_some_and(|entry| entry.link == link && entry.opens(StreamKind::Clipboard))
     }
     pub(crate) fn peer_os(&self, peer: DeviceId) -> Option<String> {
         self.log_config.lock().unwrap().as_ref().and_then(|config| {
@@ -117,6 +192,18 @@ impl FileLinks {
                 .find(|member| member.device == peer)
                 .map(|member| member.os.clone())
         })
+    }
+    pub fn is_phone(&self, peer: DeviceId) -> bool {
+        self.log_config.lock().unwrap().as_ref().is_some_and(|config| {
+            config
+                .members()
+                .members
+                .iter()
+                .any(|m| m.device == peer && m.is_mobile())
+        })
+    }
+    pub fn history_capable(&self, peer: DeviceId) -> bool {
+        self.links.links().by_peer(peer).is_some_and(|e| e.permits(0x0356))
     }
     pub fn peer_formats(&self, peer: DeviceId, link: LinkId) -> Option<dto::FormatSupport> {
         self.links
@@ -305,9 +392,10 @@ impl BulkLink for FileLinks {
                 .and_then(|e| e.peer_formats.clone())
         });
         let cloud_links = binding.as_ref().is_some_and(|binding| {
-            self.links.links().by_peer(peer).is_some_and(|entry| {
-                entry.peer_boot == binding.boot && entry.agreement.contains("oink.cloud-file-links/1")
-            })
+            self.links
+                .links()
+                .by_peer(peer)
+                .is_some_and(|entry| entry.peer_boot == binding.boot && entry.opens(StreamKind::Clipboard))
         });
         Arc::new(BoundLink {
             links: self,
@@ -388,7 +476,7 @@ impl BoundLink {
         };
         let mut cancelled = binding.cancelled.subscribe();
         let stream = tokio::select! {
-            result = self.links.links.open_low(scope, self.links.kind, options) => result.map_err(|error| io::Error::new(io::ErrorKind::ConnectionAborted, error))?,
+            result = self.links.open_low(peer, scope, options) => result?,
             _ = interrupted(&mut permission, &mut cancelled) => return Err(io::Error::from(io::ErrorKind::ConnectionAborted)),
         };
         if *permission.borrow() || *cancelled.borrow() {
@@ -526,11 +614,11 @@ impl BulkLink for PersistentLink {
                 .by_peer(peer)
                 .filter(|entry| entry.link == scope)
                 .ok_or(io::ErrorKind::NotConnected)?;
-            if !entry.agreement.contains("oink.cloud-file-links/1") {
+            if !entry.opens(StreamKind::Clipboard) {
                 return Err(io::ErrorKind::Unsupported.into());
             }
             let stream = tokio::select! {
-                result = self.links.links.open_low(scope, self.links.kind, options) => result.map_err(|e| io::Error::new(io::ErrorKind::ConnectionAborted, e))?,
+                result = self.links.open_low(peer, scope, options) => result?,
                 _ = revoked(&mut permission) => return Err(io::ErrorKind::ConnectionAborted.into()),
             };
             if *permission.borrow() {
@@ -747,6 +835,67 @@ mod tests {
                 );
                 fixture.stop().await;
             },
+        );
+    }
+    #[test]
+    fn refused_low_open_logs_the_network_reason_once_per_minute() {
+        let admission = || {
+            LowError::Unavailable(oink_network::LowUnavailable {
+                from: DeviceId([2; 32]),
+                to: PEER,
+                reason: oink_network::LowFailureReason::Tcp {
+                    stage: "admission".into(),
+                    detail: "low-priority admission is unavailable".into(),
+                },
+            })
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("low-open.log");
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .with_writer(std::fs::File::create(&path).unwrap())
+            .finish();
+        let start = Instant::now();
+        tracing::subscriber::with_default(subscriber, || {
+            let mut failures = OpenFailures::default();
+            // The file layer retries every few seconds; only the first and the
+            // one a minute later reach the log.
+            for second in [0, 5, 10, 59, 60, 65] {
+                failures.failed(
+                    StreamKind::Clipboard,
+                    PEER,
+                    &admission(),
+                    start + Duration::from_secs(second),
+                );
+            }
+            failures.failed(
+                StreamKind::Clipboard,
+                PEER,
+                &LowError::Interrupted,
+                start + Duration::from_secs(66),
+            );
+            failures.opened(StreamKind::Clipboard, PEER);
+            failures.opened(StreamKind::Clipboard, PEER);
+        });
+        let log = std::fs::read_to_string(path).unwrap();
+        let refused: Vec<_> = log
+            .lines()
+            .filter(|line| line.contains("low-priority admission is unavailable"))
+            .collect();
+        assert_eq!(refused.len(), 2, "{log}");
+        assert!(
+            refused[0].contains("WARN") && refused[0].contains("attempts=1"),
+            "{log}"
+        );
+        assert!(refused[1].contains("attempts=5"), "{log}");
+        assert!(refused.iter().all(|line| line.contains(&PEER.short())), "{log}");
+        // A different reason is logged at once and its count starts over.
+        assert!(log.contains("attempts=1 reason=operation interrupted"), "{log}");
+        assert_eq!(
+            log.matches("Low open succeeded after failed attempts").count(),
+            1,
+            "{log}"
         );
     }
     const PEER: DeviceId = DeviceId([1; 32]);

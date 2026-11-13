@@ -4,7 +4,8 @@
 //!   [`ApiError::Unavailable`]，不重试（请求可能已经执行）。
 //! - 事件：[`RemoteApi::follow_events`] 在调用线程上保持一条订阅连接，把事件分发给 [`AgentApi::subscribe`]
 //!   注册的回调，直到连接结束；返回结束的原因。后台仍在运行、只是因积压断开这条订阅时
-//!   （[`EventsEnd::Lagged`]），界面重新订阅并重新拉取全部状态；其它原因界面随之退出，
+//!   （[`EventsEnd::Lagged`]），或后台因网络层出错在同一进程里重启（[`EventsEnd::Restarting`]）时，
+//!   界面重新订阅并重新拉取全部状态；其它原因界面随之退出，
 //!   不重连、不重新拉起后台。订阅回调跨重连保留。
 //! - 每次新建连接都重新读 `ipc.json`：服务进程重启后地址与令牌会变。
 
@@ -21,7 +22,8 @@ use serde::de::DeserializeOwned;
 
 use crate::api::*;
 use crate::ipc::{
-    BuildIdentity, CLOSING_BUILD_MISMATCH, CLOSING_LAGGED, CLOSING_STOPPING, Endpoint, Envelope, ServiceInfo,
+    BuildIdentity, CLOSING_BUILD_MISMATCH, CLOSING_LAGGED, CLOSING_RESTARTING, CLOSING_STOPPING, Endpoint, Envelope,
+    ServiceInfo,
 };
 
 /// 连接超时（本机回环，服务进程在运行时立即连上）。
@@ -40,6 +42,8 @@ pub enum EventsEnd {
     Stopping,
     /// 服务进程仍在运行，但断开了这条订阅（界面积压太多）；界面重新订阅并重新拉取全部状态。
     Lagged,
+    /// 网络层出错，服务进程在同一进程里重启后台；界面等新后台的 IPC 可用后重新订阅并重新拉取全部状态。
+    Restarting,
     /// 没有预告就断开（服务进程崩溃或被结束），或连不上。
     Lost(String),
     /// 本进程调用了 [`RemoteApi::stop_following`]。
@@ -404,6 +408,7 @@ impl RemoteApi {
                 return match reason {
                     CLOSING_STOPPING => EventsEnd::Stopping,
                     CLOSING_LAGGED => EventsEnd::Lagged,
+                    CLOSING_RESTARTING => EventsEnd::Restarting,
                     other => EventsEnd::Lost(format!("服务进程关闭了订阅：{other}")),
                 };
             }
@@ -504,6 +509,15 @@ impl AgentApi for RemoteApi {
             muted,
         })
     }
+    fn mobile_audio_state(&self, device: DeviceKey) -> ApiResult<Option<MobileAudioState>> {
+        self.call(Request::MobileAudioState { device })
+    }
+    fn start_mobile_audio_endpoint(&self, target: MobileAudioTarget) -> ApiResult<()> {
+        self.call(Request::StartMobileAudioEndpoint { target })
+    }
+    fn release_mobile_audio_endpoint(&self, target: MobileAudioTarget) -> ApiResult<()> {
+        self.call(Request::ReleaseMobileAudioEndpoint { target })
+    }
     fn set_local_paused(&self, request_id: String, paused: bool) -> ApiResult<crate::device_cards::DeviceControlReply> {
         self.call(Request::SetLocalPaused { request_id, paused })
     }
@@ -524,6 +538,12 @@ impl AgentApi for RemoteApi {
     }
     fn member_addresses(&self, device: DeviceKey) -> ApiResult<Vec<String>> {
         self.call(Request::MemberAddresses { device })
+    }
+    fn member_routes(&self, device: DeviceKey) -> ApiResult<crate::api::MemberRoutes> {
+        self.call(Request::MemberRoutes { device })
+    }
+    fn set_member_route(&self, device: DeviceKey, selection: crate::api::RouteSelection) -> ApiResult<bool> {
+        self.call(Request::SetMemberRoute { device, selection })
     }
     fn set_member_address(&self, device: DeviceKey, address: String) -> ApiResult<()> {
         self.call(Request::SetMemberAddress { device, address })
@@ -697,6 +717,9 @@ impl AgentApi for RemoteApi {
     }
     fn lock_focus_to(&self, device: DeviceKey) -> ApiResult<()> {
         self.call(Request::LockFocusTo { device })
+    }
+    fn move_pointer_to(&self, device: DeviceKey) -> ApiResult<()> {
+        self.call(Request::MovePointerTo { device })
     }
     fn set_focus_locked(&self, locked: bool) -> ApiResult<()> {
         self.call(Request::SetFocusLocked { locked })

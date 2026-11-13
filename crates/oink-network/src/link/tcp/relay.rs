@@ -112,7 +112,7 @@ impl Core {
                         )
                     });
                     let inbound = super::super::InboundLow {
-                        stream: LowStream::new(stream),
+                        stream: LowStream::new(stream, &worker.network.hub),
                         first,
                     };
                     let _ = worker
@@ -281,7 +281,7 @@ pub(super) async fn forward_low<R: RecordRead, W: RecordWrite>(
             output.finish_records().await?;
             return Ok(());
         }
-        let header = oink_protocol::v1::frame::FrameHeader::parse(&prefix, oink_protocol::frame::MAX_LOW_MESSAGE)
+        let header = oink_protocol::v2::frame::FrameHeader::parse(&prefix, oink_protocol::frame::MAX_LOW_MESSAGE)
             .map_err(std::io::Error::other)?
             .ok_or_else(|| std::io::Error::other("partial Low header"))?;
         let length = header.total_length() - 6;

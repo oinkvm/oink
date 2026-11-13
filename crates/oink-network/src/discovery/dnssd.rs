@@ -11,7 +11,7 @@
 //! （`kDNSServiceFlagsShareConnection`），用 `poll` 等待可读后调用 `DNSServiceProcessResult`，
 //! 回调也都在这个线程中执行。
 
-use super::{Advert, SERVICE_TYPE, Sighting, Source, advert_from_txt, instance_name, txt_pairs};
+use super::{Advert, MdnsPeers, SERVICE_TYPE, Sighting, Source, advert_from_txt, instance_name, txt_pairs};
 use std::collections::HashMap;
 use std::ffi::{CStr, CString, c_char, c_int, c_uchar, c_void};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -179,6 +179,14 @@ struct Ctx {
     live: HashMap<ServiceKey, LiveService>,
     /// 当前浏览的代数（每次重新浏览加一）。
     generation: u64,
+    peers: MdnsPeers,
+}
+impl Ctx {
+    /// `live` 变化之后调用：设备出现、地址变化、消失时打 INFO。
+    fn live_changed(&mut self) {
+        self.peers
+            .update(self.live.values().filter_map(|l| l.sighting.as_ref()));
+    }
 }
 
 /// 服务实例名 + 网卡序号。
@@ -274,6 +282,7 @@ extern "C" fn on_browse(
     };
     if flags & K_FLAGS_ADD == 0 {
         c.live.remove(&key);
+        c.live_changed();
         return;
     }
     let generation = c.generation;
@@ -391,6 +400,7 @@ extern "C" fn on_addr(
     };
     if let Some(l) = c.live.get_mut(&key) {
         l.sighting = Some(s.clone());
+        c.live_changed();
     }
     let _ = c.out.try_send(s);
 }
@@ -470,6 +480,7 @@ fn run(advert: Advert, out: mpsc::Sender<Sighting>, cmd: std_mpsc::Receiver<Cmd>
         pending: HashMap::new(),
         live: HashMap::new(),
         generation: 0,
+        peers: MdnsPeers::default(),
     });
     let ctx_ptr: *mut Ctx = &mut *ctx;
     let mut reg = register(conn, &advert);
@@ -527,6 +538,7 @@ fn run(advert: Advert, out: mpsc::Sender<Sighting>, cmd: std_mpsc::Receiver<Cmd>
             let cur = ctx.generation;
             let settled = last_browse.elapsed() >= REBROWSE_GRACE;
             ctx.live.retain(|_, l| l.generation == cur || !settled);
+            ctx.live_changed();
             for l in ctx.live.values() {
                 if let Some(s) = &l.sighting {
                     let _ = ctx.out.try_send(s.clone());

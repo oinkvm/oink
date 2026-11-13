@@ -1,0 +1,20 @@
+# Build-time generator for the Kotlin and Swift bindings. It lives outside the
+# workspace on purpose: the UniFFI CLI pulls in template and TOML crates that no
+# shipped binary links, so they stay out of the product dependency graph and its
+# licence and advisory checks. Keep the UniFFI version equal to the one
+# crates/oink-mobile-ffi links, or the generated scaffolding will not match.
+[package]
+name = "oink-uniffi-bindgen"
+version = "0.0.0"
+edition = "2024"
+publish = false
+license = "GPL-3.0-only"
+
+[[bin]]
+name = "oink-uniffi-bindgen"
+path = "src/main.rs"
+
+[dependencies]
+uniffi = { version = "=0.32.2", features = ["cli"] }
+
+[workspace]

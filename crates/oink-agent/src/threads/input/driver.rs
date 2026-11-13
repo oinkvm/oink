@@ -60,8 +60,8 @@ pub(super) struct Driver {
     resume_hotkey: Option<oink_input::capture_loop::ResumeHotkey>,
     input_safety: oink_input::session_gate::InputSafety,
     owner_acks: Vec<PendingOwnerApply>,
-    capture_fault: Option<oink_protocol::v1::dto::ResourceFaultCode>,
-    display_fault: Option<oink_protocol::v1::dto::ResourceFaultCode>,
+    capture_fault: Option<oink_protocol::v2::dto::ResourceFaultCode>,
+    display_fault: Option<oink_protocol::v2::dto::ResourceFaultCode>,
     display_failure_since: Option<Instant>,
     update_hold: Option<(u64, Instant)>,
     update_committed: bool,
@@ -215,6 +215,7 @@ impl Driver {
         let modifier_backend = native.clone();
         router.set_modifier_release_probe(Arc::new(move |mask| modifier_backend.reconcile_passed_modifiers(mask)));
         router.set_local_feel(native.feel_profile());
+        router.set_text_pacing(native.text_pacing());
         let trail = super::trail::Trail::new();
         trail.duration(settings.cursor_trail_duration_ms);
         let _ = main.send(MainCommand::TrailDuration(settings.cursor_trail_duration_ms));
@@ -419,15 +420,15 @@ impl Driver {
             self.online = online;
         }
     }
-    fn observe_display_fault(&mut self, fault: oink_protocol::v1::dto::ResourceFaultCode) {
+    fn observe_display_fault(&mut self, fault: oink_protocol::v2::dto::ResourceFaultCode) {
         self.display_fault = Some(fault);
-        if fault == oink_protocol::v1::dto::ResourceFaultCode::None {
+        if fault == oink_protocol::v2::dto::ResourceFaultCode::None {
             self.display_failure_since = None;
         } else {
             self.display_failure_since.get_or_insert(self.now);
         }
     }
-    fn display_enumeration_fault(&self) -> Option<oink_protocol::v1::dto::ResourceFaultCode> {
+    fn display_enumeration_fault(&self) -> Option<oink_protocol::v2::dto::ResourceFaultCode> {
         // Display reconfiguration can briefly yield an error or an empty list.
         // Preserve immediate resource facts for routing; only the local notice
         // requires three continuous seconds of failed enumeration.
@@ -436,7 +437,7 @@ impl Driver {
             .and(self.display_fault)
     }
     fn resource_faults(&self) -> super::ResourceFaults {
-        use oink_protocol::v1::dto::ResourceFaultCode;
+        use oink_protocol::v2::dto::ResourceFaultCode;
         let native = self.inject.resource_faults();
         let target = self.injection_available.map(|available| {
             if available {
@@ -505,9 +506,9 @@ impl Driver {
                     .safety_sequence
                     .is_some_and(|sequence| sequence != self.emergency_sequence) =>
                 {
-                    Err(oink_protocol::v1::dto::ControlFailure::StaleRevision)
+                    Err(oink_protocol::v2::dto::ControlFailure::StaleRevision)
                 }
-                2 => Err(oink_protocol::v1::dto::ControlFailure::ApplyFailed),
+                2 => Err(oink_protocol::v2::dto::ControlFailure::ApplyFailed),
                 _ => Ok(super::OwnerInputApplied {
                     cleanup_pending: state == 3,
                     emergency_sequence: pending.emergency_sequence,
@@ -653,7 +654,7 @@ impl Driver {
         let Some(state) = self
             .adapter
             .receive_state(peer)
-            .filter(|s| s.opening_read(admission))
+            .filter(|s| s.opening_read(admission.into()))
             .cloned()
         else {
             return;
@@ -671,22 +672,23 @@ impl Driver {
     }
     fn fault(&mut self, peer: DeviceId, which: Which, full: bool, code: StreamCode) {
         self.status_dirty = true;
-        if code == StreamCode::Cancelled
+        if code != StreamCode::None
             && let Some(pair) = self.pairs.get(&peer)
         {
-            // The safety fence deliberately ends a native session. Mark the
-            // handle before dropping it: the network owner may see the closed
-            // queue before InputStreams receives our notice. Both event orders
-            // must tell the peer this was cancellation, not a failed opening.
+            // Close the handle with the code before dropping it: the network
+            // owner may see the dropped queue before InputStreams receives our
+            // notice, and would close with `None`. The peer must learn why
+            // (cancellation by the safety fence is not a failed opening; an
+            // invalid record is not a lost stream).
             match which {
                 Which::Outbound => {
                     if let Some((stream, _)) = &pair.outbound {
-                        stream.cancel();
+                        stream.close_with(code);
                     }
                 }
                 Which::Inbound => {
                     if let Some((stream, _)) = &pair.inbound {
-                        stream.cancel();
+                        stream.close_with(code);
                     }
                 }
             }
@@ -805,7 +807,7 @@ impl Driver {
                 let disabling =
                     [routing.keyboard_mode, routing.mouse_mode].contains(&oink_foundation::input::InputMode::Disabled);
                 if disabling && expected_emergency_sequence != self.emergency_sequence {
-                    let _ = reply.try_send(Err(oink_protocol::v1::dto::ControlFailure::StaleRevision));
+                    let _ = reply.try_send(Err(oink_protocol::v2::dto::ControlFailure::StaleRevision));
                     return;
                 }
                 let failures = Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -823,7 +825,7 @@ impl Driver {
                 reply,
             } => {
                 if !paused && expected_emergency_sequence != self.emergency_sequence {
-                    let _ = reply.try_send(Err(oink_protocol::v1::dto::ControlFailure::StaleRevision));
+                    let _ = reply.try_send(Err(oink_protocol::v2::dto::ControlFailure::StaleRevision));
                     return;
                 }
                 let failures = Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -937,8 +939,11 @@ impl Driver {
                 let result = self.adapter.router_mut().lock_focus_to(target);
                 let _ = reply.try_send(result);
             }
-            InputCommand::MovePointerTo(target) => {
-                let _ = self.adapter.router_mut().move_pointer_to(target);
+            InputCommand::MovePointerTo(target, reply) => {
+                let result = self.adapter.router_mut().move_pointer_to(target);
+                if let Some(reply) = reply {
+                    let _ = reply.send(result);
+                }
             }
             InputCommand::ReturnPointerHome => self.adapter.router_mut().return_pointer_home(),
             InputCommand::PeerAdmission(admission) => {
@@ -979,6 +984,8 @@ impl Driver {
                 }
                 self.adapter.router_mut().retire_boot(boot);
             }
+            InputCommand::PointerBase(base) => self.adapter.router_mut().set_pointer_base(base),
+            InputCommand::TextFocus(state) => self.adapter.router_mut().set_text_focus(state),
             InputCommand::KeyboardDisabled(disabled) => {
                 let enabling = disabled && !self.paused && !self.adapter.router().keyboard_disabled();
                 let held = if enabling {
@@ -1004,9 +1011,9 @@ impl Driver {
             InputCommand::LocalFeel(feel) => self.adapter.router_mut().set_local_feel(feel),
             InputCommand::LocalDisplays(displays) => {
                 self.observe_display_fault(if displays.is_empty() {
-                    oink_protocol::v1::dto::ResourceFaultCode::DeviceUnavailable
+                    oink_protocol::v2::dto::ResourceFaultCode::DeviceUnavailable
                 } else {
-                    oink_protocol::v1::dto::ResourceFaultCode::None
+                    oink_protocol::v2::dto::ResourceFaultCode::None
                 });
                 if self.adapter.router().local_displays() != displays {
                     if let Some(trace) = &self.inject.trace {
@@ -1021,11 +1028,12 @@ impl Driver {
                 }
             }
             InputCommand::LocalDisplayFailure => {
-                self.observe_display_fault(oink_protocol::v1::dto::ResourceFaultCode::BackendFailed);
+                self.observe_display_fault(oink_protocol::v2::dto::ResourceFaultCode::BackendFailed);
             }
             InputCommand::PeerFacts {
                 boot,
                 os,
+                mobile,
                 displays,
                 transform,
             } => {
@@ -1040,6 +1048,7 @@ impl Driver {
                     self.pairs.get_mut(&boot.device_id).unwrap().os = Some(os);
                     let now = self.micros();
                     self.adapter.router_mut().set_peer_os(boot.device_id, os, now);
+                    self.adapter.router_mut().set_peer_mobile(boot.device_id, mobile);
                     self.adapter.router_mut().set_peer_displays(boot.device_id, displays);
                     self.adapter.router_mut().set_peer_input_transform(boot, transform);
                 }
@@ -1343,10 +1352,15 @@ impl Driver {
                 unlocked,
             } => {
                 crate::auto_unlock::record_flow_diagnostic(5, epoch, u64::from(unlocked));
-                if !self.paused && self.current_inbound(peer, stream) && self.adapter.attached(peer) {
+                // Paused while the answer was prepared: still answer, with the reason.
+                if self.current_inbound(peer, stream) && self.adapter.attached(peer) {
                     self.send_from(
                         peer,
-                        Message::Control(ControlMsg::UnlockReply { epoch, unlocked }),
+                        Message::Control(ControlMsg::UnlockReply {
+                            epoch,
+                            unlocked: unlocked && !self.paused,
+                            paused: self.paused,
+                        }),
                         None,
                     );
                 }
@@ -1495,7 +1509,6 @@ impl Driver {
                         Some(Ok(wire::Decoded::Packet(message))) if valid_reliable(&message) => {
                             self.received(peer, message, arrived, false)
                         }
-                        Some(Ok(wire::Decoded::Retired)) => {}
                         Some(Ok(wire::Decoded::Deferred(message))) => self.received_declaration(peer, message),
                         Some(Err(error)) => {
                             self.protocol_violation(peer, &bytes, error.code, false);
@@ -1510,7 +1523,7 @@ impl Driver {
             if self.cursor.pending.is_some() {
                 break;
             }
-            let mut bytes = [0u8; oink_protocol::v1::limits::DATAGRAM];
+            let mut bytes = [0u8; oink_protocol::v2::limits::DATAGRAM];
             let motion = self
                 .pairs
                 .get(&peer)
@@ -1526,7 +1539,6 @@ impl Driver {
                     .and_then(|pair| pair.admission.as_ref())
                     .map(|admission| wire::decode(&bytes[..len], admission, true));
                 match decoded {
-                    Some(Ok(wire::Decoded::Retired)) => {}
                     Some(Ok(wire::Decoded::Packet(message))) if valid_datagram(&message) => {
                         progressed = true;
                         self.received(peer, message, arrived, true);
@@ -1539,12 +1551,12 @@ impl Driver {
         self.read_peers = peers;
         progressed
     }
-    fn protocol_violation(&self, peer: DeviceId, bytes: &[u8], code: oink_protocol::v1::ErrorCode, datagram: bool) {
+    fn protocol_violation(&self, peer: DeviceId, bytes: &[u8], code: oink_protocol::v2::ErrorCode, datagram: bool) {
         let Some(stream) = self.pairs.get(&peer).and_then(|p| p.inbound.as_ref()).map(|p| p.0.id()) else {
             return;
         };
         let type_id =
-            oink_protocol::v1::frame::OpaqueFrame::parse_exact(bytes, oink_protocol::v1::limits::RELIABLE_FRAME)
+            oink_protocol::v2::frame::OpaqueFrame::parse_exact(bytes, oink_protocol::v2::limits::RELIABLE_FRAME)
                 .ok()
                 .map(|frame| frame.header.type_id);
         self.notices.post(InputNotice::ProtocolViolation {
@@ -1555,22 +1567,22 @@ impl Driver {
             datagram,
         });
     }
-    fn received_declaration(&mut self, peer: DeviceId, message: oink_protocol::v1::Message) {
-        use oink_protocol::v1::{self, dto};
+    fn received_declaration(&mut self, peer: DeviceId, message: oink_protocol::v2::Message) {
+        use oink_protocol::v2::{self, dto};
         if !self.adapter.attached(peer) || self.paused {
             return;
         }
         let notice = match &message {
-            v1::Message::DndNotice(notice) => crate::dnd::wire::notice_header(notice).map(Some),
-            v1::Message::AttachmentHead(head) => crate::dnd::wire::attachment_notice_header(head).map(Some),
-            v1::Message::AttachmentResult(result) => result.kind().and_then(|kind| {
+            v2::Message::DndNotice(notice) => crate::dnd::wire::notice_header(notice).map(Some),
+            v2::Message::AttachmentHead(head) => crate::dnd::wire::attachment_notice_header(head).map(Some),
+            v2::Message::AttachmentResult(result) => result.kind().and_then(|kind| {
                 if kind == dto::AttachmentKind::Drag {
                     Ok(None)
                 } else {
-                    Err(v1::ErrorCode::UnsupportedValue.into())
+                    Err(v2::ErrorCode::UnsupportedValue.into())
                 }
             }),
-            _ => Err(v1::ErrorCode::UnsupportedValue.into()),
+            _ => Err(v2::ErrorCode::UnsupportedValue.into()),
         };
         match notice {
             Ok(Some(notice)) => {
@@ -1749,6 +1761,24 @@ impl Driver {
             // Low pacing observes activity even when OS display wake is disabled.
             let _ = self.main.send(MainCommand::Activity { from: Some(peer) });
         }
+        // Paused after the target's entry check: refuse at once with the reason
+        // instead of letting the target wait out its reply window.
+        if attached
+            && self.paused
+            && let Message::Control(ControlMsg::UnlockQuery { epoch }) = &message
+        {
+            crate::auto_unlock::record_flow_diagnostic(4, *epoch, 0);
+            self.send_from(
+                peer,
+                Message::Control(ControlMsg::UnlockReply {
+                    epoch: *epoch,
+                    unlocked: false,
+                    paused: true,
+                }),
+                None,
+            );
+            return;
+        }
         if attached && !self.paused {
             match &message {
                 Message::Control(ControlMsg::UnlockQuery { epoch }) => {
@@ -1774,7 +1804,7 @@ impl Driver {
                     }
                     return;
                 }
-                Message::Control(ControlMsg::UnlockReply { epoch, unlocked })
+                Message::Control(ControlMsg::UnlockReply { epoch, unlocked, .. })
                     if self.sync_unlock.confirm(
                         peer,
                         *epoch,
@@ -1785,8 +1815,17 @@ impl Driver {
                 {
                     return;
                 }
-                Message::Control(ControlMsg::UnlockReply { epoch, unlocked }) => {
-                    crate::auto_unlock::record_flow_diagnostic(6, *epoch, u64::from(*unlocked));
+                Message::Control(ControlMsg::UnlockReply {
+                    epoch,
+                    unlocked,
+                    paused,
+                }) => {
+                    // 6 = reply received: 1 unlocked, 0 still locked, 2 source paused.
+                    crate::auto_unlock::record_flow_diagnostic(
+                        6,
+                        *epoch,
+                        if *paused { 2 } else { u64::from(*unlocked) },
+                    );
                     let focus = self.adapter.router().focus();
                     if focus.holder == self.local
                         && focus.epoch == *epoch
@@ -2422,7 +2461,7 @@ impl Driver {
             self.shared.wake.get().expect("native wake installed")();
         }
     }
-    fn post_wire(&mut self, peer: DeviceId, message: oink_protocol::v1::Message) {
+    fn post_wire(&mut self, peer: DeviceId, message: oink_protocol::v2::Message) {
         let Some(pair) = self.pairs.get(&peer) else {
             return;
         };
@@ -2432,15 +2471,15 @@ impl Driver {
         if !admission.admits(message.type_id(), false) {
             return;
         }
-        let mut buffer = [0; oink_protocol::v1::limits::RELIABLE_FRAME];
+        let mut buffer = [0; oink_protocol::v2::limits::RELIABLE_FRAME];
         let Ok(len) = wire::encode_wire(&message, &mut buffer) else {
             self.fault(peer, Which::Outbound, false, StreamCode::Invalid);
             return;
         };
         if self.post_bytes(peer, &buffer[..len], false) {
             let notice = match &message {
-                oink_protocol::v1::Message::DndNotice(notice) => crate::dnd::wire::notice_header(notice).ok(),
-                oink_protocol::v1::Message::AttachmentHead(head) => {
+                oink_protocol::v2::Message::DndNotice(notice) => crate::dnd::wire::notice_header(notice).ok(),
+                oink_protocol::v2::Message::AttachmentHead(head) => {
                     crate::dnd::wire::attachment_notice_header(head).ok()
                 }
                 _ => None,
@@ -2469,9 +2508,9 @@ impl Driver {
         if pair.outbound.is_none() || !wire::supported(&message, admission) {
             return;
         }
-        let mut buffer = [0; oink_protocol::v1::limits::RELIABLE_FRAME];
+        let mut buffer = [0; oink_protocol::v2::limits::RELIABLE_FRAME];
         let maximum = if datagram {
-            oink_protocol::v1::limits::DATAGRAM
+            oink_protocol::v2::limits::DATAGRAM
         } else {
             buffer.len()
         };
@@ -2521,7 +2560,7 @@ impl Driver {
                 if !wire::supported(&message, admission) {
                     continue;
                 }
-                let mut buffer = [0; oink_protocol::v1::limits::RELIABLE_FRAME];
+                let mut buffer = [0; oink_protocol::v2::limits::RELIABLE_FRAME];
                 let Ok(len) = wire::encode(&message, &mut buffer) else {
                     continue;
                 };
@@ -2682,9 +2721,9 @@ impl CaptureLoop for Driver {
     }
     fn capture_available(&mut self, available: bool) {
         self.capture_fault = Some(if available {
-            oink_protocol::v1::dto::ResourceFaultCode::None
+            oink_protocol::v2::dto::ResourceFaultCode::None
         } else {
-            oink_protocol::v1::dto::ResourceFaultCode::CaptureUnavailable
+            oink_protocol::v2::dto::ResourceFaultCode::CaptureUnavailable
         });
         self.now = Instant::now();
         self.adapter.at(self.micros());
@@ -2701,7 +2740,7 @@ impl CaptureLoop for Driver {
         // A completed withdrawal is an observed nonfault, not missing evidence.
         // None would make the keyboard card unknown throughout pause; unlike the
         // mouse it has no independent injection observation to retain its health.
-        self.capture_fault = Some(oink_protocol::v1::dto::ResourceFaultCode::None);
+        self.capture_fault = Some(oink_protocol::v2::dto::ResourceFaultCode::None);
         self.now = Instant::now();
         self.adapter.at(self.micros());
         self.adapter.router_mut().set_capture_available(false);

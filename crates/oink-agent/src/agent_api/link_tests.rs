@@ -2,7 +2,7 @@
 use super::*;
 use crate::snapshot_tests::{Displays, pair, start_with_clip, until};
 use oink_network::link::{DialMode, DialOrigin};
-use oink_protocol::v1::dto::FactPath;
+use oink_protocol::v2::dto::FactPath;
 use std::io::Read;
 
 async fn inspect_link(node: &Node, peer: &Node, relay: Option<&Node>) {

@@ -77,6 +77,7 @@ typedef struct {
     bool explicit_master;
     bool buffer_before_tap;
     bool tap_private;
+    bool keep_silence; // echo reference: deliver every zero, never omit
     uint32_t requested_frames;
     CFMutableArrayRef diagnostic_stages;
 } OinkCapture;
@@ -250,7 +251,7 @@ static OSStatus capture_io(AudioObjectID device, const AudioTimeStamp *now,
         }
     }
     uint64_t tail = (uint64_t)(capture->sample_rate * 5.0);
-    bool quiet = zero && capture->zero_frames >= tail;
+    bool quiet = !capture->keep_silence && zero && capture->zero_frames >= tail;
     capture->zero_frames = zero ? (capture->zero_frames < tail ? capture->zero_frames + frames : tail) : 0;
     if (quiet && capture->wake != MACH_PORT_NULL) {
         // The tap is still healthy. Count deliberately omitted zeros separately
@@ -803,8 +804,24 @@ size_t oink_audio_capture_diagnostics(void *opaque, char *buffer, size_t capacit
     }
 }
 
+static void *capture_start(uint32_t requested_frames, uint32_t capture_mode, const char *selected_uid, bool buffer_before_tap, bool tap_private, bool collect_diagnostics, bool realtime, bool include_own_process, bool keep_silence, double *sample_rate, char *error, size_t error_size);
+
 void *oink_audio_capture_start(bool mute, uint32_t requested_frames, uint32_t capture_mode, const char *selected_uid, bool buffer_before_tap, bool tap_private, bool collect_diagnostics, bool realtime, double *sample_rate, char *error, size_t error_size) {
     (void)mute; // ABI retained; the durable endpoint lease owns local silence.
+    return capture_start(requested_frames, capture_mode, selected_uid, buffer_before_tap, tap_private,
+        collect_diagnostics, realtime, false, false, sample_rate, error, error_size);
+}
+
+// Echo reference: the whole mix of one output device, Oink's own playback
+// included (the reference must contain everything the speaker plays). Device
+// tap with that device as clock master, HAL default buffer, no physical buffer
+// lease and no zero omission; polled by its reader, so no wake semaphore.
+void *oink_audio_reference_tap_start(const char *output_uid, double *sample_rate, char *error, size_t error_size) {
+    return capture_start(UINT32_MAX, 1, output_uid, false, true, false, false, true, true,
+        sample_rate, error, error_size);
+}
+
+static void *capture_start(uint32_t requested_frames, uint32_t capture_mode, const char *selected_uid, bool buffer_before_tap, bool tap_private, bool collect_diagnostics, bool realtime, bool include_own_process, bool keep_silence, double *sample_rate, char *error, size_t error_size) {
     @autoreleasepool {
         if (oink_audio_capture_cleanup_failed()) {
             snprintf(error, error_size, "Capture disabled after cleanup failure; tap/mute release may be incomplete. Exit this process, verify local audio, then restart the application");
@@ -829,12 +846,14 @@ void *oink_audio_capture_start(bool mute, uint32_t requested_frames, uint32_t ca
             const char *stage = "Resolve Oink audio process";
             char detail[256] = {0};
             CATapDescription *description = nil;
+            NSArray *excluded = nil;
             NSDictionary *aggregate = nil;
             NSString *physical_uid = nil;
             capture->info.capture_mode = capture_mode;
             capture->explicit_master = selected_uid != NULL;
             capture->buffer_before_tap = buffer_before_tap;
             capture->tap_private = tap_private;
+            capture->keep_silence = keep_silence;
             capture->requested_frames = requested_frames;
             if (collect_diagnostics)
                 capture->diagnostic_stages = CFArrayCreateMutable(NULL, 0, &kCFTypeArrayCallBacks);
@@ -888,14 +907,15 @@ void *oink_audio_capture_start(bool mute, uint32_t requested_frames, uint32_t ca
             }
             if (buffer_before_tap) capture_physical_lease(capture, requested_frames);
             capture_record_snapshot(capture, @"physical_at_tap_creation");
+            excluded = include_own_process ? @[] : @[@(own_process)];
             if (device_scope(capture_mode)) {
-                description = [[CATapDescription alloc] initExcludingProcesses:@[@(own_process)]
+                description = [[CATapDescription alloc] initExcludingProcesses:excluded
                     andDeviceUID:physical_uid withStream:0];
             } else {
                 description = [[CATapDescription alloc]
-                    initStereoGlobalTapButExcludeProcesses:@[@(own_process)]];
+                    initStereoGlobalTapButExcludeProcesses:excluded];
             }
-            description.name = @"Oink system audio";
+            description.name = include_own_process ? @"Oink echo reference" : @"Oink system audio";
             description.privateTap = tap_private;
             // A long-lived CATapMutedWhenTapped tap on macOS 14 can capture a
             // newly started output client without muting its original output.

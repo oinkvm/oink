@@ -2,7 +2,7 @@
 //! store authorizes membership or a live session. Unknown fields round-trip.
 use super::store::{self, StoreError};
 use oink_foundation::{DeviceId, GroupId};
-use oink_protocol::v1::{RawMap, RawValue, schema::WireValue};
+use oink_protocol::v2::{RawMap, RawValue, schema::WireValue};
 use std::{
     collections::BTreeSet,
     path::{Path, PathBuf},
@@ -169,7 +169,7 @@ impl PresenceStore {
                 .into(),
             ));
         }
-        oink_protocol::v1::cbor::encode_map(&candidate, MAX_RECORD_BYTES)?;
+        oink_protocol::v2::cbor::encode_map(&candidate, MAX_RECORD_BYTES)?;
         self.raw = candidate;
         self.dirty = true;
         Ok(())

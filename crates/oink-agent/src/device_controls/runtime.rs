@@ -12,7 +12,7 @@ use crate::{
     device_cards::*,
     node::{Node, lock},
 };
-use oink_protocol::v1::{
+use oink_protocol::v2::{
     Message, dto,
     schema::{FixedBytes, WireDto, WireValue},
 };
@@ -143,7 +143,7 @@ fn failed(id: &str, reason: Failure) -> DeviceControlReply {
         result: DeviceControlResult::from_owner(dto::ControlOutcome::Refused, reason),
     })
 }
-fn field<T>(result: oink_protocol::v1::Result<T>) -> Result<T, Failure> {
+fn field<T>(result: oink_protocol::v2::Result<T>) -> Result<T, Failure> {
     result.map_err(|_| Failure::InvalidValue)
 }
 pub(super) fn boot(requester: Requester) -> dto::Boot {
@@ -239,7 +239,7 @@ impl Node {
         &self,
         device: DeviceKey,
         option: dto::LocalOption,
-        value: oink_protocol::v1::RawValue,
+        value: oink_protocol::v2::RawValue,
     ) -> crate::api::ApiResult<()> {
         self.edit_device_option_with(device, option, |_| Ok(value))
     }
@@ -247,7 +247,7 @@ impl Node {
         &self,
         device: DeviceKey,
         option: dto::LocalOption,
-        patch: impl FnOnce(oink_protocol::v1::RawValue) -> crate::api::ApiResult<oink_protocol::v1::RawValue>,
+        patch: impl FnOnce(oink_protocol::v2::RawValue) -> crate::api::ApiResult<oink_protocol::v2::RawValue>,
     ) -> crate::api::ApiResult<()> {
         let config = self.link_config()?;
         let nonce = if device.0 == self.id() {
@@ -350,6 +350,9 @@ impl Node {
                 });
             }
         };
+        if let TokenOperation::AudioMode { role, device, mode } = binding.operation {
+            return self.audio_mode_control(id, &binding, role, device, mode);
+        }
         match make(&binding, &id) {
             Ok(request) => self.invoke_control(id, binding, request),
             Err(reason) => DeviceControlReply::Completed(DeviceControlCompleted {
@@ -357,6 +360,38 @@ impl Node {
                 result: DeviceControlResult::refused(reason),
             }),
         }
+    }
+    /// A speaker / microphone mode change is executed here, by the device
+    /// whose user made it: the audio owner authors it in the global audio
+    /// configuration and broadcasts it. No owner request is sent to the
+    /// changed device (setter decides).
+    fn audio_mode_control(
+        &self,
+        id: String,
+        binding: &TokenBinding,
+        role: oink_audio::route::Role,
+        device: DeviceKey,
+        mode: oink_audio::route::Mode,
+    ) -> DeviceControlReply {
+        if crate::device_cards::request_id(&id).is_err() {
+            return failed(&id, Failure::InvalidValue);
+        }
+        if let Err(reason) = self.validate_control_target(binding) {
+            return failed(&id, reason);
+        }
+        if binding.owner.device.0 != self.id() {
+            return failed(&id, Failure::InvalidValue);
+        }
+        let Some(audio) = self.inner.audio.get() else {
+            return failed(&id, Failure::Offline);
+        };
+        let result = match audio.set_audio_mode(device.0, role, mode) {
+            Ok(outcome) => DeviceControlResult::from_owner(outcome, Failure::None),
+            Err(reason) => DeviceControlResult::from_owner(dto::ControlOutcome::Failed, reason),
+        };
+        // The new route tokens must be visible before the caller rebases.
+        self.refresh_device_cards();
+        DeviceControlReply::Completed(DeviceControlCompleted { request_id: id, result })
     }
     pub(crate) fn local_pause_control(&self, id: String, paused: bool) -> DeviceControlReply {
         if let Some(reply) = lock(&self.inner.controls).repeated_local_pause(&id, self.id().into(), paused) {
@@ -510,24 +545,22 @@ impl Node {
             return Err(Failure::StaleBoot);
         }
         if binding.owner.device.0 != self.id() {
-            let capability = if matches!(
-                binding.operation,
-                TokenOperation::Option {
-                    edit: crate::device_cards::CardOptionEdit::MouseMode(crate::device_cards::SharingMode::Disabled)
-                }
-            ) {
-                "oink.input.mouse-disabled/1"
-            } else if matches!(binding.operation, TokenOperation::OwnerOption { option: 26..=28 }) {
-                "oink.input.touchpad-options/1"
-            } else if matches!(binding.operation, TokenOperation::ExitVolume { .. }) {
-                "oink.audio.exit-volume/1"
-            } else {
-                "oink.device-options/1"
+            // The registry decides from the message this binding sends: every
+            // option (MouseMode and 26..=28 included) needs oink.device/2, the
+            // exit volume oink.audio/2 (protocol-v2 1.1).
+            use oink_protocol::v2::registry::type_id;
+            let message = match binding.operation {
+                TokenOperation::Pause { .. } => type_id::ConfigPauseDevice,
+                TokenOperation::ExitVolume { .. } => type_id::ConfigSetExitVolume,
+                TokenOperation::OwnerOption { .. }
+                | TokenOperation::Option { .. }
+                | TokenOperation::ForwardingControls
+                | TokenOperation::MicrophoneControls => type_id::ConfigSetLocalOption,
+                // An audio mode is authored by this device and broadcast in
+                // the global configuration; it is never sent to another owner.
+                TokenOperation::AudioMode { .. } => return Err(Failure::Unsupported),
             };
-            if !config
-                .peer_agreement(binding.owner.device.0)
-                .is_some_and(|agreement| agreement.contains(capability))
-            {
+            if !config.peer_permits(binding.owner.device.0, message) {
                 return Err(Failure::Unsupported);
             }
         }
@@ -600,30 +633,16 @@ impl Node {
         if config.applied().group != group || !config.applied().members.contains(&requester.device.0) {
             return Err(Failure::NotMember);
         }
-        if requester.device.0 != self.id() {
-            if !config
+        // A remote request arrived on C0, whose admission already required the
+        // registry capabilities of its message: oink.device/2 for every local
+        // option (MouseMode and 26..=28 included) and pause, oink.audio/2 for
+        // the exit volume (protocol-v2 1.1).
+        if requester.device.0 != self.id()
+            && !config
                 .peer_boot(requester.device.0)
                 .is_some_and(|live| live.nonce == requester.nonce)
-            {
-                return Err(Failure::StaleBoot);
-            }
-            let capability = if matches!(request, Message::ConfigSetLocalOption(edit) if edit.option().ok() == Some(oink_protocol::v1::dto::LocalOption::MouseMode) && (edit.value().ok().is_some_and(|v| v == oink_protocol::v1::RawValue::Uint(2)) || self.settings().routing.mouse_mode == oink_foundation::input::InputMode::Disabled))
-            {
-                "oink.input.mouse-disabled/1"
-            } else if matches!(request, Message::ConfigSetLocalOption(edit) if edit.option().ok().is_some_and(|option| matches!(option.number(), 26..=28)))
-            {
-                "oink.input.touchpad-options/1"
-            } else if matches!(request, Message::ConfigSetExitVolume(_)) {
-                "oink.audio.exit-volume/1"
-            } else {
-                "oink.device-options/1"
-            };
-            if !config
-                .peer_agreement(requester.device.0)
-                .is_some_and(|a| a.contains(capability))
-            {
-                return Err(Failure::Unsupported);
-            }
+        {
+            return Err(Failure::StaleBoot);
         }
         if target
             != boot(Requester {
@@ -696,7 +715,7 @@ impl Node {
         } else {
             dto::ControlOutcome::Refused
         };
-        let mut raw: oink_protocol::v1::RawMap = [
+        let mut raw: oink_protocol::v2::RawMap = [
             (1, FixedBytes(id).write()),
             (2, target.write()),
             (3, outcome.write()),

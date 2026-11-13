@@ -10,7 +10,7 @@ use oink_foundation::clipboard::ClipPlatform;
 use oink_network::link::{ModuleEvent, QueueSpec};
 use oink_protocol::{
     frame::{StreamKind, StreamTag},
-    v1::{self, Message},
+    v2::{self, Message},
 };
 use std::io::{self, Read};
 
@@ -104,11 +104,12 @@ async fn scenario() {
         )
         .unwrap();
     tx.post(
-        v1::frame::encode(
+        v2::frame::encode(
             &Message::ClipboardOffer(
                 oink_clipboard::sync::Ordering::new(source.id(), 30)
                     .capture(
                         oink_clipboard::wire::inventory(&inventory).unwrap(),
+                        vec![],
                         1,
                         oink_clipboard::Sensitivity::Normal,
                         0,
@@ -116,7 +117,7 @@ async fn scenario() {
                     .unwrap()
                     .unwrap(),
             ),
-            v1::limits::RELIABLE_FRAME,
+            v2::limits::RELIABLE_FRAME,
         )
         .unwrap(),
     )

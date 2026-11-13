@@ -2,7 +2,7 @@ use super::{model::*, store, types::*, wire};
 use crate::api::{DeviceKey, GroupKey, Placement, ScreenKey};
 use oink_display::layout::LayoutSettings;
 use oink_foundation::{DeviceId, GroupId, Point, Size};
-use oink_protocol::v1::schema::WireDto;
+use oink_protocol::v2::schema::WireDto;
 use std::collections::BTreeSet;
 fn device(n: u8) -> DeviceKey {
     DeviceKey(DeviceId([n; 32]))
@@ -116,7 +116,7 @@ fn catalog_wire_and_atomic_store_roundtrip() {
     let raw = wire::catalog(&c).unwrap();
     let bytes = raw.encode(MAX_BYTES).unwrap();
     assert_eq!(
-        wire::read_catalog(oink_protocol::v1::dto::LayoutProfileCatalogV3::decode(&bytes, MAX_BYTES).unwrap()).unwrap(),
+        wire::read_catalog(oink_protocol::v2::dto::LayoutProfileCatalog::decode(&bytes, MAX_BYTES).unwrap()).unwrap(),
         c
     );
     let root = tempfile::tempdir().unwrap();
@@ -580,7 +580,7 @@ fn finite_integer_native_and_unique_visibility_are_required() {
 
 #[test]
 fn future_catalog_fields_survive_rename_save_and_store() {
-    use oink_protocol::v1::{RawValue as V, dto};
+    use oink_protocol::v2::{RawValue as V, dto};
     let s = snapshot();
     let c = catalog(&s);
     let mut raw = wire::catalog(&c).unwrap().into_raw();
@@ -600,7 +600,7 @@ fn future_catalog_fields_survive_rename_save_and_store() {
         panic!()
     };
     placement.insert(77, V::Text("future placement".into()));
-    let c = wire::read_catalog(dto::LayoutProfileCatalogV3::from_raw(raw).unwrap()).unwrap();
+    let c = wire::read_catalog(dto::LayoutProfileCatalog::from_raw(raw).unwrap()).unwrap();
     let c = c.rename(device(1), &c.active_profile_id, "Renamed").unwrap();
     let mut changed = s.clone();
     changed.placements[0].origin.x = 50.0;
@@ -680,10 +680,10 @@ fn shared_dto_retains_both_visibility_layers_and_default_sharing() {
     changed.disabled[0].disabled = true;
     assert!(!same_content(&original, &changed));
     let raw = wire::snapshot(&changed).unwrap();
-    let oink_protocol::v1::RawValue::Map(raw) = raw else {
+    let oink_protocol::v2::RawValue::Map(raw) = raw else {
         unreachable!()
     };
-    let dto = oink_protocol::v1::dto::LayoutProfileSnapshot::from_raw(raw).unwrap();
+    let dto = oink_protocol::v2::dto::LayoutProfileSnapshot::from_raw(raw).unwrap();
     let decoded = wire::read_snapshot(dto, &changed.active_profile_id).unwrap();
     assert!(same_content(&changed, &decoded));
     assert!(!screen_shared(&decoded, device(1)));
@@ -946,9 +946,9 @@ fn rapid_second_pairing_result_needs_no_first_group_history() {
 }
 
 #[test]
-fn old_saved_profiles_load_unchanged_and_obsolete_fields_are_ignored() {
+fn old_saved_profiles_roundtrip_locally_but_are_omitted_from_v2_wire() {
     use base64::Engine as _;
-    use oink_protocol::v1::{RawValue as V, dto};
+    use oink_protocol::v2::{RawValue as V, dto};
     let s = snapshot();
     let original = catalog(&s)
         .save(device(1), &s, state(&s), Some("Keep existing"), 20)
@@ -958,7 +958,10 @@ fn old_saved_profiles_load_unchanged_and_obsolete_fields_are_ignored() {
     raw.insert(6, V::Array(vec![V::Bytes(vec![1; 32])]));
     raw.insert(7, V::Array(vec![V::Bytes(vec![2; 16])]));
     raw.insert(8, V::Array(vec![V::Bytes(vec![1; 32])]));
-    let legacy = dto::LayoutProfileCatalogV2::from_raw(raw).unwrap();
+    // A pre-v2 writer may have left retired numbered fields behind. The one
+    // canonical catalog decoder must accept them as unknown data and the
+    // business decoder must drop them before the next save.
+    let legacy = dto::LayoutProfileCatalog::from_raw(raw).unwrap();
     let root = tempfile::tempdir().unwrap();
     store::save(root.path(), &original).unwrap();
     let path = std::fs::read_dir(root.path().join("layout-profiles-v2"))
@@ -970,14 +973,21 @@ fn old_saved_profiles_load_unchanged_and_obsolete_fields_are_ignored() {
     let envelope = serde_json::json!({"schema":1,"catalog_cbor":base64::engine::general_purpose::STANDARD.encode(legacy.encode(MAX_BYTES).unwrap())});
     std::fs::write(&path, serde_json::to_vec(&envelope).unwrap()).unwrap();
     let loaded = store::load(root.path(), original.group).unwrap().unwrap();
-    assert_eq!(loaded, original);
-    store::save(root.path(), &loaded).unwrap();
-    assert_eq!(store::load(root.path(), original.group).unwrap().unwrap(), original);
+    assert_eq!(loaded.schema, original.schema);
+    assert_eq!(loaded.group, original.group);
+    assert_eq!(loaded.version, original.version);
+    assert_eq!(loaded.active_profile_id, original.active_profile_id);
+    assert_eq!(loaded.profiles, original.profiles);
+    let stored = wire::storage_catalog(&loaded).unwrap();
+    assert!([6, 7, 8].iter().all(|k| stored.raw().contains_key(k)));
     assert!(
-        ![6, 7, 8]
+        [6, 7, 8]
             .iter()
-            .any(|k| wire::catalog(&loaded).unwrap().raw().contains_key(k))
+            .all(|k| !wire::catalog(&loaded).unwrap().raw().contains_key(k))
     );
+    store::save(root.path(), &loaded).unwrap();
+    let reloaded = store::load(root.path(), original.group).unwrap().unwrap();
+    assert_eq!(reloaded, loaded);
 }
 
 #[test]
@@ -1092,7 +1102,7 @@ fn profile_match_and_new_saved_state_do_not_track_presence() {
 
 #[test]
 fn older_writer_cannot_rebind_retained_physical_topology() {
-    use oink_protocol::v1::{RawValue as V, dto, schema::WireValue};
+    use oink_protocol::v2::{RawValue as V, dto, schema::WireValue};
     let s = snapshot();
     let mut c = catalog(&s);
     c.profiles[0].saved_topology = Some(physical(&s));
@@ -1112,7 +1122,7 @@ fn older_writer_cannot_rebind_retained_physical_topology() {
     };
     // An older build updates content/revision but preserves unknown metadata.
     profile.insert(9, old_revision);
-    let received = wire::read_catalog(dto::LayoutProfileCatalogV3::from_raw(raw).unwrap()).unwrap();
+    let received = wire::read_catalog(dto::LayoutProfileCatalog::from_raw(raw).unwrap()).unwrap();
     assert!(received.active().saved_topology.is_none());
     assert_eq!(received.active().content, c.active().content);
     let encoded = wire::catalog(&received).unwrap();

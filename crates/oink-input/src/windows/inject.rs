@@ -15,10 +15,10 @@
 use oink_foundation::input::{KeyCode, MouseButton};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBD_EVENT_FLAGS, KEYBDINPUT, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP,
-    KEYEVENTF_SCANCODE, MOUSE_EVENT_FLAGS, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN,
-    MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN,
-    MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_VIRTUALDESK, MOUSEEVENTF_WHEEL, MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, MOUSEINPUT,
-    VIRTUAL_KEY,
+    KEYEVENTF_SCANCODE, KEYEVENTF_UNICODE, MOUSE_EVENT_FLAGS, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL,
+    MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE,
+    MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_VIRTUALDESK, MOUSEEVENTF_WHEEL, MOUSEEVENTF_XDOWN,
+    MOUSEEVENTF_XUP, MOUSEINPUT, VIRTUAL_KEY,
 };
 
 use super::keymap;
@@ -271,9 +271,93 @@ pub(crate) fn key(code: KeyCode, pressed: bool) -> Option<INPUT> {
     })
 }
 
+/// UTF-16 units per `SendInput` batch of committed text (two events each).
+pub(crate) const TEXT_BATCH_UNITS: usize = 512;
+
+/// Committed text: one `KEYEVENTF_UNICODE` press and release per UTF-16 code
+/// unit, surrogate pairs in order (high, then low). Windows turns each unit into
+/// `VK_PACKET` and a `WM_CHAR` carrying it, independent of the keyboard layout
+/// and the active IME; text controls combine the two surrogate `WM_CHAR`s.
+/// Each batch goes to one `SendInput`, so no other input interleaves inside
+/// it. Batches hold at most [`TEXT_BATCH_UNITS`] units and split only between
+/// user-perceived characters (never inside a surrogate pair).
+pub(crate) fn text_batches(text: &str) -> Vec<Vec<INPUT>> {
+    crate::text::utf16_chunks(text, TEXT_BATCH_UNITS)
+        .into_iter()
+        .map(|chunk| {
+            chunk
+                .into_iter()
+                .flat_map(|unit| [unicode(unit, true), unicode(unit, false)])
+                .collect()
+        })
+        .collect()
+}
+
+pub(crate) fn unicode(unit: u16, pressed: bool) -> INPUT {
+    INPUT {
+        r#type: INPUT_KEYBOARD,
+        Anonymous: INPUT_0 {
+            ki: KEYBDINPUT {
+                wVk: VIRTUAL_KEY(0),
+                wScan: unit,
+                dwFlags: if pressed {
+                    KEYEVENTF_UNICODE
+                } else {
+                    KEYEVENTF_UNICODE | KEYEVENTF_KEYUP
+                },
+                time: 0,
+                dwExtraInfo: INJECT_TAG,
+            },
+        },
+    }
+}
+
 #[cfg(all(test, debug_assertions))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn long_text_is_batched_below_the_message_queue_limit() {
+        let long = "😀".repeat(3000) + &"a".repeat(1000); // 7000 units
+        let batches = text_batches(&long);
+        assert_eq!(batches.iter().map(Vec::len).sum::<usize>(), 14_000);
+        assert!(batches.iter().all(|batch| batch.len() <= 2 * TEXT_BATCH_UNITS));
+        // A batch never ends between the two halves of a surrogate pair.
+        for batch in &batches {
+            // SAFETY: keyboard inputs built above.
+            let last = unsafe { batch.last().unwrap().Anonymous.ki.wScan };
+            assert!(!(0xD800..0xDC00).contains(&last));
+        }
+    }
+
+    #[test]
+    fn text_is_one_unicode_press_and_release_per_utf16_unit() {
+        let inputs = text_batches("中😀").concat();
+        let units: Vec<(u16, bool)> = inputs
+            .iter()
+            .map(|input| {
+                assert_eq!(input.r#type, INPUT_KEYBOARD);
+                // SAFETY: built as keyboard input above.
+                let key = unsafe { input.Anonymous.ki };
+                assert_eq!(key.wVk, VIRTUAL_KEY(0));
+                assert_eq!(key.dwExtraInfo, INJECT_TAG);
+                assert!(key.dwFlags.contains(KEYEVENTF_UNICODE));
+                assert!(!key.dwFlags.contains(KEYEVENTF_SCANCODE));
+                (key.wScan, !key.dwFlags.contains(KEYEVENTF_KEYUP))
+            })
+            .collect();
+        assert_eq!(
+            units,
+            [
+                (0x4E2D, true),
+                (0x4E2D, false),
+                (0xD83D, true),
+                (0xD83D, false),
+                (0xDE00, true),
+                (0xDE00, false)
+            ]
+        );
+    }
 
     #[test]
     fn game_relative_input_uses_only_move_and_keeps_echo_tag() {

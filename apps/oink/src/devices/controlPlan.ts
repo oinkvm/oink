@@ -16,10 +16,9 @@ export function controlCommand(card:DeviceCard,action:ControlAction):CardAction|
   if(action.kind==='microphone') {
     const mic=card.status?.microphone;
     if(action.mode==='source'&&!mic?.permissionGranted || action.mode==='receiver'&&!mic?.virtualReady)return null;
-    // v1 release enables receiving. Local needs a second localAction after
-    // release; Receive can finish with release alone. Never flip Receive first
-    // while this device is still the source.
-    return action.mode==='source'?mic?.shareAction:mic?.mode==='source'||action.mode==='muted'?mic?.localAction:mic?.receiveAction;
+    // One write in the global audio configuration: leaving the sender for
+    // receive or local clears it and sets the receive switch together.
+    return action.mode==='source'?mic?.shareAction:action.mode==='receiver'?mic?.receiveAction:mic?.localAction;
   }
   return null;
 }
@@ -64,7 +63,7 @@ export function controlObservation(cards:DeviceCardsView|null,device:string,acti
   if(action.kind==='microphone'){
     const mic=s?.microphone;
     const mode=!mic?null:mic.mode==='source'?'source':mic.virtualReady&&(mic.mode==='idle'||mic.mode==='receiver')?'receiver':'muted';
-    return {token,matches:mode===action.mode,intermediate:mic?.mode==='source'&&action.mode==='muted',microphoneMode:mode??undefined};
+    return {token,matches:mode===action.mode,microphoneMode:mode??undefined};
   }
   const desired=action.desired;
   switch(action.resource){

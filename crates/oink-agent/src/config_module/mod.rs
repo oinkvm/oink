@@ -17,8 +17,9 @@ use oink_display::{
 };
 use oink_foundation::{DeviceId, GroupId, session::Boot, snapshot::Snapshot};
 use oink_network::link::{ConfigPort, LinkLayer};
-use oink_protocol::v1::{self, dto};
+use oink_protocol::v2::{self, dto};
 use oink_routing::TopologyLayout;
+pub use runtime::check_group_state;
 use std::{
     collections::{BTreeMap, BTreeSet},
     net::SocketAddr,
@@ -59,7 +60,7 @@ pub struct MemberInfo {
     pub os: String,
     pub online: bool,
     /// Offline entries contain historical metadata with a neutral DTO shell,
-    /// not a retained live Boot, sequence, status, capability or claim baseline.
+    /// not a retained live Boot, sequence, status, capability or audio route.
     pub facts: Option<Arc<dto::DeviceFacts>>,
     pub added_by: Option<DeviceId>,
     pub added_at_ms: u64,
@@ -68,6 +69,16 @@ pub struct MemberInfo {
     pub address_stale: bool,
     pub protocol_incompatible: bool,
 }
+impl MemberInfo {
+    pub(crate) fn is_mobile(&self) -> bool {
+        matches!(self.os.as_str(), "android" | "ios")
+            || self
+                .facts
+                .as_ref()
+                .is_some_and(|facts| facts.device_kind() == Ok(dto::DeviceKind::Mobile))
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct MemberTable {
     pub members: Vec<MemberInfo>,
@@ -77,6 +88,8 @@ pub struct AppliedState {
     pub group: GroupId,
     pub roster_digest: [u8; 32],
     pub pointer_slots: BTreeMap<DeviceId, Option<u8>>,
+    /// The pointer base computer (protocol §14.3), if recorded.
+    pub pointer_base: Option<DeviceId>,
     /// Group-wide device list order; sort with `oink_network::device_order::sort_key`.
     pub device_order: BTreeMap<DeviceId, i64>,
     pub members: Vec<DeviceId>,
@@ -132,8 +145,9 @@ pub enum ConfigChange {
     },
     DeviceControl {
         peer: DeviceId,
-        message: v1::Message,
+        message: v2::Message,
     },
+    /// Committed text from an admitted member's C0, for the input owner.
     ProtocolError {
         link: oink_network::link::LinkId,
         peer: DeviceId,
@@ -170,6 +184,10 @@ pub struct ConfigDeps {
     pub port: ConfigPort,
     pub identity: Arc<oink_network::identity::Identity>,
     pub application: Arc<dyn ConfigApplication>,
+    /// Whether this backend pairs with devices outside its roster. Pairing is
+    /// part of the `oink.group/2` baseline in protocol v2, so a backend without
+    /// the pairing component refuses each incoming request here instead.
+    pub pairing: bool,
 }
 impl std::fmt::Debug for ConfigDeps {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -266,19 +284,29 @@ impl ConfigModule {
             .filter(|l| l.state == oink_network::link::LinkState::Ready)
             .map(|l| l.peer_boot)
     }
-    pub fn peer_agreement(&self, device: DeviceId) -> Option<Arc<v1::admission::Agreement>> {
+    pub fn peer_agreement(&self, device: DeviceId) -> Option<Arc<v2::admission::Agreement>> {
         self.links
             .links()
             .by_peer(device)
             .filter(|l| l.state == oink_network::link::LinkState::Ready)
             .map(|l| Arc::new(l.agreement.clone()))
     }
-    pub(crate) fn peer_supports(&self, device: DeviceId, capability: &str) -> bool {
+    /// Whether the ready link to `device` can carry message `type_id` (a
+    /// `registry::type_id` constant): the send gate's own registry rule.
+    pub(crate) fn peer_permits(&self, device: DeviceId, type_id: u16) -> bool {
         self.links
             .links()
             .by_peer(device)
             .filter(|l| l.state == oink_network::link::LinkState::Ready)
-            .is_some_and(|l| l.agreement.contains(capability))
+            .is_some_and(|l| l.permits(type_id))
+    }
+    /// Whether the ready link to `device` negotiated the stream gate of `kind`.
+    pub(crate) fn peer_opens(&self, device: DeviceId, kind: oink_protocol::frame::StreamKind) -> bool {
+        self.links
+            .links()
+            .by_peer(device)
+            .filter(|l| l.state == oink_network::link::LinkState::Ready)
+            .is_some_and(|l| l.opens(kind))
     }
     pub fn peer_formats(&self, device: DeviceId) -> Option<Arc<dto::FormatSupport>> {
         self.links
@@ -295,7 +323,7 @@ impl ConfigModule {
             .filter(|l| l.state == oink_network::link::LinkState::Ready)
             .and_then(|l| l.peer_audio.clone())
     }
-    pub fn send_device_control(&self, peer: DeviceId, message: v1::Message) -> ApiResult<()> {
+    pub fn send_device_control(&self, peer: DeviceId, message: v2::Message) -> ApiResult<()> {
         self.call(move |owner| owner.device_control(peer, message))
     }
     pub fn send_protocol_error(&self, link: oink_network::link::LinkId, error: dto::ProtocolError) -> ApiResult<()> {
@@ -318,16 +346,17 @@ impl ConfigModule {
             owner.publish_facts()
         })
     }
-    pub fn publish_local_microphone(
-        &self,
-        observation: dto::MicrophoneObservation,
-        watermark: Option<dto::AudioExitClaim>,
-    ) -> ApiResult<u64> {
+    pub fn publish_local_microphone(&self, observation: dto::MicrophoneObservation) -> ApiResult<u64> {
         self.call(move |owner| {
-            owner
-                .local
-                .microphone(observation, watermark)
-                .map_err(runtime::internal)?;
+            owner.local.microphone(observation).map_err(runtime::internal)?;
+            owner.publish_facts()
+        })
+    }
+    /// Publish the global audio configuration the audio owner executes
+    /// (`None` while it has not merged after a start or group switch).
+    pub fn publish_local_audio_config(&self, config: Option<oink_audio::route::AudioConfig>) -> ApiResult<u64> {
+        self.call(move |owner| {
+            owner.local.audio_config(config.as_ref()).map_err(runtime::internal)?;
             owner.publish_facts()
         })
     }
@@ -359,7 +388,7 @@ impl ConfigModule {
         &self,
         mut result: dto::LayoutArrangementResult,
     ) -> ApiResult<dto::LayoutArrangementResult> {
-        use oink_protocol::v1::schema::WireValue;
+        use oink_protocol::v2::schema::WireValue;
         let shared = self.shared.clone();
         self.call(move |owner| {
             // Local projection (including a new RTT) can advance Facts without
@@ -553,3 +582,6 @@ impl ConfigModule {
 
 #[cfg(all(test, debug_assertions))]
 pub(crate) use runtime::tests as runtime_tests;
+
+#[cfg(test)]
+mod upgrade_data_tests;

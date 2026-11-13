@@ -55,7 +55,7 @@ pub(crate) fn backend() -> Result<Box<dyn ClipboardBackend>, ClipboardError> {
 }
 
 /// A private named pasteboard: real AppKit behavior without touching the
-/// user's general clipboard.
+/// user's general clipboard (probes running beside an installed Oink).
 pub(crate) fn named_backend(name: &str) -> Result<Box<dyn ClipboardBackend>, ClipboardError> {
     if name.is_empty() {
         return Err(ClipboardError::Unsupported);
@@ -116,6 +116,45 @@ impl ClipboardBackend for MacClipboard {
 
     fn write_native(&self, spec: crate::NativeSpec) -> Result<u64, ClipboardError> {
         self.write_native_guarded(spec, std::sync::Arc::new(|| Ok(())))
+    }
+    fn write_mobile_guarded(
+        &self,
+        mut spec: crate::NativeSpec,
+        guard: crate::content::ReaderGuard,
+    ) -> Result<u64, ClipboardError> {
+        let cached = small_files::mobile::prepare(&mut spec, &guard).map_err(|error| {
+            // The guard is the mobile receive revision fence. A local copy
+            // while staging is a rejected publication, exactly like the guard
+            // check at the native declaration boundary below.
+            if guard().is_err() {
+                ClipboardError::Busy
+            } else {
+                ClipboardError::ContentUnavailable(crate::content::reason(&error))
+            }
+        })?;
+        // A proxy holds the uploaded files in its own cache: publish their
+        // file URLs directly, like a Finder copy. A File Provider placeholder
+        // or a second cached copy would add a failure point (the extension
+        // can be disconnected) and still be the same local bytes.
+        if !spec.files.is_empty()
+            && spec
+                .files
+                .iter()
+                .filter(|entry| files::is_top_level(entry))
+                .all(|entry| entry.local_path.is_some())
+        {
+            spec.file_contents = None;
+        }
+        let count = self.write_native_guarded(spec, guard)?;
+        if let Some(cached) = cached
+            && let Err(error) = cached.published(self.name.as_deref(), count)
+        {
+            // The board was already written. Keep the consumer lock held by
+            // the provider even if cache identity recording fails; reporting a
+            // failed write here would make the sender publish the share again.
+            tracing::warn!(reason = ?crate::content::reason(&error), "mobile clipboard cache identity unavailable");
+        }
+        Ok(count)
     }
     fn write_native_guarded(
         &self,

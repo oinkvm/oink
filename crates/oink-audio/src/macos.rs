@@ -94,18 +94,54 @@ struct NativeInfo {
 }
 
 struct SourceMute {
-    lease: crate::macos_mute::MuteLease,
+    lease: Option<crate::macos_mute::MuteLease>,
     owned: Arc<AtomicBool>,
     cleanup: Arc<Mutex<Option<String>>>,
+}
+impl SourceMute {
+    /// Keep the endpoint muted for the next capture of the same forwarding.
+    /// A lease that lost exact ownership is restored here instead.
+    fn into_held(mut self) -> Option<HeldSourceMute> {
+        if !self.lease.as_ref().is_some_and(|lease| lease.transferable()) {
+            return None; // Drop restores (or releases) through the journal.
+        }
+        self.owned.store(false, Ordering::Release);
+        self.lease.take().map(HeldSourceMute)
+    }
+}
+impl std::fmt::Debug for SourceMute {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SourceMute")
+            .field("endpoint", &self.lease.as_ref().map(|lease| lease.uid()))
+            .finish()
+    }
 }
 impl Drop for SourceMute {
     fn drop(&mut self) {
         self.owned.store(false, Ordering::Release);
-        if let Err(error) = self.lease.finish()
+        if let Some(lease) = &mut self.lease
+            && let Err(error) = lease.finish()
             && let Ok(mut state) = self.cleanup.lock()
         {
             *state = Some(error);
         }
+    }
+}
+
+/// The source-output mute lease of one forwarding session, between a retired
+/// capture and its replacement. A capture rebuild is not a forwarding end: the
+/// endpoint stays muted and no media pause runs. Dropping it (forwarding ended
+/// before a replacement adopted it) restores local output, pausing media first.
+pub struct HeldSourceMute(crate::macos_mute::MuteLease);
+impl HeldSourceMute {
+    /// Restore local output now and report an unconfirmed restoration.
+    pub fn finish(mut self) -> Option<String> {
+        self.0.finish().err()
+    }
+}
+impl std::fmt::Debug for HeldSourceMute {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("HeldSourceMute").field(&self.0.uid()).finish()
     }
 }
 
@@ -136,6 +172,12 @@ unsafe extern "C" {
         tap_private: bool,
         collect_diagnostics: bool,
         realtime: bool,
+        sample_rate: *mut f64,
+        error: *mut c_char,
+        error_size: usize,
+    ) -> *mut c_void;
+    fn oink_audio_reference_tap_start(
+        output_uid: *const c_char,
         sample_rate: *mut f64,
         error: *mut c_char,
         error_size: usize,
@@ -176,6 +218,9 @@ pub struct Capture {
     error: Arc<Mutex<Option<String>>>,
     restart: Arc<Mutex<Option<String>>>,
     omitted_silent_frames: Arc<CaptureProgress>,
+    /// The worker leaves its mute lease here on exit; the owner decides between
+    /// restoring it (forwarding end) and handing it to the next capture.
+    parked_mute: Arc<Mutex<Option<SourceMute>>>,
 }
 
 impl Capture {
@@ -194,6 +239,26 @@ impl Capture {
         mute: bool,
         options: MacCaptureOptions,
     ) -> Result<Self, String> {
+        Self::start_encoded_with(encoder, mute, None, options)
+    }
+
+    /// Muted replacement capture for the same forwarding session: adopts the
+    /// retired capture's mute lease instead of restoring and re-muting, and
+    /// binds the new tap to that lease's exact endpoint.
+    pub fn continue_encoded(
+        encoder: crate::source::Encoder,
+        held: HeldSourceMute,
+        options: MacCaptureOptions,
+    ) -> Result<Self, String> {
+        Self::start_encoded_with(encoder, true, Some(held), options)
+    }
+
+    fn start_encoded_with(
+        encoder: crate::source::Encoder,
+        mute: bool,
+        held: Option<HeldSourceMute>,
+        options: MacCaptureOptions,
+    ) -> Result<Self, String> {
         let mode = options.native_mode();
         let selected_uid = options
             .output_uid
@@ -210,6 +275,7 @@ impl Capture {
             options.tap_private,
             options.collect_diagnostics,
             options.recovery_dir,
+            held,
         )
     }
 
@@ -264,8 +330,9 @@ impl Capture {
         tap_private: bool,
         collect_diagnostics: bool,
         recovery_dir: Option<std::path::PathBuf>,
+        held: Option<HeldSourceMute>,
     ) -> Result<Self, String> {
-        if mute && recovery_dir.is_none() {
+        if mute && held.is_none() && recovery_dir.is_none() {
             return Err("muted macOS capture requires a durable recovery directory".into());
         }
         let muted_owned = Arc::new(AtomicBool::new(false));
@@ -280,6 +347,8 @@ impl Capture {
         let worker_restart = restart.clone();
         let omitted_silent_frames = Arc::new(CaptureProgress::default());
         let worker_omitted = omitted_silent_frames.clone();
+        let parked_mute = Arc::new(Mutex::new(None));
+        let worker_parked = parked_mute.clone();
         let stop = Arc::new(AtomicBool::new(false));
         let stopping = Arc::clone(&stop);
         let error_state = Arc::new(Mutex::new(None));
@@ -291,19 +360,34 @@ impl Capture {
                 // Establish the write-ahead endpoint lease BEFORE native tap
                 // start. New app clients inherit hardware mute without tap
                 // rebuilding. Already-muted outputs remain the user's mute.
-                let lease_uid = if mute {
-                    match selected_uid.as_ref().map(|uid| uid.to_string_lossy().into_owned())
-                        .map(Ok).unwrap_or_else(Self::current_default_output_id) {
-                        Ok(uid) => Some(uid),
-                        Err(error) => { let _ = ready_tx.send(Err(error)); return; }
+                // A rebuild of the same forwarding adopts the retired capture's
+                // lease: the endpoint never unmutes between the two taps.
+                let held = held.map(|held| SourceMute { lease: Some(held.0), owned: worker_muted.clone(), cleanup: worker_cleanup.clone() });
+                let (lease_uid, mut mute_lease) = match held {
+                    Some(mut held) if mute => {
+                        let lease = held.lease.as_mut().expect("held lease");
+                        lease.rebind_owner();
+                        (Some(lease.uid().to_owned()), Some(held))
                     }
-                } else { None };
-                let mut mute_lease = match (recovery_dir.as_deref(), lease_uid.as_deref()) {
-                    (Some(dir), Some(uid)) => match crate::macos_mute::MuteLease::start(dir, uid) {
-                        Ok(lease) => Some(SourceMute { lease, owned: worker_muted.clone(), cleanup: worker_cleanup.clone() }),
-                        Err(error) => { let _ = ready_tx.send(Err(error)); return; }
-                    },
-                    _ => None,
+                    held => {
+                        // An unmuted capture ends a held mute: dropping restores it.
+                        drop(held);
+                        let lease_uid = if mute {
+                            match selected_uid.as_ref().map(|uid| uid.to_string_lossy().into_owned())
+                                .map(Ok).unwrap_or_else(Self::current_default_output_id) {
+                                Ok(uid) => Some(uid),
+                                Err(error) => { let _ = ready_tx.send(Err(error)); return; }
+                            }
+                        } else { None };
+                        let mute_lease = match (recovery_dir.as_deref(), lease_uid.as_deref()) {
+                            (Some(dir), Some(uid)) => match crate::macos_mute::MuteLease::start(dir, uid) {
+                                Ok(lease) => Some(SourceMute { lease: Some(lease), owned: worker_muted.clone(), cleanup: worker_cleanup.clone() }),
+                                Err(error) => { let _ = ready_tx.send(Err(error)); return; }
+                            },
+                            _ => None,
+                        };
+                        (lease_uid, mute_lease)
+                    }
                 };
                 worker_muted.store(mute_lease.is_some(), Ordering::Release);
                 // Bind the tap to the exact output we muted, closing a default
@@ -370,13 +454,13 @@ impl Capture {
                 let mut events = events::Events::new(mute, &clock);
                 let mut last_check = Instant::now();
                 while !stopping.load(Ordering::Acquire) {
-                    if let Some(lease) = &mut mute_lease {
-                        match lease.lease.check_ownership() {
+                    if let Some(lease) = mute_lease.as_mut().and_then(|mute| mute.lease.as_mut()) {
+                        match lease.check_ownership() {
                             Ok(true) => { worker_controls.store(true, Ordering::Release); break; }
                             Err(error) => { *worker_error.lock().unwrap() = Some(error); break; }
                             Ok(false) => {}
                         }
-                        if lease.lease.default_changed() {
+                        if lease.default_changed() {
                             worker_default.store(true, Ordering::Release);
                             break;
                         }
@@ -434,15 +518,11 @@ impl Capture {
                     *worker_cleanup.lock().unwrap() = Some(error.clone());
                     *state = Some(error);
                 }
+                // The tap is gone; the mute is not. Only the owner knows whether
+                // this exit ends forwarding (restore) or is a rebuild (handover).
                 worker_muted.store(false, Ordering::Release);
-                if let Some(lease) = &mut mute_lease
-                    && let Err(error) = lease.lease.finish()
-                {
-                    *worker_cleanup.lock().unwrap() = Some(error.clone());
-                    *worker_error.lock().unwrap() = Some(error);
-                    // A failed lease release must not announce a successful
-                    // native rebuild that could lose its pending old journal.
-                    *worker_restart.lock().unwrap() = None;
+                if let Some(mute) = mute_lease.take() {
+                    *worker_parked.lock().unwrap() = Some(mute);
                 }
             })
             .map_err(|error| format!("Start audio capture worker: {error}"))?;
@@ -458,6 +538,7 @@ impl Capture {
                 error: error_state,
                 restart,
                 omitted_silent_frames,
+                parked_mute,
             }),
             result => {
                 let _ = worker.join();
@@ -485,12 +566,47 @@ impl Capture {
     }
     /// Join IO and restore the lease before the owner publishes stop/off state.
     pub fn finish(&mut self) -> Option<String> {
+        self.join_worker();
+        // Dropping the parked lease pauses media and restores local output.
+        drop(self.parked_mute.lock().ok().and_then(|mut parked| parked.take()));
+        self.cleanup_result()
+    }
+
+    /// Join IO for a rebuild within the same forwarding session. The mute lease
+    /// is returned for `continue_encoded` instead of being restored, unless it
+    /// already lost exact ownership (then it is restored or released here).
+    pub fn finish_keep_mute(&mut self) -> (Option<String>, Option<HeldSourceMute>) {
+        self.join_worker();
+        let held = self
+            .parked_mute
+            .lock()
+            .ok()
+            .and_then(|mut parked| parked.take())
+            .and_then(SourceMute::into_held);
+        (self.cleanup_result(), held)
+    }
+
+    fn join_worker(&mut self) {
         self.stop.store(true, Ordering::Release);
         if let Some(worker) = self.worker.take() {
             worker.thread().unpark();
             let _ = worker.join();
         }
-        self.cleanup_error.lock().ok().and_then(|error| error.clone())
+    }
+
+    fn cleanup_result(&self) -> Option<String> {
+        let cleanup = self.cleanup_error.lock().ok().and_then(|error| error.clone());
+        if let Some(error) = &cleanup {
+            if let Ok(mut state) = self.error.lock() {
+                *state = Some(error.clone());
+            }
+            // A failed lease release must not announce a successful native
+            // rebuild that could lose its pending old journal.
+            if let Ok(mut restart) = self.restart.lock() {
+                *restart = None;
+            }
+        }
+        cleanup
     }
 
     /// Runtime errors stop the native tap immediately, restoring local sound.
@@ -803,6 +919,173 @@ impl Drop for RealtimeCapture {
     }
 }
 
+/// Native ring (stereo samples + host/callback/sequence per frame) and the
+/// diagnostic event ring of one native capture, from `native/macos.m`.
+const NATIVE_CAPTURE_BYTES: usize = 8192 * (2 * 4 + 3 * 8) + 1024 * 56;
+
+/// Full-system echo reference: a process tap of the exact output device Oink
+/// plays to, including Oink's own process, polled on a workgroup thread that
+/// only copies into the reference handoff. Returns when `stop` is set (Ok) or
+/// with the reason the Oink playback reference must be used instead.
+pub(crate) fn run_system_reference(
+    control: &Arc<crate::echo::Control>,
+    output_id: &str,
+    stop: &AtomicBool,
+) -> Result<(), (crate::echo::SystemStatus, String)> {
+    use crate::{
+        CapturePreflight,
+        echo::{SystemFeed, SystemPacket, SystemStatus},
+    };
+    let uid = output_id.strip_prefix("coreaudio:").ok_or_else(|| {
+        (
+            SystemStatus::Unsupported,
+            format!("not a CoreAudio output: {output_id}"),
+        )
+    })?;
+    // Only an existing grant: the echo reference never presents the system
+    // prompt and never warns in the UI; the speaker-forwarding flow asks.
+    match crate::capture_permission_preflight() {
+        CapturePreflight::Authorized => {}
+        state => {
+            return Err((
+                SystemStatus::PermissionDenied,
+                format!("System Audio Recording not granted ({state:?})"),
+            ));
+        }
+    }
+    if Capture::cleanup_failed() {
+        return Err((
+            SystemStatus::StartFailed,
+            "an earlier tap cleanup failed; taps are disabled for this process".into(),
+        ));
+    }
+    let uid = CString::new(uid).map_err(|_| (SystemStatus::Unsupported, "output UID contains NUL".into()))?;
+    let mut rate = 0.0;
+    let mut error = [0 as c_char; 1024];
+    // SAFETY: valid C string and writable outputs; the handle is owned below.
+    let raw = unsafe { oink_audio_reference_tap_start(uid.as_ptr(), &mut rate, error.as_mut_ptr(), error.len()) };
+    if raw.is_null() {
+        // SAFETY: the bridge writes a NUL-terminated message on failure.
+        let message = unsafe { CStr::from_ptr(error.as_ptr()) }.to_string_lossy().into_owned();
+        let status = if message.starts_with("capture_permission_denied") {
+            SystemStatus::PermissionDenied
+        } else if message.contains("output-only")
+            || message.contains("exactly one output stream")
+            || message.contains("macOS 14.2")
+            || message.contains("Unsupported system audio format")
+        {
+            SystemStatus::Unsupported
+        } else {
+            SystemStatus::StartFailed
+        };
+        return Err((status, message));
+    }
+    let mut native = NativeCapture::new(raw, Arc::new(CaptureProgress::default()));
+    let mut info = NativeInfo::default();
+    // SAFETY: live handle; NativeInfo matches the bridge layout.
+    unsafe { oink_audio_capture_info(native.0, &mut info) };
+    let period_frames = if info.buffer_frames == u32::MAX {
+        512
+    } else {
+        info.buffer_frames
+    };
+    let period_ns = (f64::from(period_frames) * 1e9 / rate).round() as u64;
+    // SAFETY: live handle owned by this thread.
+    let device = unsafe { oink_audio_capture_device_id(native.0) };
+    let result = (|| {
+        let mut schedule =
+            crate::realtime::Schedule::device(device, period_ns).map_err(|e| (SystemStatus::StartFailed, e))?;
+        let clock = HostClock::new();
+        // The tap delivers exact zeros itself while nothing plays, so a
+        // delivery gap is lost audio, never silence.
+        let mut feed = SystemFeed::new(
+            control.clone(),
+            rate.round() as u32,
+            false,
+            Duration::from_millis(50),
+            NATIVE_CAPTURE_BYTES,
+        );
+        tracing::info!(
+            rate,
+            period_frames,
+            latency_frames = info.latency_frames,
+            physical_latency_frames = info.physical_latency_frames,
+            physical_safety_frames = info.physical_safety_frames,
+            "full-system echo reference tap running"
+        );
+        let guard = schedule
+            .enter()
+            .map_err(|e| (SystemStatus::StartFailed, format!("enter audio workgroup: {e}")))?;
+        let mut input = [0.0f32; 4096 * 2];
+        let mut last_check = Instant::now();
+        let mut failure = None;
+        while !stop.load(Ordering::Acquire) {
+            for _ in 0..8 {
+                let (mut host_ns, mut callback_ns, mut sequence) = (0, 0, 0);
+                // SAFETY: sole reader; fixed 4096 stereo frames of output.
+                let frames = unsafe {
+                    oink_audio_capture_read(
+                        native.0,
+                        input.as_mut_ptr(),
+                        input.len() / 2,
+                        &mut host_ns,
+                        &mut callback_ns,
+                        &mut sequence,
+                    )
+                };
+                if frames == 0 {
+                    break;
+                }
+                feed.packet(SystemPacket {
+                    samples: &input[..frames * 2],
+                    stamp: clock.instant(host_ns),
+                    position: Some(sequence),
+                    discontinuity: false,
+                    arrived: Instant::now(),
+                });
+            }
+            let now = Instant::now();
+            feed.account(now);
+            if now.saturating_duration_since(last_check) >= Duration::from_secs(1) {
+                last_check = now;
+                let mut message = [0 as c_char; 1024];
+                // SAFETY: live handle; bounded writable error buffer.
+                let health = unsafe { oink_audio_capture_check(native.0, message.as_mut_ptr(), message.len()) };
+                if health != 0 {
+                    // SAFETY: a failed check writes a NUL-terminated message.
+                    let text = unsafe { CStr::from_ptr(message.as_ptr()) }
+                        .to_string_lossy()
+                        .into_owned();
+                    let status = if health == 2 {
+                        SystemStatus::OutputChanged
+                    } else {
+                        SystemStatus::CaptureFailed
+                    };
+                    failure = Some((status, text));
+                    break;
+                }
+            }
+            // Polled: copies stay off the HAL thread, the owner can stop it
+            // without a wake handle, and lateness is measured, not assumed.
+            thread::sleep(Duration::from_millis(2));
+        }
+        drop(guard);
+        match failure {
+            Some((status, text)) => {
+                feed.fail(status, text.clone());
+                Err((status, text))
+            }
+            None => Ok(()),
+        }
+    })();
+    let cleanup = native.finish();
+    match (result, cleanup) {
+        (Err(error), _) => Err(error),
+        (Ok(()), Err(error)) => Err((SystemStatus::CaptureFailed, error)),
+        (Ok(()), Ok(())) => Ok(()),
+    }
+}
+
 /// Only ordinary control/teardown threads take this lock; the HAL callback and
 /// encoder never do. A 1s health-poll mirror can be stale past the watchdog's
 /// 500ms deadline even while callbacks continuously omit healthy digital zeros.
@@ -940,6 +1223,7 @@ mod tests {
             error: Arc::new(Mutex::new(None)),
             restart: Arc::new(Mutex::new(None)),
             omitted_silent_frames: Arc::new(CaptureProgress::default()),
+            parked_mute: Arc::new(Mutex::new(None)),
         };
         // SAFETY: the fixture allocates a ring/semaphore only, without a HAL
         // device, permission request, mute lease or settings change.

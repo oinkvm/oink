@@ -15,7 +15,11 @@ members = [
     "crates/oink-telemetry",
     "crates/oink-crash",
     "crates/oink-audio",
+    "crates/oink-audio/native/aec3",
     "crates/oink-autostart",
+    "crates/oink-adb",
+    "crates/oink-mobile-core",
+    "crates/oink-mobile-ffi",
     "apps/oink/src-tauri",
     "tests/support",
 ]
@@ -43,6 +47,7 @@ oink-agent = { path = "crates/oink-agent" }
 oink-telemetry = { path = "crates/oink-telemetry" }
 oink-crash = { path = "crates/oink-crash" }
 oink-audio = { path = "crates/oink-audio" }
+oink-aec3 = { path = "crates/oink-audio/native/aec3" }
 oink-autostart = { path = "crates/oink-autostart" }
 
 # 各模块共用的第三方依赖。模块专用的依赖写在各自 crate 的 Cargo.toml 里。
@@ -51,6 +56,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["float_roundtrip"] }
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+uniffi = { version = "=0.32.2", features = ["tokio"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 

@@ -587,11 +587,12 @@ define_class!(
                     let inventory = self.ivars().source.inventory();
                     let representation =
                         content::find(&inventory, *id).ok_or_else(|| content::unavailable(Unavailable::NoSuchItem))?;
-                    if !self.ivars().foreign && representation.format == NativeFormat::Mac(name.clone()) {
+                    let foreign = self.ivars().foreign || representation.format.platform() != ClipPlatform::Mac;
+                    if !foreign && representation.format == NativeFormat::Mac(name.clone()) {
                         return Ok(bytes);
                     }
                     if representation.standard == Some(StandardFormat::Url) {
-                        let link = if self.ivars().foreign {
+                        let link = if foreign {
                             content::url::Link::decode(&bytes)?
                         } else {
                             content::url::capture(
@@ -605,7 +606,7 @@ define_class!(
                         decoded_link = true;
                         return link.render(ClipPlatform::Mac, &name);
                     }
-                    let translated = if self.ivars().foreign {
+                    let translated = if foreign {
                         content::decode_standard(representation, &bytes)?
                     } else {
                         MacTranslator.standard_with_source(representation, &bytes, self.ivars().source.as_ref())?
@@ -775,7 +776,12 @@ fn native_items_lazy(
     let wanted: HashSet<_> = inventory.wanted(ClipPlatform::Mac).map(|r| r.id).collect();
     let foreign = inventory.platform != ClipPlatform::Mac;
     let mut out = Vec::new();
-    for original in &inventory.items {
+    // A picture of a file root (Inventory::bitmap_root) is written on that
+    // root's pasteboard item below: each image is one item with its bitmap
+    // and its file URL, so image-pasting apps get every picture and Finder
+    // gets every file, without a second item per image.
+    let mut pictures: HashMap<NodeId, Retained<NSPasteboardItem>> = HashMap::new();
+    for (index, original) in inventory.items.iter().enumerate() {
         let item = NSPasteboardItem::new();
         let mut bindings = Vec::new();
         let mut file_values = Vec::new();
@@ -798,7 +804,7 @@ fn native_items_lazy(
                 }
                 continue;
             }
-            let offered = if foreign {
+            let offered = if foreign || rep.format.platform() != ClipPlatform::Mac {
                 if rep.standard == Some(StandardFormat::Url) {
                     content::url::names(original, ClipPlatform::Mac)
                 } else {
@@ -875,6 +881,10 @@ fn native_items_lazy(
             count += types.len();
         }
         if count > 0 {
+            if foreign && let Some(root) = inventory.bitmap_root(index) {
+                pictures.insert(root, item);
+                continue;
+            }
             out.push((if foreign { None } else { original.file }, item));
         }
     }
@@ -894,7 +904,10 @@ fn native_items_lazy(
                 Some(urls) => urls.get(&root.id).ok_or(ClipboardError::Unsupported)?.as_str(),
                 None => "",
             };
-            let item = selection.take().unwrap_or_else(NSPasteboardItem::new);
+            let item = selection
+                .take()
+                .or_else(|| pictures.remove(&root.id))
+                .unwrap_or_else(NSPasteboardItem::new);
             let ty = NSString::from_str("public.file-url");
             let ok = if let Some(lazy) = lazy_urls {
                 let provider = DataProvider::new(

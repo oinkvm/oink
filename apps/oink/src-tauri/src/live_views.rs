@@ -213,7 +213,7 @@ mod tests {
                 group_quality: true,
                 diagnostics: true,
                 audio_quality: false,
-                card_signals: true
+                card_signals: true,
             }
         );
         assert_eq!(union(panel, LiveViews::default()), panel);

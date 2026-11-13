@@ -1,13 +1,12 @@
 //! Mono capture uses the same band-limited kernel as speaker audio.
-#[cfg(any(target_os = "macos", windows, test))]
-pub(super) struct Resampler {
+#[derive(Debug)]
+pub struct Resampler {
     history: Vec<f32>,
     kernel: crate::resample::Kernel,
     input_position: u64,
     output_position: u64,
     step: f64,
 }
-#[cfg(any(target_os = "macos", windows, test))]
 impl Resampler {
     pub fn new(rate: u32) -> Self {
         let step = f64::from(rate) / 48_000.0;
@@ -20,6 +19,15 @@ impl Resampler {
             step,
         }
     }
+    pub fn reset(&mut self) {
+        self.history.fill(0.0);
+        self.input_position = 0;
+        self.output_position = 0;
+    }
+    pub fn delay_ns(&self) -> u64 {
+        (self.kernel.delay() as f64 * 1_000_000_000.0 / (48_000.0 * self.step)) as u64
+    }
+
     pub fn push(&mut self, value: f32, mut emit: impl FnMut(f32)) {
         let value = if value.is_finite() { value } else { 0.0 };
         if self.step == 1.0 {

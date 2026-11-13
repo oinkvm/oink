@@ -388,7 +388,7 @@ impl Node {
                 .and_then(|h| h.device)
                 && let Ok(input) = self.input_thread()
             {
-                input.send(crate::threads::input::InputCommand::MovePointerTo(target.0));
+                input.send(crate::threads::input::InputCommand::MovePointerTo(target.0, None));
             }
             return;
         }
@@ -405,7 +405,7 @@ impl Node {
                     && let Ok(input) = self.input_thread()
                 {
                     tracing::info!("hotkey: move the pointer to the next online device");
-                    input.send(crate::threads::input::InputCommand::MovePointerTo(target));
+                    input.send(crate::threads::input::InputCommand::MovePointerTo(target, None));
                 }
                 Ok(())
             }

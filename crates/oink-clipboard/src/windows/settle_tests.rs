@@ -89,6 +89,7 @@ fn announced_kinds(source: &mut ClipboardOrdering, reader: &WinClipboard) -> Vec
     source
         .capture(
             crate::wire::inventory(&inventory).unwrap(),
+            vec![],
             captured.snapshot.change_count,
             captured.snapshot.sensitivity,
             0,
@@ -218,8 +219,9 @@ fn multi_step_writer_settles_on_private_window_station() {
     let final_count = reader.change_count();
     assert_ne!(text_count, final_count);
     source.local_change(final_count, at + Duration::from_millis(50));
-    assert!(!source.capture_due(at + Duration::from_millis(124)));
-    assert!(source.capture_due(at + Duration::from_millis(125)));
+    let quiet = crate::sync::SOURCE_QUIET_PERIOD;
+    assert!(!source.capture_due(at + Duration::from_millis(49) + quiet));
+    assert!(source.capture_due(at + Duration::from_millis(50) + quiet));
     let complete = reader.read().unwrap();
     assert_eq!(complete.change_count, reader.change_count());
     assert_eq!(
@@ -237,7 +239,7 @@ fn multi_step_writer_settles_on_private_window_station() {
         .unwrap();
     changes.recv().unwrap();
     source.local_change(reader.change_count(), at + Duration::from_secs(1));
-    assert!(source.capture_due(at + Duration::from_millis(1075)));
+    assert!(source.capture_due(at + Duration::from_secs(1) + quiet));
     assert!(announced_kinds(&mut source, &reader).contains(&StandardFormat::Rtf));
 
     // One transaction held open across its steps: a reader must fail Busy, never

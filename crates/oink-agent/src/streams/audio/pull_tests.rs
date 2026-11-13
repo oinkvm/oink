@@ -175,12 +175,12 @@ fn real_m1_to_fill_has_no_heap_through_bad_packets_first_plc_reset_retirement_an
 fn real_m1_malformed_records_consume_one_callback_scan_budget() {
     let mut harness = Harness::new(1);
     let mut bytes = [0; media::FRAME_CAPACITY];
-    let len = oink_protocol::v1::hot::encode_into(
+    let len = oink_protocol::v2::hot::encode_into(
         0x0606,
         &[
-            (1, oink_protocol::v1::hot::Value::Uint(5)),
-            (2, oink_protocol::v1::hot::Value::Uint(1)),
-            (3, oink_protocol::v1::hot::Value::Uint(1)),
+            (1, oink_protocol::v2::hot::Value::Uint(5)),
+            (2, oink_protocol::v2::hot::Value::Uint(1)),
+            (3, oink_protocol::v2::hot::Value::Uint(1)),
         ],
         &mut bytes,
         media::FRAME_CAPACITY,

@@ -8,7 +8,7 @@ use oink_foundation::{
     DeviceId,
     session::{Boot, PairId},
 };
-use oink_protocol::v1::{
+use oink_protocol::v2::{
     self, Message, RawValue, dto,
     schema::{WireDto, WireValue},
 };
@@ -18,6 +18,8 @@ use std::{
 };
 use zeroize::Zeroizing;
 
+/// Requests waiting for the user's answer on a desktop; a phone keeps one
+/// (user 2026-11-11), see [`Sessions::set_pending_limit`].
 pub const MAX_PENDING: usize = 3;
 pub const MAX_ACTIVE: usize = 32;
 pub const MAX_PER_PEER: usize = 4;
@@ -28,6 +30,17 @@ const PROGRESS_TIMEOUT: Duration = Duration::from_secs(10);
 pub enum Direction {
     Incoming,
     Outgoing,
+}
+/// Whether an incoming request may become a pending request on this device.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Admission {
+    Open,
+    /// The initiator is blocked: refused with the ordinary `Declined`, so it cannot
+    /// tell a block from a user's decline.
+    Blocked,
+    /// One pairing at a time is taken (a desktop's welcome connect step):
+    /// refused with `QueueFull`.
+    Busy,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Phase {
@@ -52,6 +65,10 @@ pub struct View {
     pub attempts_left: u8,
     pub feedback: dto::PairFeedbackKind,
     pub terminal: Option<dto::PairProblem>,
+    /// The request was accepted: by this device's user (incoming) or by the
+    /// peer (outgoing). Kept on the ended view, so an owner can tell a request
+    /// nobody took from a pairing that ran.
+    pub accepted: bool,
 }
 #[derive(Clone, Debug, Default)]
 pub struct Snapshot {
@@ -91,7 +108,6 @@ struct Session {
     view: View,
     transcript: Transcript,
     code: Option<Zeroizing<String>>,
-    accepted: bool,
     deadline: Option<Instant>,
     attempt: Attempt,
     request: dto::PairRequest,
@@ -133,6 +149,7 @@ pub struct Sessions {
     terminal: HashMap<PairId, Terminal>,
     order: VecDeque<PairId>,
     rates: HashMap<DeviceId, Bucket>,
+    pending_limit: usize,
 }
 impl Sessions {
     pub fn new(local: Boot) -> Self {
@@ -143,7 +160,14 @@ impl Sessions {
             terminal: HashMap::new(),
             order: VecDeque::new(),
             rates: HashMap::new(),
+            pending_limit: MAX_PENDING,
         }
+    }
+    /// How many incoming requests may wait for the user's answer at once
+    /// (at most [`MAX_PENDING`]); the next one is refused with
+    /// `TooManyPendingRequests`.
+    pub fn set_pending_limit(&mut self, limit: usize) {
+        self.pending_limit = limit.clamp(1, MAX_PENDING);
     }
     pub fn snapshot(&self) -> Snapshot {
         let mut result = Snapshot {
@@ -151,7 +175,7 @@ impl Sessions {
             ..Snapshot::default()
         };
         for session in self.active.values() {
-            if session.view.direction == Direction::Incoming && !session.accepted {
+            if session.view.direction == Direction::Incoming && !session.view.accepted {
                 result.requests.push(session.view.clone());
             } else {
                 result.sessions.push(session.view.clone());
@@ -224,13 +248,13 @@ impl Sessions {
             && self
                 .active
                 .values()
-                .filter(|s| s.view.direction == Direction::Incoming && !s.accepted)
+                .filter(|s| s.view.direction == Direction::Incoming && !s.view.accepted)
                 .count()
-                >= MAX_PENDING
+                >= self.pending_limit
         {
             let mut p = problem(dto::PairCode::TooManyPendingRequests, dto::PairStage::Request);
-            p = with(p, 6, 4u32.write());
-            p = with(p, 7, 3u32.write());
+            p = with(p, 6, (self.pending_limit as u32 + 1).write());
+            p = with(p, 7, (self.pending_limit as u32).write());
             p = with(p, 9, dto::PairLimitKind::PendingRequests.write());
             return Err(p);
         }
@@ -274,10 +298,10 @@ impl Sessions {
                     attempts_left: 3,
                     feedback: dto::PairFeedbackKind::Waiting,
                     terminal: None,
+                    accepted: false,
                 },
                 transcript,
                 code: Some(group_pake::generate_code()),
-                accepted: false,
                 deadline: None,
                 attempt: Attempt {
                     number: 0,
@@ -297,7 +321,7 @@ impl Sessions {
         request: dto::PairRequest,
         peer: Boot,
         transcript: Transcript,
-        blocked: bool,
+        admission: Admission,
         now: Instant,
     ) -> Result<Vec<Effect>> {
         let context = request.context().map_err(protocol)?;
@@ -311,7 +335,7 @@ impl Sessions {
         }
         if let Some(terminal) = self.terminal.get(&id) {
             if terminal.peer != peer {
-                return Err(protocol(v1::ErrorCode::AuthenticationFailed.into()));
+                return Err(protocol(v2::ErrorCode::AuthenticationFailed.into()));
             }
             return Ok(vec![Effect::Send {
                 peer,
@@ -320,9 +344,13 @@ impl Sessions {
         }
         if let Some(session) = self.active.get(&id) {
             if session.request != request {
-                return Err(protocol(v1::ErrorCode::StateConflict.into()));
+                return Err(protocol(v2::ErrorCode::StateConflict.into()));
             }
-            let message = if session.accepted { accepted(id) } else { queued(id) };
+            let message = if session.view.accepted {
+                accepted(id)
+            } else {
+                queued(id)
+            };
             return Ok(vec![Effect::Send { peer, message }]);
         }
         if self.rates.len() >= 4096 && !self.rates.contains_key(&peer.device_id) {
@@ -359,8 +387,14 @@ impl Sessions {
                 ),
             ));
         }
-        if blocked {
-            return Ok(self.refuse(id, peer, problem(dto::PairCode::Declined, dto::PairStage::Request)));
+        match admission {
+            Admission::Open => {}
+            Admission::Blocked => {
+                return Ok(self.refuse(id, peer, problem(dto::PairCode::Declined, dto::PairStage::Request)));
+            }
+            Admission::Busy => {
+                return Ok(self.refuse(id, peer, problem(dto::PairCode::QueueFull, dto::PairStage::Request)));
+            }
         }
         if let Err(problem) = self.capacity(peer, true) {
             return Ok(self.refuse(id, peer, problem));
@@ -378,10 +412,10 @@ impl Sessions {
                     attempts_left: 3,
                     feedback: dto::PairFeedbackKind::Waiting,
                     terminal: None,
+                    accepted: false,
                 },
                 transcript,
                 code: None,
-                accepted: false,
                 deadline: None,
                 attempt: Attempt {
                     number: 0,
@@ -428,11 +462,11 @@ impl Sessions {
     }
     pub fn accept(&mut self, id: PairId, revision: u64) -> Result<Vec<Effect>> {
         let s = self.current(id, revision)?;
-        if s.view.direction != Direction::Incoming || s.accepted {
+        if s.view.direction != Direction::Incoming || s.view.accepted {
             return Err(problem(dto::PairCode::StateChanged, dto::PairStage::Request));
         }
         let s = self.active.get_mut(&id).expect("checked");
-        s.accepted = true;
+        s.view.accepted = true;
         s.view.phase = Phase::EnterCode;
         let peer = s.view.peer;
         self.changed(id);
@@ -446,7 +480,7 @@ impl Sessions {
     }
     pub fn decline(&mut self, id: PairId, revision: u64) -> Result<Vec<Effect>> {
         let s = self.current(id, revision)?;
-        if s.view.direction != Direction::Incoming || s.accepted {
+        if s.view.direction != Direction::Incoming || s.view.accepted {
             return Err(problem(dto::PairCode::StateChanged, dto::PairStage::Request));
         }
         let reason = problem(dto::PairCode::Declined, dto::PairStage::Request);
@@ -485,7 +519,9 @@ impl Sessions {
         let rows = self
             .active
             .iter()
-            .filter(|(_, s)| s.view.peer.device_id == device && s.view.direction == Direction::Incoming && !s.accepted)
+            .filter(|(_, s)| {
+                s.view.peer.device_id == device && s.view.direction == Direction::Incoming && !s.view.accepted
+            })
             .map(|(&id, s)| (id, s.view.peer))
             .collect::<Vec<_>>();
         rows.into_iter()
@@ -509,7 +545,7 @@ impl Sessions {
             return Err(problem(dto::PairCode::InvalidCodeSyntax, dto::PairStage::Code));
         }
         if s.view.direction != Direction::Incoming
-            || !s.accepted
+            || !s.view.accepted
             || s.view.phase != Phase::EnterCode
             || attempt != s.attempt.number + 1
             || attempt > 3
@@ -559,12 +595,12 @@ impl Sessions {
             Message::ConfigPairQueued(_) => Ok(Vec::new()),
             Message::ConfigPairAccept(_) => {
                 if s.view.direction != Direction::Outgoing {
-                    return Err(protocol(v1::ErrorCode::StateConflict.into()));
+                    return Err(protocol(v2::ErrorCode::StateConflict.into()));
                 }
-                if s.accepted {
+                if s.view.accepted {
                     return Ok(Vec::new());
                 }
-                self.active.get_mut(&id).unwrap().accepted = true;
+                self.active.get_mut(&id).unwrap().view.accepted = true;
                 self.changed(id);
                 Ok(vec![Effect::Changed])
             }
@@ -601,7 +637,7 @@ impl Sessions {
             Message::ConfigPairPake(record) => self.receive_pake(id, record, now),
             Message::ConfigPairFeedback(feedback) => {
                 if feedback.attempt().map_err(protocol)? != s.attempt.number {
-                    return Err(protocol(v1::ErrorCode::StateConflict.into()));
+                    return Err(protocol(v2::ErrorCode::StateConflict.into()));
                 }
                 let kind = feedback.feedback().map_err(protocol)?;
                 if kind==dto::PairFeedbackKind::WrongCode {self.wrong(id)}
@@ -610,7 +646,7 @@ impl Sessions {
                     self.verified(id,now)
                 } else {Ok(Vec::new())}
             }
-            _ => Err(protocol(v1::ErrorCode::StateConflict.into())),
+            _ => Err(protocol(v2::ErrorCode::StateConflict.into())),
         }
     }
     fn receive_pake(&mut self, id: PairId, record: dto::PairPake, now: Instant) -> Result<Vec<Effect>> {
@@ -619,7 +655,7 @@ impl Sessions {
         let kind = dto::PairStepKind::read(
             step.raw()
                 .get(&1)
-                .ok_or_else(|| protocol(v1::ErrorCode::MalformedFrame.into()))?,
+                .ok_or_else(|| protocol(v2::ErrorCode::MalformedFrame.into()))?,
         )
         .map_err(protocol)?;
         if record.suite().map_err(protocol)?.0 != dto::PAIRING_SUITE {
@@ -627,8 +663,8 @@ impl Sessions {
         }
         let incoming = Message::ConfigPairPake(record.clone());
         let s = self.active.get_mut(&id).expect("checked");
-        if !s.accepted {
-            return Err(protocol(v1::ErrorCode::StateConflict.into()));
+        if !s.view.accepted {
+            return Err(protocol(v2::ErrorCode::StateConflict.into()));
         }
         if let Some((_, old, reply)) =
             s.attempt.incoming.iter().find(|(k, m, _)| {
@@ -636,7 +672,7 @@ impl Sessions {
             })
         {
             if *old != incoming {
-                return Err(protocol(v1::ErrorCode::StateConflict.into()));
+                return Err(protocol(v2::ErrorCode::StateConflict.into()));
             }
             return Ok(vec![Effect::Send {
                 peer: s.view.peer,
@@ -650,7 +686,7 @@ impl Sessions {
                     || !matches!(s.view.phase, Phase::ShowCode)
                     || attempt != s.attempt.number + 1
                 {
-                    return Err(protocol(v1::ErrorCode::StateConflict.into()));
+                    return Err(protocol(v2::ErrorCode::StateConflict.into()));
                 }
                 let start = dto::PakeStart::from_raw(body).map_err(protocol)?;
                 if start.context().map_err(protocol)? != s.view.context {
@@ -675,14 +711,14 @@ impl Sessions {
             }
             dto::PairStepKind::Reply => {
                 if s.view.direction != Direction::Incoming || attempt != s.attempt.number {
-                    return Err(protocol(v1::ErrorCode::StateConflict.into()));
+                    return Err(protocol(v2::ErrorCode::StateConflict.into()));
                 }
                 let reply = dto::PakeReply::from_raw(body).map_err(protocol)?;
                 let receiver = s
                     .attempt
                     .receiver
                     .take()
-                    .ok_or_else(|| protocol(v1::ErrorCode::StateConflict.into()))?;
+                    .ok_or_else(|| protocol(v2::ErrorCode::StateConflict.into()))?;
                 match receiver.finish(
                     &reply.message().map_err(protocol)?.0,
                     &reply.confirmation().map_err(protocol)?.0,
@@ -694,21 +730,21 @@ impl Sessions {
             }
             dto::PairStepKind::Finish => {
                 if s.view.direction != Direction::Outgoing || attempt != s.attempt.number {
-                    return Err(protocol(v1::ErrorCode::StateConflict.into()));
+                    return Err(protocol(v2::ErrorCode::StateConflict.into()));
                 }
                 let finish = dto::PakeFinish::from_raw(body).map_err(protocol)?;
                 let initiator = s
                     .attempt
                     .initiator
                     .take()
-                    .ok_or_else(|| protocol(v1::ErrorCode::StateConflict.into()))?;
+                    .ok_or_else(|| protocol(v2::ErrorCode::StateConflict.into()))?;
                 match initiator.finish(&finish.confirmation().map_err(protocol)?.0) {
                     Ok(()) => feedback(id, attempt, dto::PairFeedbackKind::Verified),
                     Err(group_pake::PakeError::WrongCode) => feedback(id, attempt, dto::PairFeedbackKind::WrongCode),
                     Err(_) => return Err(problem(dto::PairCode::ProtocolViolation, dto::PairStage::Code)),
                 }
             }
-            _ => return Err(protocol(v1::ErrorCode::UnsupportedValue.into())),
+            _ => return Err(protocol(v2::ErrorCode::UnsupportedValue.into())),
         };
         s.attempt.incoming.push((kind, incoming, reply.clone()));
         let peer = s.view.peer;
@@ -899,7 +935,7 @@ pub fn parse_key(value: &str) -> Option<PairId> {
         return None;
     }
     let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(value).ok()?;
-    let pair = dto::PairId::from_raw(v1::cbor::decode_map(&bytes, 512).ok()?).ok()?;
+    let pair = dto::PairId::from_raw(v2::cbor::decode_map(&bytes, 512).ok()?).ok()?;
     wire::read_pair(&pair).ok()
 }
 pub fn problem(code: dto::PairCode, stage: dto::PairStage) -> dto::PairProblem {
@@ -910,7 +946,7 @@ fn with(p: dto::PairProblem, key: u32, value: RawValue) -> dto::PairProblem {
     raw.insert(key, value);
     dto::PairProblem::from_raw(raw).expect("problem field")
 }
-fn protocol(_: v1::Error) -> dto::PairProblem {
+fn protocol(_: v2::Error) -> dto::PairProblem {
     problem(dto::PairCode::ProtocolViolation, dto::PairStage::Code)
 }
 fn queued(id: PairId) -> Message {
@@ -960,10 +996,10 @@ fn message_pair(message: &Message) -> Result<PairId> {
         Message::ConfigPairCancel(v) => v.pair_id(),
         Message::ConfigPairEnded(v) => v
             .pair_id()
-            .and_then(|id| id.ok_or(v1::ErrorCode::MalformedFrame.into())),
+            .and_then(|id| id.ok_or(v2::ErrorCode::MalformedFrame.into())),
         Message::ConfigPairPake(v) => v.pair_id(),
         Message::ConfigPairFeedback(v) => v.pair_id(),
-        _ => return Err(protocol(v1::ErrorCode::StateConflict.into())),
+        _ => return Err(protocol(v2::ErrorCode::StateConflict.into())),
     }
     .map_err(protocol)?;
     wire::read_pair(&pair).map_err(protocol)
@@ -1043,7 +1079,7 @@ mod tests {
             panic!()
         };
         let id = wire::read_pair(&req.pair_id().unwrap()).unwrap();
-        let reply = one(r.request(req, i.local, transcript(), false, now).unwrap());
+        let reply = one(r.request(req, i.local, transcript(), Admission::Open, now).unwrap());
         i.receive(r.local, reply, now).unwrap();
         let reply = one(r.accept(id, r.view(id).unwrap().revision).unwrap());
         i.receive(r.local, reply, now).unwrap();
@@ -1081,7 +1117,13 @@ mod tests {
         let mut r = Sessions::new(boot(9));
         for n in 1..=3 {
             let effects = r
-                .request(request(boot(n), r.local, n), boot(n), transcript(), false, now)
+                .request(
+                    request(boot(n), r.local, n),
+                    boot(n),
+                    transcript(),
+                    Admission::Open,
+                    now,
+                )
                 .unwrap();
             assert!(matches!(one(effects), Message::ConfigPairQueued(_)));
         }
@@ -1091,7 +1133,8 @@ mod tests {
         ] {
             let before = r.snapshot().revision;
             let req = request(boot(4), r.local, if blocked { 4 } else { 5 });
-            let effects = r.request(req.clone(), boot(4), transcript(), blocked, now).unwrap();
+            let admission = if blocked { Admission::Blocked } else { Admission::Open };
+            let effects = r.request(req.clone(), boot(4), transcript(), admission, now).unwrap();
             assert_eq!(effects.len(), 1);
             let Message::ConfigPairDeclined(declined) = one(effects) else {
                 panic!()
@@ -1105,14 +1148,111 @@ mod tests {
             let row = r.snapshot().requests[0].clone();
             r.accept(row.id, row.revision).unwrap();
             assert!(matches!(
-                one(r.request(req, boot(4), transcript(), false, now).unwrap()),
+                one(r.request(req, boot(4), transcript(), Admission::Open, now).unwrap()),
                 Message::ConfigPairDeclined(_)
             ));
             if blocked {
-                r.request(request(boot(5), r.local, 6), boot(5), transcript(), false, now)
-                    .unwrap();
+                r.request(
+                    request(boot(5), r.local, 6),
+                    boot(5),
+                    transcript(),
+                    Admission::Open,
+                    now,
+                )
+                .unwrap();
             }
         }
+    }
+    /// A phone keeps one request waiting (user 2026-11-11): the next one is refused at
+    /// once with TooManyPendingRequests naming the limit, without a row; once the first
+    /// is answered, a new request is listed again.
+    #[test]
+    fn a_pending_limit_of_one_refuses_a_second_request_until_the_first_is_answered() {
+        let now = Instant::now();
+        let mut r = Sessions::new(boot(9));
+        r.set_pending_limit(1);
+        let first = one(r
+            .request(
+                request(boot(1), r.local, 1),
+                boot(1),
+                transcript(),
+                Admission::Open,
+                now,
+            )
+            .unwrap());
+        assert!(matches!(first, Message::ConfigPairQueued(_)));
+        let before = r.snapshot().revision;
+        let Message::ConfigPairDeclined(declined) = one(r
+            .request(
+                request(boot(2), r.local, 2),
+                boot(2),
+                transcript(),
+                Admission::Open,
+                now,
+            )
+            .unwrap())
+        else {
+            panic!()
+        };
+        let reason = declined.reason().unwrap();
+        assert_eq!(reason.code().unwrap(), dto::PairCode::TooManyPendingRequests);
+        assert_eq!(reason.limit().unwrap(), Some(1));
+        assert_eq!(r.snapshot().revision, before, "no row for the refused request");
+        assert_eq!(r.snapshot().requests.len(), 1);
+        let row = r.snapshot().requests[0].clone();
+        r.accept(row.id, row.revision).unwrap();
+        let third = one(r
+            .request(
+                request(boot(3), r.local, 3),
+                boot(3),
+                transcript(),
+                Admission::Open,
+                now,
+            )
+            .unwrap());
+        assert!(
+            matches!(third, Message::ConfigPairQueued(_)),
+            "an accepted pairing is no longer pending"
+        );
+    }
+    /// A busy exclusive owner refuses without claiming a decline or showing a row, and
+    /// the initiator ends with that reason.
+    #[test]
+    fn busy_is_refused_as_queue_full_not_declined() {
+        let now = Instant::now();
+        let mut initiator = Sessions::new(boot(1));
+        let mut receiver = Sessions::new(boot(2));
+        let Message::ConfigPairRequest(request) = one(initiator
+            .start(
+                context(initiator.local, receiver.local, 1),
+                receiver.local,
+                transcript(),
+            )
+            .unwrap())
+        else {
+            panic!()
+        };
+        let id = wire::read_pair(&request.pair_id().unwrap()).unwrap();
+        let before = receiver.snapshot().revision;
+        let refusal = one(receiver
+            .request(request, initiator.local, transcript(), Admission::Busy, now)
+            .unwrap());
+        let Message::ConfigPairDeclined(ref declined) = refusal else {
+            panic!()
+        };
+        assert_eq!(declined.reason().unwrap().code().unwrap(), dto::PairCode::QueueFull);
+        assert!(receiver.snapshot().requests.is_empty());
+        assert_eq!(receiver.snapshot().revision, before, "no request row on the receiver");
+        assert!(
+            initiator
+                .receive(receiver.local, refusal, now)
+                .unwrap()
+                .iter()
+                .any(|effect| {
+                    matches!(effect, Effect::Ended { id: ended, problem } if *ended == id
+                && problem.code().unwrap() == dto::PairCode::QueueFull)
+                })
+        );
     }
     #[test]
     fn blocking_pending_requests_declines_peer_without_local_failure() {
@@ -1131,7 +1271,7 @@ mod tests {
         };
         let id = wire::read_pair(&request.pair_id().unwrap()).unwrap();
         let queued = one(receiver
-            .request(request.clone(), initiator.local, transcript(), false, now)
+            .request(request.clone(), initiator.local, transcript(), Admission::Open, now)
             .unwrap());
         initiator.receive(receiver.local, queued, now).unwrap();
         let before = receiver.snapshot().revision;
@@ -1154,7 +1294,7 @@ mod tests {
         assert!(receiver.block_pending(initiator.local.device_id).is_empty());
         assert_eq!(
             one(receiver
-                .request(request, initiator.local, transcript(), true, now)
+                .request(request, initiator.local, transcript(), Admission::Blocked, now)
                 .unwrap()),
             declined,
             "retries must retain the ordinary decline response"
@@ -1177,7 +1317,7 @@ mod tests {
         let peer = boot(1);
         let req = request(peer, r.local, 1);
         let id = wire::read_pair(&req.pair_id().unwrap()).unwrap();
-        r.request(req, peer, transcript(), false, now).unwrap();
+        r.request(req, peer, transcript(), Admission::Open, now).unwrap();
         let rev = r.view(id).unwrap().revision;
         r.block_pending(peer.device_id);
         assert_eq!(
@@ -1188,14 +1328,14 @@ mod tests {
         peer2.nonce = [8; 16];
         for n in 2..=4 {
             assert_eq!(
-                r.request(request(peer2, r.local, n), peer2, transcript(), true, now)
+                r.request(request(peer2, r.local, n), peer2, transcript(), Admission::Blocked, now)
                     .unwrap()
                     .len(),
                 1
             );
         }
         let Message::ConfigPairDeclined(d) = one(r
-            .request(request(peer2, r.local, 5), peer2, transcript(), true, now)
+            .request(request(peer2, r.local, 5), peer2, transcript(), Admission::Blocked, now)
             .unwrap())
         else {
             panic!()
@@ -1204,7 +1344,7 @@ mod tests {
         let now = now + Duration::from_secs(10);
         let req = request(peer2, r.local, 6);
         let id = wire::read_pair(&req.pair_id().unwrap()).unwrap();
-        r.request(req, peer2, transcript(), false, now).unwrap();
+        r.request(req, peer2, transcript(), Admission::Open, now).unwrap();
         r.accept(id, r.view(id).unwrap().revision).unwrap();
         assert!(r.block_pending(peer.device_id).is_empty());
         assert!(r.active.contains_key(&id));

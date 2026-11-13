@@ -4,10 +4,10 @@ use crate::{
     api::DeviceKey,
     node::{Node, lock},
 };
-use oink_protocol::v1::dto;
+use oink_protocol::v2::dto;
 use serde::{Deserialize, Serialize};
 
-pub const CAP: &str = "oink.layout.topology/1";
+pub const CAP: &str = "oink.layout/2";
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PhysicalScreen {
     pub id: String,
@@ -27,7 +27,18 @@ pub type PhysicalTopology = Vec<PhysicalDevice>;
 
 pub fn from_facts(table: &crate::config_module::MemberTable) -> Option<PhysicalTopology> {
     let mut topology = Vec::new();
-    for member in &table.members {
+    for member in table.members.iter().filter(|member| {
+        !member.is_mobile()
+            || member.facts.as_ref().is_some_and(|f| {
+                f.os().is_ok_and(|os| os.0 == "android")
+                    && f.displays().is_ok_and(|d| {
+                        d.0.iter().any(|s| {
+                            s.key()
+                                .is_ok_and(|key| key.0 == oink_foundation::display::ANDROID_INPUT_DISPLAY)
+                        })
+                    })
+            })
+    }) {
         let mut screens = Vec::new();
         for display in member.facts.as_ref()?.displays().ok()?.0 {
             let bounds = display.bounds().ok()?;
@@ -171,55 +182,57 @@ impl Node {
         {
             return Ok(());
         }
-        let (target, next, _command, _gate) =
+        let (target, next, _command, _gate) = {
+            let mut data = lock(&self.inner.profiles.data);
+            if data.pending_layout.is_some()
+                || data
+                    .operations
+                    .iter()
+                    .any(|op| matches!(op.status, OperationStatus::Running | OperationStatus::OutcomeUnknown))
             {
-                let mut data = lock(&self.inner.profiles.data);
-                if data.pending_layout.is_some()
-                    || data
-                        .operations
-                        .iter()
-                        .any(|op| matches!(op.status, OperationStatus::Running | OperationStatus::OutcomeUnknown))
-                {
-                    return Ok(());
-                }
-                let Some(catalog) = data.catalog.as_ref() else {
-                    return Ok(());
-                };
-                let profile = catalog.active().clone();
-                // Fixed writer authority, no online-dependent election or failover.
-                if profile.content_revision.writer.0 != self.id() {
-                    return Ok(());
-                }
-                if config.members().members.iter().any(|m| {
-                    !m.is_self && m.online && !config.peer_agreement(m.device).is_some_and(|a| a.contains(CAP))
-                }) {
-                    return Ok(());
-                }
-                // A manual layout arrives before its companion catalog on some links.
-                // Wait for that catalog; never restore over that intervening edit.
-                let new_layout = data.restore_layout_version.as_ref() != Some(&applied.version);
-                data.restore_layout_version = Some(applied.version.clone());
-                if new_layout && applied.layout_source == dto::LayoutSource::Manual {
-                    data.restore_tracker.manual_layout(&profile);
-                    return Ok(());
-                }
-                let mut next = data.restore_tracker.clone();
-                if !next.observe(&profile, observation.physical_topology.as_ref()) {
-                    data.restore_tracker = next;
-                    return Ok(());
-                }
-                // Ordinary observation must not transiently claim the command gate:
-                // that makes unrelated manual IPC commands spuriously return Busy.
-                // Reserve only an actual return, and don't consume it if a command
-                // or catalog transfer already owns either gate.
-                let Ok(command) = self.inner.profiles.command_gate.try_lock() else {
-                    return Ok(());
-                };
-                let Ok(gate) = self.inner.profiles.gate.try_lock() else {
-                    return Ok(());
-                };
-                (profile.content, next, command, gate)
+                return Ok(());
+            }
+            let Some(catalog) = data.catalog.as_ref() else {
+                return Ok(());
             };
+            let profile = catalog.active().clone();
+            // Fixed writer authority, no online-dependent election or failover.
+            if profile.content_revision.writer.0 != self.id() {
+                return Ok(());
+            }
+            if config.members().members.iter().any(|m| {
+                !m.is_self
+                    && !m.is_mobile()
+                    && m.online
+                    && !config.peer_agreement(m.device).is_some_and(|a| a.contains(CAP))
+            }) {
+                return Ok(());
+            }
+            // A manual layout arrives before its companion catalog on some links.
+            // Wait for that catalog; never restore over that intervening edit.
+            let new_layout = data.restore_layout_version.as_ref() != Some(&applied.version);
+            data.restore_layout_version = Some(applied.version.clone());
+            if new_layout && applied.layout_source == dto::LayoutSource::Manual {
+                data.restore_tracker.manual_layout(&profile);
+                return Ok(());
+            }
+            let mut next = data.restore_tracker.clone();
+            if !next.observe(&profile, observation.physical_topology.as_ref()) {
+                data.restore_tracker = next;
+                return Ok(());
+            }
+            // Ordinary observation must not transiently claim the command gate:
+            // that makes unrelated manual IPC commands spuriously return Busy.
+            // Reserve only an actual return, and don't consume it if a command
+            // or catalog transfer already owns either gate.
+            let Ok(command) = self.inner.profiles.command_gate.try_lock() else {
+                return Ok(());
+            };
+            let Ok(gate) = self.inner.profiles.gate.try_lock() else {
+                return Ok(());
+            };
+            (profile.content, next, command, gate)
+        };
         let restored = config
             .edit_layout_if_current(
                 applied,

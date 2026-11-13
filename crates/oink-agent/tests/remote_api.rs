@@ -559,7 +559,7 @@ async fn tolerant_settings_startup_preserves_files_and_reports_local_issues_scen
 }
 
 fn saved_layout(dir: &std::path::Path) -> oink_display::layout::Layout {
-    use oink_protocol::v1::schema::WireDto;
+    use oink_protocol::v2::schema::WireDto;
     let identity = oink_network::identity::Identity::load_or_create(dir).unwrap();
     let stored = oink_agent::config_module::group_store::load(
         &dir.join(oink_agent::config_module::group_store::STATE_FILE),
@@ -568,7 +568,7 @@ fn saved_layout(dir: &std::path::Path) -> oink_display::layout::Layout {
     .unwrap()
     .unwrap();
     let value =
-        oink_protocol::v1::dto::LayoutValue::from_raw(stored.layout_register().unwrap().value().unwrap()).unwrap();
+        oink_protocol::v2::dto::LayoutValue::from_raw(stored.layout_register().unwrap().value().unwrap()).unwrap();
     oink_agent::config_module::layout_wire::from_wire(&value).unwrap()
 }
 

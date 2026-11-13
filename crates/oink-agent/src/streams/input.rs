@@ -4,8 +4,10 @@
 //! one order. Two rules beyond the shared machine:
 //!
 //! 1. **The pair.** Each end manages only the I0 it writes. It reopens it for exactly
-//!    four reasons: its own post reported full (or busy); the reader closed or rejected
-//!    it; this device's "can be controlled" changed; this device resumed from pause.
+//!    five reasons: its own post reported full (or busy); the reader closed or rejected
+//!    it; this device's "can be controlled" changed; this device resumed from pause;
+//!    the reader's Facts show it resumed after they showed it paused while this stream
+//!    was open (it may have refused this stream as `Paused`).
 //!    Never because the peer's stream closed or was replaced. The pair is *attached* when
 //!    the outbound stream is open, the inbound one exists and its opening state has been
 //!    read, and the release of keys from the previous detach has completed. It is
@@ -17,49 +19,29 @@
 //! handles and passes them to the input thread with fixed-size commands
 //! (`threads::input::InputCommand`). Attach, detach and everything the router sees
 //! happen on the input thread, in the adapter ([`RouterAdapter`]).
-use oink_foundation::{DeviceId, input::FeelProfile};
+use oink_foundation::DeviceId;
 use oink_protocol::frame::StreamKind;
-use oink_routing::{Packet as Message, control::ControlMsg, dnd::DndMsg};
+use oink_protocol::v2::registry::{Transport, type_id};
+use oink_routing::Packet as Message;
 
 pub(crate) mod wire;
 
 pub const KINDS: &[StreamKind] = &[StreamKind::Input];
 
-/// The opening state of I0, in this order; reading the last one ends the opening.
-/// 1 `ControlMsg::InputCapability`, 2 `ControlMsg::Feel`, 3 `ControlMsg::FocusState`,
-/// 4 `ControlMsg::GameMode`, 5 `DndMsg::Caps`.
-pub const OPENING_MESSAGES: usize = 5;
-
 // C0 authentication is already complete; allow three seconds for the small I0
 // opening under load, then recover before a stuck link becomes a lasting outage.
 const OPENING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 
-/// What the inbound I0 has told about its writer. Lives and dies with that stream: cleared
-/// when it closes or is replaced, kept while only the outbound stream is reopened. Between
-/// attaches (and while this device is paused) state messages update it without reaching
-/// the router; at every attach the router gets the newest values.
-#[derive(Clone, Debug, Default, PartialEq)]
-pub struct ReceiveState {
-    /// From `InputCapability`. The router's `sharing` flag for the peer.
-    pub controllable: Option<bool>,
-    pub touchpad_contacts: Option<u8>,
-    pub feel: Option<FeelProfile>,
-    /// Newest `ControlMsg::FocusState` (carries the peer's router instance).
-    pub focus: Option<ControlMsg>,
-    /// Newest `ControlMsg::GameMode`.
-    pub game_mode: Option<ControlMsg>,
-    /// Newest `DndMsg::Caps`.
-    pub dnd_caps: Option<DndMsg>,
-}
+pub use oink_routing::adapter::{Adapter, OPENING_MESSAGES, PeerCaps, ReceiveState};
 
-impl ReceiveState {
-    /// All five opening messages have been read.
-    pub fn opening_read(&self, admission: &wire::PeerAdmission) -> bool {
-        self.controllable.is_some()
-            && self.feel.is_some()
-            && self.focus.is_some()
-            && (!admission.relative() || self.game_mode.is_some())
-            && (!admission.drag() || self.dnd_caps.is_some())
+impl From<&wire::PeerAdmission> for PeerCaps {
+    fn from(admission: &wire::PeerAdmission) -> Self {
+        Self {
+            relative: admission.relative(),
+            drag: admission.drag(),
+            input: admission.agreement.permits(type_id::InputCapability),
+            windows_lock: admission.agreement.permits(type_id::ControlLockRemoteWindows),
+        }
     }
 }
 
@@ -78,141 +60,21 @@ pub trait RouterAdapter {
     /// sends nothing before the pair is attached).
     fn opening_state(&self, controllable: bool) -> [Message; OPENING_MESSAGES];
 }
-
-impl ReceiveState {
-    /// State messages keep their newest value even while the pair is detached.
-    pub fn record(&mut self, message: &Message) {
-        match message {
-            Message::Control(ControlMsg::InputCapability {
-                controllable,
-                touchpad_contacts,
-            }) => {
-                self.controllable = Some(*controllable);
-                self.touchpad_contacts = *touchpad_contacts;
-            }
-            Message::Control(ControlMsg::Feel { profile }) => self.feel = Some(profile.clone()),
-            Message::Control(m @ ControlMsg::FocusState { .. }) => self.focus = Some(m.clone()),
-            Message::Control(m @ ControlMsg::GameMode { .. }) => self.game_mode = Some(m.clone()),
-            Message::Dnd(m @ DndMsg::Caps { .. }) => self.dnd_caps = Some(m.clone()),
-            _ => {}
-        }
-    }
-}
-
-/// Concrete adapter owned by the native input loop. It has no system backend and can
-/// also drive the real router in the simulator. Input stream identities stay outside it.
-#[derive(Debug)]
-pub struct Adapter {
-    router: oink_routing::Router,
-    received: std::collections::HashMap<DeviceId, ReceiveState>,
-    active: std::collections::HashSet<DeviceId>,
-    now: oink_routing::Micros,
-}
-impl Adapter {
-    pub fn new(router: oink_routing::Router) -> Self {
-        Self {
-            router,
-            received: Default::default(),
-            active: Default::default(),
-            now: 0,
-        }
-    }
-    pub fn router(&self) -> &oink_routing::Router {
-        &self.router
-    }
-    pub fn router_mut(&mut self) -> &mut oink_routing::Router {
-        &mut self.router
-    }
-    pub fn at(&mut self, now: oink_routing::Micros) {
-        self.now = now;
-    }
-    pub fn receive_state(&self, peer: DeviceId) -> Option<&ReceiveState> {
-        self.received.get(&peer)
-    }
-    pub fn clear_received(&mut self, peer: DeviceId) {
-        self.received.remove(&peer);
-    }
-}
-impl std::ops::Deref for Adapter {
-    type Target = oink_routing::Router;
-    fn deref(&self) -> &Self::Target {
-        &self.router
-    }
-}
-impl std::ops::DerefMut for Adapter {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.router
-    }
-}
 impl RouterAdapter for Adapter {
     fn attach(&mut self, admission: &wire::PeerAdmission, state: &ReceiveState, peer_os: oink_routing::Os) {
-        let peer = admission.boot.device_id;
-        if self.attached(peer) || !state.opening_read(admission) {
-            return;
-        }
-        let Some(ControlMsg::FocusState {
-            session: Some(instance),
-            ..
-        }) = state.focus.as_ref()
-        else {
-            return;
-        };
-        let enabled = admission.drag() && matches!(state.dnd_caps, Some(DndMsg::Caps { enabled: true }));
-        self.router.set_peer_os(peer, peer_os, self.now);
-        if !self.router.attach_input(
-            admission.boot,
-            *instance,
-            state.controllable == Some(true),
-            enabled,
-            state.feel.clone().expect("complete opening"),
-            self.now,
-        ) {
-            return;
-        }
-        self.router.set_peer_windows_lock(
-            peer,
-            admission
-                .agreement
-                .contains(oink_routing::control::WINDOWS_LOCK_CAPABILITY),
-        );
-        self.router.set_peer_touchpad_contacts(peer, state.touchpad_contacts);
-        self.router
-            .set_peer_scroll_pixels(peer, admission.agreement.contains("oink.input.scroll-pixels/1"));
-        self.router
-            .set_peer_touchpad_options(peer, admission.agreement.contains("oink.input.touchpad-options/1"));
-        self.router
-            .set_peer_pointer_move_hidden(peer, admission.agreement.contains("oink.pointer.move-hidden/1"));
-        self.router
-            .set_peer_local_click(peer, admission.agreement.contains("oink.focus.local-click/1"));
-        self.active.insert(peer);
-        self.received.insert(peer, state.clone());
-        for message in [
-            state.focus.clone().map(Message::Control),
-            state.game_mode.clone().map(Message::Control),
-        ]
-        .into_iter()
-        .flatten()
-        {
-            self.router.input_message(peer, message, self.now);
-        }
-        self.router.resend_input_preferences(peer);
+        Adapter::attach_with(self, admission.boot, admission.into(), state, peer_os);
     }
     fn detach(&mut self, peer: DeviceId) {
-        if self.active.remove(&peer) {
-            self.router.detach_input(peer);
-        }
+        Adapter::detach(self, peer);
     }
     fn attached(&self, peer: DeviceId) -> bool {
-        self.active.contains(&peer)
+        Adapter::attached(self, peer)
     }
     fn inbound(&mut self, peer: DeviceId, message: Message) {
-        self.received.entry(peer).or_default().record(&message);
-        if self.active.contains(&peer) {
-            self.router.input_message(peer, message, self.now);
-        }
+        Adapter::inbound(self, peer, message);
     }
     fn opening_state(&self, controllable: bool) -> [Message; OPENING_MESSAGES] {
-        self.router.input_opening(controllable)
+        Adapter::opening_state(self, controllable)
     }
 }
 
@@ -252,6 +114,7 @@ pub struct InputStreams {
     paused: bool,
     controllable: bool,
     touchpad_contacts: Option<u8>,
+    pointer_base: Option<oink_routing::PointerBase>,
 }
 impl InputStreams {
     pub fn new(links: LinkLayer, config: ConfigModule, input: Arc<InputThread>, controllable: bool) -> Self {
@@ -269,6 +132,7 @@ impl InputStreams {
             paused,
             controllable,
             touchpad_contacts,
+            pointer_base: None,
         }
     }
     /// Spawn before dialing starts so every ready link is observed.
@@ -331,6 +195,7 @@ impl InputStreams {
                 change = changes.next() => match change {
                     Some(crate::config_module::ConfigChange::Facts { device, capabilities_changed }) => {
                         self.facts_changed(device,capabilities_changed);
+                        self.publish_pointer_base();
                     },
                     // The platform observer owns active native input geometry.
                     // Config facts also retain OS-disabled screens for the editor.
@@ -359,6 +224,35 @@ impl InputStreams {
                 self.links.close_stream(stream, StreamCode::None);
             }
             self.input.send(InputCommand::OutboundGone { peer });
+        }
+    }
+    /// The recorded base computer's primary screen from its DeviceFacts (the
+    /// local facts when it is this device), with its system scale (§14.3).
+    fn publish_pointer_base(&mut self) {
+        let base = self.config.applied().pointer_base.and_then(|device| {
+            let facts = if device == self.links.id() {
+                Some(self.config.local_facts())
+            } else {
+                self.config
+                    .members()
+                    .members
+                    .iter()
+                    .find(|member| member.device == device)
+                    .and_then(|member| member.facts.clone())
+            }?;
+            let displays = facts.displays().ok()?.0;
+            let primary = displays
+                .iter()
+                .find(|d| d.is_primary().unwrap_or(false))
+                .or_else(|| displays.first())?;
+            Some(oink_routing::PointerBase {
+                screen: oink_routing::ScreenId::new(device, primary.key().ok()?.0),
+                system_scale: primary.system_scale().ok().flatten().unwrap_or(1.0),
+            })
+        });
+        if base != self.pointer_base {
+            self.pointer_base = base.clone();
+            self.input.send(InputCommand::PointerBase(base));
         }
     }
     fn wait_end(peer: DeviceId, p: &PeerStreams, reason: &'static str, now: Instant) {
@@ -442,6 +336,7 @@ impl InputStreams {
     /// members, local publications (including this device's pause), controls.
     fn config_state_changed(&mut self) {
         self.input.wake()(); // Apply the shared layout even when native capability stays None (Mac source).
+        self.publish_pointer_base();
         self.refresh_contacts();
         self.pause_changed(self.local_paused());
     }
@@ -520,7 +415,13 @@ impl InputStreams {
                 QueueSpec::reliable(StreamKind::Input).0,
                 self.config
                     .peer_agreement(peer)
-                    .filter(|agreement| agreement.contains("oink.input.relative/1"))
+                    .filter(|agreement| {
+                        agreement.permits_on(
+                            type_id::InputRelativeMotion,
+                            StreamKind::Input as u16,
+                            Transport::Datagram,
+                        )
+                    })
                     .map(|_| QueueSpec::datagram(StreamKind::Input)),
             ) {
                 Ok((input, motion)) => {
@@ -573,8 +474,9 @@ impl InputStreams {
                     return;
                 };
                 match which {
+                    // The input thread closed the handle with `code` before
+                    // it dropped it and sent this notice.
                     Which::Outbound if p.outbound == Some(stream) => {
-                        self.links.close_stream(stream, code);
                         p.outbound = None;
                         let step = p
                             .machine
@@ -583,7 +485,6 @@ impl InputStreams {
                         self.poll();
                     }
                     Which::Inbound if p.inbound == Some(stream) => {
-                        self.links.close_stream(stream, code);
                         p.inbound = None;
                         p.wait_since.get_or_insert_with(Instant::now);
                     }
@@ -615,6 +516,19 @@ impl StreamModule for InputStreams {
         let (Some(boot), Some(agreement)) = (self.config.peer_boot(peer), self.config.peer_agreement(peer)) else {
             return;
         };
+        // A process whose link does not open the input stream (the iOS share
+        // extension: core, group, low, clipboard, device only) never opens I0,
+        // so waiting for its opening would retire a healthy link every
+        // OPENING_TIMEOUT. Phone main apps open I0 like any member.
+        if !self
+            .links
+            .links()
+            .links
+            .iter()
+            .any(|entry| entry.link == link && entry.opens(StreamKind::Input))
+        {
+            return;
+        }
         self.peers.insert(
             peer,
             PeerStreams {
@@ -656,10 +570,13 @@ impl StreamModule for InputStreams {
             return;
         };
         p.wait_since.get_or_insert_with(Instant::now);
-        let relative = self
-            .config
-            .peer_agreement(peer)
-            .is_some_and(|agreement| agreement.contains("oink.input.relative/1"));
+        let relative = self.config.peer_agreement(peer).is_some_and(|agreement| {
+            agreement.permits_on(
+                type_id::InputRelativeMotion,
+                StreamKind::Input as u16,
+                Transport::Datagram,
+            )
+        });
         if stream.tag.kind != StreamKind::Input
             || stream.priority != Priority::Interactive
             || stream.has_datagram != relative
@@ -671,6 +588,14 @@ impl StreamModule for InputStreams {
             stream.reject(StreamCode::StaleOrdinal);
             return;
         }
+        // Paused: nothing on I0 would be acted on; the opener learns why at
+        // once instead of waiting for an opening this device will not send.
+        if self.paused {
+            stream.reject(StreamCode::Paused);
+            return;
+        }
+        // The peer is sharing again: an I0 it refused as Paused reopens now.
+        let resumed = p.machine.peer_resumed();
         if let Some(old) = p.inbound.take() {
             self.links.close_stream(old, StreamCode::None);
             self.input.send(InputCommand::InboundGone { peer, stream: old });
@@ -686,6 +611,9 @@ impl StreamModule for InputStreams {
             motion,
             peer_os: self.os(peer),
         });
+        if resumed {
+            self.poll();
+        }
     }
     fn inbound_low(&mut self, mut operation: InboundLow) {
         operation.stream.cancel();
@@ -733,6 +661,19 @@ impl StreamModule for InputStreams {
         if peer == self.links.id() {
             return;
         }
+        // New facts may be the peer's resume (its pause state is a fact).
+        // A late `Paused` refusal of a stream opened during the peer's pause
+        // would otherwise park I0 until the opening timeout retires the link
+        // (`StreamMachine::peer_facts`).
+        let peer_paused = super::peer_facts_paused(&self.config, peer);
+        if let Some(p) = self.peers.get_mut(&peer) {
+            let redial = peer_paused.map_or(Step::Nothing, |paused| p.machine.peer_facts(paused, Instant::now()));
+            let resumed = p.machine.peer_resumed();
+            self.step(peer, redial);
+            if resumed {
+                self.poll();
+            }
+        }
         let Some(boot) = self.config.peer_boot(peer) else {
             return;
         };
@@ -745,17 +686,17 @@ impl StreamModule for InputStreams {
         else {
             return;
         };
-        let project = || -> oink_protocol::v1::Result<_> {
-            use oink_protocol::v1::{dto, schema::WireValue};
+        let project = || -> oink_protocol::v2::Result<_> {
+            use oink_protocol::v2::{dto, schema::WireValue};
             if oink_network::wire_identity::read_boot(&facts.boot()?)? != boot {
-                return Err(oink_protocol::v1::ErrorCode::AuthenticationFailed.into());
+                return Err(oink_protocol::v2::ErrorCode::AuthenticationFailed.into());
             }
             let mut displays = Vec::new();
             for display in facts.displays()?.0 {
                 let bounds = display.bounds()?;
                 let extent = display
                     .reference_extent()?
-                    .map(|size| Ok::<_, oink_protocol::v1::Error>(oink_foundation::Size::new(size.w()?, size.h()?)))
+                    .map(|size| Ok::<_, oink_protocol::v2::Error>(oink_foundation::Size::new(size.w()?, size.h()?)))
                     .transpose()?;
                 displays.push(oink_foundation::display::DisplayInfo {
                     key: display.key()?.0,
@@ -776,16 +717,19 @@ impl StreamModule for InputStreams {
                     let value = dto::InputTransformValue::read(&option.value()?)?;
                     transform = Some(
                         crate::config::read_transform(value)
-                            .map_err(|_| oink_protocol::v1::ErrorCode::UnsupportedValue)?,
+                            .map_err(|_| oink_protocol::v2::ErrorCode::UnsupportedValue)?,
                     );
                 }
             }
-            Ok((displays, transform, oink_routing::Os::parse(&facts.os()?.0)))
+            // A phone's control-page touchpad is a trackpad source like a Mac's.
+            let mobile = facts.device_kind() == Ok(dto::DeviceKind::Mobile);
+            Ok((displays, transform, oink_routing::Os::parse(&facts.os()?.0), mobile))
         };
-        if let Ok((displays, transform, os)) = project() {
+        if let Ok((displays, transform, os, mobile)) = project() {
             self.input.send(InputCommand::PeerFacts {
                 boot,
                 os,
+                mobile,
                 displays,
                 transform,
             });
@@ -800,12 +744,14 @@ impl StreamModule for InputStreams {
 #[cfg(all(test, debug_assertions))]
 mod tests {
     use super::*;
+    use oink_foundation::input::FeelProfile;
     use oink_foundation::{
         Point,
         input::{InjectEvent, KeyCode},
     };
     use oink_routing::input::InputMsg;
     use oink_routing::{Os, Output, Router, RouterConfig, SimpleLayout};
+    use oink_routing::{control::ControlMsg, dnd::DndMsg};
     const ME: DeviceId = DeviceId([1; 32]);
     const PEER: DeviceId = DeviceId([2; 32]);
     pub(super) fn boot(device_id: DeviceId) -> oink_foundation::session::Boot {
@@ -819,14 +765,14 @@ mod tests {
             boot: boot(peer),
             link: oink_network::link::LinkId(1),
             agreement: Arc::new(
-                oink_protocol::v1::admission::Agreement::new(
+                oink_protocol::v2::admission::Agreement::new(
                     [
-                        "oink.core/1",
-                        "oink.group/1",
-                        "oink.clipboard/1",
+                        "oink.core/2",
+                        "oink.group/2",
+                        "oink.clipboard/2",
                         "oink.low/1",
-                        "oink.input/1",
-                        "oink.input.relative/1",
+                        "oink.input/2",
+                        "oink.input/2",
                         "oink.drag/1",
                     ]
                     .into_iter()
@@ -899,10 +845,10 @@ mod tests {
         let mut state = ReceiveState::default();
         for message in &messages[..4] {
             state.record(message);
-            assert!(!state.opening_read(&admission(PEER)));
+            assert!(!state.opening_read((&admission(PEER)).into()));
         }
         state.record(&messages[4]);
-        assert!(state.opening_read(&admission(PEER)));
+        assert!(state.opening_read((&admission(PEER)).into()));
     }
     #[test]
     fn detached_actions_do_not_enter_router_and_state_survives_outbound_reopen() {
@@ -974,7 +920,7 @@ mod tests {
         let incomplete = a.receive_state(PEER).unwrap().clone();
         a.attach(&admission(PEER), &incomplete, Os::MacOS);
         assert!(!a.attached(PEER));
-        assert!(!incomplete.opening_read(&admission(PEER)));
+        assert!(!incomplete.opening_read((&admission(PEER)).into()));
     }
     #[test]
     fn reattach_uses_latest_focus_and_resends_latest_local_preferences() {
@@ -1058,16 +1004,16 @@ mod os_tests {
             let mut admission = admission(peer);
             if capable {
                 admission.agreement = Arc::new(
-                    oink_protocol::v1::admission::Agreement::new(
+                    oink_protocol::v2::admission::Agreement::new(
                         [
-                            "oink.core/1",
-                            "oink.group/1",
-                            "oink.input/1",
+                            "oink.core/2",
+                            "oink.group/2",
+                            "oink.input/2",
                             "oink.low/1",
-                            "oink.clipboard/1",
-                            "oink.input.relative/1",
+                            "oink.clipboard/2",
+                            "oink.input/2",
                             "oink.drag/1",
-                            "oink.input.touchpad-options/1",
+                            "oink.input/2",
                         ]
                         .into_iter()
                         .map(str::to_owned)
@@ -1075,9 +1021,24 @@ mod os_tests {
                     )
                     .unwrap(),
                 );
+            } else {
+                admission.agreement = Arc::new(
+                    oink_protocol::v2::admission::Agreement::new(
+                        [
+                            "oink.core/2",
+                            "oink.group/2",
+                            "oink.clipboard/2",
+                            "oink.low/1",
+                            "oink.drag/1",
+                        ]
+                        .into_iter()
+                        .map(str::to_owned),
+                    )
+                    .unwrap(),
+                );
             }
             input.attach(&admission, &state, Os::MacOS);
-            assert_eq!(input.router.peer_touchpad_options(peer), Some(capable));
+            assert_eq!(input.router().peer_touchpad_options(peer), Some(capable));
             input.inbound(peer, enter(&input));
             input.drain_outputs();
             input.router_mut().set_accept_contacts(false);

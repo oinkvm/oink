@@ -1,0 +1,12 @@
+<!-- Android 11 (fullBackupContent). Same as the cloud-backup section of
+     data_extraction_rules.xml; see the reasons there. This format has no
+     separate device-transfer rules, so attachments stay behind on Android 11
+     device transfer as well. -->
+<full-backup-content>
+    <exclude domain="file" path="core/device-only/" />
+    <exclude domain="file" path="core/mobile-session.lock" />
+    <exclude domain="sharedpref" path="audio-permissions.xml" />
+    <exclude domain="device_sharedpref" path="privilege_recovery.xml" />
+    <exclude domain="file" path="core/transfers/" />
+    <exclude domain="file" path="received/" />
+</full-backup-content>

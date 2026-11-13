@@ -176,15 +176,23 @@ fn restart_and_check(home: &Path, expected: usize) {
 fn fatal_host_panic_keeps_crash_recovery() {
     let _scenario = watchdog::Scenario::new(module_path!(), "fatal_host_panic_keeps_crash_recovery");
     let home = tempfile::tempdir().unwrap();
-    let mut child = Command::new(std::env::current_exe().unwrap())
+    // The child fails on purpose. Its harness output ("exit_child ... FAILED")
+    // is captured here, so it does not read as a failure in this run's log.
+    let child = Command::new(std::env::current_exe().unwrap())
         .args(["exit_child", "--exact", "--nocapture"])
         .env("OINK_TEST_EXIT_HOME", home.path())
         .env("OINK_TEST_EXIT_PANIC", "1")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
         .spawn()
         .unwrap();
     watchdog::phase(&format!("wait for synthetic-panic child pid={} to exit", child.id()));
-    let status = child.wait().unwrap();
-    assert!(!status.success());
+    let output = child.wait_with_output().unwrap();
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("synthetic fatal host panic"),
+        "the child failed for another reason: {output:?}"
+    );
     restart_and_check(home.path(), 1);
 }
 

@@ -178,8 +178,10 @@ pub fn source_folder(root: &Path, id: DeviceId, name: &str) -> io::Result<String
         }
         clean.push(c);
     }
+    // A leading dot would hide the folder in Finder and `ls`; device names
+    // (phone names especially) are free text, so drop it like trailing dots.
     let clean = crate::sync::files::sanitize_component(
-        clean.trim_end_matches([' ', '.']),
+        clean.trim_start_matches([' ', '.']).trim_end_matches([' ', '.']),
         crate::sync::files::TargetOs::Windows,
     );
     for len in (12..=64).step_by(4) {
@@ -422,6 +424,23 @@ mod tests {
             source_folder(root.path(), id, "safe").unwrap_err().kind(),
             io::ErrorKind::InvalidData
         );
+    }
+    /// Device names are free text (a phone's name especially). The folder is
+    /// visible in Finder and valid on both Mac and Windows.
+    #[test]
+    fn device_folder_names_are_visible_and_safe_on_mac_and_windows() {
+        let root = tempfile::tempdir().unwrap();
+        for (byte, name, expected) in [
+            (0x31, ".Pixel", "Pixel"),
+            (0x32, "CON", "CON_"),
+            (0x33, "a:b|c?/d", "a_b_c__d"),
+            (0x34, " . ", "_"),
+            (0x35, "iPhone. ", "iPhone"),
+        ] {
+            let id = DeviceId([byte; 32]);
+            let folder = source_folder(root.path(), id, name).unwrap();
+            assert_eq!(folder, format!("{expected} {}", &id.to_hex()[..12]), "{name:?}");
+        }
     }
     #[test]
     fn directories_are_stable_sanitized_and_collision_safe() {

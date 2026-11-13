@@ -1,6 +1,6 @@
 //! Selected-device pull rendering and bounded, nonblocking diagnostics.
 //! The realtime callback performs no logging or diagnostic I/O.
-use crate::{OutputDevice, handoff, realtime};
+use crate::{OutputDevice, echo, handoff, realtime};
 #[cfg(not(target_os = "macos"))]
 use cpal::traits::{DeviceTrait, HostTrait};
 use serde::{Deserialize, Serialize};
@@ -196,6 +196,10 @@ pub(crate) struct OutputGap {
 }
 
 pub(crate) trait NativeRender: Send {
+    /// Driven only by the desktop native output callbacks. Mobile renders
+    /// through `Render::fill_native_pull`, and its playback stub never runs a
+    /// callback.
+    #[cfg(any(target_os = "macos", windows))]
     fn fill(&mut self, output: &mut [f32], timing: NativeOutputTiming);
     /// Entire adapter work, including native format copy/release.
     fn complete(&mut self, elapsed: Duration);
@@ -376,6 +380,9 @@ pub struct Playback {
     trace_dropped: Arc<AtomicU64>,
     underrun_frames: Arc<AtomicU64>,
     info: PlaybackInfo,
+    echo_control: Arc<echo::Control>,
+    /// Native output id (`coreaudio:`/`wasapi:`), for the system reference.
+    output_id: String,
     stopped: bool,
     quiescent: bool,
 }
@@ -416,6 +423,7 @@ impl Playback {
     ) -> Result<Self, String> {
         struct Silent(Box<dyn NativeRender>);
         impl NativeRender for Silent {
+            #[cfg(any(target_os = "macos", windows))]
             fn fill(&mut self, output: &mut [f32], timing: NativeOutputTiming) {
                 self.0.fill(output, timing);
                 output.fill(0.0);
@@ -448,14 +456,19 @@ impl Playback {
         let trace_dropped = Arc::new(AtomicU64::new(0));
         let underrun_frames = Arc::new(AtomicU64::new(0));
         let metrics = Arc::new(CallbackMetrics::default());
+        let echo_control = Arc::new(echo::Control::new()?);
+        let render_tap = echo::RenderTap::new(echo_control.clone());
         let render = Render::new(
             input,
-            metrics.clone(),
-            started,
-            callback_ms.clone(),
-            options.trace.then_some(trace_tx),
-            trace_dropped.clone(),
-            underrun_frames.clone(),
+            RenderOptions {
+                metrics: metrics.clone(),
+                started,
+                callback_ms: callback_ms.clone(),
+                traces: options.trace.then_some(trace_tx),
+                trace_dropped: trace_dropped.clone(),
+                underrun_frames: underrun_frames.clone(),
+                render_tap: Some(render_tap),
+            },
         );
         let e = error.clone();
         let stream = NativePlayback::start(
@@ -497,12 +510,33 @@ impl Playback {
             trace_dropped,
             underrun_frames,
             info,
+            echo_control,
+            output_id: id.to_owned(),
             stopped: false,
             quiescent: false,
         })
     }
     pub fn info(&self) -> PlaybackInfo {
         self.info.clone()
+    }
+
+    /// Create the capture-side Case A owner paired with this playback
+    /// callback's single Rust `RenderTap`. The caller owns the returned
+    /// processor on its capture worker and must drop it before playback; it
+    /// keeps `CaseAInput::control()` to serve `Control::update`.
+    pub fn echo_input(&self, enabled: bool) -> Result<echo::CaseAInput, String> {
+        echo::CaseAInput::new(self.echo_control.clone(), enabled)
+    }
+    /// Start recording the full mix of this playback's physical output as the
+    /// echo reference (desktop). The caller starts it only while this device
+    /// is the audio exit and the shared microphone source with AEC on, and
+    /// drops it to stop recording; failures fall back inside `echo::Control`.
+    pub fn echo_system_reference(&self) -> echo::SystemReference {
+        echo::SystemReference::start(self.echo_control.clone(), &self.output_id)
+    }
+    /// Identity of this playback's echo control (one per native output).
+    pub fn echo_control(&self) -> Arc<echo::Control> {
+        self.echo_control.clone()
     }
     pub fn trace_dropped(&self) -> u64 {
         self.trace_dropped.load(Ordering::Relaxed)
@@ -628,17 +662,34 @@ pub(crate) struct Render {
     incidents: handoff::Producer<CallbackIncident>,
     pending_incident: CallbackIncident,
     callback_sequence: u64,
+    render_tap: Option<echo::RenderTap>,
+    /// Native output frame position of the next frame given to `render_tap`:
+    /// the callback frames accumulated so far plus reported native gaps.
+    tap_frame: u64,
+    /// Frames the device played that never reached the tap (a rejected
+    /// callback); the next tap packet starts a new reference timeline.
+    tap_gap: bool,
+}
+struct RenderOptions {
+    metrics: Arc<CallbackMetrics>,
+    started: Instant,
+    callback_ms: Arc<AtomicU64>,
+    traces: Option<handoff::Producer<PlaybackTrace>>,
+    trace_dropped: Arc<AtomicU64>,
+    underrun_frames: Arc<AtomicU64>,
+    render_tap: Option<echo::RenderTap>,
 }
 impl Render {
-    fn new(
-        input: Box<dyn PullInput>,
-        metrics: Arc<CallbackMetrics>,
-        started: Instant,
-        callback_ms: Arc<AtomicU64>,
-        traces: Option<handoff::Producer<PlaybackTrace>>,
-        trace_dropped: Arc<AtomicU64>,
-        underrun_frames: Arc<AtomicU64>,
-    ) -> Self {
+    fn new(input: Box<dyn PullInput>, options: RenderOptions) -> Self {
+        let RenderOptions {
+            metrics,
+            started,
+            callback_ms,
+            traces,
+            trace_dropped,
+            underrun_frames,
+            render_tap,
+        } = options;
         let mut scratch = vec![0.0; (MAX_PULL_FRAMES + 1) * 2].into_boxed_slice();
         let mut kinds = vec![crate::sink::quality::OutputKind::Intentional; MAX_PULL_FRAMES + 1].into_boxed_slice();
         std::hint::black_box(&mut scratch);
@@ -670,9 +721,43 @@ impl Render {
             incidents,
             pending_incident: CallbackIncident::default(),
             callback_sequence: 0,
+            render_tap,
+            tap_frame: 0,
+            tap_gap: false,
         }
     }
-    #[cfg(any(test, feature = "test-support"))]
+    /// Reuse the same DSP for a stream opened and stopped by a mobile host.
+    pub(crate) fn for_native_pull(input: Box<dyn PullInput>) -> Self {
+        Self::new(
+            input,
+            RenderOptions {
+                metrics: Arc::new(CallbackMetrics::default()),
+                started: Instant::now(),
+                callback_ms: Arc::new(AtomicU64::new(0)),
+                traces: None,
+                trace_dropped: Arc::new(AtomicU64::new(0)),
+                underrun_frames: Arc::new(AtomicU64::new(0)),
+                render_tap: None,
+            },
+        )
+    }
+
+    pub(crate) fn fill_native_pull(&mut self, output: &mut [f32], rate: u32, channels: u16, period: u32, at: Instant) {
+        self.fill(
+            output,
+            NativeOutputTiming {
+                sample_rate: rate,
+                channels,
+                period_frames: period,
+                callback_at: at,
+                playback_at: None,
+                padding_frames: 0,
+                buffer_frames: period,
+                native_gap_frames: None,
+            },
+        );
+    }
+
     fn fill(&mut self, output: &mut [f32], timing: NativeOutputTiming) {
         let began = Instant::now();
         self.fill_inner(output, timing);
@@ -737,6 +822,8 @@ impl Render {
         if needed > MAX_PULL_FRAMES {
             output.fill(0.0);
             self.metrics.fault.store(true, Ordering::Release);
+            self.tap_frame += frames as u64;
+            self.tap_gap = true;
             return;
         }
         let generation = self.metrics.quality_generation.load(Ordering::Acquire);
@@ -830,6 +917,34 @@ impl Render {
         self.input.end();
         self.pending_incident.work = self.input.work();
         self.pending_incident.missing_frames = missing;
+        if let Some(tap) = &mut self.render_tap {
+            // One presentation estimate for every callback: the backend's
+            // playback time, or (WASAPI without a clock reading) the same
+            // padding-based estimate from the callback instant. Mixing in the
+            // bare callback instant would shift the timeline by the queue depth.
+            let presented = timing.playback_at.unwrap_or_else(|| {
+                timing.callback_at + Duration::from_secs_f64(f64::from(timing.padding_frames) / f64::from(rate))
+            });
+            let host_ns = echo::estimated_host_ns(presented);
+            let gap = timing.native_gap_frames.unwrap_or(0);
+            self.tap_frame += gap;
+            tap.supply(
+                output,
+                channels,
+                echo::Time {
+                    host_ns: (host_ns != 0).then_some(host_ns),
+                    device_clock: None,
+                    // The reference clock fit needs a continuous native frame
+                    // position; callbacks are contiguous unless a gap is known.
+                    native_frame: Some(self.tap_frame as f64),
+                    rate,
+                    quality: echo::TimeQuality::Estimated,
+                    discontinuity: gap != 0 || std::mem::take(&mut self.tap_gap),
+                    delivered_at: timing.callback_at,
+                },
+            );
+            self.tap_frame += frames as u64;
+        }
         if missing != 0 {
             self.underrun_frames.fetch_add(missing, Ordering::Relaxed);
             self.metrics.deadline_misses.fetch_add(1, Ordering::Relaxed);
@@ -904,6 +1019,7 @@ fn callback_offset_ns(at: Instant) -> u64 {
 }
 
 impl NativeRender for Render {
+    #[cfg(any(target_os = "macos", windows))]
     fn fill(&mut self, output: &mut [f32], timing: NativeOutputTiming) {
         self.fill_inner(output, timing);
     }
@@ -955,12 +1071,15 @@ impl Render {
         let (tx, _) = handoff::channel(8192, empty_trace());
         Self::new(
             input,
-            Arc::new(CallbackMetrics::default()),
-            Instant::now(),
-            Arc::new(AtomicU64::new(0)),
-            trace.then_some(tx),
-            Arc::new(AtomicU64::new(0)),
-            Arc::new(AtomicU64::new(0)),
+            RenderOptions {
+                metrics: Arc::new(CallbackMetrics::default()),
+                started: Instant::now(),
+                callback_ms: Arc::new(AtomicU64::new(0)),
+                traces: trace.then_some(tx),
+                trace_dropped: Arc::new(AtomicU64::new(0)),
+                underrun_frames: Arc::new(AtomicU64::new(0)),
+                render_tap: None,
+            },
         )
     }
     pub(crate) fn simulate(
@@ -1013,6 +1132,9 @@ impl Render {
     }
 }
 
+#[cfg(all(test, any(target_os = "macos", windows)))]
+#[path = "playback_case_a_tests.rs"]
+mod case_a_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1107,12 +1229,15 @@ mod tests {
                 ramp,
                 cursor: 0,
             }),
-            metrics,
-            Instant::now(),
-            Arc::new(AtomicU64::new(0)),
-            Some(tx),
-            Arc::new(AtomicU64::new(0)),
-            Arc::new(AtomicU64::new(0)),
+            RenderOptions {
+                metrics,
+                started: Instant::now(),
+                callback_ms: Arc::new(AtomicU64::new(0)),
+                traces: Some(tx),
+                trace_dropped: Arc::new(AtomicU64::new(0)),
+                underrun_frames: Arc::new(AtomicU64::new(0)),
+                render_tap: None,
+            },
         );
         (control, render, traces)
     }

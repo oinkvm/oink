@@ -1,7 +1,7 @@
 //! Bounded descriptor attachments. One source identity and one assembly deadline
 //! cover both the reliable prefix and the Low remainder.
 use oink_network::link::StreamId;
-use oink_protocol::v1::{
+use oink_protocol::v2::{
     self, Message, RawMap, RawValue as V, dto, limits,
     schema::{Open, WireDto, WireValue},
 };
@@ -16,11 +16,11 @@ pub(crate) enum Header {
     Drag(dto::DndNotice),
 }
 impl Header {
-    fn from_message(message: Message) -> v1::Result<Self> {
+    fn from_message(message: Message) -> v2::Result<Self> {
         match message {
             Message::ClipboardOffer(o) => Ok(Self::Offer(o)),
             Message::DndNotice(n) => Ok(Self::Drag(n)),
-            _ => Err(v1::ErrorCode::UnsupportedValue.into()),
+            _ => Err(v2::ErrorCode::UnsupportedValue.into()),
         }
     }
     fn message(&self) -> Message {
@@ -35,19 +35,19 @@ impl Header {
             Self::Drag(_) => dto::AttachmentKind::Drag,
         }
     }
-    fn identity(&self) -> v1::Result<RawMap> {
+    fn identity(&self) -> v2::Result<RawMap> {
         Ok(match self {
             Self::Offer(o) => o.id()?.into_raw(),
             Self::Drag(n) => n.key()?.into_raw(),
         })
     }
-    fn inventory(&self) -> v1::Result<dto::Inventory> {
+    fn inventory(&self) -> v2::Result<dto::Inventory> {
         match self {
             Self::Offer(o) => o.inventory(),
             Self::Drag(n) => n.inventory(),
         }
     }
-    fn with_inventory(&self, inventory: dto::Inventory) -> v1::Result<Self> {
+    fn with_inventory(&self, inventory: dto::Inventory) -> v2::Result<Self> {
         Ok(match self {
             Self::Offer(o) => {
                 let mut raw = o.raw().clone();
@@ -61,7 +61,7 @@ impl Header {
             }
         })
     }
-    fn wire(&self) -> v1::Result<dto::AttachmentHeader> {
+    fn wire(&self) -> v2::Result<dto::AttachmentHeader> {
         let kind = match self {
             Self::Offer(_) => 0,
             Self::Drag(_) => 1,
@@ -72,7 +72,7 @@ impl Header {
         };
         dto::AttachmentHeader::from_raw([(1, V::Uint(kind)), (2, V::Map([(1, message)].into()))].into())
     }
-    fn from_wire(header: dto::AttachmentHeader) -> v1::Result<Self> {
+    fn from_wire(header: dto::AttachmentHeader) -> v2::Result<Self> {
         match header.variant()? {
             Open::Known(dto::AttachmentKind::Offer) => {
                 Ok(Self::Offer(dto::OfferAttachment::from_raw(header.body()?)?.offer()?))
@@ -80,11 +80,11 @@ impl Header {
             Open::Known(dto::AttachmentKind::Drag) => {
                 Ok(Self::Drag(dto::DragAttachment::from_raw(header.body()?)?.notice()?))
             }
-            _ => Err(v1::ErrorCode::UnsupportedValue.into()),
+            _ => Err(v2::ErrorCode::UnsupportedValue.into()),
         }
     }
 }
-fn inventory_parts(inventory: &dto::Inventory, count: usize) -> v1::Result<(dto::Inventory, dto::InventoryRemainder)> {
+fn inventory_parts(inventory: &dto::Inventory, count: usize) -> v2::Result<(dto::Inventory, dto::InventoryRemainder)> {
     #[cfg(test)]
     SPLIT_WORK.with_borrow_mut(|work| work.partitions += 1);
     let items = inventory.items()?.0;
@@ -128,7 +128,7 @@ fn inventory_parts(inventory: &dto::Inventory, count: usize) -> v1::Result<(dto:
     )?;
     Ok((dto::Inventory::from_raw(raw)?, tail))
 }
-fn head(id: u64, header: &Header, remaining: usize) -> v1::Result<Message> {
+fn head(id: u64, header: &Header, remaining: usize) -> v2::Result<Message> {
     #[cfg(test)]
     SPLIT_WORK.with_borrow_mut(|work| work.heads += 1);
     Ok(Message::AttachmentHead(dto::AttachmentHead::from_raw(
@@ -152,13 +152,13 @@ thread_local! {
     static SPLIT_WORK: std::cell::RefCell<SplitWork> = Default::default();
 }
 
-fn prefix_count(id: u64, header: &Header, inventory: &dto::Inventory) -> v1::Result<usize> {
+fn prefix_count(id: u64, header: &Header, inventory: &dto::Inventory) -> v2::Result<usize> {
     let (Some(V::Array(items)), Some(V::Array(roots))) = (inventory.raw().get(&3), inventory.raw().get(&4)) else {
-        return Err(v1::ErrorCode::MalformedFrame.into());
+        return Err(v2::ErrorCode::MalformedFrame.into());
     };
     let count = items.len() + roots.len();
     if count > 65535 {
-        return Err(v1::ErrorCode::LimitExceeded.into());
+        return Err(v2::ErrorCode::LimitExceeded.into());
     }
     let mut empty = inventory.raw().clone();
     empty.insert(3, V::Array(vec![]));
@@ -167,7 +167,7 @@ fn prefix_count(id: u64, header: &Header, inventory: &dto::Inventory) -> v1::Res
     // Keep all envelope/unknown fields. Only descriptor bytes, the two array
     // lengths and the remaining count vary; CBOR array and uint headers have
     // identical widths. No candidate prefix needs a DTO rebuild or validation.
-    let base = v1::frame::FRAME_HEADER + v1::cbor::map_len(empty.raw())? - 3;
+    let base = v2::frame::FRAME_HEADER + v2::cbor::map_len(empty.raw())? - 3;
     let mut bytes = 0;
     let mut best = 0;
     for (index, descriptor) in items.iter().chain(roots).enumerate() {
@@ -186,7 +186,7 @@ fn prefix_count(id: u64, header: &Header, inventory: &dto::Inventory) -> v1::Res
     }
     Ok(best)
 }
-pub(crate) fn split(id: u64, message: Message) -> v1::Result<(Message, Option<Message>)> {
+pub(crate) fn split(id: u64, message: Message) -> v2::Result<(Message, Option<Message>)> {
     let mut header = Header::from_message(message)?;
     let original = header.inventory()?;
     let mut inventory = oink_clipboard::wire::reliable_inventory(&original)?;
@@ -194,7 +194,7 @@ pub(crate) fn split(id: u64, message: Message) -> v1::Result<(Message, Option<Me
         header = header.with_inventory(inventory.clone())?;
     }
     let message = header.message();
-    if v1::frame::encode(&message, limits::RELIABLE_FRAME).is_ok() {
+    if v2::frame::encode(&message, limits::RELIABLE_FRAME).is_ok() {
         return Ok((message, None));
     }
     inventory = oink_clipboard::wire::descriptor_inventory(&inventory)?;
@@ -203,7 +203,7 @@ pub(crate) fn split(id: u64, message: Message) -> v1::Result<(Message, Option<Me
     let (prefix, tail) = inventory_parts(&inventory, low)?;
     let count = low + tail.items()?.0.len() + tail.roots()?.0.len();
     let first = head(id, &header.with_inventory(prefix)?, count - low)?;
-    v1::frame::encode(&first, limits::RELIABLE_FRAME)?;
+    v2::frame::encode(&first, limits::RELIABLE_FRAME)?;
     let second = Message::AttachmentItems(dto::AttachmentItems::from_raw(
         [
             (1, V::Uint(id)),
@@ -214,7 +214,7 @@ pub(crate) fn split(id: u64, message: Message) -> v1::Result<(Message, Option<Me
         ]
         .into(),
     )?);
-    v1::frame::encode(&second, limits::LOW_FRAME)?;
+    v2::frame::encode(&second, limits::LOW_FRAME)?;
     Ok((first, Some(second)))
 }
 fn result(
@@ -304,7 +304,7 @@ impl Assemblies {
         stream: StreamId,
         message: Message,
         now: Instant,
-    ) -> v1::Result<(Option<Message>, Vec<Message>)> {
+    ) -> v2::Result<(Option<Message>, Vec<Message>)> {
         let (id, family, identity, remaining, header, tail) = match &message {
             Message::AttachmentHead(head) => {
                 let header = Header::from_wire(head.header()?)?;
@@ -325,12 +325,12 @@ impl Assemblies {
                 None,
                 Some(items.items()?),
             ),
-            _ => return Err(v1::ErrorCode::UnsupportedValue.into()),
+            _ => return Err(v2::ErrorCode::UnsupportedValue.into()),
         };
         let family_id = match family {
             dto::AttachmentKind::Offer => 0,
             dto::AttachmentKind::Drag => 1,
-            _ => return Err(v1::ErrorCode::UnsupportedValue.into()),
+            _ => return Err(v2::ErrorCode::UnsupportedValue.into()),
         };
         let key = (stream, family_id);
         let mut replies = vec![];
@@ -352,7 +352,7 @@ impl Assemblies {
                     return Ok((None, vec![]));
                 }
                 if old.identity != identity || old.remaining != remaining {
-                    return Err(v1::ErrorCode::StateConflict.into());
+                    return Err(v2::ErrorCode::StateConflict.into());
                 }
                 if now >= old.expires {
                     let old = self.entries.get_mut(&key).unwrap();
@@ -375,19 +375,19 @@ impl Assemblies {
         } else {
             limits::LOW_FRAME
         };
-        let size = v1::frame::encode(&message, limit)?.len();
+        let size = v2::frame::encode(&message, limit)?.len();
         let prefix = header
             .as_ref()
             .map(|h| h.inventory().and_then(|i| Ok(i.items()?.0.len() + i.roots()?.0.len())))
             .transpose()?
             .unwrap_or(0);
         if prefix.checked_add(remaining as usize).is_none_or(|n| n > 65535) {
-            return Err(v1::ErrorCode::LimitExceeded.into());
+            return Err(v2::ErrorCode::LimitExceeded.into());
         }
         if let Some(tail) = &tail
             && tail.descriptor_count()? != remaining as usize
         {
-            return Err(v1::ErrorCode::StateConflict.into());
+            return Err(v2::ErrorCode::StateConflict.into());
         }
         let old_bytes = self.entries.get(&key).filter(|e| e.id != id).map_or(0, |e| e.bytes);
         if self.entries.len() >= 64 && !self.entries.contains_key(&key)
@@ -428,7 +428,7 @@ impl Assemblies {
             entry.tail = Some(tail);
         }
         if entry.bytes > limits::INVENTORY + limits::RELIABLE_FRAME {
-            return Err(v1::ErrorCode::LimitExceeded.into());
+            return Err(v2::ErrorCode::LimitExceeded.into());
         }
         if entry.head.is_none() || entry.remaining > 0 && entry.tail.is_none() {
             return Ok((None, replies));
@@ -437,7 +437,7 @@ impl Assemblies {
         let mut inventory = header.inventory()?.into_raw();
         if let Some(tail) = entry.tail.take() {
             if tail.descriptor_count()? != entry.remaining as usize {
-                return Err(v1::ErrorCode::StateConflict.into());
+                return Err(v2::ErrorCode::StateConflict.into());
             }
             let V::Array(items) = inventory.get_mut(&3).unwrap() else {
                 unreachable!()
@@ -527,7 +527,13 @@ mod tests {
         let mut raw = oink_clipboard::wire::inventory(&inventory).unwrap().into_raw();
         raw.insert(900, V::Map([(1, V::Text("future".into()))].into()));
         let offer = oink_clipboard::sync::Ordering::new(DeviceId([1; 32]), 0)
-            .capture(dto::Inventory::from_raw(raw).unwrap(), 1, Sensitivity::Normal, 0)
+            .capture(
+                dto::Inventory::from_raw(raw).unwrap(),
+                vec![],
+                1,
+                Sensitivity::Normal,
+                0,
+            )
             .unwrap()
             .unwrap();
         Message::ClipboardOffer(offer)
@@ -557,8 +563,8 @@ mod tests {
             let inventory = header.inventory().unwrap();
             let (larger, _) = inventory_parts(&inventory, kept + 1).unwrap();
             let larger = head(256, &header.with_inventory(larger).unwrap(), count as usize - kept - 1).unwrap();
-            assert!(v1::frame::encode(&first, limits::RELIABLE_FRAME).is_ok());
-            assert!(v1::frame::encode(&larger, limits::RELIABLE_FRAME).is_err());
+            assert!(v2::frame::encode(&first, limits::RELIABLE_FRAME).is_ok());
+            assert!(v2::frame::encode(&larger, limits::RELIABLE_FRAME).is_err());
             let mut cache = Assemblies::default();
             let now = Instant::now();
             assert!(cache.receive(stream(1), first, now).unwrap().0.is_none());
@@ -573,7 +579,7 @@ mod tests {
         let original = offer();
         let (head, tail) = split(1, original.clone()).unwrap();
         let tail = tail.unwrap();
-        assert!(v1::frame::encode(&head, limits::RELIABLE_FRAME).is_ok());
+        assert!(v2::frame::encode(&head, limits::RELIABLE_FRAME).is_ok());
         for reverse in [false, true] {
             let mut cache = Assemblies::default();
             let now = Instant::now();

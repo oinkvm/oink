@@ -2,7 +2,7 @@
 //! speaker encoder, media channel, decoder, jitter buffer and drift correction.
 use super::*;
 use oink_audio::{media::Kind, microphone as mic};
-use oink_protocol::v1::schema::{FixedBytes, Text};
+use oink_protocol::v2::schema::{FixedBytes, Text};
 
 // Local logs retain the native endpoint ID. The diagnostic recorder keeps only
 // this exact-in-f64 48-bit pseudonym, never the endpoint name or native UID.
@@ -52,14 +52,34 @@ pub(super) struct Runtime {
     default_inputs: mic::DefaultInputHistory,
     output: Option<String>,
     selected: Option<String>,
-    selected_claim: Option<Stamp>,
-    route_claim: Option<Stamp>,
+    selected_route: Option<Version>,
+    route_version: Option<Version>,
     settings: Option<mic::Settings>,
+    capture_echo_policy: Option<(bool, bool)>,
+    /// Case A control of the running capture; served on every tick (ordinary
+    /// owner thread) so engines are never created in the capture callback.
+    capture_echo: Option<Arc<oink_audio::echo::Control>>,
+    /// Full-system echo reference recording of the local exit's output. It
+    /// lives exactly as long as a capture that has AEC enabled on the local
+    /// exit, so the system mix is never recorded when it cannot be used.
+    capture_reference: Option<oink_audio::echo::SystemReference>,
+    /// Last logged reference choice (source, system status).
+    echo_reference_logged: Option<(oink_audio::echo::ReferenceSource, oink_audio::echo::SystemStatus)>,
+    /// Rate-limited `oink_echo` lines of the running capture's processor.
+    echo_log: oink_audio::echo::SummaryLog,
     fault: Option<dto::ResourceFaultCode>,
     retry_at: Option<Instant>,
     retry_delay: Duration,
     capture_watchdog: CaptureWatchdog,
-    published: Option<(dto::MicrophoneObservation, Option<dto::AudioExitClaim>)>,
+    published: Option<dto::MicrophoneObservation>,
+    /// The source refused our demand: (source, its route version and its
+    /// published microphone observation then). No new demand until one of
+    /// them changes, so a definite refusal is not repeated (pause audit 5).
+    refused: Option<(
+        DeviceId,
+        Option<dto::AudioRouteVersion>,
+        Option<dto::MicrophoneObservation>,
+    )>,
 }
 impl Runtime {
     pub(super) fn selectable_inputs(&self) -> Vec<mic::InputDevice> {
@@ -180,6 +200,10 @@ impl Runtime {
     pub(super) fn live(&self) -> bool {
         self.active() || self.silenced.is_some()
     }
+    /// The virtual microphone output exists: this device can receive.
+    pub(super) fn virtual_ready(&self) -> bool {
+        self.output.is_some()
+    }
     pub(super) fn output_quality(
         &self,
         at_ms: u64,
@@ -202,6 +226,20 @@ impl Runtime {
             .chain(self.retry_at)
             .min()
     }
+    fn clear_capture_echo(&mut self) {
+        // Stop the system recording before the processor that uses it.
+        self.capture_reference = None;
+        self.capture_echo_policy = None;
+        self.capture_echo = None;
+        self.echo_reference_logged = None;
+        self.echo_log = Default::default();
+    }
+    /// A capture runs AEC against this device's own exit output. The exit
+    /// then stays open through source silence (`tick_exit`): closing it would
+    /// rebuild this capture without AEC and discard the adapted engine.
+    pub(super) fn echo_holds_exit(&self) -> bool {
+        self.capture.is_some() && self.capture_echo_policy == Some((true, true))
+    }
     /// The demand gate of the local source. Native capture may exist only while
     /// `permit` holds; otherwise this drops it (closing the OS stream) and
     /// retires its encoder's bursts. A route kept only by mute or zero volume is
@@ -213,6 +251,7 @@ impl Runtime {
             return Gate::Open;
         }
         self.capture = None;
+        self.clear_capture_echo();
         if let Some(encoded) = self.encoded.take() {
             self.burst = self.burst.max(encoded.burst());
             self.silenced = None;
@@ -232,6 +271,7 @@ impl Runtime {
             self.burst = self.burst.max(encoded.burst());
         }
         self.silenced = None;
+        self.clear_capture_echo();
         for (peer, lease) in self.source.leases() {
             if let Ok(session) = lease.prepared.session() {
                 let stop =
@@ -255,6 +295,20 @@ impl Runtime {
             owner.streams.forget_microphone(receiving.peer);
         }
     }
+    fn source_observation(owner: &Owner, peer: DeviceId) -> Option<dto::MicrophoneObservation> {
+        owner
+            .group
+            .members()
+            .members
+            .iter()
+            .find(|member| member.device == peer)?
+            .facts
+            .as_ref()?
+            .resources()
+            .ok()??
+            .microphone()
+            .ok()?
+    }
     pub(super) fn stop(&mut self, owner: &mut Owner) {
         self.stop_resources(owner);
         self.fault = None;
@@ -274,7 +328,10 @@ impl Runtime {
         self.output = output;
     }
     fn capable(owner: &Owner, peer: DeviceId) -> bool {
-        owner.current_boot(peer).is_some() && owner.group.peer_supports(peer, "oink.audio.microphone/1")
+        owner.current_boot(peer).is_some()
+            && owner
+                .group
+                .peer_permits(peer, oink_protocol::v2::registry::type_id::MicrophoneDemand)
     }
     pub(super) fn tick(&mut self, owner: &mut Owner) {
         let now = Instant::now();
@@ -321,24 +378,24 @@ impl Runtime {
             return;
         }
         let resolution = owner.microphone.resolution;
-        if self.route_claim != resolution.stamp() || self.settings.as_ref() != Some(&settings) {
-            if self.route_claim != resolution.stamp() {
+        if self.route_version != resolution.version() || self.settings.as_ref() != Some(&settings) {
+            if self.route_version != resolution.version() {
                 self.stop(owner);
             }
-            self.route_claim = resolution.stamp();
+            self.route_version = resolution.version();
             self.settings = Some(settings.clone());
             self.fault = None;
         }
         self.retry_if_due(now);
         let source_boot = boot(owner.links.boot());
-        let stamp = resolution.stamp().map(Stamp::to_wire);
+        let stamp = resolution.version().map(Version::to_wire);
         let removed = self.source.retain(now, |peer, lease| {
-            resolution.owner() == Some(owner.links.id())
+            resolution.target() == Some(owner.links.id())
                 && resolution.available()
                 && Self::capable(owner, peer)
                 && lease.prepared.session().is_ok_and(|s| {
                     s.source() == Ok(source_boot.clone())
-                        && s.share_claim().ok() == stamp
+                        && s.route_version().ok() == stamp
                         && s.receiver_output().and_then(|o| o.receiver()).ok() == owner.current_boot(peer)
                 })
         });
@@ -349,7 +406,9 @@ impl Runtime {
             mic::permission(),
             mic::Permission::Granted | mic::Permission::SystemControlled
         );
-        let local_claim = resolution.stamp().filter(|stamp| stamp.owner == owner.links.id());
+        let local_source = resolution
+            .version()
+            .filter(|_| resolution.target() == Some(owner.links.id()));
         let selected_missing = self
             .selected
             .as_ref()
@@ -358,20 +417,20 @@ impl Runtime {
             capture.stop_after_device_invalidation();
         }
         let default_changed = previous_default != self.default_inputs.current.as_ref().map(|i| i.id.clone());
-        if self.selected_claim != local_claim
+        if self.selected_route != local_source
             || input_changed
             || selected_missing
-            || (devices_changed && local_claim.is_some() && self.selected.is_none())
+            || (devices_changed && local_source.is_some() && self.selected.is_none())
             || (settings.input.is_none() && default_changed)
-            || (local_claim.is_some() && self.selected.is_none() && self.fault.is_none())
+            || (local_source.is_some() && self.selected.is_none() && self.fault.is_none())
         {
             // Follow-default means observing actual default-input changes, not
             // freezing the first UID forever. Explicit selections stay pinned.
             self.retire_source(owner);
             self.fault = None;
-            self.selected_claim = local_claim;
+            self.selected_route = local_source;
             self.selected = None;
-            if local_claim.is_some() {
+            if local_source.is_some() {
                 self.select_input(settings.input.as_deref(), permitted, now, mic::switch_default_input);
             }
         }
@@ -392,6 +451,34 @@ impl Runtime {
             owner.streams.report_closed_source(Kind::Microphone, burst, now);
         }
         if gate == Gate::Open
+            && self.capture.is_some()
+            && (self.capture_echo_policy != Some((owner.settings.echo_cancellation, owner.playback.is_some()))
+                || !same_echo_control(
+                    self.capture_echo.as_ref(),
+                    owner.playback.as_ref().and_then(|p| p.echo_control()).as_ref(),
+                ))
+        {
+            // The output RenderTap and local AEC preference are part of the
+            // capture owner lifetime. Rebuild when either changes so a local
+            // output appearing after microphone start cannot leave Case A
+            // bypassed, and a disabled preference cannot retain a processor.
+            // A replaced playback (output device switch) has a new control:
+            // its reference history and system recording start over. The next
+            // encoder continues above this one's bursts.
+            let policy = (owner.settings.echo_cancellation, owner.playback.is_some());
+            let control_changed = self.capture_echo_policy == Some(policy);
+            tracing::info!(target: oink_audio::echo::LOG_TARGET, event = "aec_capture_rebuilt",
+                echo_cancellation = policy.0, local_exit = policy.1,
+                previous_echo_cancellation = self.capture_echo_policy.is_some_and(|p| p.0),
+                previous_local_exit = self.capture_echo_policy.is_some_and(|p| p.1),
+                cause = if control_changed { "control" } else { "policy" },
+                "microphone capture rebuilt for echo cancellation");
+            self.capture = None;
+            if let Some(encoded) = self.encoded.take() {
+                self.burst = self.burst.max(encoded.burst());
+            }
+            self.clear_capture_echo();
+        } else if gate == Gate::Open
             && self.capture.is_none()
             && self.fault.is_none()
             && let Some(input) = &self.selected
@@ -420,17 +507,54 @@ impl Runtime {
                         }
                         accepted
                     }));
-                    let capture = mic::Capture::start(input, permit, encoder)?;
-                    Ok((capture, encoded))
+                    let echo_policy = (owner.settings.echo_cancellation, owner.playback.is_some());
+                    let echo_input = owner
+                        .playback
+                        .as_ref()
+                        .map(|playback| playback.echo_input(echo_policy.0))
+                        .transpose()?;
+                    let echo_control = echo_input.as_ref().map(oink_audio::echo::CaseAInput::control);
+                    let capture = mic::Capture::start_with_echo(input, permit, encoder, echo_input)?;
+                    Ok((capture, encoded, echo_policy, echo_control))
                 });
             match result {
-                Ok((capture, encoded)) => {
+                Ok((capture, encoded, echo_policy, echo_control)) => {
                     self.capture_watchdog.opened(now.max(Instant::now()));
                     self.capture = Some(capture);
                     self.encoded = Some(encoded);
+                    self.capture_echo_policy = Some(echo_policy);
+                    // Record the whole output mix only while it can be used:
+                    // local exit + shared mic source (this capture) + AEC on.
+                    self.capture_reference = match (echo_policy, &owner.playback) {
+                        ((true, true), Some(playback)) if echo_control.is_some() => playback.echo_system_reference(),
+                        _ => None,
+                    };
+                    self.capture_echo = echo_control;
                     self.silenced = None;
                 }
                 Err(error) => self.fail(owner, error, now),
+            }
+        }
+        // Case A engines are created and retired here, on the audio owner, not
+        // in the capture callback. A local exit keeps this owner on its 20 ms
+        // maintenance cadence, which also serves resets the worker requests.
+        if let (Some(control), Some((enabled, local_exit))) = (&self.capture_echo, self.capture_echo_policy) {
+            control.update(enabled, true, local_exit, now);
+            let choice = (control.reference_source(), control.system_status());
+            if self.echo_reference_logged != Some(choice) {
+                self.echo_reference_logged = Some(choice);
+                // The platform's text stays in the local log only; the
+                // diagnostics recorder keeps the two typed names.
+                let detail = control.system_detail();
+                tracing::info!(target: oink_audio::echo::LOG_TARGET, event = "aec_reference",
+                    reference_source = choice.0.name(), system_status = choice.1.name(), detail = ?detail,
+                    "echo cancellation reference");
+            }
+            while let Some(summary) = control.take_summary() {
+                let lines = self.echo_log.record(summary, now);
+                if !lines.is_empty() {
+                    crate::audio::report::submit(move || lines.emit());
+                }
             }
         }
         let capture_error = self
@@ -455,10 +579,10 @@ impl Runtime {
             let _ = encoded.levels();
         }
         let remote = resolution
-            .owner()
+            .target()
             .filter(|p| *p != owner.links.id() && resolution.available() && Self::capable(owner, *p));
         if let Some(peer) = remote
-            && !settings.receive_muted
+            && owner.receiving()
             && self.output.is_some()
         {
             if self.monitor.is_none() && self.fault.is_none() {
@@ -498,11 +622,15 @@ impl Runtime {
             if self.receiving.as_ref().is_some_and(|r| {
                 r.peer != peer
                     || r.session.source().ok() != owner.current_boot(peer)
-                    || r.session.share_claim().ok() != stamp
+                    || r.session.route_version().ok() != stamp
             }) {
                 self.stop_receiving(owner);
             }
-            if self.demand.active && self.fault.is_none() {
+            let hold = (peer, stamp.clone(), Self::source_observation(owner, peer));
+            if self.refused.as_ref().is_some_and(|refused| *refused != hold) {
+                self.refused = None;
+            }
+            if self.demand.active && self.fault.is_none() && self.refused.is_none() {
                 // A local application holds the virtual microphone open while a remote one is shared.
                 crate::usage_days::mark(crate::usage_days::Feature::Microphone);
                 if self.receiving.is_none() {
@@ -527,7 +655,7 @@ impl Runtime {
     }
     fn begin_receiving(&mut self, owner: &mut Owner, peer: DeviceId, now: Instant) {
         let Some(source) = owner.current_boot(peer) else { return };
-        let Some(stamp) = owner.microphone.resolution.stamp() else {
+        let Some(stamp) = owner.microphone.resolution.version() else {
             return;
         };
         let output = dto::ReceiverOutputBinding::from_raw(
@@ -730,47 +858,58 @@ impl Runtime {
                 }
             }
             Message::MicrophoneDemand(demand) => {
-                if self.fault.is_some()
-                    || !matches!(
-                        mic::permission(),
-                        mic::Permission::Granted | mic::Permission::SystemControlled
-                    )
-                {
+                let Ok(session) = demand.session() else { return };
+                // A definite refusal answers at once with its reason; the
+                // receiver holds off instead of repeating it (pause audit 5).
+                // Pause and sleep stay silent: the facts already say so.
+                let refuse = |owner: &mut Owner, reason: Failure| {
+                    if let Ok(stop) = dto::MicrophoneStop::from_raw([(1, session.write()), (2, reason.write())].into())
+                    {
+                        let _ = owner.streams.send(peer, &Message::MicrophoneStop(stop), now);
+                    }
+                };
+                if self.fault.is_some() {
+                    return refuse(owner, Failure::ResourceFault);
+                }
+                if !matches!(
+                    mic::permission(),
+                    mic::Permission::Granted | mic::Permission::SystemControlled
+                ) {
+                    return refuse(owner, Failure::PermissionDenied);
+                }
+                if owner.microphone.resolution.target() != Some(owner.links.id()) {
+                    return refuse(owner, Failure::RouteChanged);
+                }
+                if !owner.microphone.resolution.available() {
                     return;
                 }
-                if owner.microphone.resolution.owner() != Some(owner.links.id())
-                    || !owner.microphone.resolution.available()
-                    || !owner.profile_allowed(peer, StreamFormat::Opus5ms)
+                if !owner.profile_allowed(peer, StreamFormat::Opus5ms)
+                    || !demand.formats().is_ok_and(|formats| {
+                        formats
+                            .0
+                            .iter()
+                            .any(|d| StreamFormat::from_descriptor(d) == Ok(StreamFormat::Opus5ms))
+                    })
                 {
-                    return;
+                    return refuse(owner, Failure::Unsupported);
                 }
-                let Ok(formats) = demand.formats() else { return };
-                if !formats
-                    .0
-                    .iter()
-                    .any(|d| StreamFormat::from_descriptor(d) == Ok(StreamFormat::Opus5ms))
-                {
-                    return;
-                }
-                let (Ok(session), Some(remote), Some(stamp)) = (
-                    demand.session(),
-                    owner.current_boot(peer),
-                    owner.microphone.resolution.stamp(),
-                ) else {
+                let (Some(remote), Some(stamp)) = (owner.current_boot(peer), owner.microphone.resolution.version())
+                else {
                     return;
                 };
-                let Ok(prepared) = self.source.offer(
+                let prepared = match self.source.offer(
                     peer,
-                    session,
+                    session.clone(),
                     mic::session::SessionContext {
                         source: &boot(owner.links.boot()),
                         receiver: &remote,
-                        claim: &stamp.to_wire(),
+                        route: &stamp.to_wire(),
                     },
                     StreamFormat::Opus5ms,
                     now,
-                ) else {
-                    return;
+                ) {
+                    Ok(prepared) => prepared,
+                    Err(reason) => return refuse(owner, reason),
                 };
                 let message = Message::MicrophonePrepared(prepared);
                 owner.streams.set_microphone_opening(peer, vec![message.clone()]);
@@ -813,6 +952,20 @@ impl Runtime {
                         .as_ref()
                         .is_some_and(|r| r.peer == peer && r.session == session)
                     {
+                        let reason = stop.reason().unwrap_or(Failure::None);
+                        tracing::info!(reason = reason.number(), "microphone source stopped our session");
+                        // A route change is the normal end of a session; any other
+                        // reason is the source refusing this demand until its state changes.
+                        if reason != Failure::RouteChanged
+                            || session.route_version().ok()
+                                == owner.microphone.resolution.version().map(Version::to_wire)
+                        {
+                            self.refused = Some((
+                                peer,
+                                owner.microphone.resolution.version().map(Version::to_wire),
+                                Self::source_observation(owner, peer),
+                            ));
+                        }
                         self.stop_receiving(owner);
                     }
                 }
@@ -893,17 +1046,24 @@ impl Runtime {
             ]
             .into(),
         );
-        if let Ok(observation) = observation {
-            let state = (observation.clone(), owner.microphone.claims.watermark().cloned());
-            if self.published.as_ref() != Some(&state)
-                && owner
-                    .group
-                    .publish_local_microphone(observation.clone(), owner.microphone.claims.watermark().cloned())
-                    .is_ok()
-            {
-                self.published = Some(state);
-            }
+        if let Ok(observation) = observation
+            && self.published.as_ref() != Some(&observation)
+            && owner.group.publish_local_microphone(observation.clone()).is_ok()
+        {
+            self.published = Some(observation);
         }
+    }
+}
+
+fn same_echo_control(
+    capture: Option<&Arc<oink_audio::echo::Control>>,
+    playback: Option<&Arc<oink_audio::echo::Control>>,
+) -> bool {
+    match (capture, playback) {
+        (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+        // A capture without a processor follows `capture_echo_policy`.
+        (None, _) => true,
+        (Some(_), None) => false,
     }
 }
 

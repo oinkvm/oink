@@ -1,5 +1,6 @@
 use super::*;
 pub(in crate::content) mod batch;
+mod proxy;
 use crate::model::{ContentSize, INVENTORY_BYTES, MAX_DISCOVERED_NODES, NodeKind};
 use std::{
     collections::HashMap,
@@ -18,6 +19,7 @@ pub struct Local {
     state: Arc<Mutex<State>>,
     cancelled: Arc<AtomicBool>,
     clipboard: bool,
+    origin: Option<oink_foundation::DeviceId>,
 }
 struct State {
     nodes: HashMap<NodeId, Node>,
@@ -40,7 +42,25 @@ pub(crate) struct Reference {
     path: PathBuf,
     offered: Fingerprint,
     followed: Vec<batch::Followed>,
+    proxy: Option<proxy::Location>,
     _source: Mutex<Option<crate::cache::SourceLease>>,
+}
+impl Reference {
+    fn path(&self) -> io::Result<PathBuf> {
+        self.proxy
+            .as_ref()
+            .map_or_else(|| Ok(self.path.clone()), proxy::Location::path)
+    }
+    fn inspect(&self) -> io::Result<Fingerprint> {
+        let current = inspect(&self.path()?)?;
+        self.normalize(current)
+    }
+    fn normalize(&self, current: Fingerprint) -> io::Result<Fingerprint> {
+        match &self.proxy {
+            Some(proxy) => proxy.normalize(current, &self.offered),
+            None => Ok(current),
+        }
+    }
 }
 enum Location {
     Owned(Arc<Reference>),
@@ -53,6 +73,7 @@ impl Location {
             path,
             offered,
             followed,
+            proxy: None,
             _source: Mutex::new(Some(source)),
         }))
     }
@@ -150,6 +171,54 @@ impl Local {
         Arc::get_mut(&mut local).unwrap().clipboard = true;
         Ok(local)
     }
+    /// Files this device holds on behalf of another device (a phone's upload
+    /// kept by its proxy PC). `origin` names that device, so a native receive
+    /// of these files lands in its own received-files folder.
+    pub fn received_from(roots: Vec<(NodeId, PathBuf)>, origin: oink_foundation::DeviceId) -> io::Result<Arc<Self>> {
+        let mut used = std::collections::HashSet::new();
+        let mut names = HashMap::new();
+        for (id, path) in &roots {
+            let name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .ok_or(io::ErrorKind::InvalidInput)?;
+            names.insert(*id, batch::component(name, &mut used));
+        }
+        let tracked: Vec<_> = roots
+            .into_iter()
+            .map(|(id, path)| Ok((id, proxy::Root::load(path)?)))
+            .collect::<io::Result<_>>()?;
+        let roots = tracked
+            .iter()
+            .map(|(id, root)| Ok((*id, root.path()?)))
+            .collect::<io::Result<_>>()?;
+        let mut local = Self::new(roots)?;
+        {
+            let mut state = local.state.lock().unwrap();
+            for (id, root) in tracked {
+                if let Some(node) = state.nodes.get_mut(&id) {
+                    node.entry.name = names[&id].clone();
+                    if let Location::Owned(reference) = &mut node.location {
+                        let reference = Arc::get_mut(reference).unwrap();
+                        reference.offered = root.offered();
+                        reference.proxy = Some(root.location(PathBuf::new()));
+                        if !reference.offered.directory {
+                            node.entry.version = reference.offered.version();
+                        }
+                    }
+                }
+            }
+        }
+        let inner = Arc::get_mut(&mut local).unwrap();
+        inner.origin = Some(origin);
+        {
+            let state = inner.state.lock().unwrap();
+            for root in &mut inner.roots {
+                *root = state.nodes[&root.id].entry.clone();
+            }
+        }
+        Ok(local)
+    }
     fn with_limit(roots: Vec<(NodeId, PathBuf)>, limit: usize) -> io::Result<Arc<Self>> {
         if roots.len() > limit {
             return Err(unavailable(Unavailable::LimitExceeded));
@@ -235,6 +304,7 @@ impl Local {
             })),
             cancelled: Arc::new(AtomicBool::new(false)),
             clipboard: false,
+            origin: None,
         }))
     }
     fn valid(&self) -> io::Result<()> {
@@ -274,12 +344,19 @@ impl Namespace for Local {
             let result = (|| {
                 verify_chain(&state, entry.id, self.clipboard)?;
                 let reference = state.nodes[&entry.id].location.get()?;
+                let path = reference.path()?;
+                let expected = if reference.proxy.is_some() {
+                    inspect(&path)?
+                } else {
+                    reference.offered.clone()
+                };
                 super::super::grants::SourceRoot::capture_followed(
                     state.nodes[&entry.id].entry.clone(),
-                    &reference.path,
-                    &reference.offered,
+                    &path,
+                    &expected,
                     reference.followed.clone(),
                 )
+                .map(|root| root.with_tracked(reference.proxy.as_ref().and_then(proxy::Location::tracked)))
             })();
             match result {
                 Ok(root) => captured.push(root),
@@ -291,6 +368,54 @@ impl Namespace for Local {
 
     fn real_clipboard_files(&self) -> bool {
         self.clipboard
+    }
+    fn tracked_file(&self, id: NodeId) -> io::Result<Option<crate::tracked_file::TrackedFile>> {
+        let state = self.state.lock().unwrap();
+        let reference = state
+            .nodes
+            .get(&id)
+            .ok_or_else(|| unavailable(Unavailable::NoSuchItem))?
+            .location
+            .get()?;
+        Ok(reference.proxy.as_ref().and_then(proxy::Location::tracked))
+    }
+    fn proxy_file_moved(&self, id: NodeId, target: &crate::tracked_file::TrackedFile) -> io::Result<()> {
+        let state = self.state.lock().unwrap();
+        let reference = state
+            .nodes
+            .get(&id)
+            .ok_or_else(|| unavailable(Unavailable::NoSuchItem))?
+            .location
+            .get()?;
+        if let Some(proxy) = &reference.proxy {
+            proxy.relocate(target)?;
+        }
+        Ok(())
+    }
+    fn origin(&self) -> Option<oink_foundation::DeviceId> {
+        self.origin
+    }
+    fn announced_roots(&self) -> Vec<(NodeId, PathBuf, [u64; 2])> {
+        if !self.clipboard {
+            return Vec::new();
+        }
+        let state = self.state.lock().unwrap();
+        self.roots
+            .iter()
+            .filter_map(|root| {
+                let node = state.nodes.get(&root.id)?;
+                // A link (or a root reached through one) is bound to the
+                // batch that followed it; only plain paths are recorded.
+                if node.entry.kind.symlink_target().is_some() {
+                    return None;
+                }
+                let reference = node.location.get().ok()?;
+                reference
+                    .followed
+                    .is_empty()
+                    .then(|| (root.id, reference.path.clone(), reference.offered.identity))
+            })
+            .collect()
     }
     fn retain_files(&self, retention: super::super::transfer::FileRetention) {
         if !self.clipboard {
@@ -332,7 +457,7 @@ impl Namespace for Local {
             return Err(unavailable(Unavailable::NoSuchItem));
         }
         let reference = node.location.get()?;
-        let fingerprint = inspect(&reference.path)?;
+        let fingerprint = reference.inspect()?;
         if let Some(view) = &node.view {
             if view.fingerprint != fingerprint {
                 return Err(unavailable(Unavailable::Superseded));
@@ -350,7 +475,7 @@ impl Namespace for Local {
                 }
                 ancestor = state.nodes[&id].entry.parent;
             }
-            let parent_path = reference.path.clone();
+            let parent_path = reference.path()?;
             let mut logical = Vec::new();
             let mut ancestor = Some(id);
             while let Some(current) = ancestor {
@@ -378,7 +503,7 @@ impl Namespace for Local {
                 }
                 children.push((name, captured));
             }
-            if inspect(&parent_path)? != fingerprint {
+            if reference.inspect()? != fingerprint {
                 return Err(unavailable(Unavailable::Superseded));
             }
             children.sort_by(|a, b| a.0.cmp(&b.0));
@@ -403,18 +528,23 @@ impl Namespace for Local {
                 }
                 metadata_bytes = metadata_bytes.saturating_add(
                     crate::wire::node(&entry)
-                        .and_then(|value| oink_protocol::v1::schema::WireDto::encode(&value, INVENTORY_BYTES))
+                        .and_then(|value| oink_protocol::v2::schema::WireDto::encode(&value, INVENTORY_BYTES))
                         .map_err(|_| unavailable(Unavailable::InvalidData))?
                         .len(),
                 );
                 if metadata_bytes > 64 * 1024 * 1024 {
                     return Err(unavailable(Unavailable::LimitExceeded));
                 }
+                let tail = path.strip_prefix(&parent_path).ok().map(Path::to_path_buf);
+                let mut location = Location::new(path, fingerprint, followed);
+                if let (Some(parent), Some(tail), Location::Owned(child)) = (&reference.proxy, tail, &mut location) {
+                    Arc::get_mut(child).unwrap().proxy = Some(parent.child(&tail));
+                }
                 staged.push((
                     child,
                     Node {
                         entry: entry.clone(),
-                        location: Location::new(path, fingerprint, followed),
+                        location,
                         selected: None,
                         view: None,
                     },
@@ -452,7 +582,7 @@ impl Namespace for Local {
             return Err(unavailable(Unavailable::NoSuchItem));
         }
         let reference = node.location.get()?;
-        let current = inspect(&reference.path)?;
+        let current = reference.inspect()?;
         if !self.clipboard && node.selected.as_ref().is_some_and(|old| *old != current) {
             return Err(unavailable(Unavailable::Superseded));
         }
@@ -478,14 +608,16 @@ impl Namespace for Local {
             return Err(unavailable(Unavailable::InvalidData));
         }
         let reference = node.location.get()?;
-        let read = crate::cache::SourceLease::reading(reference.path.clone());
-        let mut file = File::open(&reference.path)?;
-        if file_fingerprint(&file)? != selected {
+        let path = reference.path()?;
+        let read = crate::cache::SourceLease::reading(path.clone());
+        let mut file = File::open(&path)?;
+        if reference.normalize(file_fingerprint(&file)?)? != selected {
             return Err(unavailable(Unavailable::Superseded));
         }
         file.seek(SeekFrom::Start(offset))?;
         Ok(super::super::terminal_reader(Box::new(Reader {
             file,
+            proxy: reference.proxy.clone(),
             _read: read,
             selected,
             cancelled: self.cancelled.clone(),
@@ -497,6 +629,7 @@ impl Namespace for Local {
 }
 struct Reader {
     file: File,
+    proxy: Option<proxy::Location>,
     _read: crate::cache::SourceLease,
     selected: Fingerprint,
     cancelled: Arc<AtomicBool>,
@@ -504,19 +637,28 @@ struct Reader {
     id: NodeId,
     clipboard: bool,
 }
+impl Reader {
+    fn fingerprint(&self) -> io::Result<Fingerprint> {
+        let current = file_fingerprint(&self.file)?;
+        match &self.proxy {
+            Some(proxy) => proxy.normalize(current, &self.selected),
+            None => Ok(current),
+        }
+    }
+}
 impl Read for Reader {
     fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
         if self.cancelled.load(Ordering::Acquire) {
             return Err(unavailable(Unavailable::Cancelled));
         }
         verify_chain(&self.state.lock().unwrap(), self.id, self.clipboard)?;
-        if file_fingerprint(&self.file)? != self.selected {
+        if self.fingerprint()? != self.selected {
             return Err(unavailable(Unavailable::Superseded));
         }
         let count = self.file.read(bytes)?;
         // Includes EOF and truncation; never acknowledge bytes from two versions.
         verify_chain(&self.state.lock().unwrap(), self.id, self.clipboard)?;
-        if file_fingerprint(&self.file)? != self.selected {
+        if self.fingerprint()? != self.selected {
             return Err(unavailable(Unavailable::Superseded));
         }
         Ok(count)
@@ -535,7 +677,7 @@ fn verify_chain(state: &State, mut id: NodeId, clipboard: bool) -> io::Result<()
         let current = (if node.entry.kind.symlink_target().is_some() {
             inspect_leaf(&reference.path)
         } else {
-            inspect(&reference.path)
+            reference.inspect()
         })
         .map_err(|error| {
             if clipboard

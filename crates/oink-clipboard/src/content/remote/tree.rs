@@ -85,7 +85,7 @@ impl Namespace for Remote {
         }
     }
     fn origin(&self) -> Option<oink_foundation::DeviceId> {
-        Some(self.0.inventory.id.clip.origin)
+        Some(self.0.sender.get().copied().unwrap_or(self.0.inventory.id.clip.origin))
     }
     fn roots(&self) -> Vec<FileNode> {
         self.0
@@ -114,7 +114,7 @@ impl Namespace for Remote {
     }
     fn in_use(&self) -> bool {
         self.0.delivery_started.load(Ordering::Acquire)
-            && self.receipt().is_none()
+            && self.0.terminal.load(Ordering::Acquire) == 0
             && !self.0.cancelled.load(Ordering::Acquire)
     }
 }

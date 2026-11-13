@@ -78,12 +78,21 @@ pub enum InputCommand {
         reply: std::sync::mpsc::SyncSender<Result<(), oink_routing::FocusLockError>>,
     },
     ReturnPointerHome,
-    MovePointerTo(oink_foundation::DeviceId),
+    MovePointerTo(
+        DeviceId,
+        Option<std::sync::mpsc::SyncSender<Result<(), oink_routing::FocusLockError>>>,
+    ),
     GameMode(GameMode),
     KeyboardDisabled(bool),
     PeerAdmission(PeerAdmission),
     RetirePeer(oink_foundation::session::Boot),
+    /// The pointer base computer's primary screen and system scale, for
+    /// screenless sources' pointer units (protocol §14.3).
+    PointerBase(Option<oink_routing::PointerBase>),
     SessionLocked(Option<bool>),
+    /// The text-focus watcher (`oink_input::text_focus`, protocol §14.7). The
+    /// latest report replaces a pending one.
+    TextFocus(oink_routing::control::TextFocusState),
     LocalUnlock {
         admission: LocalUnlockAdmission,
         job: crate::auto_unlock::typing::Job,
@@ -112,6 +121,8 @@ pub enum InputCommand {
     PeerFacts {
         boot: oink_foundation::session::Boot,
         os: Os,
+        /// DeviceFacts `device_kind` is Mobile (a phone).
+        mobile: bool,
         displays: Vec<oink_foundation::display::DisplayInfo>,
         transform: Option<oink_foundation::input_transform::InputTransform>,
     },
@@ -124,7 +135,7 @@ pub enum InputCommand {
         hidden: bool,
     },
     VolumeExit(
-        Arc<Snapshot<Option<Arc<oink_protocol::v1::dto::AudioSessionContext>>>>,
+        Arc<Snapshot<Option<Arc<oink_protocol::v2::dto::AudioSessionContext>>>>,
         Arc<std::sync::atomic::AtomicBool>,
     ),
     Hotkeys(Vec<oink_routing::HotkeyBinding>),
@@ -200,7 +211,7 @@ pub enum InputCommand {
     SendMessage {
         peer: DeviceId,
         stream: StreamId,
-        message: oink_protocol::v1::Message,
+        message: oink_protocol::v2::Message,
     },
     Stop,
 }
@@ -238,7 +249,7 @@ pub enum InputNotice {
         peer: DeviceId,
         stream: StreamId,
         type_id: Option<u16>,
-        code: oink_protocol::v1::ErrorCode,
+        code: oink_protocol::v2::ErrorCode,
         datagram: bool,
     },
 }
@@ -302,7 +313,7 @@ pub struct InputStatus {
     pub keyboard_disabled: bool,
     pub resource_faults: ResourceFaults,
     /// Persistent local enumeration failure only; shared screen faults also include input injection.
-    pub display_enumeration_fault: Option<oink_protocol::v1::dto::ResourceFaultCode>,
+    pub display_enumeration_fault: Option<oink_protocol::v2::dto::ResourceFaultCode>,
     /// Cached native Caps behavior; absent until a supported backend observes it.
     pub caps_lock_switches_input_source: Option<bool>,
     pub source_modes_revision: u64,
@@ -370,7 +381,7 @@ pub struct OwnerInputApplied {
     pub local_emergency_sequence: u64,
 }
 pub type OwnerApplyReply =
-    std::sync::mpsc::SyncSender<Result<OwnerInputApplied, oink_protocol::v1::dto::ControlFailure>>;
+    std::sync::mpsc::SyncSender<Result<OwnerInputApplied, oink_protocol::v2::dto::ControlFailure>>;
 pub use faults::ResourceFaults;
 mod commands;
 mod drag;

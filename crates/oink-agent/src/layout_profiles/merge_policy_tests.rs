@@ -196,8 +196,8 @@ fn singleton_multi_keeps_all_sixteen_multi_profiles_in_both_pairing_directions()
     for reverse in [false, true] {
         for custom in [false, true] {
             let mut multi = catalog(4, 1, 3, 16);
-            multi.extensions = oink_protocol::v1::cbor::encode_map(
-                &[(1000, oink_protocol::v1::RawValue::Bool(true))].into(),
+            multi.extensions = oink_protocol::v2::cbor::encode_map(
+                &[(1000, oink_protocol::v2::RawValue::Bool(true))].into(),
                 MAX_BYTES,
             )
             .unwrap();

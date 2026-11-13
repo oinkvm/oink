@@ -55,7 +55,7 @@ it('draws device glyphs at menu icon size, like the prototype', async () => {
 
 it('lists the online device items in prototype order with a danger kick', async () => {
   menu({ target: 'device:remote', screens: [{ id: 'remote:1', device: 'remote', name: 'Display 1', hidden: false }] });
-  expect(await items()).toEqual(['Lock pointer', 'Hide all screens', 'Input devices', 'Game mode', 'Set as audio output', 'Pause sharing', 'Remove from group']);
+  expect(await items()).toEqual(['Lock pointer', 'Hide all screens', 'Input devices', 'Game mode', 'Set as audio output', 'Connection Route', 'Pause sharing', 'Remove from group']);
   expect(screen.getByRole('menuitem', { name: 'Remove from group' }).className).toMatch(/danger/);
 });
 

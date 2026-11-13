@@ -6,6 +6,9 @@ use serde::{Deserialize, Serialize};
 /// Fixed reference diagonal used by every layout, independent of connected displays.
 pub const REFERENCE_DIAGONAL_METERS: f64 = 0.686;
 
+/// Android helper's native coordinate space for explicit input handoff.
+pub const ANDROID_INPUT_DISPLAY: &str = "android:built-in";
+
 /// 本机的一块显示器。
 ///
 /// **本机全局坐标**（`bounds` 所用坐标系）就是本机系统的光标坐标：

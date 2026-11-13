@@ -1,7 +1,7 @@
 //! Physical volume keys retain their first press context. A held repeat cannot
-//! migrate to another claim/output, and duplicate downs do not adjust twice.
+//! migrate to another route/output, and duplicate downs do not adjust twice.
 use super::*;
-use oink_protocol::v1::dto::AudioSessionContext;
+use oink_protocol::v2::dto::AudioSessionContext;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KeyAction {
@@ -42,7 +42,7 @@ pub(super) struct Press {
     id: u64,
     held: bool,
 }
-impl Owner {
+impl<E: Endpoint + ?Sized> VolumeOwner<E> {
     /// Retire press identities when their authenticated group/Boot authority
     /// ends. Otherwise departed members would occupy the bounded key table
     /// until the output changes, and a reconnect could continue an old repeat.
@@ -67,7 +67,7 @@ impl Owner {
         if output.receiver() != version.exit() {
             return Err(ControlFailure::StaleBoot);
         }
-        if event.session.exit_claim() != version.exit_claim() {
+        if event.session.route_version() != version.route_version() {
             return Err(ControlFailure::RouteChanged);
         }
         if output.generation() != version.output_generation() || output.output_id() != version.output_id() {

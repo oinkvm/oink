@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::Packet as Message;
-use crate::control::{ControlMsg, FocusScope};
+use crate::control::{ControlMsg, EdgeSide, EdgeState, FocusScope, TextRefusal};
 use crate::input::{InputMsg, ScrollAmount};
 
 use oink_foundation::display::DisplayInfo;
@@ -56,7 +56,13 @@ mod local_modes;
 mod windows_lock;
 pub use windows_lock::WindowsLockPermit;
 mod screen;
+mod screenless;
 mod source_foreground;
+pub use screenless::{MemberInput, PointerBase};
+#[cfg(test)]
+mod screenless_tests;
+mod text;
+mod text_focus;
 #[cfg(test)]
 mod windows_lock_tests;
 use game::GameState;
@@ -286,6 +292,27 @@ pub enum StatusEvent {
         ended: bool,
     },
     LocalFactsChanged,
+    /// A screenless member's input had no focus to join and no selected
+    /// device to move the pointer to (protocol §14.2); it was dropped.
+    NoTarget,
+    /// The focus holder did not inject this member's text (protocol §12.1).
+    TextRefused {
+        seq: u64,
+        reason: TextRefusal,
+    },
+    /// The focus holder's edge report for this screenless source (§14.4).
+    Edge {
+        state: EdgeState,
+        edge: EdgeSide,
+        target: Option<DeviceId>,
+    },
+    /// The text-input focus of `device`, the focus holder this screenless
+    /// member's input goes to, changed (§14.7). The control page pops up or
+    /// hides its keyboard from it.
+    TextFocus {
+        device: DeviceId,
+        state: crate::control::TextFocusState,
+    },
     KeyboardDisabled(bool),
     MouseDisabled(bool),
     InputDisablesReleased,
@@ -406,8 +433,11 @@ enum HeldItem {
 struct Peer {
     touchpad_contacts: Option<u8>,
     touchpad_options: bool,
+    /// A phone (DeviceFacts `device_kind` Mobile): its control page sends
+    /// what a Mac trackpad sends (see [`Peer::trackpad_source`]).
+    mobile: bool,
     scroll_pixels: bool,
-    /// Negotiated `oink.pointer.move-hidden/1`: accepts explicit hidden-screen entry.
+    /// Negotiated `oink.input/2`: accepts explicit hidden-screen entry.
     pointer_move_hidden: bool,
     local_click: bool,
     connected: bool,
@@ -426,10 +456,18 @@ struct Peer {
 }
 
 impl Peer {
+    /// A source whose touchpad sends raw contacts together with the system's
+    /// semantic gestures and phased touchpad scroll (with momentum): a Mac
+    /// (its trackpad) or a phone (its control-page touchpad, user 2026-11-12).
+    /// Receivers choose between the two streams the same way for both.
+    fn trackpad_source(&self) -> bool {
+        self.os == Os::MacOS || self.mobile
+    }
     fn new(_now: Micros) -> Self {
         Self {
             touchpad_contacts: None,
             touchpad_options: false,
+            mobile: false,
             scroll_pixels: false,
             pointer_move_hidden: false,
             local_click: false,
@@ -480,6 +518,20 @@ pub struct Router {
     last_user_activity: Option<Micros>,
     last_local_user_activity: Option<Micros>,
     update_remote_until: Micros,
+    /// Last injected `InputText` sequence per sender Boot (`text` module).
+    text_seq: HashMap<DeviceId, (oink_foundation::session::Boot, u64)>,
+    /// Backend limit for committed text (`text` module); `None` inserts a text at once.
+    text_pacing: Option<oink_foundation::input::TextPacing>,
+    /// Admitted text not injected yet, one paced slice each, and when the next may go.
+    text_slices: std::collections::VecDeque<String>,
+    text_next: Micros,
+    /// This device's own text-input focus as the platform watcher reports it
+    /// (`text_focus` module, §14.7).
+    text_focus: text_focus::LocalTextFocus,
+    /// Screenless member: the newest text-focus revision per holder router
+    /// instance, and the last state reported (`text_focus` module).
+    text_focus_revisions: HashMap<DeviceId, (Option<[u8; 16]>, u64)>,
+    text_focus_last: Option<(DeviceId, crate::control::TextFocusState)>,
     /// Group-visible manual focus lock, including the last unlock tombstone.
     focus_lock: Option<crate::control::FocusLock>,
     /// Device policy survives departures; focus_lock only describes an active pin.
@@ -579,6 +631,24 @@ pub struct Router {
     gesture_lock: Option<Target>,
     source_gesture: Option<Gesture>,
     motion_seq: u64,
+    /// Screenless member (`screenless` module): control-page device selector,
+    /// focus explicitly entered on its own screen, outgoing text sequence.
+    selected_target: Option<DeviceId>,
+    screen_focus: bool,
+    text_out_seq: u64,
+    /// Holder side of screenless sources: pointer-unit conversion, the sources
+    /// that sent pointer units, and the edge state last reported to each.
+    pointer_base: Option<screenless::PointerBase>,
+    pointer_sources: HashSet<DeviceId>,
+    edge_reports: HashMap<
+        DeviceId,
+        (
+            u64,
+            crate::control::EdgeState,
+            crate::control::EdgeSide,
+            Option<DeviceId>,
+        ),
+    >,
     /// 按着的键已发出的自动重复次数（`KeyRepeat::n`）。
     key_repeats: HashMap<KeyCode, u32>,
     caps_press: Option<caps::CapsPress>,
@@ -658,6 +728,13 @@ impl Router {
             last_user_activity: None,
             last_local_user_activity: None,
             update_remote_until: 0,
+            text_seq: HashMap::new(),
+            text_pacing: None,
+            text_slices: Default::default(),
+            text_next: 0,
+            text_focus: Default::default(),
+            text_focus_revisions: HashMap::new(),
+            text_focus_last: None,
             focus_lock: None,
             owner_pointer_locked: false,
             lock_escape_sources: HashSet::new(),
@@ -720,6 +797,12 @@ impl Router {
             gesture_lock: None,
             source_gesture: None,
             motion_seq: 0,
+            selected_target: None,
+            screen_focus: false,
+            text_out_seq: 0,
+            pointer_base: None,
+            pointer_sources: HashSet::new(),
+            edge_reports: HashMap::new(),
             key_repeats: HashMap::new(),
             caps_press: None,
             mac_caps_switch: false,
@@ -824,6 +907,12 @@ impl Router {
             self.display_revision += 1;
         }
         self.displays = displays;
+        if self.cfg.screenless && self.displays.is_empty() && self.screen_focus_active() {
+            // A disabled/locked Android helper no longer owns a virtual pointer.
+            // Retained layout geometry must not preserve an active focus session.
+            self.member_emergency(0);
+            self.become_untargeted(self.epoch);
+        }
         if self.displays.is_empty() {
             self.set_owner_pointer_locked(false);
         }
@@ -1119,6 +1208,7 @@ impl Router {
             self.apply_game_preference();
         }
         if paused {
+            self.discard_text("sharing paused");
             self.cancel_source_contacts();
             self.retire_received_multifinger();
             self.fresh_join = false;
@@ -1207,6 +1297,9 @@ impl Router {
     /// 本机收回了焦点的岛以外的一切情况）时收回到本机，光标出现在本机主屏中央；焦点已在本机时不动。
     /// 保留设备自己的指针锁偏好，并通告新的焦点（epoch + 1）。
     pub fn return_pointer_home(&mut self) {
+        if self.cfg.screenless {
+            return;
+        }
         if !self.paused && self.redirect_target(self.me()).is_some() {
             self.enforce_screen_policy();
             return;
@@ -1335,6 +1428,10 @@ impl Router {
 
     /// 焦点在其他设备上时收回到本机（epoch + 1，通告所有设备），光标出现在 `at`。
     fn reclaim_focus(&mut self, at: Option<ScreenPos>) {
+        // A screenless member never claims focus (protocol §14.2).
+        if self.cfg.screenless {
+            return;
+        }
         let me = self.me();
         if self.holder == me && !self.fresh_join {
             return;
@@ -1447,6 +1544,7 @@ impl Router {
             self.release_origin(o);
         }
         self.paused = true;
+        self.discard_text("emergency stop");
         self.emergency = Some(origin);
         // 回到本机、显示光标：焦点在别处（或状态已经分裂）就在本机收回；已经在本机也再切一次 Local，
         // 让 backend 在任何情况下都恢复并显示光标。
@@ -1615,6 +1713,9 @@ impl Router {
         }
         if let Some(t) = self.dnd_deadline() {
             take(t);
+        }
+        if !self.text_slices.is_empty() {
+            take(self.text_next);
         }
         d
     }
@@ -1872,6 +1973,7 @@ impl Router {
         if self.fully_paused {
             return;
         }
+        self.release_text(now);
         if self.sync_deadline().is_some_and(|t| now >= t) {
             self.sync_seq += self.sync_step() - 1;
             self.send_state_sync();
@@ -2257,7 +2359,14 @@ impl Router {
                 self.keys.insert(code, vec![Target::Dropped]);
                 return Disposition::Swallow;
             }
-            if t == Target::Local
+            if self.cfg.screenless
+                && code.is_volume()
+                && let Some(exit) = self.member_volume_exit()
+            {
+                // A phone's control page (see `member_input`): the exit, never the focus.
+                self.begin_volume(self.me(), code, exit);
+                t = Target::LocalInjected;
+            } else if t == Target::Local
                 && !self.keyboard_local()
                 && code.is_volume()
                 && let Some(exit) = self.active_volume_exit()
@@ -2476,6 +2585,34 @@ impl Router {
                 }
             }
             ControlMsg::CursorTrail { active } => self.trail_msg(from, active),
+            ControlMsg::TextRefused { seq, reason } => {
+                if self.cfg.screenless {
+                    self.out.push(Output::Status(StatusEvent::TextRefused { seq, reason }));
+                }
+            }
+            ControlMsg::TextFocus {
+                epoch,
+                seq,
+                editable,
+                secure,
+                revision,
+            } => self.receive_text_focus(
+                from,
+                epoch,
+                revision,
+                crate::control::TextFocusState { seq, editable, secure },
+            ),
+            ControlMsg::EdgeReport {
+                epoch,
+                state,
+                edge,
+                target,
+            } => {
+                // Only the current holder's report for the current focus counts.
+                if self.cfg.screenless && from == self.holder && epoch == self.epoch {
+                    self.out.push(Output::Status(StatusEvent::Edge { state, edge, target }));
+                }
+            }
             m @ ControlMsg::CursorTrailHandoff { .. } => self.trail_receive(from, m, now),
             // Consumed by the input module's adapter (it becomes the peer's
             // `sharing` flag when the pair attaches); the router itself does not act on it.
@@ -2511,6 +2648,12 @@ impl Router {
                     && (epoch, me) == (self.epoch, self.claim)
                     && self.holder == me
                     && !self.paused;
+                // A screenless member is entered only on its own (Android) screen.
+                if self.cfg.screenless && !self.displays.iter().any(|d| d.key == display) {
+                    self.send_focus_state(from);
+                    self.dnd_focus_enter_ignored(from, epoch, "screenless member");
+                    return;
+                }
                 if self.layout.source_requires_target(me) || (!pointer_shortcut && self.hidden_entry(me, &display)) {
                     self.send_focus_state(from);
                     self.dnd_focus_enter_ignored(from, epoch, "target excluded by layout policy");
@@ -2586,7 +2729,14 @@ impl Router {
                 } else {
                     pointer_source
                 };
-                self.become_holder(epoch, Some(at.clone()));
+                if self.cfg.screenless {
+                    // An untargeted member already "holds" focus without its
+                    // screen: entering the screen is a change of holder there.
+                    self.become_holder_at(epoch, Some(at.clone()));
+                    self.screen_focus = true;
+                } else {
+                    self.become_holder(epoch, Some(at.clone()));
+                }
                 if focus_changed {
                     if pointer_shortcut {
                         // Other sources reject unconfirmed claims naming hidden devices.
@@ -2909,10 +3059,15 @@ impl Router {
             self.filter_multifinger(origin, contacts::MultiEvent::Scroll(*phase));
             return;
         }
-        if self.paused || self.epoch == 0 || !self.scope_allows(self.focus_scope.as_ref(), self.claim) {
+        // A screenless member without focus on its own screen ("no target")
+        // never injects; presses reaching it go nowhere (releases still settle).
+        let untargeted = self.cfg.screenless && self.holder == me && !self.screen_focus;
+        if self.paused || self.epoch == 0 || untargeted || !self.scope_allows(self.focus_scope.as_ref(), self.claim) {
             // 尚未接受移交、共享已暂停或旧实例焦点：远端的移动、按下、滚动不生效；抬起仍处理。
             let drop = match &msg {
                 InputMsg::Motion { .. }
+                | InputMsg::PointerMotion { .. }
+                | InputMsg::Text { .. }
                 | InputMsg::RelativeMotion { .. }
                 | InputMsg::Scroll { .. }
                 | InputMsg::KeyRepeat { .. } => true,
@@ -2925,6 +3080,17 @@ impl Router {
                 _ => false,
             };
             if drop {
+                // Text is refused with its reason, never silently (protocol §12.1).
+                if let InputMsg::Text { seq, .. } = &msg {
+                    let reason = if self.paused {
+                        TextRefusal::Paused
+                    } else if untargeted {
+                        TextRefusal::Unsupported
+                    } else {
+                        TextRefusal::NotJoined
+                    };
+                    self.send(origin, Message::Control(ControlMsg::TextRefused { seq: *seq, reason }));
+                }
                 self.diagnostic_contact_gate(
                     origin,
                     &msg,
@@ -2969,6 +3135,28 @@ impl Router {
                 y,
             } => {
                 self.receive_relative(origin, epoch, generation, seq, x, y);
+            }
+            InputMsg::PointerMotion { seq, dx, dy } => {
+                if self.game_mode().active {
+                    return;
+                }
+                if self.holder == me && self.claim != me {
+                    tracing::debug!(?origin, "island: ignoring remote pointer motion");
+                } else if self.holder == me {
+                    self.pointer_sources.insert(origin);
+                    let k = self.pointer_unit_scale();
+                    let _ = seq;
+                    self.remote_motion(origin, dx * k, dy * k, now);
+                } else {
+                    self.forward(origin, hops, msg);
+                }
+            }
+            InputMsg::Text { seq, text } => {
+                if self.holder != me {
+                    self.forward(origin, hops, InputMsg::Text { seq, text });
+                } else if let Some(boot) = self.admitted_boots.get(&origin).copied() {
+                    self.remote_text(boot, seq, text, now);
+                }
             }
             InputMsg::Motion { seq, dx, dy } => {
                 tracing::debug!(target: "oink_cursor_timing",
@@ -3292,6 +3480,12 @@ impl Router {
         }
         let r = self.layout.step_from_source(&from, (dx, dy), origin);
         if r.to.screen.device == me {
+            if r.blocked_x || r.blocked_y {
+                let side = screenless::edge_side(if r.blocked_x { dx } else { 0. }, if r.blocked_x { 0. } else { dy });
+                self.report_edge(origin, EdgeState::Blocked, side, None);
+            } else {
+                self.report_edge(origin, EdgeState::Clear, screenless::edge_side(dx, dy), None);
+            }
             self.button_diagnostics.end_episode();
             self.retain_resistance(&r.to, origin, delta);
             self.pointer = Some(r.to.clone());
@@ -3309,6 +3503,7 @@ impl Router {
             return;
         }
         if self.leave_blocked() || !self.input_ready(r.to.screen.device) {
+            self.report_edge(origin, EdgeState::Blocked, screenless::edge_side(dx, dy), None);
             self.diagnostic(DecisionKind::Refused, self.refusal_reason(), Some(&r.to));
             self.resistance = None;
             // 当作墙：留在当前屏幕内。
@@ -3329,6 +3524,13 @@ impl Router {
         if let Some(p) = self.clamp_move(&from, dx, dy, origin) {
             self.retain_resistance(&p, origin, delta);
             if !self.push_resistance(origin, &p, Some(&from), &r.to, delta, now) {
+                let target = r.to.screen.device;
+                self.report_edge(
+                    origin,
+                    EdgeState::Approaching,
+                    screenless::edge_side(dx, dy),
+                    Some(target),
+                );
                 self.diagnostic(DecisionKind::Refused, DecisionReason::Resistance, Some(&r.to));
                 self.out.push(Output::Inject(self.pushed_move(&p, dx, dy, origin)));
                 self.pointer = Some(p);
@@ -3477,7 +3679,13 @@ impl Router {
 
     // ================= 目标端注入 =================
 
+    /// The focus device's own forwarding context. A phone never forwards: its
+    /// probe is only for its control page (`member_volume_exit`), so keys that
+    /// other sources send to its own (Android) screen keep the local rule.
     fn active_volume_exit(&self) -> Option<crate::input::VolumeRoute> {
+        if self.cfg.screenless {
+            return None;
+        }
         self.volume_exit.as_ref().and_then(|probe| probe()).filter(|route| {
             route.source == self.cfg.boot
                 && route.target.device_id != self.me()
@@ -3489,7 +3697,8 @@ impl Router {
     fn begin_volume(&mut self, origin: DeviceId, code: KeyCode, route: crate::input::VolumeRoute) {
         let exit = route.target.device_id;
         // Use source HID modifiers before the destination's Cmd/Ctrl remapping.
-        let meta = self.volume_modifiers(origin) & 0x88 != 0;
+        // A phone has no forwarding gain, so its keys never take the Cmd/Win path.
+        let meta = !(origin == self.me() && self.cfg.screenless) && self.volume_modifiers(origin) & 0x88 != 0;
         let target = if meta {
             VolumeTarget::Forwarding
         } else {
@@ -3539,17 +3748,39 @@ impl Router {
                     self.out.push(Output::Status(StatusEvent::AudioVolumeKey { code }));
                 }
             }
-            VolumeTarget::Exit { route, press_id } => self.send(
-                route.target.device_id,
-                Message::Input(InputMsg::Volume {
-                    route,
-                    press_id,
-                    code,
-                    pressed,
-                    repeat,
-                    modifiers: self.volume_modifiers(origin),
-                }),
-            ),
+            VolumeTarget::Exit { route, press_id } => {
+                // The control page's media keys never combine with held modifiers.
+                let modifiers = if origin == self.me() && self.cfg.screenless {
+                    0
+                } else {
+                    self.volume_modifiers(origin)
+                };
+                if route.target == self.cfg.boot {
+                    // A phone that is itself the exit executes its own control
+                    // page's keys, as an exit executes a received `Volume`.
+                    self.out.push(Output::ExitVolumeKey {
+                        source: route.source,
+                        route,
+                        press_id,
+                        code,
+                        pressed,
+                        repeat,
+                        modifiers,
+                    });
+                } else {
+                    self.send(
+                        route.target.device_id,
+                        Message::Input(InputMsg::Volume {
+                            route,
+                            press_id,
+                            code,
+                            pressed,
+                            repeat,
+                            modifiers,
+                        }),
+                    );
+                }
+            }
         }
         if !pressed {
             self.volume_targets.remove(&(origin, code));
@@ -3801,7 +4032,7 @@ impl Router {
                 oink_foundation::input_transform::InputTransform::initial(source_os.as_str())
                     .resolve(self.me(), self.cfg.os.as_str())
             },
-            |s| s.resolve(self.me(), self.cfg.os.as_str()),
+            |s| s.resolve_for_source(self.me(), source_os.as_str(), self.cfg.os.as_str()),
         )
     }
     fn map_key(&self, origin: DeviceId, code: KeyCode) -> KeyCode {
@@ -3971,6 +4202,8 @@ impl Router {
         self.unconfirmed_since = None;
         self.rejoin = false;
         self.enter_due = None;
+        // A screenless member without focus on its own screen has no cursor to park.
+        let was_holder = was_holder && (!self.cfg.screenless || std::mem::take(&mut self.screen_focus));
         if was_holder {
             if !was_gap {
                 self.local_cursor = self.pointer.clone();
@@ -3991,12 +4224,20 @@ impl Router {
     }
 
     fn become_holder(&mut self, epoch: u64, at: Option<ScreenPos>) {
+        if self.cfg.screenless {
+            return self.become_untargeted(epoch);
+        }
+        self.become_holder_at(epoch, at);
+    }
+
+    fn become_holder_at(&mut self, epoch: u64, at: Option<ScreenPos>) {
         if self.holder != self.me() && !self.keyboard_local() {
             self.cancel_caps();
         }
         let was_gap = self.gap.take().is_some();
         let me = self.me();
-        let was_holder = self.holder == me;
+        // A screenless member holds its own screen only with `screen_focus`.
+        let was_holder = self.holder == me && (!self.cfg.screenless || self.screen_focus);
         if !was_holder && self.layout.contains_device(self.holder) {
             self.last_enabled_focus = Some(self.holder);
         }
@@ -4516,6 +4757,8 @@ impl Router {
         if self.holder == self.me() && self.claim == self.me() {
             messages.push(self.input_game_state());
         }
+        // A lost text-focus change is recovered here (§14.7).
+        messages.extend(self.text_focus_record(peer));
         messages.push(Message::Control(ControlMsg::FocusState {
             lock_state: self.focus_lock.clone(),
             epoch: self.epoch,

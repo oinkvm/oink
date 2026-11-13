@@ -85,9 +85,10 @@ async fn unadmitted_link_times_out_and_member_redial_recovers() {
     });
     entering.recv().unwrap();
     let stored = same_group(2).remove(0);
+    let roster = stored.state.roster().unwrap();
     let anchor = Anchor {
         group: GroupId(stored.state.group().unwrap().0),
-        root: stored.state.roster().unwrap().root_id().unwrap().0,
+        root: oink_network::roster::root_id(&roster).unwrap(),
     };
     let target_state = State::verify(stored.state, anchor).unwrap();
     let local_state = target_state.clone();
@@ -234,18 +235,20 @@ async fn advancing_proof_chunks_extend_admission_but_replays_do_not() {
                 &[(1, RawValue::Bytes(vec![7; 32768]))].into(),
             )
             .unwrap();
-            owner.lookups.insert(link, (anchor, Instant::now() + ADMISSION_TIMEOUT));
-            let header = v1::frame::encode(
+            owner
+                .member
+                .inject_lookup(link, anchor, Instant::now() + ADMISSION_TIMEOUT);
+            let header = v2::frame::encode(
                 &Message::ConfigMergeTransfer(dto::MergeTransfer::from_raw([(1, reference.write())].into()).unwrap()),
-                v1::limits::CONFIG_FRAME,
+                v2::limits::CONFIG_FRAME,
             )
             .unwrap();
             owner.control(link, &header).map_err(internal)?;
-            let begin = v1::frame::encode(&frames[0], v1::limits::CONFIG_FRAME).unwrap();
+            let begin = v2::frame::encode(&frames[0], v2::limits::CONFIG_FRAME).unwrap();
             owner.control(link, &begin).map_err(internal)?;
             let before = Instant::now();
             owner.sessions.get_mut(&link).unwrap().deadline = Some(before - Duration::from_millis(1));
-            let chunk = v1::frame::encode(&frames[1], v1::limits::CONFIG_FRAME).unwrap();
+            let chunk = v2::frame::encode(&frames[1], v2::limits::CONFIG_FRAME).unwrap();
             owner.control(link, &chunk).map_err(internal)?;
             let renewed = owner.sessions[&link].deadline.unwrap();
             assert!(renewed >= before + ADMISSION_TIMEOUT);
@@ -280,7 +283,7 @@ async fn unreceipted_commit_after_peer_reset_keeps_the_link_available_for_pairin
     // Model a crash before the source persisted its receipt. The peer then
     // explicitly resets its unreadable group; its historical proofs survive.
     let path = nodes[0].directory.path().join(oink_network::pair_journal::FILE);
-    let mut journal = v1::cbor::decode_map(&std::fs::read(&path).unwrap(), 64 * 1024 * 1024).unwrap();
+    let mut journal = v2::cbor::decode_map(&std::fs::read(&path).unwrap(), 64 * 1024 * 1024).unwrap();
     let RawValue::Array(rows) = journal.get_mut(&3).unwrap() else {
         panic!("transactions")
     };
@@ -288,7 +291,7 @@ async fn unreceipted_commit_after_peer_reset_keeps_the_link_available_for_pairin
         let RawValue::Map(row) = row else { panic!("transaction") };
         row.insert(9, false.write());
     }
-    std::fs::write(&path, v1::cbor::encode_map(&journal, 64 * 1024 * 1024).unwrap()).unwrap();
+    std::fs::write(&path, v2::cbor::encode_map(&journal, 64 * 1024 * 1024).unwrap()).unwrap();
     reset_group_state(nodes[1].directory.path(), &nodes[1].identity).unwrap();
     restart(&mut nodes[0]).await;
     restart(&mut nodes[1]).await;
@@ -310,7 +313,7 @@ async fn unreceipted_commit_after_peer_reset_keeps_the_link_available_for_pairin
                     .as_ref()
                     .as_ref()
                     .is_some_and(|m| m.problem.is_some())
-                && owner.proof_expected.is_empty()))
+                && !owner.member.expects_any_proof()))
             .unwrap())
         .await,
         "{:?}",
@@ -326,8 +329,8 @@ async fn unreceipted_commit_after_peer_reset_keeps_the_link_available_for_pairin
                         s.peer.as_ref().and_then(|p| p.anchor().ok())
                     ))
                     .collect::<Vec<_>>(),
-                o.lookups.clone(),
-                o.proof_expected.len(),
+                o.member.lookups_pending(),
+                o.member.expects_any_proof(),
                 o.shared.migration.load()
             )))
             .unwrap()
@@ -520,7 +523,7 @@ async fn repeat_signed_history(queue_current_state: bool) {
     let peer = nodes[1].identity.id();
     let bundle = nodes[0]
         .group
-        .call(move |owner| Ok(owner.journal.lookup(peer, old, None).unwrap().unwrap()))
+        .call(move |owner| Ok(owner.member.journal.lookup(peer, old, None).unwrap().unwrap()))
         .unwrap();
     let context = dto::ObjectContext::from_raw(
         [
@@ -540,15 +543,15 @@ async fn repeat_signed_history(queue_current_state: bool) {
     let header = Message::ConfigMergeTransfer(dto::MergeTransfer::from_raw([(1, reference.write())].into()).unwrap());
     let frames = std::iter::once(header)
         .chain(messages)
-        .map(|message| v1::frame::encode(&message, v1::limits::CONFIG_FRAME).unwrap())
+        .map(|message| v2::frame::encode(&message, v2::limits::CONFIG_FRAME).unwrap())
         .collect::<Vec<_>>();
     let queued = queue_current_state.then(|| {
         nodes[0]
             .group
             .call(|owner| {
-                v1::frame::encode(
+                v2::frame::encode(
                     &Message::ConfigState(owner.state.wire().clone()),
-                    v1::limits::CONFIG_FRAME,
+                    v2::limits::CONFIG_FRAME,
                 )
                 .map_err(internal)
             })
@@ -591,12 +594,12 @@ async fn repeat_signed_history(queue_current_state: bool) {
                     owner
                         .control(incoming, &frames[0])
                         .map_err(|e| internal(format!("history header: {e}")))?;
-                    let expected = owner.proof_expected.contains_key(&(incoming, digest));
+                    let expected = owner.member.expects_proof(incoming, digest);
                     for frame in &frames[1..] {
                         owner.control(incoming, frame).map_err(|e| {
                             internal(format!(
                                 "history frame {:04x}: {e}",
-                                v1::frame::OpaqueFrame::parse_exact(frame, v1::limits::CONFIG_FRAME)
+                                v2::frame::OpaqueFrame::parse_exact(frame, v2::limits::CONFIG_FRAME)
                                     .unwrap()
                                     .header
                                     .type_id
@@ -611,7 +614,7 @@ async fn repeat_signed_history(queue_current_state: bool) {
                         admitted,
                         was_ready,
                         expected,
-                        owner.proof_expected.contains_key(&(incoming, digest)),
+                        owner.member.expects_proof(incoming, digest),
                         session.ready,
                         owner.state.roster().anchor().group,
                     ))
@@ -1011,7 +1014,7 @@ async fn lookup_for_the_current_signed_group_resumes_member_admission() {
     let no_lookup = nodes.iter().all(|node| {
         node.group
             .call(|owner| {
-                Ok(owner.lookups.is_empty()
+                Ok(!owner.member.lookups_pending()
                     && owner
                         .shared
                         .migration
@@ -1113,9 +1116,9 @@ async fn bounded_mandatory_c0_queue_closes_its_link_and_other_members_keep_runni
     let closed = nodes[0]
         .group
         .call(move |owner| {
-            let frame = v1::frame::encode(
+            let frame = v2::frame::encode(
                 &Message::ConfigState(owner.state.wire().clone()),
-                v1::limits::CONFIG_FRAME,
+                v2::limits::CONFIG_FRAME,
             )
             .unwrap();
             for _ in 0..16384 {
@@ -1327,14 +1330,14 @@ async fn in_flight_old_group_frames_do_not_close_a_retired_member_lane() {
             assert_ne!(old, owner.state.roster().anchor());
             let frames = [Message::ConfigFacts(facts.clone()), Message::ConfigState(state)];
             let outcomes = frames
-                .map(|message| owner.control(link, &v1::frame::encode(&message, v1::limits::CONFIG_FRAME).unwrap()));
+                .map(|message| owner.control(link, &v2::frame::encode(&message, v2::limits::CONFIG_FRAME).unwrap()));
             assert_eq!(owner.state.digest().unwrap(), current);
             assert!(!owner.sessions[&link].ready);
             // A bare greeting has no historical member authority.
             owner.sessions.get_mut(&link).unwrap().admitted_anchor = None;
             let unauthenticated = owner.control(
                 link,
-                &v1::frame::encode(&Message::ConfigFacts(facts), v1::limits::CONFIG_FRAME).unwrap(),
+                &v2::frame::encode(&Message::ConfigFacts(facts), v2::limits::CONFIG_FRAME).unwrap(),
             );
             assert!(unauthenticated.is_err());
             Ok(outcomes)
@@ -1357,7 +1360,7 @@ async fn lookup_proof_after_target_projection_resumes_signed_admission() {
     let requester = nodes[0].identity.id();
     let bundle = nodes[1]
         .group
-        .call(move |owner| Ok(owner.journal.lookup(requester, source, None).unwrap().unwrap()))
+        .call(move |owner| Ok(owner.member.journal.lookup(requester, source, None).unwrap().unwrap()))
         .unwrap();
     let context = dto::ObjectContext::from_raw(
         [
@@ -1375,7 +1378,7 @@ async fn lookup_proof_after_target_projection_resumes_signed_admission() {
     let header = Message::ConfigMergeTransfer(dto::MergeTransfer::from_raw([(1, reference.write())].into()).unwrap());
     let frames = std::iter::once(header)
         .chain(messages)
-        .map(|message| v1::frame::encode(&message, v1::limits::CONFIG_FRAME).unwrap())
+        .map(|message| v2::frame::encode(&message, v2::limits::CONFIG_FRAME).unwrap())
         .collect::<Vec<_>>();
     let peer = nodes[1].links.boot();
     let target_state = nodes[0].group.call(|owner| Ok(owner.state.clone())).unwrap();
@@ -1416,8 +1419,8 @@ async fn lookup_proof_after_target_projection_resumes_signed_admission() {
             // an outstanding source lookup, then another recovery installs the
             // signed target before the encoded reply reaches its control parser.
             owner
-                .lookups
-                .insert(link, (source, Instant::now() + Duration::from_secs(10)));
+                .member
+                .inject_lookup(link, source, Instant::now() + Duration::from_secs(10));
             owner.commit(target_state)?;
             for frame in frames {
                 owner.control(link, &frame).map_err(internal)?;
@@ -1490,5 +1493,66 @@ async fn replacing_prepared_query_after_member_removal_refreshes_pairing_context
                 .any(|m| m.device == nodes[0].identity.id() && m.online))
         .await
     );
+    stop(&nodes).await;
+}
+
+/// H16: a peer-chosen PairProblem.winner that this owner cannot re-encode is a
+/// protocol violation on that C0, never a panic of the configuration thread.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn oversized_peer_pair_problem_closes_its_c0_and_the_owner_keeps_running() {
+    let nodes = start(fresh(2)).await;
+    let id = request(&nodes[0], &nodes[1], [31; 16]).await;
+    assert!(until(|| nodes[1].group.pairings().requests.iter().any(|r| r.id == id)).await);
+    let pair = pairing::parse_key(&id).unwrap();
+    // The responder declines; the initiator records that failure as a durable
+    // local event, which converts the peer's problem.
+    let peer = nodes[1].identity.id();
+    let mut winner = wire::pair(pair).into_raw();
+    winner.insert(99, RawValue::Bytes(vec![7; 9000]));
+    let mut problem = pairing::problem(dto::PairCode::Declined, dto::PairStage::Request).into_raw();
+    problem.insert(5, RawValue::Map(winner));
+    let declined = Message::ConfigPairDeclined(
+        dto::PairDeclined::from_raw([(1, wire::pair(pair).write()), (2, RawValue::Map(problem))].into()).unwrap(),
+    );
+    let frame = v2::frame::encode(&declined, v2::limits::CONFIG_FRAME).unwrap();
+    let refused = nodes[0]
+        .group
+        .call(move |owner| {
+            let link = owner.links.links().by_peer(peer).unwrap().link;
+            Ok(owner.control(link, &frame).is_err())
+        })
+        .unwrap();
+    assert!(refused, "the peer's malformed problem is refused");
+    // The owner thread is alive and serves later commands.
+    assert!(nodes[0].group.call(|_| Ok(())).is_ok());
+    stop(&nodes).await;
+}
+
+/// M35: a cancel refused for a stale revision is not the answer for the next
+/// revision of the same pairing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancel_after_a_stale_revision_uses_the_current_revision() {
+    let nodes = start(fresh(2)).await;
+    let id = request(&nodes[0], &nodes[1], [32; 16]).await;
+    let session = nodes[0]
+        .group
+        .pairings()
+        .sessions
+        .iter()
+        .find(|s| s.id == id)
+        .unwrap()
+        .clone();
+    let stale = nodes[0]
+        .group
+        .cancel_pairing(id.clone(), session.revision.0 + 100)
+        .unwrap();
+    assert!(
+        matches!(&stale, api::PairReply::Problem(api::PairRejection::Problem { problem }) if problem.code == dto::PairCode::StaleRevision.number()),
+        "{stale:?}"
+    );
+    assert!(matches!(
+        nodes[0].group.cancel_pairing(id, session.revision.0).unwrap(),
+        api::PairReply::Value(api::CancelResult::Cancelled)
+    ));
     stop(&nodes).await;
 }

@@ -52,6 +52,8 @@ pub mod session_gate;
 mod source_foreground;
 pub mod source_time;
 pub mod stale_step;
+pub mod text;
+pub mod text_focus;
 pub mod timing;
 pub mod warp_base;
 pub mod warp_delta;
@@ -91,6 +93,22 @@ pub fn supported_key_codes(os: &str) -> Vec<KeyCode> {
         .into_iter()
         .filter(|&k| native_key_supported(os, k))
         .collect()
+}
+
+/// Probe entry: insert committed text with the same native events as the
+/// backend's `InjectEvent::Text`, without starting an [`InputBackend`]. On
+/// Windows it always calls `SendInput` in this process (never the protected
+/// input service), so it only reaches windows at or below this integrity level.
+#[cfg(target_os = "macos")]
+pub fn inject_text_direct(text: &str) -> Result<(), InputError> {
+    macos::text::post_text(None, text, |event| {
+        objc2_core_graphics::CGEvent::post(objc2_core_graphics::CGEventTapLocation::HIDEventTap, Some(event));
+        Ok(())
+    })
+}
+#[cfg(windows)]
+pub fn inject_text_direct(text: &str) -> Result<(), InputError> {
+    windows::send_text_local(text)
 }
 
 /// macOS 的 Caps Lock 状态与输入法（诊断、实机测试程序使用）。
@@ -170,6 +188,12 @@ pub trait InputBackend: Send + Sync {
     }
     /// Runs after finite held-input cleanup, before that worker exits.
     fn stop_injection_session(&self) {}
+    /// How much committed text one `InjectEvent::Text` may carry and how long
+    /// to wait before the next one. The router paces remote text with it so
+    /// the injection thread never waits inside a text. None: no limit.
+    fn text_pacing(&self) -> Option<oink_foundation::input::TextPacing> {
+        None
+    }
     /// Ordinary-thread observation of the current injection target. None keeps
     /// the existing permission-only policy; false withdraws controllability
     /// without claiming the network connection is offline.

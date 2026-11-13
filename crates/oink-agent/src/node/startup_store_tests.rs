@@ -1,5 +1,5 @@
 use super::*;
-use oink_protocol::v1::dto::LocalOption;
+use oink_protocol::v2::dto::LocalOption;
 use oink_test_support::input::FakeInput;
 
 fn options(data_dir: &std::path::Path) -> NodeOptions {
@@ -18,7 +18,7 @@ fn options(data_dir: &std::path::Path) -> NodeOptions {
 #[tokio::test]
 async fn new_boot_restores_disabled_sources_to_shared_and_preserves_enabled_modes() {
     use oink_foundation::input::InputMode;
-    use oink_protocol::v1::schema::WireValue;
+    use oink_protocol::v2::schema::WireValue;
 
     for keyboard in [InputMode::Disabled, InputMode::Local, InputMode::Shared] {
         for mouse in [InputMode::Disabled, InputMode::Local, InputMode::Shared] {
@@ -83,7 +83,7 @@ async fn new_boot_restores_disabled_sources_to_shared_and_preserves_enabled_mode
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn persisted_disables_never_enter_started_input_or_published_owner_facts() {
     use oink_foundation::input::InputMode;
-    use oink_protocol::v1::schema::WireValue;
+    use oink_protocol::v2::schema::WireValue;
     for mouse in [InputMode::Disabled, InputMode::Local] {
         let home = tempfile::tempdir().unwrap();
         let mut config = AgentConfig::load_from(home.path()).unwrap();

@@ -2,7 +2,7 @@
 //! committed projection is replayed before discovery; its decision never rolls back.
 use crate::{group_merge, group_state::State, roster::Anchor, wire_identity as wire};
 use oink_foundation::{DeviceId, session::PairId};
-use oink_protocol::v1::{
+use oink_protocol::v2::{
     self, RawMap, RawValue, dto,
     schema::{WireDto, WireValue},
 };
@@ -17,7 +17,7 @@ pub enum Error {
     #[error("pairing journal I/O failed: {0}")]
     Io(#[from] std::io::Error),
     #[error("pairing journal validation failed: {0}")]
-    Wire(#[from] v1::Error),
+    Wire(#[from] v2::Error),
     #[error("pairing journal conflict")]
     Conflict,
     #[error("pairing decision is unavailable")]
@@ -90,7 +90,7 @@ impl Journal {
             Ok(file) => {
                 let mut bytes = Vec::new();
                 file.take(MAX_FILE as u64 + 1).read_to_end(&mut bytes)?;
-                v1::cbor::decode_map(&bytes, MAX_FILE)?
+                v2::cbor::decode_map(&bytes, MAX_FILE)?
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => [
                 (1, 1u8.write()),
@@ -116,7 +116,7 @@ impl Journal {
         let mut candidate = self.raw.clone();
         let result = apply(&mut candidate)?;
         validate(&candidate, self.local)?;
-        let bytes = v1::cbor::encode_map(&candidate, MAX_FILE)?;
+        let bytes = v2::cbor::encode_map(&candidate, MAX_FILE)?;
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -354,14 +354,20 @@ impl Journal {
         {
             return Err(Error::Unauthorized);
         }
-        let result = group_merge::verify_bundle(bundle, group_merge::anchor(&intent.source()?)?)?;
+        let format1 = crate::legacy_merge::is_format1(bundle)?;
+        crate::legacy_merge::verify_any(bundle)?;
         if local == source {
-            group_merge::adopt(bundle, current, local)?;
+            // A 0.3.x decision recovered after the upgrade (M33).
+            if format1 {
+                crate::legacy_merge::adopt(bundle, current, local)?;
+            } else {
+                group_merge::adopt(bundle, current, local)?;
+            }
         } else if local != target || current.digest()? != intent.target_base_digest()?.0 {
             return Err(Error::Unauthorized);
         }
         let bundle = bundle.clone();
-        let projected = result.wire().clone();
+        let projected = bundle.target_state()?;
         self.edit(|raw| {
             if raw.contains_key(&9) {
                 return Err(Error::Conflict);
@@ -419,7 +425,11 @@ impl Journal {
         self.edit(|raw| {
             let Some(projection) = raw.get(&9) else { return Ok(()) };
             let state = get::<dto::GroupState>(projection.as_map()?, 3)?;
-            if group_merge::digest(&state)? != digest {
+            // Compare on the v2 projection as well: a 0.3.x result is retained
+            // in its own shape and installed as its projection (M2, M33).
+            if group_merge::digest(&state)? != digest
+                && group_merge::digest(&crate::legacy_merge::project_state(&state)?)? != digest
+            {
                 return Err(Error::Conflict);
             }
             raw.remove(&9);
@@ -597,12 +607,16 @@ impl Journal {
     pub fn adopt(&mut self, bundle: &dto::MergeTransferBundle, current: &State, apply: bool) -> Result<()> {
         let cert = bundle.certificate()?;
         let intent = cert.intent()?;
-        let source = group_merge::anchor(&intent.source()?)?;
-        let result = if apply {
-            group_merge::adopt(bundle, current, self.local)?
+        if apply {
+            if crate::legacy_merge::is_format1(bundle)? {
+                crate::legacy_merge::adopt(bundle, current, self.local)?;
+            } else {
+                group_merge::adopt(bundle, current, self.local)?;
+            }
         } else {
-            group_merge::verify_bundle(bundle, source)?
-        };
+            crate::legacy_merge::verify_any(bundle)?;
+        }
+        let result = bundle.target_state()?;
         let pair = wire::read_pair(&intent.pair_id()?)?;
         let decision = cert.permit_decision()?;
         let bundle = bundle.clone();
@@ -642,7 +656,7 @@ impl Journal {
                         [
                             (1, wire::pair(pair).write()),
                             (2, decision.write()),
-                            (3, result.wire().write()),
+                            (3, result.write()),
                         ]
                         .into(),
                     ),
@@ -737,7 +751,9 @@ impl Journal {
             }
             let bundle = get::<dto::MergeTransferBundle>(row, 8)?;
             let intent = bundle.certificate()?.intent()?;
-            if group_merge::anchor(&intent.source()?)? != source {
+            // A 0.3.x proof is found by the v2 root of its source roster: the
+            // requester upgraded and knows its group by that root (M33).
+            if crate::legacy_merge::anchors(&bundle)?.0 != source {
                 continue;
             }
             let roster = crate::roster::Roster::verify(bundle.source_roster()?, source)?;
@@ -870,14 +886,21 @@ fn validate(raw: &RawMap, local: DeviceId) -> Result<()> {
         get::<bool>(row, 9)?;
         get::<bool>(row, 13)?;
         if let Some(archive) = row.get(&10) {
-            dto::GroupState::read(archive)?.encode(v1::limits::CONFIG_STATE)?;
+            dto::GroupState::read(archive)?.encode(v2::limits::CONFIG_STATE)?;
         }
         if matches!(status, 1 | 4) {
             let bundle = get::<dto::MergeTransferBundle>(row, 8)?;
             if bundle.plan()? != plan || bundle.certificate()?.permit_decision()? != decision {
                 return Err(Error::Conflict);
             }
-            group_merge::verify_bundle(&bundle, group_merge::anchor(&intent.source()?)?)?;
+            let source = group_merge::anchor(&intent.source()?)?;
+            // A proof committed by 0.3.x stays checked under the definitions
+            // it was certified with; see `legacy_merge`.
+            if crate::legacy_merge::is_format1(&bundle)? {
+                crate::legacy_merge::verify_bundle(&bundle, source)?;
+            } else {
+                group_merge::verify_bundle(&bundle, source)?;
+            }
         }
         if status == 2 {
             get::<dto::PairProblem>(row, 12)?;
@@ -1126,7 +1149,7 @@ mod tests {
         std::fs::remove_dir(&path).unwrap();
         let mut raw = journal.raw.clone();
         raw.insert(99, 1u8.write());
-        let bytes = v1::cbor::encode_map(&raw, MAX_FILE).unwrap();
+        let bytes = v2::cbor::encode_map(&raw, MAX_FILE).unwrap();
         std::fs::write(&path, &bytes).unwrap();
         assert!(Journal::load(&path, local).is_err());
         assert_eq!(std::fs::read(&path).unwrap(), bytes);

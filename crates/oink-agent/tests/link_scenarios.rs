@@ -380,8 +380,28 @@ async fn clipboard_reaches(from: &Dev, to: &Dev, text: &str) {
     from.clip.copy(vec![ClipData::Text(text.into())], Sensitivity::Normal);
     let clip = to.clip.clone();
     let expected = vec![ClipData::Text(text.into())];
+    let diagnostic_at = Instant::now() + Duration::from_secs(10);
     wait_for(&format!("clipboard text {text:?} on {}", to.name), 10.0, || {
-        clip.items() == expected
+        let ready = clip.items() == expected;
+        if !ready && Instant::now() >= diagnostic_at {
+            eprintln!(
+                "CLIPBOARD_FAILURE from={:?} to={:?} from_activity={:?} to_activity={:?} from_low={:?} to_low={:?}{}",
+                from.node.id(),
+                to.node.id(),
+                from.node.clipboard_activity(),
+                to.node.clipboard_activity(),
+                from.node.links().ok().and_then(|links| links
+                    .links()
+                    .by_peer(to.node.id())
+                    .map(|entry| links.low_status(entry.link))),
+                to.node.links().ok().and_then(|links| links
+                    .links()
+                    .by_peer(from.node.id())
+                    .map(|entry| links.low_status(entry.link))),
+                dump(&[from, to]),
+            );
+        }
+        ready
     })
     .await;
 }
@@ -407,13 +427,233 @@ async fn group_anchor(dev: &Dev) -> (oink_foundation::GroupId, [u8; 32]) {
     let stored = oink_agent::config_module::group_store::load(&dev.dir.join("group-state.json"), dev.node.id())
         .unwrap()
         .unwrap();
-    (stored.group(), stored.state.roster().unwrap().root_id().unwrap().0)
+    let roster = stored.state.roster().unwrap();
+    (stored.group(), oink_network::roster::root_id(&roster).unwrap())
 }
 
 fn member_ids(node: &Node) -> Vec<DeviceId> {
     let mut ids: Vec<_> = node.group().unwrap().members.iter().map(|m| m.device.id.0).collect();
     ids.sort();
     ids
+}
+
+/// Turn the current retained file into the shape emitted by the 104/105 line.
+/// The bytes are produced from a real paired directory and remain opaque to v2.
+fn write_legacy_105_group_state(path: &Path, build: u8) {
+    use base64::Engine as _;
+    use oink_protocol::v2::{RawValue, cbor};
+    let mut envelope: serde_json::Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    envelope["legacy_build"] = serde_json::Value::from(u64::from(build));
+    envelope["protocol"] = serde_json::Value::from("oink-wire/1");
+    let encoded = envelope["state_cbor"].as_str().unwrap();
+    let bytes = base64::engine::general_purpose::STANDARD.decode(encoded).unwrap();
+    let mut state = cbor::decode_map(&bytes, oink_protocol::v2::limits::CONFIG_STATE).unwrap();
+
+    let roster = match state.get_mut(&3).unwrap() {
+        RawValue::Map(roster) => roster,
+        _ => panic!("roster map"),
+    };
+    roster.insert(2, RawValue::Bytes(vec![build; 32]));
+    let records = match roster.get_mut(&3).unwrap() {
+        RawValue::Array(records) => records,
+        _ => panic!("roster records"),
+    };
+    for (index, record) in records.iter_mut().enumerate() {
+        let RawValue::Map(record) = record else {
+            panic!("record map")
+        };
+        record.insert(
+            2,
+            RawValue::Map(
+                [
+                    (1, RawValue::Text("ed25519".into())),
+                    (2, RawValue::Bytes(vec![build.wrapping_add(index as u8); 64])),
+                ]
+                .into(),
+            ),
+        );
+        let RawValue::Map(body) = record.get_mut(&1).unwrap() else {
+            panic!("record body")
+        };
+        body.insert(6, RawValue::Bytes(vec![build.wrapping_add(1); 32]));
+    }
+
+    let registers = match state.get_mut(&2).unwrap() {
+        RawValue::Array(registers) => registers,
+        _ => panic!("registers"),
+    };
+    for register in registers {
+        let RawValue::Map(register) = register else {
+            panic!("register map")
+        };
+        register.insert(6, RawValue::Bytes(vec![build.wrapping_add(2); 32]));
+        register.insert(
+            7,
+            RawValue::Map(
+                [
+                    (1, RawValue::Array(Vec::new())),
+                    (2, RawValue::Array(Vec::new())),
+                    (3, RawValue::Array(Vec::new())),
+                    (4, RawValue::Array(Vec::new())),
+                ]
+                .into(),
+            ),
+        );
+    }
+    let bytes = cbor::encode_map(&state, oink_protocol::v2::limits::CONFIG_STATE).unwrap();
+    envelope["state_cbor"] = base64::engine::general_purpose::STANDARD.encode(bytes).into();
+    std::fs::write(path, serde_json::to_vec_pretty(&envelope).unwrap()).unwrap();
+}
+
+fn mark_legacy_105_settings(path: &Path, build: u8) {
+    let mut envelope: serde_json::Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    envelope["legacy_build"] = serde_json::Value::from(u64::from(build));
+    envelope["protocol"] = serde_json::Value::from("oink-wire/1");
+    envelope["local"]["confirm_quit"] = serde_json::Value::Bool(false);
+    std::fs::write(path, serde_json::to_vec_pretty(&envelope).unwrap()).unwrap();
+}
+
+#[test]
+fn legacy_directories_keep_identity_and_reconnect_with_v2() {
+    common::watchdog::run(
+        module_path!(),
+        "legacy_directories_keep_identity_and_reconnect_with_v2",
+        Some(4),
+        legacy_directories_keep_identity_and_reconnect_with_v2_scenario(),
+    );
+}
+
+async fn legacy_directories_keep_identity_and_reconnect_with_v2_scenario() {
+    for (alpha_build, beta_build) in [(30, 33), (104, 105)] {
+        let root = tempfile::tempdir().unwrap();
+        exercise_legacy_pair(root.path(), alpha_build, beta_build).await;
+    }
+}
+
+async fn exercise_legacy_pair(root: &Path, alpha_build: u8, beta_build: u8) {
+    let a = start(root, "alpha").await;
+    let b = start(root, "beta").await;
+    common::pair(&a.node, &b.node).await;
+    let original_anchor = group_anchor(&a).await;
+    let original_members = ids(&[&a, &b]);
+    let original_layout = oink_agent::config_module::group_store::load(&a.dir.join("group-state.json"), a.node.id())
+        .unwrap()
+        .unwrap()
+        .layout_register()
+        .unwrap()
+        .value()
+        .unwrap();
+    let group = a.node.group_id().unwrap();
+    wait_for("saved layout profile before upgrade", 15.0, || {
+        oink_agent::layout_profiles::store::load(&a.dir, group.into()).is_ok_and(|catalog| catalog.is_some())
+    })
+    .await;
+    let original_catalog = oink_agent::layout_profiles::store::load(&a.dir, group.into())
+        .unwrap()
+        .unwrap();
+    let original_profile_id = original_catalog.active_profile_id.clone();
+
+    // Keep a user preference observable through the legacy JSON envelope.
+    a.node.shutdown().await;
+    b.node.shutdown().await;
+    let mut settings = oink_agent::config::AgentConfig::load_from(&a.dir).unwrap();
+    settings.update(|value| value.confirm_quit = false).unwrap();
+    settings.save().unwrap();
+    mark_legacy_105_settings(&a.dir.join("settings.json"), alpha_build);
+    mark_legacy_105_settings(&b.dir.join("settings.json"), beta_build);
+    write_legacy_105_group_state(&a.dir.join("group-state.json"), alpha_build);
+    write_legacy_105_group_state(&b.dir.join("group-state.json"), beta_build);
+    let a = restart(root, &a).await;
+    let b = restart(root, &b).await;
+    wait_for("v2 handshake after legacy-format restart", 20.0, || {
+        a.node.group_id() == Some(group)
+            && b.node.group_id() == Some(group)
+            && member_ids(&a.node) == original_members
+            && member_ids(&b.node) == original_members
+            && path_to(&a.node, &b.node).is_some()
+            && path_to(&b.node, &a.node).is_some()
+    })
+    .await;
+    assert!(
+        a.node.pairings().unwrap().requests.is_empty(),
+        "legacy restart requested pairing"
+    );
+    assert!(
+        b.node.pairings().unwrap().requests.is_empty(),
+        "legacy restart requested pairing"
+    );
+    common::active(&[&a.node, &b.node]).await;
+
+    assert_eq!(group_anchor(&a).await, original_anchor);
+    assert_eq!(group_anchor(&b).await, original_anchor);
+    assert_eq!(
+        oink_agent::config_module::group_store::load(&a.dir.join("group-state.json"), a.node.id())
+            .unwrap()
+            .unwrap()
+            .layout_register()
+            .unwrap()
+            .value()
+            .unwrap(),
+        original_layout
+    );
+    assert!(
+        !oink_agent::config::AgentConfig::load_from(&a.dir)
+            .unwrap()
+            .settings
+            .confirm_quit
+    );
+    let restarted_catalog = oink_agent::layout_profiles::store::load(&a.dir, group.into())
+        .unwrap()
+        .unwrap();
+    assert_eq!(restarted_catalog.active_profile_id, original_profile_id);
+    assert!(
+        restarted_catalog
+            .profiles
+            .iter()
+            .any(|profile| profile.id == original_profile_id)
+    );
+
+    // The protocol upgrade never rewrites local files into a new schema.
+    // Retired proof and visibility fields remain opaque to the v2 runtime and
+    // therefore remain readable by a 0.3.x process even when startup observes
+    // a legitimate native layout change.
+    use base64::Engine as _;
+    use oink_protocol::v2::RawValue;
+    for (dir, build) in [(&a.dir, alpha_build), (&b.dir, beta_build)] {
+        let envelope: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.join("group-state.json")).unwrap()).unwrap();
+        assert_eq!(envelope["schema"], 1);
+        assert_eq!(envelope["legacy_build"], u64::from(build));
+        assert_eq!(envelope["protocol"], "oink-wire/1");
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(envelope["state_cbor"].as_str().unwrap())
+            .unwrap();
+        let state = oink_protocol::v2::cbor::decode_map(&bytes, oink_protocol::v2::limits::CONFIG_STATE).unwrap();
+        let roster = state.get(&3).unwrap().as_map().unwrap();
+        assert!(roster.contains_key(&2));
+        let RawValue::Array(records) = roster.get(&3).unwrap() else {
+            panic!("roster records")
+        };
+        for record in records {
+            let record = record.as_map().unwrap();
+            assert!(record.contains_key(&2));
+            assert!(record.get(&1).unwrap().as_map().unwrap().contains_key(&6));
+        }
+        let RawValue::Array(registers) = state.get(&2).unwrap() else {
+            panic!("registers")
+        };
+        for register in registers {
+            let register = register.as_map().unwrap();
+            assert!(register.contains_key(&6));
+            assert!(register.contains_key(&7));
+        }
+        let settings: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.join("settings.json")).unwrap()).unwrap();
+        assert_eq!(settings["legacy_build"], u64::from(build));
+        assert_eq!(settings["protocol"], "oink-wire/1");
+        assert_eq!(settings["local"]["confirm_quit"], false);
+    }
+    shutdown(vec![a, b]).await;
 }
 fn ids(devs: &[&Dev]) -> Vec<DeviceId> {
     let mut ids: Vec<_> = devs.iter().map(|d| d.node.id()).collect();
@@ -993,9 +1233,8 @@ async fn file_transfer_interrupted_by_link_drop_completes_after_reconnect_scenar
             .is_some_and(|progress| progress.done >= VERIFIED && progress.done < bytes.len() as u64)
     })
     .await;
-    // The read checkpoint identifies the actual consumer's destination. Current
-    // clipboard items can already belong to a later native publication, even
-    // for this same offer, and that new copy is not the active download.
+    // The received copy B's clipboard holds now; the reconnect must keep it.
+    let held = oink_clipboard::ClipboardBackend::change_count(&*b.clip);
     let links = b.node.links().unwrap();
     let source_device = a.node.id();
     let interrupted = links.links().by_peer(source_device).unwrap().link;
@@ -1007,16 +1246,14 @@ async fn file_transfer_interrupted_by_link_drop_completes_after_reconnect_scenar
             .is_none_or(|link| link.link != interrupted)
     })
     .await;
-    // Force the later publication to win while the original reader is blocked.
-    // Looking up its destination in b.clip.items() would now wait for the wrong
-    // file even when the original download completes with all bytes intact.
-    common::watchdog::until("reconnect republishes a different native received copy", || {
-        b.clip.items().iter().any(|data| match data {
-            ClipData::Files(files) => files
-                .iter()
-                .any(|file| file.local_path.as_ref().is_some_and(|path| path != &received_path)),
-            _ => false,
-        })
+    // The reconnect re-delivers A's unchanged offer. B already holds that clip
+    // from its own write, so it is not written again: the blocked reader keeps
+    // the only native copy and must finish it over the new link.
+    common::watchdog::until("source reconnects", || {
+        links
+            .links()
+            .by_peer(source_device)
+            .is_some_and(|link| link.link != interrupted)
     })
     .await;
     resume.send(()).unwrap();
@@ -1040,6 +1277,11 @@ async fn file_transfer_interrupted_by_link_drop_completes_after_reconnect_scenar
         "linked reader continues beyond its verified offset after reconnect"
     );
     assert_ne!(links.links().by_peer(source_device).unwrap().link, interrupted);
+    assert_eq!(
+        oink_clipboard::ClipboardBackend::change_count(&*b.clip),
+        held,
+        "the reconnect wrote the copy B already held again"
+    );
     assert!(
         std::fs::read(received).unwrap() == bytes,
         "received file differs from the source"
@@ -1182,6 +1424,17 @@ async fn pause_and_resume_from_either_side_restore_every_stream_scenario() {
             .unwrap();
         }
         common::active(&[&a.node, &b.node]).await;
+        // Active is an observation, not a lease on the stream pair: I0 can
+        // attach before the resumed C0 Facts replace a writer that the paused
+        // peer may have refused. Capture the IDs in the readiness predicate;
+        // querying them again after a separate wait races that replacement.
+        let mut resumed = None;
+        common::converge(&[&a.node, &b.node], "resumed input pairs attached", || {
+            resumed = common::input_id(&a.node, b.node.id()).zip(common::input_id(&b.node, a.node.id()));
+            resumed.is_some()
+        })
+        .await;
+        let (forward, reverse) = resumed.unwrap();
         assert_eq!(
             a.node.links().unwrap().links().by_peer(b.node.id()).map(|l| l.link),
             Some(link),
@@ -1189,8 +1442,7 @@ async fn pause_and_resume_from_either_side_restore_every_stream_scenario() {
         );
         // Full pause closes both input directions. The authenticated link stays,
         // but neither endpoint may reuse a writer from the retired session.
-        for (index, (writer, peer)) in [(&a, &b), (&b, &a)].into_iter().enumerate() {
-            let resumed = common::input_id(&writer.node, peer.node.id()).unwrap();
+        for (index, resumed) in [forward, reverse].into_iter().enumerate() {
             assert_eq!(resumed.link, old[index].link, "keep the authenticated link");
             assert!(
                 resumed.tag.ordinal > old[index].tag.ordinal,
@@ -1522,7 +1774,7 @@ async fn layout_edit_made_while_peer_is_away_reaches_it_after_restart_scenario()
             .unwrap()
             .edit_layout(
                 Box::new(|l| l.settings.gap_travel = !l.settings.gap_travel),
-                oink_protocol::v1::dto::LayoutSource::Manual,
+                oink_protocol::v2::dto::LayoutSource::Manual,
             )
             .unwrap();
         let expected = editor.node.layout();
@@ -1950,7 +2202,7 @@ fn update_received_while_the_state_file_cannot_be_written_is_applied_once_it_can
             api(&a.node, |node| {
                 node.link_config().unwrap().edit_layout(
                     Box::new(|layout| layout.settings.gap_travel = !layout.settings.gap_travel),
-                    oink_protocol::v1::dto::LayoutSource::Manual,
+                    oink_protocol::v2::dto::LayoutSource::Manual,
                 )
             })
             .await
@@ -2537,7 +2789,7 @@ async fn display_notifications_refresh_layout_topology_api_and_restore_detached_
     let remembered = a.node.layout().0.screen(&second_id).unwrap().clone();
     let remembered_wire = oink_agent::config_module::layout_wire::to_wire(
         &a.node.layout().0,
-        oink_protocol::v1::dto::LayoutSource::Manual,
+        oink_protocol::v2::dto::LayoutSource::Manual,
     )
     .unwrap()
     .screens()

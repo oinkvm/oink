@@ -104,6 +104,14 @@ pub fn encode(report: &AdmittedReport) -> Result<Vec<u8>> {
             }
             "event"
         }
+        Report::RuntimeFault(f) => {
+            // A handled failure: error level, closed identifiers only.
+            tags["component"] = json!(f.component);
+            tags["fault"] = json!(f.fault);
+            event["level"] = json!("error");
+            event["exception"] = json!({"values":[{"type":f.fault,"mechanism":{"type":"oink_fault","handled":true}}]});
+            "event"
+        }
         Report::MeasuredInterval(_) | Report::PerformanceDistribution(_) => {
             let c = report.report.context().ok_or(Error::Invalid)?;
             tags["metric"] = json!(c.metric.name());

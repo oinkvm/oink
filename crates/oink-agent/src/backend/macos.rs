@@ -130,33 +130,41 @@ define_class!(
             // numeric fatal boundary as main; never leave a status-only shell
             // or race main's return against the fatal capsule commit.
             std::thread::spawn(move || crate::telemetry::fatal_boundary(move || {
-                let result = if smoke {
-                    crate::host::AgentHost::start_launch_smoke_locked(net, lock)
-                } else {
-                    crate::host::AgentHost::start_platform_locked(net, lock, crate::host::IpcMode::Required)
-                };
-                match result {
-                    Ok(host) => {
-                        if !smoke { super::attach(host.node()); }
-                        if smoke {
-                            let home = host.node().data_dir().to_path_buf();
-                            // FIFO main-queue work follows the Node's registration.
-                            // Require a real initial AppKit callback as well as a
-                            // completed host startup before packaging can pass.
-                            crate::appearance::watch_system_theme(move |_| {
-                                if let Err(error) = std::fs::write(home.join("launch-smoke-ready"), b"host and AppKit appearance ready\n") {
-                                    tracing::error!(%error, "launch smoke readiness failed");
-                                    EXIT.store(1, Ordering::Release);
-                                    stop_loop();
-                                }
-                            });
-                        }
-                        tracing::info!("backend ready for UI");
+                // Runs after every start; `restarts` counts the restarts after
+                // a network-layer failure (`host::supervise`).
+                let ready = move |host: &crate::host::AgentHost, restarts: u32| {
+                    if !smoke { super::attach(host.node()); }
+                    if smoke {
+                        let home = host.node().data_dir().to_path_buf();
+                        // FIFO main-queue work follows the Node's registration.
+                        // Require a real initial AppKit callback as well as a
+                        // completed host startup before packaging can pass.
+                        crate::appearance::watch_system_theme(move |_| {
+                            if let Err(error) = std::fs::write(home.join("launch-smoke-ready"), b"host and AppKit appearance ready\n") {
+                                tracing::error!(%error, "launch smoke readiness failed");
+                                EXIT.store(1, Ordering::Release);
+                                stop_loop();
+                            }
+                        });
+                    }
+                    tracing::info!(restarts, "backend ready for UI");
+                    // A restarted backend leaves the windows as they are.
+                    if restarts == 0 {
                         let requested = SHOW_REQUESTED.swap(false, Ordering::AcqRel);
                         if show || requested { on_main(request_window); }
+                    }
+                };
+                let result = if smoke {
+                    crate::host::AgentHost::start_launch_smoke_locked(net, lock).map(|host| {
+                        ready(&host, 0);
                         host.block_on(host.node().wait_for_stop());
                         host.shutdown();
-                    }
+                    })
+                } else {
+                    crate::host::supervise(net, lock, ready)
+                };
+                match result {
+                    Ok(()) => {}
                     Err(error) if error.downcast_ref::<crate::host::StartupTerminated>().is_some() => {}
                     Err(error) if error.downcast_ref::<crate::instance::AlreadyRunning>().is_some() => {
                         let remote = crate::remote::RemoteApi::new(oink_foundation::paths::data_dir());

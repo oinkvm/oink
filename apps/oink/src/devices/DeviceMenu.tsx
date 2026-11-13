@@ -9,8 +9,10 @@ import type { GlyphName } from './icons';
 import type { Device, GameMode } from './types';
 import { VolumeRow, type SpeakerAction, type MicrophoneAction } from './VolumeRow';
 import { faultReason, screenValue } from './data';
+import { RouteMenu } from './RouteMenu';
 import type { ShareKind, ShareValue } from './data';
 import type { IncomingRequest, Peer } from '../pairing/data';
+import type { MobileAudioKind } from './mobileAudio';
 type Ctx = {
     kind: 'device' | 'screen' | 'tray' | 'request' | 'nearby';
     id: string;
@@ -140,6 +142,8 @@ export interface SideContextMenuProps {
     nearby: Peer[];
     onShare: (id: string, kind: ShareKind, value: ShareValue) => void;
     onMicrophone?: (id:string,action:MicrophoneAction)=>void;
+    /** Phones: "切回本地" closes an endpoint; start only where the agent allows it. */
+    onMobileAudio?: (id: string, kind: MobileAudioKind, action: 'close' | 'start') => void;
     onGrantPermission?: (id:string,kind:'input_monitoring'|'microphone')=>void;
     onGameMode: (id: string, mode: GameMode) => void;
     onPause: (id: string, paused: boolean) => void;
@@ -157,7 +161,7 @@ export interface SideContextMenuProps {
     children: ReactNode;
     standalone?: boolean;
 }
-export function SideContextMenu({ devices, screens = [], onHideScreen, onScreensHidden, screenEditPending = false, editableScreenDevices: _editableScreenDevices, requests, nearby, onShare, onMicrophone, onGrantPermission, onGameMode, onPause, onLeave, onEditAddress, onShowWindow, onAbout, onQuit, onAccept, onReject, onPair, onBlock, onOpenChange, children, standalone = false }: SideContextMenuProps) {
+export function SideContextMenu({ devices, screens = [], onHideScreen, onScreensHidden, screenEditPending = false, editableScreenDevices: _editableScreenDevices, requests, nearby, onShare, onMicrophone, onMobileAudio, onGrantPermission, onGameMode, onPause, onLeave, onEditAddress, onShowWindow, onAbout, onQuit, onAccept, onReject, onPair, onBlock, onOpenChange, children, standalone = false }: SideContextMenuProps) {
     const [ctx, setCtx] = useState<Ctx | null>(null);
     const [open, setOpenState] = useState(false);
     const ctxRef = useRef<Ctx | null>(null);
@@ -199,6 +203,8 @@ export function SideContextMenu({ devices, screens = [], onHideScreen, onScreens
     let body: ReactNode = null;
     if (device) {
         const d = device;
+        const mobile = d.os === 'android' || d.os === 'ios';
+        const hasLayout = screens.some(screen => screen.device === d.id);
         const ro = d.group === 'offline';
         const self = d.group === 'self';
         const leave = self ? tr('离开设备组') : tr('踢出设备组');
@@ -209,8 +215,33 @@ export function SideContextMenu({ devices, screens = [], onHideScreen, onScreens
         const speakerSource = d.speaker.configuredMode === 'source' || d.speaker.mode === 'forwarding';
         const unavailable = (kind: ShareKind) => d.unknown || d.actionability?.[kind] === 'unavailable';
         const leaveItem = <MenuItem icon={LeaveIcon} tone="danger" onSelect={() => onLeave(d.id)}>{leave}</MenuItem>;
+        // A phone has no screens in the layout, no shared mouse/keyboard, no game
+        // mode and no remote pause. Its audio uses the endpoint controls only.
+        // Route selection is baseline core/2 on phones too (route design D10),
+        // so an online phone keeps the "选择线路" submenu in the PC position.
+        const phoneAudio = (kind: MobileAudioKind) => {
+            const endpoint = d.mobileAudio?.[kind];
+            const speaker = kind !== 'microphone';
+            if (kind === 'forward') {
+                if (d.os !== 'android') return null;
+                if (endpoint?.enabled) return <MenuItem key={kind} icon={glyph('speaker')} onSelect={() => onMobileAudio?.(d.id, kind, 'close')}>{tr('停止手机转发音频')}</MenuItem>;
+                if (endpoint?.canStart) return <MenuItem key={kind} icon={glyph('speaker')} onSelect={() => onMobileAudio?.(d.id, kind, 'start')}>{tr('让手机转发音频')}</MenuItem>;
+                return null;
+            }
+            if (endpoint?.enabled) return <MenuItem key={kind} icon={glyph(speaker ? 'speaker' : 'microphone')} onSelect={() => onMobileAudio?.(d.id, kind, 'close')}>{speaker ? tr('停止使用手机扬声器') : tr('停止使用手机麦克风')}</MenuItem>;
+            if (endpoint?.canStart) return <MenuItem key={kind} icon={glyph(speaker ? 'speaker' : 'microphone')} onSelect={() => onMobileAudio?.(d.id, kind, 'start')}>{speaker ? tr('使用手机扬声器') : tr('使用手机麦克风')}</MenuItem>;
+            return null;
+        };
+        const phoneItems = mobile ? [phoneAudio('speaker'), phoneAudio('forward'), phoneAudio('microphone')].filter(Boolean) : [];
         body = <Fragment key={`${tray ? 'tray' : 'device'}:${d.id}`}>
-          {ro ? <><MenuItem icon={anyHidden ? 'eye' : EyeOffIcon} disabled={screenEditPending} onSelect={() => onScreensHidden(d.id, !anyHidden)}>{anyHidden ? tr('显示全部屏幕') : tr('隐藏全部屏幕')}</MenuItem><MenuItem icon="edit" onSelect={() => onEditAddress(d.id)}>{tr('编辑 IP')}</MenuItem><MenuSeparator/>{leaveItem}</> : <>
+          {ro ? <>{(!mobile || hasLayout) && <MenuItem icon={anyHidden ? 'eye' : EyeOffIcon} disabled={screenEditPending} onSelect={() => onScreensHidden(d.id, !anyHidden)}>{anyHidden ? tr('显示全部屏幕') : tr('隐藏全部屏幕')}</MenuItem>}<MenuItem icon="edit" onSelect={() => onEditAddress(d.id)}>{tr('编辑 IP')}</MenuItem><MenuSeparator/>{leaveItem}</> : mobile ? <>
+            {hasLayout && <MenuItem icon={anyHidden ? 'eye' : EyeOffIcon} disabled={screenEditPending} onSelect={() => onScreensHidden(d.id, !anyHidden)}>{anyHidden ? tr('显示全部屏幕') : tr('隐藏全部屏幕')}</MenuItem>}
+            {phoneItems}
+            {phoneItems.length > 0 && <MenuSeparator/>}
+            <RouteMenu d={d}/>
+            <MenuSeparator/>
+            {leaveItem}
+          </> : <>
             <MenuItem icon={locked ? UnlockIcon : 'lock'} disabled={unavailable('screen')} onSelect={() => onShare(d.id, 'screen', locked ? 'shared' : 'locked')}>{locked ? tr('解锁指针') : tr('锁定指针')}</MenuItem>
             <MenuItem icon={anyHidden ? 'eye' : EyeOffIcon} disabled={unavailable('screen') || screenEditPending} onSelect={() => onScreensHidden(d.id, !anyHidden)}>{anyHidden ? tr('显示全部屏幕') : tr('隐藏全部屏幕')}</MenuItem>
             <MenuSub label={tr('输入设备')} icon={glyph('keyboard')}>
@@ -239,9 +270,10 @@ export function SideContextMenu({ devices, screens = [], onHideScreen, onScreens
                 {ROWS.find(r => r.kind === 'game')!.options.map(o => <MenuRadioItem key={o.value} value={o.value} closeOnSelect disabled={d.unknown}>{o.label}</MenuRadioItem>)}
               </MenuRadioGroup>
             </MenuSub>
-            <MenuItem icon={glyph('speaker')} disabled={(unavailable('speaker') && !d.speaker.canMakeExit)} onSelect={() => onShare(d.id,'speaker',speakerReceiver ? 'unused' : 'exit')}>{speakerReceiver ? tr('关闭音频出口') : tr('设为音频出口')}</MenuItem>
+            <MenuItem icon={glyph('speaker')} disabled={unavailable('speaker') && !d.speaker.canMakeExit} onSelect={() => onShare(d.id,'speaker',speakerReceiver ? 'unused' : 'exit')}>{speakerReceiver ? tr('关闭音频出口') : tr('设为音频出口')}</MenuItem>
             {exit && exit.id !== d.id && <MenuCheckboxItem closeOnSelect disabled={unavailable('speaker')} checked={speakerSource} onCheckedChange={on => onShare(d.id,'speaker',on ? 'forwarding' : 'unused')}>{tr('转发音频到 {0}',exit.name)}</MenuCheckboxItem>}
             {!exit && speakerSource && <MenuItem icon={glyph('speaker')} disabled={unavailable('speaker')} onSelect={() => onShare(d.id,'speaker','unused')}>{tr('停止共享')}</MenuItem>}
+            {!self && <><MenuSeparator/><RouteMenu d={d}/></>}
             <MenuSeparator/>
             <MenuItem icon={d.paused ? 'play' : PauseIcon} disabled={d.canPause === false} onSelect={() => onPause(d.id,!d.paused)}>{d.paused ? tr('恢复共享') : tr('暂停共享')}</MenuItem>
             {leaveItem}
@@ -253,7 +285,7 @@ export function SideContextMenu({ devices, screens = [], onHideScreen, onScreens
         const owner = devices.find(d => d.id === screen.device);
         // Visibility is a shared layout bit. Any online member may edit one
         // screen; an offline member still exposes only the whole-device action.
-        const individual = owner?.group !== 'offline';
+        const individual = owner?.group !== 'offline' && owner?.os !== 'android';
         body = <Fragment key={`screen:${screen.id}`}>
           <MenuItem icon={EyeOffIcon} disabled={screenEditPending} onSelect={() => individual ? onHideScreen(screen.id) : onScreensHidden(screen.device, true)}>{individual ? tr('隐藏此屏幕') : tr('隐藏全部屏幕')}</MenuItem>
         </Fragment>;

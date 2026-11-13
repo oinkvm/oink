@@ -29,6 +29,7 @@ impl Router {
         self.local_click_reset_peer(boot.device_id);
         self.peers.remove(&boot.device_id);
         self.admitted_boots.remove(&boot.device_id);
+        self.text_seq.remove(&boot.device_id);
     }
 
     pub fn attach_input(

@@ -12,7 +12,7 @@ pub struct Anonymizer {
 impl Anonymizer {
     pub fn new(group: GroupId) -> Self {
         Self {
-            key: blake3::derive_key(oink_protocol::v1::labels::DIAGNOSTICS_GROUP, &group.0),
+            key: blake3::derive_key(oink_protocol::v2::labels::DIAGNOSTICS_GROUP, &group.0),
         }
     }
     /// Independent devices use a local namespace, never a synthetic group ID.
@@ -20,7 +20,7 @@ impl Anonymizer {
         match group {
             Some(group) => Self::new(group),
             None => Self {
-                key: blake3::derive_key(oink_protocol::v1::labels::DIAGNOSTICS_INDEPENDENT, &me.0),
+                key: blake3::derive_key(oink_protocol::v2::labels::DIAGNOSTICS_INDEPENDENT, &me.0),
             },
         }
     }
@@ -162,7 +162,8 @@ impl SafeInput {
     }
     pub fn injection(ev: &InjectEvent) -> Self {
         match *ev {
-            InjectEvent::TouchpadContacts(_) => Self::ContactsOmitted,
+            // Remote text is never recorded: the redacted sentinel is discarded.
+            InjectEvent::TouchpadContacts(_) | InjectEvent::Text(_) => Self::ContactsOmitted,
             InjectEvent::MoveTo { pos } => Self::Position { at: pos, delta: None },
             InjectEvent::MoveToWithDelta { pos, dx, dy } => Self::Position {
                 at: pos,

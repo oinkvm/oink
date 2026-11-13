@@ -21,17 +21,17 @@ impl Source {
     }
 }
 
-impl TryFrom<oink_protocol::v1::dto::LayoutSource> for Source {
-    type Error = oink_protocol::v1::Error;
-    fn try_from(source: oink_protocol::v1::dto::LayoutSource) -> Result<Self, Self::Error> {
+impl TryFrom<oink_protocol::v2::dto::LayoutSource> for Source {
+    type Error = oink_protocol::v2::Error;
+    fn try_from(source: oink_protocol::v2::dto::LayoutSource) -> Result<Self, Self::Error> {
         match source {
-            oink_protocol::v1::dto::LayoutSource::Default => Ok(Self::Default),
-            oink_protocol::v1::dto::LayoutSource::Manual => Ok(Self::Manual),
-            _ => Err(oink_protocol::v1::ErrorCode::UnsupportedValue.into()),
+            oink_protocol::v2::dto::LayoutSource::Default => Ok(Self::Default),
+            oink_protocol::v2::dto::LayoutSource::Manual => Ok(Self::Manual),
+            _ => Err(oink_protocol::v2::ErrorCode::UnsupportedValue.into()),
         }
     }
 }
-impl From<Source> for oink_protocol::v1::dto::LayoutSource {
+impl From<Source> for oink_protocol::v2::dto::LayoutSource {
     fn from(source: Source) -> Self {
         match source {
             Source::Default => Self::Default,

@@ -5,7 +5,8 @@ import { Button, Confirmer, Icon, OinkProvider, Toaster, Tooltip, VisuallyHidden
 import { ApiFailure, api, shell } from './api/client';
 import { agent, reportBackendFailure, start, useAgent } from './api/store';
 import { inTauri } from './api/transport';
-import { presentControls, resourceAction } from './devices/project';
+import { presentControls, presentMobileAudio, resourceAction } from './devices/project';
+import { mobileAudioStart, startOutcome, useMobileAudio, type MobileAudioKind } from './devices/mobileAudio';
 import { useGrant } from './settings/useGrant';
 import { DeviceList } from './devices/DeviceList';
 import { PauseGlyph } from './devices/icons';
@@ -77,7 +78,8 @@ export function App() {
     const language = useLanguage();
     const prefs = usePreferences();
     const view = new URLSearchParams(location.search).get('view') ?? 'main';
-    const pairing = usePairing(view === 'main');
+    // A successful pairing, initiated or accepted, returns the window to the device list.
+    const pairing = usePairing(view === 'main', () => setNavMode('devices'));
     const platform = state.boot?.platform === 'windows' ? 'win' : 'mac';
     const [controlTargets,setControlTargets]=useState<ReadonlyMap<string,ControlAction[]>>(()=>new Map());
     const [controls]=useState(()=>new ControlActions({
@@ -113,10 +115,38 @@ export function App() {
     }),[controls]);
     useEffect(()=>()=>controls.dispose(),[controls]);
     useEffect(()=>{controls.snapshot();},[state.cards,controls]);
-    const devices=presentControls(state.cards,controlTargets,state.permissions);
+    const mobileAudio=useMobileAudio(state.cards);
+    const mobileAudioRef=useRef(mobileAudio);
+    mobileAudioRef.current=mobileAudio;
+    const devices=presentMobileAudio(presentControls(state.cards,controlTargets,state.permissions),mobileAudio);
     // Native/menu callbacks may run again before React renders. Always build the
     // next toggle from the newest intent, never a captured render's old value.
-    const currentDevices=()=>presentControls(agent.get().cards,controls.targets(),agent.get().permissions);
+    const currentDevices=()=>presentMobileAudio(presentControls(agent.get().cards,controls.targets(),agent.get().permissions),mobileAudioRef.current);
+    // "切回本地" on a phone is a card audio mode like any device's (this PC
+    // authors Clear(phone) in the global audio configuration); a start is
+    // sent to the endpoint only where the agent allows it (Android privileged mode).
+    const phoneAudioTitle=(kind:MobileAudioKind)=>kind!=='microphone'?tr('无法更改手机扬声器'):tr('无法更改麦克风设置');
+    // A queued start is only a request: the phone may still fail it (for
+    // example without microphone permission). Report that reason once.
+    const pendingStarts=useRef(new Set<string>());
+    const phoneAudio=(id:string,kind:MobileAudioKind,action:'close'|'start')=>{
+        if(action==='close'){
+            controls.set(id,kind!=='microphone'?{kind:'speaker',mode:'unused'}:{kind:'microphone',mode:'muted'});
+            return;
+        }
+        const request=mobileAudioStart(mobileAudioRef.current.get(id),kind);
+        if(!request)return;
+        void request().then(()=>pendingStarts.current.add(`${id}|${kind}`),error=>toast.danger({title:phoneAudioTitle(kind),description:problemText(error instanceof ApiFailure?error.problem.code:'backend_failed')}));
+    };
+    useEffect(()=>{
+        for(const key of [...pendingStarts.current]){
+            const [id,kind]=key.split('|') as [string,MobileAudioKind];
+            const outcome=startOutcome(mobileAudio.get(id),kind);
+            if(!outcome)continue;
+            pendingStarts.current.delete(key);
+            if(outcome!=='started')toast.danger({title:phoneAudioTitle(kind),description:problemText(outcome)});
+        }
+    },[mobileAudio]);
     const self = devices.find(d => d.group === 'self');
     const [navOpen, setNavOpen] = useState(true);
     const [maximized,setMaximized] = useState(false);
@@ -652,7 +682,7 @@ export function App() {
                 { placements: present.placements, native_plan_tokens: [], disabled: patches, ...(off ? { screen_shared: sharing } : {}) }, []);
         },
         requests: pairing.requests, nearby: pairing.nearby, onShare: changeShare,
-        onGameMode: (id, mode) => { void invoke(id, 'game', mode); }, onSpeaker: speaker, onMicrophone: microphone, onGrantPermission: grantDevicePermission,
+        onGameMode: (id, mode) => { void invoke(id, 'game', mode); }, onSpeaker: speaker, onMicrophone: microphone, onMobileAudio: phoneAudio, onGrantPermission: grantDevicePermission,
         onPause: (id, paused) => { void invoke(id, 'pause', paused); }, onLeave: setLeaveId,
         onEditAddress: id => { const device=devices.find(d=>d.id===id); if(device)void address.open(device); },
         onShowWindow: () => { void shell.open('main').catch(fail); }, onAbout: () => { void shell.open('about').catch(fail); },
@@ -709,7 +739,7 @@ export function App() {
                     } }} version={state.boot?.version ?? version} sideExtra={navMode === 'add' ? <SelfInfo container={winEl}/> : null} titleEnd={<><UpgradeButton/><PromoArea sponsor={!prefs.presentation.hide_sponsor} container={winEl}/></>} titleCenter={self?.paused ? <span className="win__paused"><PauseGlyph/>{tr('共享已暂停')}</span> : null} navBack={platform === 'win' && navMode !== 'devices' ? { title: navMode === 'add' ? tr('添加设备') : tr('设置'), label: tr('返回设备列表'), onBack: () => setNavMode('devices') } : null} nav={collapsed => <>
           <div className="nav-stack">
             {platform === 'win' && <RequestsGroup pairing={pairing} collapsed={collapsed} onExpand={() => setNavOpen(true)} hidden={navMode === 'settings'}/>}
-            <div className="nav-view" key={navMode} data-view={navMode} data-anim={navSwitched ? '' : undefined}>{platform === 'mac' && <><AddHead open={navMode !== 'devices'} title={navMode === 'add' ? tr('添加设备') : tr('设置')} onBack={() => setNavMode('devices')}/><RequestsGroup pairing={pairing} collapsed={collapsed} onExpand={() => setNavOpen(true)} hidden={navMode === 'settings'}/></>}{navMode === 'add' ? <AddPanel pairing={pairing}/> : navMode === 'settings' ? <SettingsNav platform={platform} query={query} onQuery={setQuery} active={section} onJump={id => setJump({ section: id, n: Date.now() })}/> : <DeviceList onGrantPermission={grantDevicePermission} onGrantAccessibility={() => { void accessibilityGrant.grant('accessibility'); }} devices={devices} selectedId={selectedDevice} onSelect={id => { setNavOpen(true); selectDevice(id); }} onToggle={toggle} onPause={menu.onPause} onSpeaker={menu.onSpeaker} onMicrophone={microphone} hiddenScreens={hiddenScreens} collapsed={collapsed} now={Date.now()} onReorder={(id, placement) => api.moveDeviceOrder(id, placement)}/>}</div>
+            <div className="nav-view" key={navMode} data-view={navMode} data-anim={navSwitched ? '' : undefined}>{platform === 'mac' && <><AddHead open={navMode !== 'devices'} title={navMode === 'add' ? tr('添加设备') : tr('设置')} onBack={() => setNavMode('devices')}/><RequestsGroup pairing={pairing} collapsed={collapsed} onExpand={() => setNavOpen(true)} hidden={navMode === 'settings'}/></>}{navMode === 'add' ? <AddPanel pairing={pairing}/> : navMode === 'settings' ? <SettingsNav platform={platform} query={query} onQuery={setQuery} active={section} onJump={id => setJump({ section: id, n: Date.now() })}/> : <DeviceList onGrantPermission={grantDevicePermission} onGrantAccessibility={() => { void accessibilityGrant.grant('accessibility'); }} devices={devices} selectedId={selectedDevice} onSelect={id => { setNavOpen(true); selectDevice(id); }} onToggle={toggle} onPause={menu.onPause} onSpeaker={menu.onSpeaker} onMicrophone={microphone} onMobileAudio={phoneAudio} hiddenScreens={hiddenScreens} collapsed={collapsed} now={Date.now()} onReorder={(id, placement) => api.moveDeviceOrder(id, placement)}/>}</div>
           </div>
         </>}>
         <div className="disp" data-hidden={navMode === 'settings' ? '' : undefined} aria-hidden={navMode === 'settings' || undefined} inert={navMode === 'settings'}>

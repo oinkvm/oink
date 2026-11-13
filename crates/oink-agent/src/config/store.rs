@@ -1,6 +1,6 @@
 //! Common encoding for local retained stores. No importer or alternate schema.
 use oink_foundation::{DeviceId, GroupId};
-use oink_protocol::v1::{
+use oink_protocol::v2::{
     RawMap, RawValue, dto,
     schema::{WireDto, WireValue},
 };
@@ -23,9 +23,9 @@ pub enum StoreError {
     #[error("local store identity mismatch")]
     IdentityMismatch,
 }
-impl From<oink_protocol::v1::Error> for StoreError {
-    fn from(error: oink_protocol::v1::Error) -> Self {
-        use oink_protocol::v1::ErrorCode;
+impl From<oink_protocol::v2::Error> for StoreError {
+    fn from(error: oink_protocol::v2::Error) -> Self {
+        use oink_protocol::v2::ErrorCode;
         match error.code {
             ErrorCode::StateConflict => Self::StateConflict,
             ErrorCode::UnsupportedValue => Self::UnsupportedValue,
@@ -47,7 +47,7 @@ pub(crate) fn read(path: &Path, maximum: usize) -> Result<Option<RawMap>, StoreE
     if bytes.len() > maximum {
         return Err(StoreError::LimitExceeded);
     }
-    let map = oink_protocol::v1::cbor::decode_map(&bytes, maximum)?;
+    let map = oink_protocol::v2::cbor::decode_map(&bytes, maximum)?;
     schema(&map)?;
     Ok(Some(map))
 }
@@ -61,7 +61,7 @@ pub(crate) fn schema(raw: &RawMap) -> Result<(), StoreError> {
 
 pub(crate) fn save(path: &Path, raw: &RawMap, maximum: usize) -> Result<(), StoreError> {
     schema(raw)?;
-    let bytes = oink_protocol::v1::cbor::encode_map(raw, maximum)?;
+    let bytes = oink_protocol::v2::cbor::encode_map(raw, maximum)?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }

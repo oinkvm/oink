@@ -1,5 +1,5 @@
 use super::*;
-use oink_protocol::v1::{
+use oink_protocol::v2::{
     dto,
     schema::{WireDto, WireValue},
 };
@@ -182,7 +182,6 @@ impl Node {
         let options = dto::LocalOptionsSummary::from_raw(
             [
                 (1, (!self.fully_paused()).write()),
-                (2, settings.audio.forwarding_enabled.write()),
                 (3, (f32::from(settings.audio.forwarding_volume_percent) / 100.).write()),
                 (4, status.group_focus.locked_device.is_some().write()),
                 (5, status.keyboard_disabled.write()),

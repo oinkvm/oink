@@ -2,7 +2,7 @@
 //! membership and live Boots from the authenticated configuration actor.
 use super::*;
 use crate::api::{DeviceKey, GroupKey};
-use oink_protocol::v1::{RawValue, dto, schema::WireDto};
+use oink_protocol::v2::{RawValue, dto, schema::WireDto};
 use std::{cell::OnceCell, collections::BTreeMap, sync::Arc};
 
 #[derive(Clone, Debug)]
@@ -39,27 +39,37 @@ pub struct CardInputs {
     /// legacy owner preference remains only the command CAS shell.
     pub screen_shared: Vec<(DeviceKey, bool)>,
     pub focus: FocusObservation,
-    /// None with baseline=false is unknown; None with baseline=true means no claim.
-    pub exit_baseline: bool,
-    pub microphone_resolution: oink_audio::claims::Resolution,
-    /// The local owner has retained every current member's audio claim baseline.
-    /// Historical resolution may still be unknown until an explicit selection.
-    pub local_exit_selection_ready: bool,
-    pub selected_exit: Option<DeviceKey>,
-    pub exit_claim: Option<(u64, DeviceKey)>,
+    /// The global audio overview this device's audio owner executes: every
+    /// online device's speaker / microphone mode and switches, and the two
+    /// registers whose versions fence this device's audio tokens.
+    pub audio: oink_audio::route::Overview,
+    /// Whether the chosen microphone source can serve right now.
+    pub microphone_resolution: oink_audio::route::Resolution,
     pub emergency_delivery: Option<EmergencyDeliveryCard>,
 }
 
 impl CardInputs {
+    /// The online speaker exit (an offline one is no exit at all).
+    pub fn selected_exit(&self) -> Option<DeviceKey> {
+        self.audio.holder(oink_audio::route::Role::Speaker).map(DeviceKey::from)
+    }
+    /// An audio mode is authored by this device, so its token binds this
+    /// device's Boot and the stamp of the register it was projected from.
+    fn audio_owner(&self, role: oink_audio::route::Role) -> Option<OwnerVersion> {
+        let local = self.members.iter().find(|member| member.is_self)?;
+        Some(OwnerVersion {
+            group: self.group?,
+            device: local.device,
+            boot_nonce: local.live_boot?,
+            revision: self.audio.route(role).map_or(0, |route| route.version.stamp),
+        })
+    }
     fn same_projection(&self, other: &Self) -> bool {
         self.group == other.group
             && self.screen_shared == other.screen_shared
             && self.focus == other.focus
-            && self.exit_baseline == other.exit_baseline
+            && self.audio == other.audio
             && self.microphone_resolution == other.microphone_resolution
-            && self.local_exit_selection_ready == other.local_exit_selection_ready
-            && self.selected_exit == other.selected_exit
-            && self.exit_claim == other.exit_claim
             && self.emergency_delivery == other.emergency_delivery
             && self.members.len() == other.members.len()
             && self.members.iter().zip(&other.members).all(|(a, b)| {
@@ -206,7 +216,7 @@ impl Projector {
     }
 
     fn exit_volume(&self, input: &CardInputs, names: &BTreeMap<DeviceKey, String>) -> Option<ExitVolumeCard> {
-        let device = input.selected_exit?;
+        let device = input.selected_exit()?;
         let member = input.members.iter().find(|m| m.device == device)?;
         let mut card = ExitVolumeCard {
             receiver_device: device,
@@ -224,7 +234,7 @@ impl Projector {
             card.refusal = Some(ExitVolumeRefusal::Offline);
             return Some(card);
         }
-        if !member.capabilities.iter().any(|c| c == "oink.audio.exit-volume/1") {
+        if !member.capabilities.iter().any(|c| c == "oink.audio/2") {
             card.condition = ExitVolumeCondition::Unsupported;
             card.refusal = Some(ExitVolumeRefusal::Unsupported);
             return Some(card);
@@ -247,14 +257,18 @@ impl Projector {
         let Some(exit) = version.exit().ok() else {
             return Some(card);
         };
-        let Some(claim) = version.exit_claim().ok() else {
+        let Some(route) = version.route_version().ok() else {
             return Some(card);
         };
-        let claim_counter = claim.counter().ok();
-        let claim_owner = claim.owner().ok().as_ref().and_then(device_key);
+        let route_seq = route.stamp().ok();
+        let route_author = route.author().ok().as_ref().and_then(device_key);
+        let selected = input
+            .audio
+            .route(oink_audio::route::Role::Speaker)
+            .map(|route| (route.version.stamp, DeviceKey::from(route.version.author)));
         if exit.device_id().ok().as_ref().and_then(device_key) != Some(device)
             || exit.nonce().ok().map(|n| n.0) != member.live_boot
-            || claim_counter.zip(claim_owner) != input.exit_claim
+            || route_seq.zip(route_author) != selected
         {
             card.refusal = Some(ExitVolumeRefusal::StateStale);
             return Some(card);
@@ -303,14 +317,14 @@ impl Projector {
                 Some(revision),
                 Some(output_id),
                 Some(output_generation),
-                Some((claim_counter, claim_owner)),
+                Some((route_seq, route_author)),
             ) = (
                 input.group,
                 member.live_boot,
                 version.revision().ok(),
                 output,
                 version.output_generation().ok(),
-                input.exit_claim,
+                selected,
             )
         {
             card.version_token = Some(self.tokens.issue(&TokenBinding {
@@ -323,8 +337,8 @@ impl Projector {
                 operation: TokenOperation::ExitVolume {
                     output_id,
                     output_generation,
-                    claim_counter,
-                    claim_owner,
+                    route_seq,
+                    route_author,
                 },
             }));
             card.can_set = true;
@@ -336,6 +350,17 @@ impl Projector {
         let (os, logo) = match member.os.as_str() {
             "macos" => (CardOs::Macos, CardLogo::Macos),
             "windows" => (CardOs::Windows, CardLogo::Windows10),
+            "android" => (CardOs::Android, CardLogo::Android),
+            // Offline members keep their last cached facts; the badge reads the
+            // reported shape from them rather than from the live-boot view.
+            "ios" => (
+                CardOs::Ios,
+                match member.facts.as_deref().and_then(|f| f.form_factor().ok().flatten()) {
+                    Some(dto::FormFactor::Phone) => CardLogo::Iphone,
+                    Some(dto::FormFactor::Tablet) => CardLogo::Ipad,
+                    _ => CardLogo::Ios,
+                },
+            ),
             "linux" => (CardOs::Linux, CardLogo::Linux),
             _ => (CardOs::Other, CardLogo::Generic),
         };
@@ -370,6 +395,14 @@ impl Projector {
                 && f.group().ok().map(|g| GroupKey(oink_foundation::GroupId(g.0))) == input.group
                 && member.live_boot.is_some()
         });
+        // The crown means the phone can be driven right now: only the live
+        // boot's facts may grant it (DeviceFacts key 32); offline members and
+        // stale cached facts keep the plain Android head.
+        let logo = if logo == CardLogo::Android && online && facts.is_some_and(|f| f.android_privileged() == Ok(true)) {
+            CardLogo::AndroidPrivileged
+        } else {
+            logo
+        };
         let (status, pause) = if online {
             let context = OwnerContext::new(input.group, member, facts, &self.tokens);
             let pause = context.pause();
@@ -437,6 +470,15 @@ impl<'a> OwnerContext<'a> {
     fn supports(&self, capability: &str) -> bool {
         self.member.capabilities.iter().any(|c| c == capability)
     }
+    /// Phones own their resources locally. Their C0 accepts only microphone
+    /// controls and exit volume; every other owner option or pause is refused,
+    /// so cards never offer those actions for a phone (protocol-v2 audio §D10).
+    fn mobile(&self) -> bool {
+        matches!(self.member.os.as_str(), "android" | "ios")
+            || self
+                .facts
+                .is_some_and(|facts| facts.device_kind() == Ok(dto::DeviceKind::Mobile))
+    }
     fn version(&self, option: u32) -> Option<OwnerVersion> {
         Some(OwnerVersion {
             group: self.group?,
@@ -458,9 +500,9 @@ impl<'a> OwnerContext<'a> {
         match self.value(option)? {
             RawValue::Uint(0) => Some(SharingMode::Shared),
             RawValue::Uint(1) => Some(SharingMode::Local),
-            RawValue::Uint(2) if option == 1 && self.supports("oink.input.mouse-disabled/1") => {
-                Some(SharingMode::Disabled)
-            }
+            // Every v2 member decodes a disabled mouse; facts are complete
+            // for every v2 peer (protocol-v2 1.1).
+            RawValue::Uint(2) if option == 1 => Some(SharingMode::Disabled),
             _ => None,
         }
     }
@@ -469,7 +511,7 @@ impl<'a> OwnerContext<'a> {
         // reads across this card's icons/actions, never across owner revisions.
         self.resources
             .get_or_init(|| {
-                if !self.supports("oink.device-resources/1") {
+                if !self.supports("oink.device/2") {
                     return None;
                 }
                 self.facts?.resources().ok().flatten()
@@ -485,7 +527,7 @@ impl<'a> OwnerContext<'a> {
             1 => faults.mouse(),
             2 | 5 => faults.keyboard(),
             3 => faults.clipboard(),
-            4 | 15 | 20 => faults.speaker(),
+            4 | 15 => faults.speaker(),
             6 => faults.screen(),
             _ => return None,
         }
@@ -494,23 +536,14 @@ impl<'a> OwnerContext<'a> {
         ResourceFault::try_from(&fault).ok()
     }
     fn action(&self, edit: CardOptionEdit) -> CardAction {
-        let option = edit.number();
-        if matches!(edit, CardOptionEdit::MouseMode(SharingMode::Disabled))
-            && !self.supports("oink.input.mouse-disabled/1")
-        {
+        if self.mobile() {
             return CardAction::unavailable(CardActionUnavailable::Unsupported);
         }
+        let option = edit.number();
         if let Some(fault) = self.fault(option) {
             match fault.code {
                 ResourceFaultCode::None => {}
                 ResourceFaultCode::Unrecognized => return CardAction::unavailable(CardActionUnavailable::StateUnknown),
-                // Stopping sharing or changing the selected exit is a recovery
-                // operation, not a permission grant. Keep known owner failures
-                // visible while preserving the normal boot/revision checks.
-                _ if matches!(
-                    edit,
-                    CardOptionEdit::ForwardingEnabled(false) | CardOptionEdit::AudioExitClaim(_)
-                ) => {}
                 _ => {
                     return if self.member.is_self {
                         CardAction::OpenPermissions
@@ -522,12 +555,77 @@ impl<'a> OwnerContext<'a> {
         } else if option != 18 {
             return CardAction::unavailable(CardActionUnavailable::StateUnknown);
         }
-        if !self.supports("oink.device-options/1") {
+        if !self.supports("oink.device/2") {
             return CardAction::unavailable(CardActionUnavailable::Unsupported);
         }
         self.version(option)
             .map(|v| self.tokens.action(v, edit))
             .unwrap_or_else(|| CardAction::unavailable(CardActionUnavailable::StateUnknown))
+    }
+    /// Every speaker / microphone mode is authored by this device in the
+    /// global audio configuration (setter decides) and needs nothing from the
+    /// changed device except that it can do it: its faults, permissions or
+    /// pause only make the mode show as unavailable. A phone becomes the exit
+    /// or the sender only on the phone itself (Android privileged mode through
+    /// its endpoint). Phones also self-enable forwarding; a PC can always turn it
+    /// back to local (Clear(phone), protocol-v2 6.1).
+    fn audio_action(
+        &self,
+        input: &CardInputs,
+        role: oink_audio::route::Role,
+        mode: oink_audio::route::Mode,
+        command: CardCommand,
+    ) -> CardAction {
+        let local = mode == oink_audio::route::Mode::Local;
+        if self.mobile() && !local {
+            return CardAction::unavailable(CardActionUnavailable::Unsupported);
+        }
+        let capability = match role {
+            oink_audio::route::Role::Speaker => "oink.audio/2",
+            oink_audio::route::Role::Microphone => "oink.audio.microphone/1",
+        };
+        if !local && !self.member.is_self && !self.supports(capability) {
+            return CardAction::unavailable(CardActionUnavailable::Unsupported);
+        }
+        if self.member.live_boot.is_none() {
+            return CardAction::unavailable(CardActionUnavailable::StateUnknown);
+        }
+        input
+            .audio_owner(role)
+            .map(|owner| {
+                self.tokens.route(
+                    owner,
+                    TokenOperation::AudioMode {
+                        role,
+                        device: self.member.device,
+                        mode,
+                    },
+                    command,
+                )
+            })
+            .unwrap_or_else(|| CardAction::unavailable(CardActionUnavailable::StateUnknown))
+    }
+    /// Turning this device's speaker "forward" on or off. Turning it off is a
+    /// recovery operation and stays possible with a known fault; turning it on
+    /// needs a healthy observation (the owner's own fault report).
+    fn forward_action(&self, input: &CardInputs, on: bool) -> CardAction {
+        use oink_audio::route::{Mode, Role};
+        if !on {
+            return self.audio_action(input, Role::Speaker, Mode::Local, CardCommand::SetAudioMode);
+        }
+        if self.mobile() {
+            return CardAction::unavailable(CardActionUnavailable::Unsupported);
+        }
+        match self.fault(4).map(|fault| fault.code) {
+            Some(ResourceFaultCode::None) => {
+                self.audio_action(input, Role::Speaker, Mode::Shared, CardCommand::SetAudioMode)
+            }
+            Some(ResourceFaultCode::Unrecognized) | None => {
+                CardAction::unavailable(CardActionUnavailable::StateUnknown)
+            }
+            Some(_) if self.member.is_self => CardAction::OpenPermissions,
+            Some(_) => CardAction::unavailable(CardActionUnavailable::RemoteFault),
+        }
     }
     fn pause(&self) -> Option<LocalPauseCard> {
         let state = self.facts?.pause().ok().flatten()?;
@@ -542,7 +640,7 @@ impl<'a> OwnerContext<'a> {
             dto::PauseReason::Unknown(_) => PauseReason::Unknown,
         };
         let can_resume =
-            self.supports("oink.device-options/1") && self.group.is_some() && self.member.live_boot.is_some();
+            !self.mobile() && self.supports("oink.device/2") && self.group.is_some() && self.member.live_boot.is_some();
         let action = if can_resume {
             self.tokens.pause(
                 OwnerVersion {
@@ -712,7 +810,7 @@ impl<'a> OwnerContext<'a> {
         };
         let game = self.resources().and_then(|r| r.game().ok().flatten());
         DeviceCardStatus {
-            accessibility_granted: if self.member.os == "macos" && self.supports("oink.input.accessibility/1") {
+            accessibility_granted: if self.member.os == "macos" {
                 self.facts.and_then(|f| f.accessibility_granted().ok().flatten())
             } else {
                 None
@@ -729,8 +827,8 @@ impl<'a> OwnerContext<'a> {
                 keyboard_enabled: self.action(CardOptionEdit::KeyboardDisabled(false)),
                 clipboard_shared: self.action(CardOptionEdit::ClipboardEnabled(true)),
                 clipboard_local: self.action(CardOptionEdit::ClipboardEnabled(false)),
-                forwarding_enabled: self.action(CardOptionEdit::ForwardingEnabled(true)),
-                forwarding_disabled: self.action(CardOptionEdit::ForwardingEnabled(false)),
+                forwarding_enabled: self.forward_action(input, true),
+                forwarding_disabled: self.forward_action(input, false),
             },
             cursor,
             screen: self.resource(6, screen, None, paused, fallback),
@@ -755,7 +853,8 @@ impl<'a> OwnerContext<'a> {
         }
     }
     fn microphone(&self, input: &CardInputs, names: &BTreeMap<DeviceKey, String>) -> MicrophoneCard {
-        use oink_protocol::v1::schema::WireValue;
+        use oink_audio::route::{Mode, Role};
+        use oink_protocol::v2::schema::WireValue;
         let observed = self.resources().and_then(|r| r.microphone().ok().flatten());
         let supported = self.supports("oink.audio.microphone/1");
         let permission_granted = observed.as_ref().is_some_and(|o| {
@@ -765,30 +864,24 @@ impl<'a> OwnerContext<'a> {
             )
         });
         let virtual_ready = observed.as_ref().is_some_and(|o| o.virtual_ready() == Ok(true));
-        let source_device = input.microphone_resolution.owner().map(DeviceKey::from);
-        let source = source_device == Some(self.member.device);
-        let receive_muted = self
-            .boolean(dto::LocalOption::MicrophoneReceiveMuted.number())
-            .unwrap_or(true);
-        let action = |edit: CardOptionEdit| {
+        // Every mode comes from the global audio overview.
+        let source_device = input.audio.holder(Role::Microphone).map(DeviceKey::from);
+        let source = input.audio.mode(self.member.device.0, Role::Microphone) == Some(Mode::Holder);
+        let receive_on = input.audio.switch(self.member.device.0, Role::Microphone) == Some(true);
+        let action = |mode| {
             if !supported {
                 return CardAction::unavailable(CardActionUnavailable::Unsupported);
             }
-            self.version(edit.number())
-                .map(|version| self.tokens.action(version, edit))
-                .unwrap_or_else(|| CardAction::unavailable(CardActionUnavailable::StateUnknown))
+            self.audio_action(input, Role::Microphone, mode, CardCommand::SetAudioMode)
         };
         let share_action = if permission_granted {
-            action(CardOptionEdit::MicrophoneShareClaim(true))
+            action(Mode::Holder)
         } else {
             CardAction::unavailable(CardActionUnavailable::RemoteFault)
         };
-        // Releasing a source must remain possible after capture permission is revoked.
-        let local_action = if source {
-            action(CardOptionEdit::MicrophoneShareClaim(false))
-        } else {
-            action(CardOptionEdit::MicrophoneReceiveMuted(true))
-        };
+        // Releasing a sender must remain possible after capture permission is
+        // revoked; one write clears the sender and turns receive off.
+        let local_action = action(Mode::Local);
         let controls = self
             .value(dto::LocalOption::MicrophoneControls.number())
             .and_then(|v| dto::ForwardingControlsValue::read(&v).ok());
@@ -806,7 +899,7 @@ impl<'a> OwnerContext<'a> {
                 MicrophoneMode::Source
             } else if !virtual_ready {
                 MicrophoneMode::Unavailable
-            } else if receive_muted {
+            } else if !receive_on {
                 MicrophoneMode::Muted
             } else if !input.microphone_resolution.available() {
                 MicrophoneMode::Idle
@@ -821,8 +914,9 @@ impl<'a> OwnerContext<'a> {
             consumer_active: observed.as_ref().is_some_and(|o| o.consumer_active() == Ok(true)),
             share_action,
             local_action,
-            receive_action: if !source && virtual_ready {
-                action(CardOptionEdit::MicrophoneReceiveMuted(false))
+            // From sender too: one write clears it and turns receive on.
+            receive_action: if virtual_ready {
+                action(Mode::Shared)
             } else {
                 CardAction::unavailable(CardActionUnavailable::StateUnknown)
             },
@@ -841,34 +935,30 @@ impl<'a> OwnerContext<'a> {
         }
     }
     fn speaker(&self, input: &CardInputs, names: &BTreeMap<DeviceKey, String>, paused: bool) -> SpeakerCard {
-        use oink_protocol::v1::schema::WireValue;
+        use oink_audio::route::{Mode, Role};
         let observed = self.resources().and_then(|r| r.speaker().ok().flatten());
-        let enabled = self.boolean(4);
-        let receiver = input.selected_exit == Some(self.member.device);
-        // The group route is unknown until the audio owner publishes its
-        // resolution. A current owner's null/withdrawn claim still proves
-        // it is not the exit, so its forwarding preference remains presentable
-        // and editable. A missing or true claim cannot establish that role.
-        let mode_known = input.exit_baseline
-            || self
-                .value(20)
-                .and_then(|value| Option::<dto::AudioExitClaim>::read(&value).ok())
-                .is_some_and(|claim| claim.is_none_or(|claim| claim.claimed() == Ok(false)));
-        let mode = if !mode_known {
-            None
-        } else if receiver {
-            Some(SpeakerMode::Receiver)
-        } else {
-            enabled.map(|v| if v { SpeakerMode::Source } else { SpeakerMode::Unused })
-        };
+        // The global audio overview says every device's mode; nobody else's
+        // record is needed.
+        let enabled = input.audio.switch(self.member.device.0, Role::Speaker);
+        let mode = input
+            .audio
+            .mode(self.member.device.0, Role::Speaker)
+            .map(|mode| match mode {
+                Mode::Holder => SpeakerMode::Receiver,
+                Mode::Shared => SpeakerMode::Source,
+                Mode::Local => SpeakerMode::Unused,
+            });
+        let receiver = mode == Some(SpeakerMode::Receiver);
         let fault = self.fault(4);
         let faulty = fault
             .as_ref()
             .is_some_and(|f| !matches!(f.code, ResourceFaultCode::None | ResourceFaultCode::Unrecognized));
+        // A phone publishes no speaker fault: its endpoint state reports one.
         let known = mode.is_some()
-            && fault
+            && (fault
                 .as_ref()
-                .is_some_and(|f| f.code != ResourceFaultCode::Unrecognized);
+                .is_some_and(|f| f.code != ResourceFaultCode::Unrecognized)
+                || (fault.is_none() && self.mobile()));
         let activity = match observed.as_ref().and_then(|o| o.activity().ok().flatten()) {
             Some(dto::SpeakerActivity::Unused | dto::SpeakerActivity::ExitReady) => SpeakerActivity::Idle,
             Some(dto::SpeakerActivity::ExitPlaying) => SpeakerActivity::Playing,
@@ -881,14 +971,7 @@ impl<'a> OwnerContext<'a> {
             Some(dto::SpeakerActivity::Failed) => SpeakerActivity::Failed,
             _ => SpeakerActivity::Unknown,
         };
-        let activity = if paused {
-            SpeakerActivity::Paused
-        } else if mode == Some(SpeakerMode::Source) && !input.exit_baseline {
-            // Knowing the source preference does not establish a destination.
-            SpeakerActivity::Unknown
-        } else {
-            activity
-        };
+        let activity = if paused { SpeakerActivity::Paused } else { activity };
         let source_live = mode == Some(SpeakerMode::Source)
             && matches!(activity, SpeakerActivity::Forwarding | SpeakerActivity::SoundSleep);
         let forwarding = if source_live {
@@ -907,13 +990,15 @@ impl<'a> OwnerContext<'a> {
                 .and_then(|d| device_key(&d))
         };
         let action = match mode {
-            Some(SpeakerMode::Receiver) => self.action(CardOptionEdit::AudioExitClaim(false)),
-            Some(SpeakerMode::Source) => self.action(CardOptionEdit::ForwardingEnabled(false)),
-            Some(SpeakerMode::Unused) => self.action(CardOptionEdit::ForwardingEnabled(true)),
+            Some(SpeakerMode::Receiver) => {
+                self.audio_action(input, Role::Speaker, Mode::Local, CardCommand::ClearAudioExit)
+            }
+            Some(SpeakerMode::Source) => self.forward_action(input, false),
+            Some(SpeakerMode::Unused) => self.forward_action(input, true),
             None => CardAction::unavailable(CardActionUnavailable::StateUnknown),
         };
-        let forwarding_controls_token = if self.supports("oink.device-options/1")
-            && fault.as_ref().is_some_and(|f| f.code == ResourceFaultCode::None)
+        let forwarding_controls_token = if self.supports("oink.device/2")
+            && (self.mobile() || fault.as_ref().is_some_and(|f| f.code == ResourceFaultCode::None))
         {
             self.version(15).map(|owner| {
                 self.tokens.issue(&TokenBinding {
@@ -951,11 +1036,7 @@ impl<'a> OwnerContext<'a> {
                     CardCondition::Ready
                 },
             },
-            make_exit_action: if self.member.is_self && !input.local_exit_selection_ready {
-                CardAction::unavailable(CardActionUnavailable::StateUnknown)
-            } else {
-                self.action(CardOptionEdit::AudioExitClaim(true))
-            },
+            make_exit_action: self.audio_action(input, Role::Speaker, Mode::Holder, CardCommand::MakeAudioExit),
             forwarding_controls_token,
             forwarding_enabled: enabled,
             activity,
@@ -972,7 +1053,7 @@ impl<'a> OwnerContext<'a> {
                 None
             },
             forwarding,
-            local_output: if self.supports("oink.audio.local-output/1") {
+            local_output: if self.supports("oink.audio/2") {
                 observed
                     .as_ref()
                     .and_then(|o| o.local_output().ok().flatten())
@@ -992,7 +1073,7 @@ impl<'a> OwnerContext<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use oink_protocol::v1::{
+    use oink_protocol::v2::{
         RawMap,
         schema::{WireDto, WireValue},
     };
@@ -1008,21 +1089,64 @@ mod tests {
             rtt_ms: None,
             live_boot: Some([id; 16]),
             facts: None,
-            capabilities: vec!["oink.device-options/1".into(), "oink.device-resources/1".into()],
+            capabilities: vec!["oink.device/2".into(), "oink.device/2".into()],
             order: None,
+        }
+    }
+    /// Every member is online in the merged overview: forward on, receive
+    /// off, nobody holds a role.
+    fn overview(members: &[CardMember]) -> oink_audio::route::Overview {
+        use oink_audio::route::{DeviceOverview, Mode};
+        oink_audio::route::Overview {
+            joined: true,
+            speaker: None,
+            microphone: None,
+            devices: members
+                .iter()
+                .map(|member| DeviceOverview {
+                    device: member.device.0,
+                    speaker: Mode::Shared,
+                    microphone: Mode::Local,
+                    forward: Some(true),
+                    receive: Some(false),
+                })
+                .collect(),
+        }
+    }
+    /// `device` holds `role` by a register `author` wrote at `stamp`.
+    fn hold(input: &mut CardInputs, role: oink_audio::route::Role, device: DeviceKey, stamp: u64, author: DeviceKey) {
+        use oink_audio::route::{Mode, Role, Route, Version};
+        let route = Some(Route {
+            version: Version {
+                stamp,
+                author: author.0,
+            },
+            target: Some(device.0),
+        });
+        match role {
+            Role::Speaker => input.audio.speaker = route,
+            Role::Microphone => input.audio.microphone = route,
+        }
+        for entry in &mut input.audio.devices {
+            let mode = match role {
+                Role::Speaker => &mut entry.speaker,
+                Role::Microphone => &mut entry.microphone,
+            };
+            if entry.device == device.0 {
+                *mode = Mode::Holder;
+            } else if *mode == Mode::Holder {
+                *mode = Mode::Local;
+            }
         }
     }
     fn inputs(members: Vec<CardMember>) -> CardInputs {
         CardInputs {
             group: Some(oink_foundation::GroupId([1; 16]).into()),
+            audio: overview(&members),
             members,
             screen_shared: vec![],
             focus: FocusObservation::default(),
-            exit_baseline: false,
             microphone_resolution: Default::default(),
-            local_exit_selection_ready: true,
-            selected_exit: None,
-            exit_claim: None,
             emergency_delivery: None,
         }
     }
@@ -1102,6 +1226,9 @@ mod tests {
                     (3, RawValue::Uint(1)),
                 ]),
             ),
+            (25, dto::DeviceKind::Desktop.write()),
+            (26, oink_protocol::v2::MAJOR.write()),
+            (27, oink_protocol::v2::MINOR.write()),
         ]
         .into_iter()
         .collect();
@@ -1140,6 +1267,84 @@ mod tests {
     }
 
     #[test]
+    fn only_a_live_android_running_privileged_mode_gets_the_crowned_logo() {
+        let logo = |member: CardMember| {
+            Projector::new()
+                .unwrap()
+                .update(&inputs(vec![member]), 1)
+                .unwrap()
+                .cards[0]
+                .logo
+        };
+        let mut phone = row(2, "phone", true);
+        phone.os = "android".into();
+        let plain = facts(&phone, 0);
+        let mut raw = plain.raw().clone();
+        raw.insert(32, true.write());
+        let privileged = Arc::new(dto::DeviceFacts::from_raw(raw).unwrap());
+
+        phone.facts = Some(plain.clone());
+        assert_eq!(logo(phone.clone()), CardLogo::Android, "privileged mode off");
+        phone.facts = Some(privileged.clone());
+        assert_eq!(logo(phone.clone()), CardLogo::AndroidPrivileged);
+        assert_eq!(
+            serde_json::to_value(CardLogo::AndroidPrivileged).unwrap(),
+            "android_privileged"
+        );
+
+        let mut offline = phone.clone();
+        offline.ready = false;
+        assert_eq!(logo(offline), CardLogo::Android, "offline keeps the plain head");
+        let mut rebooted = phone.clone();
+        rebooted.live_boot = Some([9; 16]);
+        assert_eq!(logo(rebooted), CardLogo::Android, "facts of an old boot grant nothing");
+        let mut desktop = phone;
+        desktop.os = "windows".into();
+        desktop.facts = Some(privileged);
+        assert_eq!(logo(desktop), CardLogo::Windows10);
+    }
+
+    #[test]
+    fn forwarding_phone_exposes_the_same_gain_token_and_observation_as_a_pc() {
+        let mut phone = row(2, "phone-source", true);
+        phone.os = "android".into();
+        phone.capabilities.push("oink.audio/2".into());
+        let mut raw = facts(&phone, 0).raw().clone();
+        raw.insert(25, dto::DeviceKind::Mobile.write());
+        let owner = crate::config::owner::OwnerStore::new([(
+            dto::LocalOption::ForwardingControls,
+            map([(1, 170u16.write()), (2, false.write())]),
+        )])
+        .unwrap();
+        raw.insert(
+            18,
+            RawValue::Array(owner.preferences().iter().map(WireValue::write).collect()),
+        );
+        let RawValue::Map(resources) = raw.get_mut(&16).unwrap() else {
+            unreachable!()
+        };
+        resources.insert(
+            5,
+            map([
+                (2, dto::SpeakerActivity::SourceForwarding.write()),
+                (3, 170u16.write()),
+                (4, false.write()),
+            ]),
+        );
+        phone.facts = Some(Arc::new(dto::DeviceFacts::from_raw(raw).unwrap()));
+        let mut projector = Projector::new().unwrap();
+        let view = projector.update(&inputs(vec![phone]), 1).unwrap();
+        let speaker = &view.cards[0].status.as_ref().unwrap().speaker;
+        assert_eq!(speaker.resource.configured_mode, Some(SpeakerMode::Source));
+        assert_eq!(speaker.forwarding.as_ref().unwrap().volume_percent, 170);
+        assert!(speaker.forwarding_controls_token.is_some());
+        assert!(
+            matches!(speaker.make_exit_action, CardAction::Unavailable { .. }),
+            "enabling still needs the phone endpoint request"
+        );
+    }
+
+    #[test]
     fn microphone_fault_and_activity_survive_card_projection() {
         let mut member = row(2, "microphone-owner", true);
         member.capabilities.push("oink.audio.microphone/1".into());
@@ -1168,21 +1373,16 @@ mod tests {
 
     #[test]
     fn microphone_modes_have_explicit_actions_without_capture_permission() {
-        for muted in [false, true] {
+        use oink_audio::route::{Mode, Role};
+        for receive in [true, false] {
             for permission in [dto::MicrophonePermission::Granted, dto::MicrophonePermission::Denied] {
                 let mut member = row(2, "microphone-owner", true);
                 member.capabilities.push("oink.audio.microphone/1".into());
                 let mut raw = facts(&member, 0).raw().clone();
-                // Use durable-owner preferences, not hand-written option numbers:
-                // the old fixture repeated the projector's obsolete 30/31/32 ids.
-                let owner = crate::config::owner::OwnerStore::new([
-                    (dto::LocalOption::MicrophoneShareClaim, RawValue::Null),
-                    (dto::LocalOption::MicrophoneReceiveMuted, muted.write()),
-                    (
-                        dto::LocalOption::MicrophoneControls,
-                        map([(1, 80u16.write()), (2, false.write())]),
-                    ),
-                ])
+                let owner = crate::config::owner::OwnerStore::new([(
+                    dto::LocalOption::MicrophoneControls,
+                    map([(1, 80u16.write()), (2, false.write())]),
+                )])
                 .unwrap();
                 raw.insert(
                     18,
@@ -1202,49 +1402,75 @@ mod tests {
                     ]),
                 );
                 member.facts = Some(Arc::new(dto::DeviceFacts::from_raw(raw).unwrap()));
+                let me = row(1, "self", true);
+                let card = |view: &DeviceCardsView| {
+                    view.cards
+                        .iter()
+                        .find(|card| card.device == member.device)
+                        .unwrap()
+                        .status
+                        .clone()
+                        .unwrap()
+                        .microphone
+                };
+                let mut input = inputs(vec![me.clone(), member.clone()]);
+                // The receive switch comes from the global audio overview.
+                for entry in &mut input.audio.devices {
+                    if entry.device == member.device.0 {
+                        entry.receive = Some(receive);
+                        entry.microphone = if receive { Mode::Shared } else { Mode::Local };
+                    }
+                }
                 let mut projector = Projector::new().unwrap();
-                let view = projector.update(&inputs(vec![member.clone()]), 1).unwrap();
-                let microphone = &view.cards[0].status.as_ref().unwrap().microphone;
+                let view = projector.update(&input, 1).unwrap();
+                let microphone = &card(&view);
                 assert_eq!(
                     microphone.mode,
-                    if muted {
-                        MicrophoneMode::Muted
-                    } else {
+                    if receive {
                         MicrophoneMode::Idle
+                    } else {
+                        MicrophoneMode::Muted
                     }
                 );
                 assert_eq!(
                     matches!(microphone.share_action, CardAction::Invoke { .. }),
                     permission == dto::MicrophonePermission::Granted
                 );
+                let operation = |action: &CardAction| {
+                    let CardAction::Invoke { token, .. } = action else {
+                        panic!("unavailable: {action:?}")
+                    };
+                    let binding = projector.tokens().read(token).unwrap();
+                    // This device authors every mode; the member is only its target.
+                    assert_eq!(binding.owner.device, me.device);
+                    binding.operation
+                };
+                let mode = |mode| TokenOperation::AudioMode {
+                    role: Role::Microphone,
+                    device: member.device,
+                    mode,
+                };
+                if permission == dto::MicrophonePermission::Granted {
+                    assert_eq!(operation(&microphone.share_action), mode(Mode::Holder));
+                }
                 assert_eq!(microphone.forwarding.as_ref().unwrap().volume_percent, 80);
-                let CardAction::Invoke { token, .. } = &microphone.receive_action else {
-                    panic!("receiver mute is a preference even without an active source")
-                };
-                assert!(matches!(
-                    projector.tokens().read(token).unwrap().operation,
-                    TokenOperation::Option { edit: CardOptionEdit::MicrophoneReceiveMuted(value) } if !value
-                ));
-                let CardAction::Invoke { token, .. } = &microphone.local_action else {
-                    panic!("Local must remain available without capture permission")
-                };
-                assert!(matches!(
-                    projector.tokens().read(token).unwrap().operation,
-                    TokenOperation::Option {
-                        edit: CardOptionEdit::MicrophoneReceiveMuted(true)
-                    }
-                ));
-                let mut source_input = inputs(vec![member.clone()]);
-                source_input.microphone_resolution = oink_audio::claims::Resolution::Exit {
-                    stamp: oink_audio::claims::Stamp {
-                        owner: member.device.0,
-                        counter: 1,
+                assert_eq!(operation(&microphone.receive_action), mode(Mode::Shared));
+                // Local remains available without capture permission.
+                assert_eq!(operation(&microphone.local_action), mode(Mode::Local));
+                let mut source_input = input.clone();
+                hold(&mut source_input, Role::Microphone, member.device, 1, me.device);
+                source_input.microphone_resolution = oink_audio::route::Resolution::Exit {
+                    version: oink_audio::route::Version {
+                        author: me.device.0,
+                        stamp: 1,
                     },
+                    target: member.device.0,
                     available: true,
                 };
                 let source_view = projector.update(&source_input, 2).unwrap();
-                let source = &source_view.cards[0].status.as_ref().unwrap().microphone;
+                let source = &card(&source_view);
                 assert_eq!(source.mode, MicrophoneMode::Source);
+                assert_eq!(source.source_device, Some(member.device));
                 assert_eq!(
                     source.controls_token.is_some(),
                     permission == dto::MicrophonePermission::Granted
@@ -1255,15 +1481,15 @@ mod tests {
                         TokenOperation::MicrophoneControls
                     ));
                 }
-                let CardAction::Invoke { token, .. } = &source.local_action else {
-                    panic!("source release stays callable")
+                // One write, no two-step release: local and receive straight from sender.
+                let operation = |action: &CardAction| {
+                    let CardAction::Invoke { token, .. } = action else {
+                        panic!("unavailable: {action:?}")
+                    };
+                    projector.tokens().read(token).unwrap().operation
                 };
-                assert!(matches!(
-                    projector.tokens().read(token).unwrap().operation,
-                    TokenOperation::Option {
-                        edit: CardOptionEdit::MicrophoneShareClaim(false)
-                    }
-                ));
+                assert_eq!(operation(&source.local_action), mode(Mode::Local));
+                assert_eq!(operation(&source.receive_action), mode(Mode::Shared));
             }
         }
     }
@@ -1274,19 +1500,9 @@ mod tests {
                 for reading in [None, Some((0u8, true)), Some((73u8, false))] {
                     let mut member = row(id, "volume-owner", true);
                     if supported {
-                        member.capabilities.push("oink.audio.local-output/1".into());
+                        member.capabilities.push("oink.audio/2".into());
                     }
                     let mut raw = facts(&member, 0).raw().clone();
-                    let RawValue::Array(preferences) = raw.get_mut(&18).unwrap() else {
-                        unreachable!()
-                    };
-                    for preference in preferences {
-                        if let RawValue::Map(preference) = preference
-                            && preference.get(&1) == Some(&4u32.write())
-                        {
-                            preference.insert(3, false.write());
-                        }
-                    }
                     let RawValue::Map(resources) = raw.get_mut(&16).unwrap() else {
                         unreachable!()
                     };
@@ -1301,7 +1517,8 @@ mod tests {
                     );
                     member.facts = Some(Arc::new(dto::DeviceFacts::from_raw(raw).unwrap()));
                     let mut input = inputs(vec![member]);
-                    input.exit_baseline = true;
+                    input.audio.devices[0].speaker = oink_audio::route::Mode::Local;
+                    input.audio.devices[0].forward = Some(false);
                     let mut projector = Projector::new().unwrap();
                     let view = projector.update(&input, 1).unwrap();
                     assert_eq!(
@@ -1454,7 +1671,7 @@ mod tests {
         assert!(projector.update(&input, 50).is_some());
     }
     #[test]
-    fn accessibility_requires_mac_current_owner_facts_and_negotiated_capability() {
+    fn accessibility_requires_mac_and_current_owner_facts() {
         let mut owner = row(2, "Mac", true);
         owner.os = "macos".into();
         let mut raw = facts(&owner, 0).as_ref().clone().into_raw();
@@ -1463,8 +1680,6 @@ mod tests {
         let mut projector = Projector::new().unwrap();
         let mut input = inputs(vec![owner.clone()]);
         let status = |view: Arc<DeviceCardsView>| view.cards[0].status.as_ref().unwrap().accessibility_granted;
-        assert_eq!(status(projector.update(&input, 0).unwrap()), None);
-        input.members[0].capabilities.push("oink.input.accessibility/1".into());
         assert_eq!(status(projector.update(&input, 1).unwrap()), Some(false));
         input.members[0].os = "windows".into();
         assert_eq!(status(projector.update(&input, 2).unwrap()), None);
@@ -1497,17 +1712,13 @@ mod tests {
             for is_receiver in [false, true] {
                 let mut members = vec![row(1, "self", true), row(2, "peer", true)];
                 for member in &mut members {
-                    let mut raw = facts(member, fault).raw().clone();
-                    let RawValue::Array(preferences) = raw.get_mut(&18).unwrap() else {
-                        panic!()
-                    };
-                    preferences.push(map([(1, 20u32.write()), (2, 5u64.write()), (3, RawValue::Null)]));
-                    member.facts = Some(Arc::new(dto::DeviceFacts::from_raw(raw).unwrap()));
+                    member.capabilities.push("oink.audio/2".into());
+                    member.facts = Some(facts(member, fault));
                 }
                 let mut input = inputs(members);
-                input.exit_baseline = true;
                 if is_receiver {
-                    input.selected_exit = Some(input.members[0].device);
+                    let (exit, author) = (input.members[0].device, input.members[1].device);
+                    hold(&mut input, oink_audio::route::Role::Speaker, exit, 1, author);
                 }
                 let mut projector = Projector::new().unwrap();
                 let view = projector.update(&input, 1).unwrap();
@@ -1548,241 +1759,108 @@ mod tests {
         assert!(next.cards[0].pause.is_none());
     }
     #[test]
-    fn unpublished_exit_resolution_preserves_authenticated_non_exit_modes() {
-        use oink_audio::claims::{Claims, Record, Resolution, Stamp};
-        use std::collections::BTreeSet;
-
-        for historical_claimed in [false, true] {
-            let mut members = vec![row(1, "self", true), row(2, "peer-a", true), row(3, "peer-b", true)];
-            let mut claims = Claims::default();
-            for member in &mut members {
-                let claim = (!member.is_self).then(|| {
-                    dto::AudioExitClaim::from_raw(BTreeMap::from([
-                        (
-                            1,
-                            Stamp {
-                                counter: 40,
-                                owner: member.device.0,
-                            }
-                            .to_wire()
-                            .write(),
-                        ),
-                        (2, false.write()),
-                    ]))
-                    .unwrap()
-                });
-                claims
-                    .observe(
-                        member.device.0,
-                        Record {
-                            owner: member.device.0,
-                            revision: 1,
-                            claim: claim.clone(),
-                        },
-                    )
-                    .unwrap();
-                let mut raw = facts(member, 0).raw().clone();
-                let RawValue::Array(preferences) = raw.get_mut(&18).unwrap() else {
-                    panic!()
-                };
-                let forwarding = preferences
-                    .iter_mut()
-                    .find(|value| value.as_map().unwrap().get(&1) == Some(&4u32.write()))
-                    .unwrap();
-                *forwarding = map([(1, 4u32.write()), (2, 1u64.write()), (3, (!member.is_self).write())]);
-                preferences.push(map([(1, 20u32.write()), (2, 1u64.write()), (3, claim.write())]));
-                raw.insert(20, claim.write());
-                let RawValue::Map(resources) = raw.get_mut(&16).unwrap() else {
-                    panic!()
-                };
-                resources.insert(5, map([(2, dto::SpeakerActivity::Unused.write())]));
-                member.facts = Some(Arc::new(dto::DeviceFacts::from_raw(raw).unwrap()));
-            }
-            // A reinstall has all current owners, but only a relayed witness
-            // for the old identity.
-            claims
-                .observe_watermark(
-                    dto::AudioExitClaim::from_raw(BTreeMap::from([
-                        (
-                            1,
-                            Stamp {
-                                counter: 56,
-                                owner: oink_foundation::DeviceId([9; 32]),
-                            }
-                            .to_wire()
-                            .write(),
-                        ),
-                        (2, historical_claimed.write()),
-                    ]))
-                    .unwrap(),
-                )
-                .unwrap();
-            let ids: BTreeSet<_> = members.iter().map(|m| m.device.0).collect();
-            // The witness names the old identity's last selection: an
-            // unavailable exit, or none. It never guesses an available route.
-            let stamp = Stamp {
-                counter: 56,
-                owner: oink_foundation::DeviceId([9; 32]),
-            };
-            let witnessed = if historical_claimed {
-                Resolution::Exit {
-                    stamp,
-                    available: false,
-                }
-            } else {
-                Resolution::None { barrier: Some(stamp) }
-            };
-            assert_eq!(claims.resolve(&ids, &ids), witnessed);
-            // Until the audio owner publishes that resolution, the cards have no
-            // exit baseline; current owners' null/false claims still show modes.
-            let input = inputs(members);
-            let mut projector = Projector::new().unwrap();
-            let view = projector.update(&input, 1).unwrap();
-            assert!(view.exit_volume.is_none());
-            for card in &view.cards {
-                let speaker = &card.status.as_ref().unwrap().speaker;
-                let (mode, icon) = if card.is_self {
-                    (SpeakerMode::Unused, SpeakerIcon::Unused)
-                } else {
-                    (SpeakerMode::Source, SpeakerIcon::Forwarding)
-                };
-                assert_eq!(speaker.resource.configured_mode, Some(mode));
-                assert_eq!(speaker.resource.icon, icon);
-                assert_eq!(speaker.resource.condition, CardCondition::Ready);
-                assert_eq!(
-                    speaker.activity,
-                    if card.is_self {
-                        SpeakerActivity::Idle
-                    } else {
-                        SpeakerActivity::Unknown
-                    }
-                );
-                assert!(speaker.receiver_device.is_none());
-                assert!(speaker.forwarding.is_none());
-                let CardAction::Invoke { token, .. } = &speaker.resource.action else {
-                    panic!("a known non-exit can toggle its forwarding preference")
-                };
-                assert!(matches!(projector.tokens().read(token).unwrap().operation,
-                    TokenOperation::Option { edit: CardOptionEdit::ForwardingEnabled(value) } if value == card.is_self));
-                assert!(matches!(speaker.make_exit_action, CardAction::Invoke { .. }));
-            }
-            assert_eq!(claims.resolve(&ids, &ids), witnessed);
-        }
-    }
-    #[test]
-    fn unknown_exit_still_requires_non_claiming_current_owner_facts() {
-        for case in [
-            "missing_claim",
-            "claimed",
-            "stale_boot",
-            "missing_forwarding",
-            "permission_denied",
-        ] {
-            let mut member = row(1, "self", true);
-            let mut raw = facts(&member, if case == "permission_denied" { 2 } else { 0 })
-                .raw()
-                .clone();
-            let RawValue::Array(preferences) = raw.get_mut(&18).unwrap() else {
-                panic!()
-            };
-            if case != "missing_claim" {
-                let claim = if case == "claimed" {
-                    map([
-                        (
-                            1,
-                            oink_audio::claims::Stamp {
-                                counter: 1,
-                                owner: member.device.0,
-                            }
-                            .to_wire()
-                            .write(),
-                        ),
-                        (2, true.write()),
-                    ])
-                } else {
-                    RawValue::Null
-                };
-                preferences.push(map([(1, 20u32.write()), (2, 1u64.write()), (3, claim)]));
-            }
-            if case == "missing_forwarding" {
-                preferences.retain(|value| value.as_map().unwrap().get(&1) != Some(&4u32.write()));
-            }
-            member.facts = Some(Arc::new(dto::DeviceFacts::from_raw(raw).unwrap()));
-            if case == "stale_boot" {
-                member.live_boot = Some([99; 16]);
-            }
-            let input = inputs(vec![member]);
-            let view = Projector::new().unwrap().update(&input, 1).unwrap();
-            let speaker = &view.cards[0].status.as_ref().unwrap().speaker;
-            if case == "permission_denied" {
-                assert_eq!(speaker.resource.icon, SpeakerIcon::Fault);
-                assert_eq!(speaker.resource.condition, CardCondition::Faulted);
-            } else {
-                assert_eq!(speaker.resource.icon, SpeakerIcon::Unknown, "{case}");
-                assert_eq!(speaker.resource.configured_mode, None, "{case}");
-                assert_eq!(
-                    speaker.resource.action,
-                    CardAction::unavailable(CardActionUnavailable::StateUnknown),
-                    "{case}"
-                );
-            }
-        }
-    }
-    #[test]
-    fn local_exit_selection_waits_for_the_active_group_not_historical_resolution() {
+    fn exit_choices_are_authored_here_for_any_capable_member_without_their_records() {
+        use oink_audio::route::{Mode, Role};
         let mut me = row(1, "self", true);
-        let mut peer = row(2, "peer", true);
-        for member in [&mut me, &mut peer] {
-            let mut raw = facts(member, 0).raw().clone();
-            let RawValue::Array(preferences) = raw.get_mut(&18).unwrap() else {
-                panic!()
-            };
-            preferences.push(map([(1, 20u32.write()), (2, 5u64.write()), (3, RawValue::Null)]));
-            member.facts = Some(Arc::new(dto::DeviceFacts::from_raw(raw).unwrap()));
+        let mut exit = row(2, "exit", true);
+        let mut old = row(3, "old", true);
+        exit.capabilities.push("oink.audio/2".into());
+        for member in [&mut me, &mut exit, &mut old] {
+            member.facts = Some(facts(member, 0));
         }
-        let mut input = inputs(vec![me, peer]);
-        input.local_exit_selection_ready = false;
+        let mut input = inputs(vec![me.clone(), exit.clone(), old.clone()]);
+        hold(&mut input, Role::Speaker, exit.device, 5, old.device);
         let mut projector = Projector::new().unwrap();
-        let before = projector.update(&input, 1).unwrap();
-        assert_eq!(
-            before.cards[0].status.as_ref().unwrap().speaker.make_exit_action,
-            CardAction::unavailable(CardActionUnavailable::StateUnknown)
-        );
-        // Our local readiness does not establish the remote owner's readiness.
-        assert!(matches!(
-            before.cards[1].status.as_ref().unwrap().speaker.make_exit_action,
-            CardAction::Invoke { .. }
-        ));
-        // No local owner revision or historical resolution needs to change.
-        // Readiness alone must publish a new card and usable token.
-        input.local_exit_selection_ready = true;
-        let after = projector.update(&input, 2).unwrap();
-        assert_eq!(after.revision.0, before.revision.0 + 1);
-        assert!(!input.exit_baseline);
-        let CardAction::Invoke { token, .. } = &after.cards[0].status.as_ref().unwrap().speaker.make_exit_action else {
-            panic!("the active group permits an explicit takeover")
+        let view = projector.update(&input, 1).unwrap();
+        let speaker = |device: DeviceKey| {
+            view.cards
+                .iter()
+                .find(|card| card.device == device)
+                .unwrap()
+                .status
+                .clone()
+                .unwrap()
+                .speaker
         };
-        let binding = projector.tokens().read(token).unwrap();
-        assert_eq!(binding.owner.revision, 5);
-        assert_eq!(binding.owner.device, input.members[0].device);
+        let route = |action: &CardAction| {
+            let CardAction::Invoke { token, .. } = action else {
+                panic!("route action unavailable: {action:?}")
+            };
+            projector.tokens().read(token).unwrap()
+        };
+        let chosen = speaker(exit.device);
+        assert_eq!(chosen.resource.configured_mode, Some(SpeakerMode::Receiver));
+        // Anyone may take the exit back to local, authored here.
+        let clear = route(&chosen.resource.action);
+        assert_eq!(clear.owner.device, me.device);
+        assert_eq!(clear.owner.revision, 5);
+        assert_eq!(
+            clear.operation,
+            TokenOperation::AudioMode {
+                role: Role::Speaker,
+                device: exit.device,
+                mode: Mode::Local,
+            }
+        );
+        let select = route(&speaker(me.device).make_exit_action);
+        assert_eq!(
+            select.operation,
+            TokenOperation::AudioMode {
+                role: Role::Speaker,
+                device: me.device,
+                mode: Mode::Holder,
+            }
+        );
+        // Forward is set the same way, from the exit too (one write clears it).
+        let actions = view
+            .cards
+            .iter()
+            .find(|card| card.device == exit.device)
+            .unwrap()
+            .status
+            .clone()
+            .unwrap()
+            .actions;
+        assert_eq!(
+            route(&actions.forwarding_enabled).operation,
+            TokenOperation::AudioMode {
+                role: Role::Speaker,
+                device: exit.device,
+                mode: Mode::Shared,
+            }
+        );
+        // A member without audio cannot be chosen; the others stay known.
+        assert_eq!(
+            speaker(old.device).make_exit_action,
+            CardAction::unavailable(CardActionUnavailable::Unsupported)
+        );
+        for device in [me.device, old.device] {
+            assert_eq!(speaker(device).resource.configured_mode, Some(SpeakerMode::Source));
+        }
+        // An offline exit drops out of the overview: no exit and no volume card.
+        let mut offline = input.clone();
+        offline.members[1].ready = false;
+        offline.audio.devices.retain(|entry| entry.device != exit.device.0);
+        let view = projector.update(&offline, 2).unwrap();
+        assert!(view.exit_volume.is_none());
     }
     #[test]
-    fn volume_controls_bind_claim_boot_output_and_readback() {
+    fn volume_controls_bind_route_boot_output_and_readback() {
         let mut peer = row(2, "exit", true);
-        peer.capabilities.push("oink.audio.exit-volume/1".into());
+        peer.capabilities.push("oink.audio/2".into());
         let mut raw = facts(&peer, 0).raw().clone();
         let boot = raw[&1].clone();
         let device = match &boot {
             RawValue::Map(m) => m[&1].clone(),
             _ => panic!(),
         };
-        let claim = map([(1, 9u64.write()), (2, device)]);
+        let route = map([(1, 9u64.write()), (2, device)]);
         let version = map([
             (1, boot),
             (3, RawValue::Text("output".into())),
             (4, 7u64.write()),
             (5, 11u64.write()),
-            (6, claim),
+            (6, route),
         ]);
         raw.insert(
             17,
@@ -1791,9 +1869,7 @@ mod tests {
         peer.facts = Some(Arc::new(dto::DeviceFacts::from_raw(raw).unwrap()));
         let device = peer.device;
         let mut input = inputs(vec![peer]);
-        input.exit_baseline = true;
-        input.selected_exit = Some(device);
-        input.exit_claim = Some((9, device));
+        hold(&mut input, oink_audio::route::Role::Speaker, device, 9, device);
         let mut projector = Projector::new().unwrap();
         let first = projector.update(&input, 1).unwrap();
         let volume = first.exit_volume.as_ref().unwrap();
@@ -1807,7 +1883,7 @@ mod tests {
             binding.operation,
             TokenOperation::ExitVolume {
                 output_generation: 7,
-                claim_counter: 9,
+                route_seq: 9,
                 ..
             }
         ));
@@ -1824,13 +1900,14 @@ mod tests {
                 .as_ref(),
             Some(&token)
         );
-        input.exit_claim = Some((10, device));
+        hold(&mut input, oink_audio::route::Role::Speaker, device, 10, device);
         let stale = projector.update(&input, 3).unwrap();
         assert!(!stale.exit_volume.as_ref().unwrap().can_set);
         assert_eq!(
             stale.exit_volume.as_ref().unwrap().refusal,
             Some(ExitVolumeRefusal::StateStale)
         );
+        // Not ready but still listed (link reconnecting): offline, no token.
         input.members[0].ready = false;
         let offline = projector.update(&input, 4).unwrap();
         assert_eq!(offline.exit_volume.as_ref().unwrap().receiver_device, device);

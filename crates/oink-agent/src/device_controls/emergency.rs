@@ -4,7 +4,7 @@ use crate::{
     api::DeviceKey,
     device_cards::{DeliveryState, EmergencyDeliveryCard, EmergencyRecipient},
 };
-use oink_protocol::v1::{dto, schema::WireDto};
+use oink_protocol::v2::{dto, schema::WireDto};
 use std::{collections::VecDeque, time::Instant};
 
 pub(crate) struct Recipient {
@@ -141,7 +141,7 @@ impl EmergencyEvents {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use oink_protocol::v1::schema::WireValue;
+    use oink_protocol::v2::schema::WireValue;
     #[test]
     fn coverage_ack_is_session_scoped_and_request_retry_keeps_event() {
         let peer = DeviceKey(oink_foundation::DeviceId([3; 32]));

@@ -309,7 +309,7 @@ impl LowPool {
             }
         })?;
         if !self.core.network.admit_kind(grant, kind) {
-            return Err(LowError::Interrupted);
+            return Err(LowError::Unnegotiated);
         }
         if !options.valid() {
             return Err(LowError::Budget);
@@ -338,7 +338,7 @@ impl LowPool {
             .endpoint_after_relay(hop, grant.endpoint.expect("endpoint").peer.device_id)
             .await
             .map_err(LowError::from)?;
-        Ok(LowStream::new(stream))
+        Ok(LowStream::new(stream, &self.core.network.hub))
     }
 }
 fn same_route(a: LowBinding, b: LowBinding) -> bool {
@@ -353,12 +353,42 @@ impl Core {
         for hop in &view.hops {
             if let Some(mut input) = lock(&hop.receiver).take() {
                 let core = self.clone();
-                self.spawn_background(async move{let mut stopped=core.stopped.subscribe();loop{let delivery=tokio::select!{biased;_=wait_closed(&mut stopped)=>break,item=input.recv()=>item};let Some(delivery)=delivery else{break;};core.network.hub.wake.notify_one();
-                // Register the exact incoming grant before handing control to its
-                // handler. Route cleanup cannot mistake queued replacement work
-                // for an unreferenced pool (rollback fixes A3/T1).
-                let Ok((pool,auth))=core.admit(delivery.grant,delivery.forward).await else{continue;};if let Some(reason)=delivery.refusal { if let LowMsg::Open(request)=delivery.message {let _=core.send(delivery.grant,LowMsg::Ready{request:request.request,result:Err(reason)}).await;}continue;}let cancelled=auth.clone();tokio::select!{biased;_=cancelled.cancelled()=>{},_=core.receive_authorized(pool,auth,delivery.message)=>{}}
-            }});
+                let peer_info_changed = hop.peer_info_changed.clone();
+                let key = PoolKey {
+                    peer: hop.neighbor.device_id,
+                    connection: hop.connection,
+                };
+                self.spawn_background(async move {
+                    let mut stopped = core.stopped.subscribe();
+                    loop {
+                        let delivery = tokio::select! {
+                            biased;
+                            _ = wait_closed(&mut stopped) => break,
+                            _ = peer_info_changed.notified() => {
+                                let pool = lock(&core.pools).get(&key).cloned();
+                                if let Some(pool) = pool {
+                                    let auth = lock(&pool.grants).values().find(|auth| auth.current()).cloned();
+                                    if let Some(auth) = auth { core.sync_peer_info(pool, auth).await; }
+                                }
+                                continue;
+                            }
+                            item = input.recv() => item,
+                        };
+                        let Some(delivery) = delivery else { break; };
+                        core.network.hub.wake.notify_one();
+                        // Register the exact incoming grant before handing control
+                        // to its handler: cleanup must retain queued replacement work.
+                        let Ok((pool, auth)) = core.admit(delivery.grant, delivery.forward).await else { continue; };
+                        if let Some(reason) = delivery.refusal {
+                            if let LowMsg::Open(request) = delivery.message {
+                                let _ = core.send(delivery.grant, LowMsg::Ready { request: request.request, result: Err(reason) }).await;
+                            }
+                            continue;
+                        }
+                        let cancelled = auth.clone();
+                        tokio::select! { biased; _ = cancelled.cancelled() => {}, _ = core.receive_authorized(pool, auth, delivery.message) => {} }
+                    }
+                });
             }
         }
         // Acquire replacement route grants before cancelling old ones. Pools are
@@ -371,9 +401,14 @@ impl Core {
                 let new = !lock(&self.pools)
                     .values()
                     .any(|p| lock(&p.grants).contains_key(&grant.binding));
-                if new && let Ok((pool, auth)) = self.admit(grant, None).await {
+                if new && let Ok((pool, auth)) = self.register(grant, None) {
                     self.ensure_listener();
                     let _ = self.publish_advert(grant);
+                    // Listener changes can wait for N1 capacity; apply them on
+                    // this hop's worker, never on global reconciliation.
+                    if let Ok(hop) = self.network.hop(grant) {
+                        hop.peer_info_changed.notify_one();
+                    }
                     self.start_warm(pool, auth);
                 }
             }
@@ -431,7 +466,18 @@ impl Core {
             })
             .clone()
     }
-    async fn admit(&self, grant: Grant, forward: Option<Grant>) -> Result<(Arc<Pool>, Authorization), NetError> {
+    async fn admit(
+        self: &Arc<Self>,
+        grant: Grant,
+        forward: Option<Grant>,
+    ) -> Result<(Arc<Pool>, Authorization), NetError> {
+        let (pool, auth) = self.register(grant, forward)?;
+        // A pool may be recreated after migration while N1 (and its facts)
+        // survives. Install those facts before admitting an incoming Open.
+        self.sync_peer_info(pool.clone(), auth.clone()).await;
+        Ok((pool, auth))
+    }
+    fn register(&self, grant: Grant, forward: Option<Grant>) -> Result<(Arc<Pool>, Authorization), NetError> {
         let _admission = lock(&self.admission);
         if !self.network.low_current(grant) || *self.stopped.borrow() {
             return Err(NetError::Closed);
@@ -442,6 +488,26 @@ impl Core {
             return Err(NetError::Closed);
         }
         Ok((pool, auth))
+    }
+    async fn sync_peer_info(self: &Arc<Self>, pool: Arc<Pool>, auth: Authorization) {
+        let Some(info) = self
+            .network
+            .hop(auth.grant)
+            .ok()
+            .and_then(|hop| hop.peer_info.load_full())
+        else {
+            return;
+        };
+        let LowMsg::Info { paced, port, failure } = info.as_ref() else {
+            return;
+        };
+        let changed = lock(&pool.state)
+            .advert
+            .as_ref()
+            .is_none_or(|advert| (advert.paced, advert.port, &advert.failure) != (*paced, *port, failure));
+        if changed {
+            self.receive_authorized(pool, auth, (*info).clone()).await;
+        }
     }
     fn control_authorization(&self, grant: Grant) -> Result<Authorization, NetError> {
         let key = PoolKey {

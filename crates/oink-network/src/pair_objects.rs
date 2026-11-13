@@ -1,5 +1,6 @@
 //! Bounded, authenticated C0 object staging. No partial object reaches a caller.
-use oink_protocol::v1::{
+use crate::wire_identity;
+use oink_protocol::v2::{
     self, Message, RawMap, RawValue, dto,
     schema::{WireDto, WireValue},
 };
@@ -45,29 +46,29 @@ impl Objects {
         begin: dto::PairObjectBegin,
         authorized: impl FnOnce(&dto::ObjectContext, dto::ObjectKind) -> bool,
         now: Instant,
-    ) -> v1::Result<()> {
+    ) -> v2::Result<()> {
         let reference = begin.object()?;
         let context = begin.context()?;
         let kind = reference.kind()?;
         if !authorized(&context, kind) {
-            return Err(v1::ErrorCode::AuthenticationFailed.into());
+            return Err(v2::ErrorCode::AuthenticationFailed.into());
         }
         let key = (link, reference.digest()?.0);
         let bytes = reference.bytes()? as usize;
-        if bytes == 0 || bytes > v1::limits::PAIR_OBJECT {
-            return Err(v1::ErrorCode::LimitExceeded.into());
+        if bytes == 0 || bytes > v2::limits::PAIR_OBJECT {
+            return Err(v2::ErrorCode::LimitExceeded.into());
         }
         if let Some(existing) = self.staging.get(&key) {
             return if existing.context == context && existing.reference == reference {
                 Ok(())
             } else {
-                Err(v1::ErrorCode::StateConflict.into())
+                Err(v2::ErrorCode::StateConflict.into())
             };
         }
         if self.staging.keys().filter(|(source, _)| *source == link).count() >= MAX_LINK
             || bytes > MAX_STAGING - self.reserved
         {
-            return Err(v1::ErrorCode::LimitExceeded.into());
+            return Err(v2::ErrorCode::LimitExceeded.into());
         }
         self.reserved += bytes;
         self.staging.insert(
@@ -81,34 +82,34 @@ impl Objects {
         );
         Ok(())
     }
-    pub fn chunk(&mut self, link: u64, chunk: dto::PairObjectChunk, now: Instant) -> v1::Result<()> {
+    pub fn chunk(&mut self, link: u64, chunk: dto::PairObjectChunk, now: Instant) -> v2::Result<()> {
         let key = (link, chunk.digest()?.0);
-        let s = self.staging.get_mut(&key).ok_or(v1::ErrorCode::StateConflict)?;
+        let s = self.staging.get_mut(&key).ok_or(v2::ErrorCode::StateConflict)?;
         let bytes = chunk.bytes()?.0;
         if bytes.is_empty()
             || chunk.offset()? as usize != s.bytes.len()
             || bytes.len() > s.reference.bytes()? as usize - s.bytes.len()
         {
-            return Err(v1::ErrorCode::MalformedFrame.into());
+            return Err(v2::ErrorCode::MalformedFrame.into());
         }
         s.bytes.extend_from_slice(&bytes);
         s.deadline = now + DEADLINE;
         Ok(())
     }
-    pub fn end(&mut self, link: u64, end: dto::PairObjectEnd) -> v1::Result<Complete> {
+    pub fn end(&mut self, link: u64, end: dto::PairObjectEnd) -> v2::Result<Complete> {
         let digest = end.digest()?.0;
         let s = self
             .staging
             .remove(&(link, digest))
-            .ok_or(v1::ErrorCode::StateConflict)?;
+            .ok_or(v2::ErrorCode::StateConflict)?;
         self.reserved -= s.reference.bytes()? as usize;
-        if s.bytes.len() != s.reference.bytes()? as usize || v1::retained::sha256(&s.bytes).0 != digest {
-            return Err(v1::ErrorCode::AuthenticationFailed.into());
+        if s.bytes.len() != s.reference.bytes()? as usize || wire_identity::object_digest(&s.bytes) != digest {
+            return Err(v2::ErrorCode::AuthenticationFailed.into());
         }
-        let raw = v1::cbor::decode_map(&s.bytes, v1::limits::PAIR_OBJECT)?;
+        let raw = v2::cbor::decode_map(&s.bytes, v2::limits::PAIR_OBJECT)?;
         match s.reference.kind()? {
             dto::ObjectKind::SourceState => {
-                dto::GroupState::from_raw(raw.clone())?.encode(v1::limits::CONFIG_STATE)?;
+                dto::GroupState::from_raw(raw.clone())?.encode(v2::limits::CONFIG_STATE)?;
             }
             dto::ObjectKind::Plan => {
                 dto::MergePlan::from_raw(raw.clone())?;
@@ -116,7 +117,7 @@ impl Objects {
             dto::ObjectKind::Transfer => {
                 dto::MergeTransferBundle::from_raw(raw.clone())?;
             }
-            _ => return Err(v1::ErrorCode::UnsupportedValue.into()),
+            _ => return Err(v2::ErrorCode::UnsupportedValue.into()),
         }
         Ok(Complete {
             context: s.context,
@@ -163,12 +164,12 @@ pub fn transfer(
     context: dto::ObjectContext,
     kind: dto::ObjectKind,
     raw: &RawMap,
-) -> v1::Result<(dto::ObjectRef, Vec<Message>)> {
-    let bytes = v1::cbor::encode_map(raw, v1::limits::PAIR_OBJECT)?;
-    let digest = v1::retained::sha256(&bytes);
+) -> v2::Result<(dto::ObjectRef, Vec<Message>)> {
+    let bytes = v2::cbor::encode_map(raw, v2::limits::PAIR_OBJECT)?;
+    let digest = wire_identity::object_digest(&bytes);
     let reference = dto::ObjectRef::from_raw(
         [
-            (1, digest.write()),
+            (1, RawValue::Bytes(digest.to_vec())),
             (2, (bytes.len() as u32).write()),
             (3, kind.write()),
         ]
@@ -181,7 +182,7 @@ pub fn transfer(
     for chunk in bytes.chunks(16384) {
         messages.push(Message::ConfigPairObjectChunk(dto::PairObjectChunk::from_raw(
             [
-                (1, digest.write()),
+                (1, RawValue::Bytes(digest.to_vec())),
                 (2, offset.write()),
                 (3, RawValue::Bytes(chunk.to_vec())),
             ]
@@ -190,7 +191,7 @@ pub fn transfer(
         offset += chunk.len() as u32;
     }
     messages.push(Message::ConfigPairObjectEnd(dto::PairObjectEnd::from_raw(
-        [(1, digest.write())].into(),
+        [(1, RawValue::Bytes(digest.to_vec()))].into(),
     )?));
     Ok((reference, messages))
 }

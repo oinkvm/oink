@@ -1,6 +1,15 @@
-//! Serialized audio owner commands, authenticated claims and native output binding.
+//! Serialized audio owner commands, the global audio configuration and native output binding.
 use super::*;
 use dto::{ControlFailure as Failure, LocalOption};
+use oink_audio::route::{AudioConfig, Inputs, Peer};
+
+/// This device's wall clock for HLC stamps (Unix ms, UTC).
+pub(super) fn wall_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
 
 pub(super) struct VolumeContextInputs {
     members: Arc<crate::config_module::MemberTable>,
@@ -45,56 +54,84 @@ impl Owner {
         }
         self.requester(requester)
     }
-    pub(super) fn persist_claims(&mut self, next: Claims) -> Result<(), Failure> {
-        let group = self.active_group.ok_or(Failure::NotMember)?;
-        let me = self.links.id();
-        let records = GroupClaims {
-            seen_counter: next.seen_counter(),
-            watermark: next.watermark().cloned(),
-            records: next
-                .records()
-                .map(|record| ClaimRecord {
-                    owner: record.owner,
-                    revision: record.revision,
-                    claim: record.claim.clone(),
-                })
-                .collect(),
-        };
-        let mut candidate = lock(&self.store).owner().clone();
-        candidate
-            .commit_claims(group, me, records.clone())
-            .map_err(|_| Failure::InvalidValue)?;
-        self.preflight_preferences(
-            candidate.preferences(),
-            candidate
-                .claims(self.active_group.ok_or(Failure::NotMember)?)
-                .watermark(),
-        )?;
+    /// This device's speaker mode is "forward": its forward switch is on and
+    /// it is not the exit. The switch of the exit is masked by the role (a PC
+    /// turns it on when it becomes the exit, for when it loses it), so it must
+    /// never make the exit act as a source, e.g. for volume-key contexts.
+    pub(super) fn forwarding(&self) -> bool {
+        self.audio.own().mode(Role::Speaker) == Mode::Shared
+    }
+    /// This device's microphone mode is "receive" (switch on, not the sender).
+    pub(super) fn receiving(&self) -> bool {
+        self.audio.own().mode(Role::Microphone) == Mode::Shared
+    }
+    /// The raw forward switch, also while it is masked by the exit role.
+    fn forward_switch(&self) -> bool {
+        self.audio.own().forward.on
+    }
+    /// Persist this device's own configuration (device-level) and the clock
+    /// after it changed.
+    fn persist_own_audio(&mut self) -> Result<(), Failure> {
+        let own = self.audio.own();
+        let last = self.audio.hlc_last();
         lock(&self.store)
-            .update_owner(|owner| owner.commit_claims(group, me, records))
+            .update_owner(|owner| owner.commit_audio(own, last))
             .map_err(|_| Failure::PersistenceFailed)?;
-        self.claims = next;
         Ok(())
     }
-    fn preflight_preferences(
-        &self,
-        preferences: Vec<dto::DevicePreference>,
-        watermark: Option<dto::AudioExitClaim>,
-    ) -> Result<(), Failure> {
+    /// Broadcast the configuration this device executes (nothing while it has
+    /// not merged). Every member lists itself and its linked devices, so a
+    /// phone that links only to one PC still learns every online device.
+    fn publish_audio_config(&self) -> Result<(), Failure> {
+        self.group
+            .publish_local_audio_config(self.audio.publication())
+            .map_err(|_| Failure::ApplyFailed)?;
+        Ok(())
+    }
+    /// Follow a change of this device's own configuration: persist it, and a
+    /// forward switch that turned on starts unmuted without the old automatic
+    /// off reason; one that turned off stops the source.
+    fn own_audio_changed(&mut self, forwarding_before: bool) -> Result<(), Failure> {
+        self.persist_own_audio()?;
+        let forwarding = self.forwarding();
+        // A switch the user (or a setter) turned on starts unmuted; a PC
+        // merely losing the exit back to forward keeps its gain and mute.
+        if !forwarding_before
+            && forwarding
+            && self.forward_switch()
+            && (self.settings.forwarding_muted || self.forwarding_off_reason.is_some())
+        {
+            let mut settings = self.settings.clone();
+            settings.forwarding_muted = false;
+            settings.forwarding_off_reason = None;
+            self.persist_settings(&mut settings)?;
+        } else if forwarding_before && !forwarding {
+            self.stop_source();
+        }
+        Ok(())
+    }
+    /// An automatic local change of this device's own forward switch (the
+    /// local output was taken over). It is authored like any choice.
+    pub(super) fn set_own_forwarding(&mut self, on: bool) {
+        let before = self.forwarding();
+        if !self.audio.set_own_switch(wall_ms(), Role::Speaker, on) {
+            return;
+        }
+        if let Err(reason) = self
+            .own_audio_changed(before)
+            .and_then(|()| self.publish_audio_config())
+        {
+            tracing::warn!(reason = reason.number(), "audio forward switch change failed");
+        }
+    }
+    fn preflight_preferences(&self, preferences: Vec<dto::DevicePreference>) -> Result<(), Failure> {
         let mut facts = (*self.group.local_facts()).clone();
-        let claim = preferences
-            .iter()
-            .find(|item| item.option() == Ok(LocalOption::AudioExitClaim))
-            .and_then(|item| item.value().ok())
-            .unwrap_or(RawValue::Null);
         facts
             .edit(|raw| {
                 raw.insert(18, RawValue::Array(preferences.iter().map(WireValue::write).collect()));
-                raw.insert(20, claim);
-                raw.insert(21, watermark.write());
             })
             .map_err(|_| Failure::InvalidValue)?;
-        v1::frame::encode(&Message::ConfigFacts(facts), v1::limits::CONFIG_FRAME).map_err(|_| Failure::InvalidValue)?;
+        v2::frame::encode(&Message::ConfigFacts(facts), v2::limits::CONFIG_FRAME).map_err(|_| Failure::InvalidValue)?;
         Ok(())
     }
     pub(super) fn publish_preferences(&self) -> Result<(), Failure> {
@@ -115,88 +152,63 @@ impl Owner {
         let _guard = lock(&gate);
         if let Err(reason) = self.apply_locked() {
             tracing::warn!(reason = reason.number(), "audio owner reconciliation failed");
-            // A persistence or baseline failure never authorizes a guessed exit.
+            // An unreadable or unstorable route setting never authorizes a guess.
             self.microphone.resolution = Resolution::Unknown;
             self.stop_microphone();
             self.transition(Resolution::Unknown);
         }
     }
     pub(super) fn apply_locked(&mut self) -> Result<(), Failure> {
-        let (active_group, saved) = {
-            let config = lock(&self.store);
-            let group = config.owner().active_group();
-            (group, group.map(|id| config.owner().claims(id)))
-        };
+        let active_group = lock(&self.store).owner().active_group();
         if active_group != self.active_group {
             self.transition(Resolution::Unknown);
+            // A group switch (a whole-group merge too) is a new start: this
+            // device's configuration becomes old configuration and merges
+            // with the new group (user 2026-11-11 Q3 / B).
+            if self.active_group.is_some() {
+                self.audio.restart(wall_ms());
+            }
             self.active_group = active_group;
-            self.claims = if let Some(saved) = saved {
-                let mut claims = Claims::restore(
-                    saved.records.into_iter().map(|record| Record {
-                        owner: record.owner,
-                        revision: record.revision,
-                        claim: record.claim,
-                    }),
-                    saved.seen_counter,
-                )?;
-                if let Some(watermark) = saved.watermark {
-                    claims.observe_watermark(watermark)?;
-                }
-                claims
-            } else {
-                Claims::default()
-            };
         }
         self.paused = self.group.applied().paused;
-        self.apply_microphone()?;
         self.streams.pause_changed(self.paused || self.update_suspended);
         let Some(group) = self.active_group else {
-            self.transition(Resolution::Unknown);
+            self.apply_microphone(&BTreeSet::new());
+            self.transition(Resolution::None);
             return Ok(());
         };
         let members = self.members();
         let boots: Vec<_> = members.iter().filter_map(|peer| self.current_boot(*peer)).collect();
         self.exit_volume.retain_sources(|source| boots.contains(source));
+        // Linked online members (a live link and its current Boot's facts) and
+        // the configuration each publishes; an unjoined member publishes none.
+        let mut linked = Vec::new();
         let mut available = BTreeSet::new();
-        let mut candidate = self.claims.clone();
-        let mut changed = false;
         let table = self.group.members();
-        for member in &table.members {
-            let facts = if member.is_self {
-                Some(self.group.local_facts())
-            } else {
-                member.facts.clone()
-            };
-            let Some(facts) = facts else { continue };
+        for member in table.members.iter().filter(|member| !member.is_self) {
+            let Some(facts) = member.facts.clone() else { continue };
             if facts.group().ok().map(|id| id.0) != Some(group.0)
                 || self.current_boot(member.device).as_ref() != facts.boot().ok().as_ref()
             {
                 continue;
             }
-            let Some(preference) = facts.preferences().ok().flatten().and_then(|items| {
-                items
-                    .0
-                    .into_iter()
-                    .find(|item| item.option() == Ok(LocalOption::AudioExitClaim))
-            }) else {
-                continue;
-            };
-            let claim = Option::<dto::AudioExitClaim>::read(&preference.value().map_err(|_| Failure::InvalidValue)?)
-                .map_err(|_| Failure::InvalidValue)?;
-            if claim != facts.audio_exit_claim().map_err(|_| Failure::InvalidValue)? {
-                return Err(Failure::StateConflict);
-            }
-            changed |= candidate.observe(
-                member.device,
-                Record {
-                    owner: member.device,
-                    revision: preference.revision().map_err(|_| Failure::InvalidValue)?,
-                    claim,
+            let config = match facts.audio_config().map_err(|_| Failure::InvalidValue)? {
+                Some(wire) => match AudioConfig::from_wire(&wire) {
+                    Ok(config) => Some(config),
+                    Err(reason) => {
+                        tracing::warn!(
+                            reason = reason.number(),
+                            "ignoring an audio configuration this build cannot read"
+                        );
+                        None
+                    }
                 },
-            )?;
-            if let Some(watermark) = facts.audio_claim_watermark().map_err(|_| Failure::InvalidValue)? {
-                changed |= candidate.observe_watermark(watermark)?;
-            }
+                None => None,
+            };
+            linked.push(Peer {
+                device: member.device,
+                config,
+            });
             let awake = facts.observed().is_ok_and(|state| state.awake() == Ok(true));
             let unpaused = facts
                 .pause()
@@ -207,38 +219,34 @@ impl Owner {
                 available.insert(member.device);
             }
         }
-        // The local durable record is authoritative even while its publication is
-        // queued behind this owner command. Third-party facts cannot supply it.
-        let local = lock(&self.store)
-            .owner()
-            .item(LocalOption::AudioExitClaim)
-            .ok_or(Failure::StateConflict)?;
-        changed |= candidate.observe(
-            self.links.id(),
-            Record {
-                owner: self.links.id(),
-                revision: local.revision().map_err(|_| Failure::InvalidValue)?,
-                claim: Option::<dto::AudioExitClaim>::read(&local.value().map_err(|_| Failure::InvalidValue)?)
-                    .map_err(|_| Failure::InvalidValue)?,
-            },
-        )?;
         if !self.paused && !self.power_state.sleeping {
             available.insert(self.links.id());
         }
-        let yielded = candidate.yield_to_winner(self.links.id())?;
-        if let Some(record) = yielded {
-            // Retire all sessions and pinned native keys before publishing yield.
-            self.retire_sessions();
-            self.retire_output();
-            self.publish_observations()?;
-            changed |= candidate.observe(self.links.id(), record)?;
+        let forwarding_before = self.forwarding();
+        let reconciled = self.audio.reconcile(Inputs {
+            wall_ms: wall_ms(),
+            linked: &linked,
+            receive_ready: self.virtual_microphone_ready(),
+        });
+        for (author, ahead_ms) in &reconciled.clock_ahead {
+            tracing::warn!(
+                author = %author.short(),
+                ahead_ms,
+                "received an audio configuration stamp far ahead of this clock"
+            );
         }
-        if changed {
-            self.persist_claims(candidate)?;
-            self.publish_preferences()?;
+        if reconciled.merged {
+            tracing::info!("merged with the group's audio configuration");
         }
-        let resolution = self.claims.resolve(&members, &available);
-        self.transition(resolution);
+        if reconciled.own {
+            self.own_audio_changed(forwarding_before)?;
+        }
+        // Retire the old route's media and volume presses before relaying.
+        self.transition(self.audio.resolve(Role::Speaker, &available));
+        self.apply_microphone(&available);
+        if reconciled.published {
+            self.publish_audio_config()?;
+        }
         if let Some(prepared) = self.source_session.prepared() {
             let output = prepared.session().receiver_output().ok();
             let current = self.resolved_volume().and_then(|state| state.version().ok());
@@ -251,7 +259,7 @@ impl Owner {
                     || (output.generation() == version.output_generation() && output.output_id() != version.output_id())
             });
             if retired {
-                if let Some(peer) = self.resolution.owner() {
+                if let Some(peer) = self.resolution.target() {
                     self.streams.forget_preparation(peer);
                 }
                 self.source_session.retire();
@@ -308,22 +316,21 @@ impl Owner {
         }
         let previous = self.resolution;
         // An unavailable selected exit releases the capture lease immediately.
-        let keep_capture = previous.owner().is_some_and(|owner| owner != self.links.id())
-            && resolution.owner().is_some_and(|owner| owner != self.links.id())
+        let keep_capture = previous.target().is_some_and(|owner| owner != self.links.id())
+            && resolution.target().is_some_and(|owner| owner != self.links.id())
             && resolution.available()
             && !self.paused
             && !self.power_state.sleeping
-            && self.settings.forwarding_enabled
-            && self.capture.is_some()
+            && self.forwarding()
+            && (self.capture.is_some() || self.held_mute.is_some())
             && !self.provisional;
         self.retire_sessions();
-        if previous.stamp() != resolution.stamp() {
+        if previous.version() != resolution.version() {
             self.retire_output();
         }
         self.resolution = resolution;
         if keep_capture {
-            self.exit_switch_deadline
-                .get_or_insert(Instant::now() + EXIT_SWITCH_LEASE);
+            self.exit_switching = true;
         } else {
             self.stop_source();
         }
@@ -353,10 +360,7 @@ impl Owner {
         oink_audio::validate_receive_output(settings.receive_output.as_deref()).map_err(|_| Failure::InvalidValue)?;
         oink_audio::forward_volume::validate_percent(settings.forwarding_volume_percent)
             .map_err(|_| Failure::InvalidValue)?;
-        if !self.settings.forwarding_enabled && settings.forwarding_enabled {
-            settings.forwarding_muted = false;
-        }
-        if settings.forwarding_enabled {
+        if self.forwarding() {
             settings.forwarding_off_reason = None;
         }
         let preferences = {
@@ -367,7 +371,7 @@ impl Owner {
                 .preview_preferences(&candidate)
                 .map_err(|_| Failure::InvalidValue)?
         };
-        self.preflight_preferences(preferences, self.claims.watermark().cloned())?;
+        self.preflight_preferences(preferences)?;
         lock(&self.store)
             .update_local(&serde_json::json!({"audio":patch}), |config| {
                 config.audio = settings.clone()
@@ -380,16 +384,21 @@ impl Owner {
         let output_changed = self.settings.receive_output != settings.receive_output;
         let capture_changed = self.settings.capture_scope != settings.capture_scope
             || self.settings.keep_local_playback != settings.keep_local_playback;
+        let keep_local_changed = self.settings.keep_local_playback != settings.keep_local_playback;
         let format_changed = self.settings.quality != settings.quality;
         self.settings = settings;
         self.forwarding_off_reason = self.settings.forwarding_off_reason;
-        if !self.settings.forwarding_enabled {
+        if !self.forwarding() {
             self.stop_source();
         } else if capture_changed || format_changed {
-            let _ = self.release_capture();
-        }
-        if format_changed {
-            self.stop_source();
+            // Rebuilding for a new scope or format keeps this forwarding's source
+            // mute. Turning local playback on ends that mute itself.
+            let _ = self.retire_capture(true, !keep_local_changed);
+            if format_changed {
+                // Same reset as stop_source, without ending the source mute.
+                self.exit_switching = false;
+                self.verified = false;
+            }
         }
         if output_changed {
             self.retire_sessions();
@@ -449,16 +458,12 @@ impl Owner {
         let gate = self.gate.clone();
         let _guard = lock(&gate);
         self.authorize(requester, group)?;
-        if matches!(
-            option,
-            LocalOption::MicrophoneShareClaim
-                | LocalOption::MicrophoneControls
-                | LocalOption::MicrophoneReceiveMuted
-                | LocalOption::MicrophoneInput
-        ) {
+        if matches!(option, LocalOption::MicrophoneControls | LocalOption::MicrophoneInput) {
             return self.set_microphone_option(option, expected, patch);
         }
-        if !matches!(option, LocalOption::ForwardingEnabled | LocalOption::ForwardingControls) {
+        // Forward / receive are the global audio configuration (options 4 / 24
+        // are retired): only the forwarding gain is an owner option here.
+        if option != LocalOption::ForwardingControls {
             return Err(Failure::UnsupportedOption);
         }
         let before = lock(&self.store)
@@ -468,29 +473,18 @@ impl Owner {
         if before.revision() != Ok(expected) {
             return Err(Failure::StaleRevision);
         }
-        if option == LocalOption::ForwardingEnabled {
-            let mut settings = self.settings.clone();
-            settings.forwarding_enabled = bool::read(&patch).map_err(|_| Failure::InvalidValue)?;
-            self.persist_settings(&mut settings)?;
+        let mut candidate = lock(&self.store).owner().clone();
+        candidate.edit(option, expected, patch.clone())?;
+        self.preflight_preferences(candidate.preferences())?;
+        if defer_persistence {
+            lock(&self.store).edit_forwarding_deferred(expected, patch)?;
         } else {
-            let mut candidate = lock(&self.store).owner().clone();
-            candidate.edit(option, expected, patch.clone())?;
-            self.preflight_preferences(
-                candidate.preferences(),
-                candidate
-                    .claims(self.active_group.ok_or(Failure::NotMember)?)
-                    .watermark(),
-            )?;
-            if defer_persistence {
-                lock(&self.store).edit_forwarding_deferred(expected, patch)?;
-            } else {
-                // Released peers and the final drag position require durability,
-                // even when their value is already the current in-memory value.
-                lock(&self.store).edit_owner(option, expected, patch)?;
-            }
-            let settings = lock(&self.store).settings.audio.clone();
-            self.apply_settings(settings);
+            // Released peers and the final drag position require durability,
+            // even when their value is already the current in-memory value.
+            lock(&self.store).edit_owner(option, expected, patch)?;
         }
+        let settings = lock(&self.store).settings.audio.clone();
+        self.apply_settings(settings);
         let published = self.publish_preferences().and_then(|()| self.publish_observations());
         self.publish(self.phase());
         Ok(self.option_receipt(option, &before, published))
@@ -525,40 +519,85 @@ impl Owner {
             fact_sequence,
         }
     }
-    pub(super) fn set_claim(
+    /// The local user set `device`'s speaker or microphone mode. This device
+    /// authors it in the global audio configuration and broadcasts the whole
+    /// configuration (setter decides); the device is not asked. Only what it
+    /// can do is checked: a phone is made the exit / sender only on the phone
+    /// itself and has no forward / receive; this device receives only with
+    /// its virtual microphone installed.
+    pub(super) fn set_mode(
         &mut self,
-        requester: &dto::Boot,
-        group: GroupId,
-        claimed: bool,
-        expected: u64,
-    ) -> Result<OwnerOptionApplied, Failure> {
+        device: DeviceId,
+        role: Role,
+        mode: Mode,
+    ) -> Result<dto::ControlOutcome, Failure> {
         let gate = self.gate.clone();
         let _guard = lock(&gate);
-        self.authorize(requester, group)?;
         self.apply_locked()?;
-        let option = LocalOption::AudioExitClaim;
-        let before = lock(&self.store)
-            .owner()
-            .item(option)
-            .ok_or(Failure::UnsupportedOption)?;
-        if let Some(record) = self
-            .claims
-            .command(self.links.id(), expected, claimed, &self.members())?
-        {
-            let mut candidate = self.claims.clone();
-            candidate.observe(self.links.id(), record)?;
-            self.persist_claims(candidate)?;
+        self.active_group.ok_or(Failure::NotMember)?;
+        let me = self.links.id();
+        if !self.members().contains(&device) {
+            return Err(Failure::NotMember);
         }
-        let published = self
-            .publish_preferences()
-            .and_then(|()| self.apply_locked())
-            .and_then(|()| self.publish_observations());
+        let offline = || {
+            if self.current_boot(device).is_none() {
+                Failure::Offline
+            } else {
+                Failure::Unsupported
+            }
+        };
+        let mobile = device != me
+            && self.group.members().members.iter().any(|member| {
+                member.device == device
+                    && member
+                        .facts
+                        .as_ref()
+                        .is_some_and(|facts| facts.device_kind() == Ok(dto::DeviceKind::Mobile))
+            });
+        match mode {
+            Mode::Holder => {
+                let capable = !mobile
+                    && match role {
+                        Role::Speaker => {
+                            device == me
+                                || self
+                                    .group
+                                    .peer_permits(device, oink_protocol::v2::registry::type_id::AudioQualitySourceOffer)
+                        }
+                        Role::Microphone => {
+                            if device == me {
+                                self.microphone.native
+                            } else {
+                                self.group
+                                    .peer_permits(device, oink_protocol::v2::registry::type_id::MicrophoneDemand)
+                            }
+                        }
+                    };
+                if !capable {
+                    return Err(if mobile { Failure::Unsupported } else { offline() });
+                }
+            }
+            Mode::Shared if mobile => return Err(Failure::Unsupported),
+            Mode::Shared if device == me && role == Role::Microphone && !self.virtual_microphone_ready() => {
+                return Err(Failure::Unsupported);
+            }
+            Mode::Shared | Mode::Local => {}
+        }
+        let forwarding_before = self.forwarding();
+        if !self.audio.select(wall_ms(), device, role, mode)? {
+            return Ok(dto::ControlOutcome::NoChange);
+        }
+        tracing::info!(?role, ?mode, own = device == me, "authored a global audio mode");
+        self.own_audio_changed(forwarding_before)?;
+        self.apply_locked()?;
+        self.publish_audio_config()?;
+        let _ = self.publish_observations();
         self.publish(self.phase());
-        Ok(self.option_receipt(option, &before, published))
+        Ok(dto::ControlOutcome::Applied)
     }
     pub(super) fn volume_key(&mut self, code: oink_foundation::input::KeyCode) {
         // Modified volume applies only to a currently forwarding source.
-        if !self.settings.forwarding_enabled || self.resolution.owner().is_none_or(|owner| owner == self.links.id()) {
+        if !self.forwarding() || self.resolution.target().is_none_or(|owner| owner == self.links.id()) {
             return;
         }
         let mut settings = self.settings.clone();
@@ -602,7 +641,7 @@ impl Owner {
         if self.driver_change_active() {
             return Ok(());
         }
-        if self.resolution.owner() != Some(self.links.id()) {
+        if self.resolution.target() != Some(self.links.id()) {
             if self.exit_volume.state().is_some() {
                 self.exit_volume.retire();
                 self.bound_output = None;
@@ -613,11 +652,11 @@ impl Owner {
             return Ok(());
         }
         let output = self.selected_output();
-        let claim = self.resolution.stamp().ok_or(Failure::NotExit)?.to_wire();
+        let route = self.resolution.version().ok_or(Failure::NotExit)?.to_wire();
         let same = self.exit_volume.state().is_some_and(|state| {
             state
                 .version()
-                .is_ok_and(|version| version.exit_claim() == Ok(claim.clone()))
+                .is_ok_and(|version| version.route_version() == Ok(route.clone()))
         });
         if !force && output == self.bound_output && same {
             return Ok(());
@@ -655,7 +694,7 @@ impl Owner {
         } else {
             Err(oink_audio::volume::Fault::unavailable())
         };
-        self.exit_volume.bind(claim, output, endpoint)?;
+        self.exit_volume.bind(route, output, endpoint)?;
         self.refresh_volume_context();
         Ok(())
     }
@@ -672,16 +711,17 @@ impl Owner {
         .ok()
     }
     pub(super) fn resolved_volume(&self) -> Option<dto::ExitVolumeState> {
-        let stamp = self.resolution.stamp()?;
-        if stamp.owner == self.links.id() {
+        let route = self.resolution.version()?;
+        let exit = self.resolution.target()?;
+        if exit == self.links.id() {
             return self.exit_volume.state().cloned();
         }
-        let current = self.current_boot(stamp.owner)?;
+        let current = self.current_boot(exit)?;
         let table = self.group.members();
         let facts = table
             .members
             .iter()
-            .find(|member| member.device == stamp.owner)?
+            .find(|member| member.device == exit)?
             .facts
             .as_ref()?;
         if facts.boot().ok()? != current || !facts.observed().ok()?.awake().ok()? {
@@ -689,12 +729,12 @@ impl Owner {
         }
         let state = facts.exit_volume().ok()??;
         let version = state.version().ok()?;
-        (version.exit().ok()? == current && version.exit_claim().ok()? == stamp.to_wire()).then_some(state)
+        (version.exit().ok()? == current && version.route_version().ok()? == route.to_wire()).then_some(state)
     }
     pub(super) fn current_volume_context(&self) -> Option<Arc<dto::AudioSessionContext>> {
         // This snapshot authorizes the focus router's physical volume keys,
         // independently of explicit exit-volume controls or media activity.
-        if !self.settings.forwarding_enabled {
+        if !self.forwarding() {
             return None;
         }
         let state = self.resolved_volume()?;
@@ -706,7 +746,7 @@ impl Owner {
             let version = state.version().ok()?;
             let binding = context.receiver_output().ok()?;
             if context.source() == Ok(boot(self.links.boot()))
-                && context.exit_claim() == version.exit_claim()
+                && context.route_version() == version.route_version()
                 && binding.receiver() == version.exit()
                 && binding.generation() == version.output_generation()
                 && binding.output_id() == version.output_id()
@@ -720,17 +760,17 @@ impl Owner {
     }
     pub(super) fn refresh_volume_context(&mut self) {
         let members = self.group.members();
-        let peer_boot = self.resolution.owner().and_then(|peer| self.group.peer_boot(peer));
+        let peer_boot = self.resolution.target().and_then(|peer| self.group.peer_boot(peer));
         let local_volume = self.exit_volume.state();
         // Facts and native volume observations are immutable snapshots. A mic
         // health tick need not rebuild the speaker's nested wire DTOs while all
-        // of these inputs are unchanged. Link loss/boot, roster/facts, claim,
+        // of these inputs are unchanged. Link loss/boot, roster/facts, route,
         // consent and local output generation changes invalidate immediately.
         if self.volume_context_inputs.as_ref().is_some_and(|last| {
             Arc::ptr_eq(&last.members, &members)
                 && last.peer_boot == peer_boot
                 && last.resolution == self.resolution
-                && last.forwarding_enabled == self.settings.forwarding_enabled
+                && last.forwarding_enabled == self.forwarding()
                 && last.local_volume.as_ref() == local_volume
         }) {
             return;
@@ -739,7 +779,7 @@ impl Owner {
             members,
             peer_boot,
             resolution: self.resolution,
-            forwarding_enabled: self.settings.forwarding_enabled,
+            forwarding_enabled: self.forwarding(),
             local_volume: local_volume.cloned(),
         });
         let context = self.current_volume_context();
@@ -798,7 +838,7 @@ impl Owner {
         result
     }
     fn selected_output_missing(&self) -> bool {
-        self.resolution.owner() == Some(self.links.id())
+        self.resolution.target() == Some(self.links.id())
             && self.devices.iter().any(|device| device.device == self.links.id())
             && self.bound_output.is_none()
     }
@@ -814,7 +854,7 @@ impl Owner {
             AudioPhase::Paused
         } else if self.power_state.sleeping {
             AudioPhase::SoundSleep
-        } else if self.provisional || self.starting_playback.is_some() || self.exit_switch_deadline.is_some() {
+        } else if self.provisional || self.starting_playback.is_some() || self.exit_switching {
             AudioPhase::Preparing
         } else if self.capture.is_some() {
             if self.encoded.as_ref().is_some_and(|encoded| encoded.sleeping()) {
@@ -824,9 +864,11 @@ impl Owner {
             }
         } else if self.playback.is_some() || self.playback_idle {
             AudioPhase::Receiving
-        } else if self.resolution.owner() == Some(self.links.id()) {
+        } else if self.resolution.target() == Some(self.links.id()) {
             AudioPhase::Preparing
-        } else if self.settings.forwarding_enabled && !matches!(self.resolution, Resolution::None { .. }) {
+        } else if self.forwarding() {
+            // Forward mode with no exit right now (none chosen, offline,
+            // asleep or paused) waits for one; local playback continues.
             AudioPhase::WaitingForExit
         } else {
             AudioPhase::Idle
@@ -839,8 +881,8 @@ impl Owner {
         let code = if self.mute_cleanup_error.is_some() || self.platform.capture_cleanup_failed() {
             dto::UserFacingCode::CleanupFailed
         } else if self.permission == CapturePermission::Denied
-            && self.settings.forwarding_enabled
-            && self.resolution.owner() != Some(self.links.id())
+            && self.forwarding()
+            && self.resolution.target() != Some(self.links.id())
         {
             dto::UserFacingCode::PermissionDenied
         } else if self.source_failed {
@@ -911,7 +953,7 @@ impl Owner {
             .prepared()
             .filter(|_| self.capture.is_some() && !self.provisional)
             .map(|prepared| prepared.session());
-        let is_exit = self.resolution.owner() == Some(self.links.id());
+        let is_exit = self.resolution.target() == Some(self.links.id());
         let speaker = dto::SpeakerObservation::from_raw(
             [
                 (1, source.write()),
@@ -936,7 +978,7 @@ impl Owner {
                 (
                     8,
                     self.resolution
-                        .owner()
+                        .target()
                         .filter(|owner| *owner != self.links.id())
                         .map(oink_network::wire_identity::device)
                         .write(),
@@ -964,7 +1006,7 @@ impl Owner {
         // actionable PermissionRequired state instead of CaptureUnavailable.
         let mut fault = [(1, dto::ResourceFaultCode::None.write())]
             .into_iter()
-            .collect::<oink_protocol::v1::RawMap>();
+            .collect::<oink_protocol::v2::RawMap>();
         if let Some(problem) = self.local_problem() {
             fault.insert(1, dto::ResourceFaultCode::from_number(problem.code.number()).write());
             fault.insert(3, problem.to_wire().write());
@@ -988,7 +1030,10 @@ impl Owner {
             if let Some(state) = &volume {
                 let changed = dto::ExitVolumeChanged::from_raw([(1, state.write())].into()).expect("volume state");
                 for member in self.group.members().members.iter().filter(|member| !member.is_self) {
-                    if self.group.peer_supports(member.device, "oink.audio.exit-volume/1") {
+                    if self.group.peer_permits(
+                        member.device,
+                        oink_protocol::v2::registry::type_id::ConfigExitVolumeChanged,
+                    ) {
                         self.group
                             .send_device_control(member.device, Message::ConfigExitVolumeChanged(changed.clone()))
                             .map_err(|_| Failure::ApplyFailed)?;
@@ -1010,12 +1055,8 @@ impl Owner {
             return false;
         };
         // supported_by already rejects PCM16 and anything but Opus5 without quality/1.
-        agreement.contains("oink.audio/1")
-            && profile.supported_by(
-                &self.peer_audio(peer),
-                agreement.contains("oink.audio.quality/1"),
-                v1::limits::DATAGRAM,
-            )
+        let quality = agreement.permits(oink_protocol::v2::registry::type_id::AudioQualitySourceOffer);
+        quality && profile.supported_by(&self.peer_audio(peer), quality, v2::limits::DATAGRAM)
     }
     pub(super) fn prepare_peer(&mut self, peer: DeviceId) {
         if self.update_suspended || self.driver_change_active() {
@@ -1024,30 +1065,37 @@ impl Owner {
         let Some(current_boot) = self.current_boot(peer) else {
             return;
         };
-        if self.group.peer_supports(peer, "oink.audio.state/1") {
+        if self.group.peer_opens(peer, oink_protocol::frame::StreamKind::Audio) {
             self.supported.insert(peer);
             self.streams.enable_state_reports(peer);
         }
         if self.paused || self.power_state.sleeping || !self.resolution.available() {
             return;
         }
-        let Some(stamp) = self.resolution.stamp() else { return };
-        if stamp.owner != self.links.id() {
-            if peer != stamp.owner
-                || !self.settings.forwarding_enabled
-                || !self.group.peer_supports(peer, "oink.audio/1")
+        let (Some(stamp), Some(exit)) = (self.resolution.version(), self.resolution.target()) else {
+            return;
+        };
+        if exit != self.links.id() {
+            if peer != exit
+                || !self.forwarding()
+                || !self
+                    .group
+                    .peer_permits(peer, oink_protocol::v2::registry::type_id::AudioQualitySourceOffer)
             {
                 return;
             }
             let same = self.source_session.offer().is_some_and(|offer| {
-                offer.receiver() == Ok(current_boot.clone()) && offer.exit_claim() == Ok(stamp.to_wire())
+                offer.receiver() == Ok(current_boot.clone()) && offer.route_version() == Ok(stamp.to_wire())
             });
             if !same {
                 self.selected = None;
                 self.streams.forget_preparation(peer);
                 // Choose the profile before beginning the offer: a begun offer
                 // counts as sent above, so an early return must not leave one.
-                let profile = if self.group.peer_supports(peer, "oink.audio.quality/1") {
+                let profile = if self
+                    .group
+                    .peer_permits(peer, oink_protocol::v2::registry::type_id::AudioQualitySourceOffer)
+                {
                     let rate = if self.settings.quality == oink_audio::negotiation::Quality::Lossless {
                         match self.platform.capture_sample_rate() {
                             Ok(rate) => rate,
@@ -1063,7 +1111,7 @@ impl Owner {
                         self.settings.quality.profile(rate),
                         &self.peer_audio(peer),
                         true,
-                        v1::limits::DATAGRAM,
+                        v2::limits::DATAGRAM,
                     ) else {
                         return;
                     };
@@ -1087,11 +1135,23 @@ impl Owner {
             }
             return;
         }
-        if self.mute_cleanup_error.is_some()
-            || self.platform.capture_cleanup_failed()
-            || self.playback_failed
-            || (self.playback.is_none() && !self.playback_idle)
-        {
+        // A definite output failure refuses the offer with its reason, so the
+        // source stops waiting for this exit (pause audit 6). An output that
+        // is still starting is not ready yet and stays silent.
+        let failed = if self.mute_cleanup_error.is_some() || self.platform.capture_cleanup_failed() {
+            Some(Failure::ResourceFault)
+        } else if self.playback_failed {
+            Some(Failure::OutputUnavailable)
+        } else {
+            None
+        };
+        if let Some(reason) = failed {
+            if let Some(offer) = self.offers.remove(&peer) {
+                self.refuse_offer(peer, offer, reason);
+            }
+            return;
+        }
+        if self.playback.is_none() && !self.playback_idle {
             return;
         }
         let Some(offer) = self.offers.get(&peer).cloned() else {
@@ -1107,7 +1167,7 @@ impl Owner {
             return;
         };
         let profile = match oink_audio::negotiation::select(
-            if agreement.contains("oink.audio.quality/1") {
+            if agreement.permits(oink_protocol::v2::registry::type_id::AudioQualitySourceOffer) {
                 offer
                     .preferred_descriptor()
                     .ok()
@@ -1118,8 +1178,8 @@ impl Owner {
                 StreamFormat::Opus5ms
             },
             &self.peer_audio(peer),
-            agreement.contains("oink.audio.quality/1"),
-            v1::limits::DATAGRAM,
+            agreement.permits(oink_protocol::v2::registry::type_id::AudioQualitySourceOffer),
+            v2::limits::DATAGRAM,
         ) {
             Ok(profile) => profile,
             Err(reason) => {
@@ -1171,7 +1231,7 @@ impl Owner {
                 .send(peer, &Message::AudioPrepareRefused(refusal), Instant::now());
         }
     }
-    pub(super) fn reject_prepared(&mut self, peer: DeviceId, prepared: &dto::AudioPrepared, code: v1::ErrorCode) {
+    pub(super) fn reject_prepared(&mut self, peer: DeviceId, prepared: &dto::AudioPrepared, code: v2::ErrorCode) {
         let Ok(stream) = prepared.stream_id() else { return };
         let failure = dto::ProtocolError::from_raw(
             [
@@ -1189,6 +1249,17 @@ impl Owner {
         let _ = self.streams.send(peer, &Message::AudioPreparedAck(ack), Instant::now());
     }
     pub(super) fn message(&mut self, peer: DeviceId, message: Message) {
+        let message = match message {
+            Message::AudioEndpointState(state) => {
+                self.record_mobile_audio_state(peer, state);
+                return;
+            }
+            Message::AudioEndpointResult(result) => {
+                self.record_mobile_audio_result(peer, result);
+                return;
+            }
+            message => message,
+        };
         let driver_change = self.driver_change_active();
         // M0 stays connected while the installer owns native audio. Keep the
         // latest authenticated source intent: dropping its one reliable offer
@@ -1220,9 +1291,9 @@ impl Owner {
                     || offer.receiver() != Ok(boot(self.links.boot()))
                 {
                     Some(Failure::StaleBoot)
-                } else if self.resolution.owner() != Some(self.links.id()) {
+                } else if self.resolution.target() != Some(self.links.id()) {
                     Some(Failure::NotExit)
-                } else if self.resolution.stamp().map(Stamp::to_wire) != offer.exit_claim().ok() {
+                } else if self.resolution.version().map(Version::to_wire) != offer.route_version().ok() {
                     Some(Failure::RouteChanged)
                 } else if self.paused || self.power_state.sleeping || (!driver_change && self.bound_output.is_none()) {
                     Some(Failure::OutputUnavailable)
@@ -1243,16 +1314,16 @@ impl Owner {
                 self.prepare_peer(peer);
             }
             Message::AudioPrepared(wire) => {
-                if self.resolution.owner() != Some(peer) || !self.resolution.available() || self.paused {
+                if self.resolution.target() != Some(peer) || !self.resolution.available() || self.paused {
                     return;
                 }
                 let Ok(descriptor) = wire.descriptor() else { return };
                 let Ok(profile) = StreamFormat::from_descriptor(&descriptor) else {
-                    self.reject_prepared(peer, &wire, v1::ErrorCode::UnsupportedValue);
+                    self.reject_prepared(peer, &wire, v2::ErrorCode::UnsupportedValue);
                     return;
                 };
                 if !self.profile_allowed(peer, profile) {
-                    self.reject_prepared(peer, &wire, v1::ErrorCode::UnnegotiatedCapability);
+                    self.reject_prepared(peer, &wire, v2::ErrorCode::UnnegotiatedCapability);
                     return;
                 }
                 let Ok(output) = wire.session().and_then(|session| session.receiver_output()) else {
@@ -1278,7 +1349,10 @@ impl Owner {
                 self.streams.set_opening(
                     peer,
                     vec![
-                        if self.group.peer_supports(peer, "oink.audio.quality/1") {
+                        if self
+                            .group
+                            .peer_permits(peer, oink_protocol::v2::registry::type_id::AudioQualitySourceOffer)
+                        {
                             Message::AudioQualitySourceOffer(self.source_session.offer().unwrap().clone())
                         } else {
                             Message::AudioSourceRouteOffer(self.source_session.offer().unwrap().clone())
@@ -1294,7 +1368,7 @@ impl Owner {
                     {
                         let _ = self.release_capture();
                     }
-                    if self.exit_switch_deadline.is_some() {
+                    if self.exit_switching {
                         if let Some(encoded) = &mut self.encoded
                             && let Err(error) = encoded.reconfigure(profile.config())
                         {
@@ -1339,10 +1413,26 @@ impl Owner {
                 }
                 self.streams.forget_preparation(peer);
                 self.selected = None;
-                self.stop_source();
+                if matches!(
+                    refused.reason(),
+                    Ok(Failure::NotExit | Failure::RouteChanged | Failure::OutputChanged)
+                ) {
+                    // M0 refusal may arrive before C0's new exit/output facts.
+                    // Retire only the route; this source is still forwarding.
+                    self.exit_switching = self.capture.is_some() || self.held_mute.is_some();
+                } else {
+                    self.stop_source();
+                }
                 // Facts/output changes trigger another offer; refusals never
                 // manufacture another exit or retry against an old generation.
                 self.source_session.retire();
+                // The exit's output failed: say so instead of "waiting for exit".
+                if matches!(
+                    refused.reason(),
+                    Ok(Failure::OutputUnavailable | Failure::ResourceFault)
+                ) {
+                    self.remote_problem = Some(Problem::new(dto::UserFacingCode::DeviceUnavailable));
+                }
             }
             Message::AudioRouteFault(fault) => {
                 if self

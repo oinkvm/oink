@@ -12,7 +12,7 @@ export interface ScreenKey { device: DeviceKey; display: string }
 
 export type { ApiError } from './cards';
 
-export type Os = "macos" | "windows" | "linux" | "other";
+export type Os = "macos" | "windows" | "android" | "ios" | "linux" | "other";
 
 export interface DeviceSummary {
   id: DeviceKey;
@@ -177,7 +177,7 @@ export interface SavedCustomKeymap { table: KeyMapping[]; caps_hold?: number | n
 export interface KeyboardMapping { preset: KeyPreset; table: KeyMapping[]; caps_tap_hold?: { tap: number; hold: number } | null; saved_custom?: SavedCustomKeymap | null }
 export interface TargetTransform { reverse_wheel: boolean; keyboard: KeyboardMapping }
 export interface InputLocalExclusion { scope: string; target: DeviceKey | null; mapping: KeyMapping; reason: string }
-export interface InputTransform { local_exclusions?: InputLocalExclusion[]; macos: TargetTransform; windows: TargetTransform; overrides: { target: DeviceKey; reverse_wheel: boolean | null; keyboard: KeyboardMapping | null }[] }
+export interface InputTransform { local_exclusions?: InputLocalExclusion[]; macos: TargetTransform; windows: TargetTransform; /** Android target row; absent until first edited. */ android?: TargetTransform | null; overrides: { target: DeviceKey; reverse_wheel: boolean | null; keyboard: KeyboardMapping | null }[] }
 export interface ScrollSettings { speed: number }
 export type PointerReference = { type: "last_screen" } | { type: "fixed"; display: string };
 export type PointerScaling = "physical" | "proportional";
@@ -223,7 +223,7 @@ export interface InputSettings {
   gap_travel: boolean;
 }
 
-export type CacheCategory = "clipboard_files" | "drag_files" | "provider_catalog" | "provider_materialized" | "provider_temporary" | "delivered_files";
+export type CacheCategory = "clipboard_files" | "drag_files" | "provider_catalog" | "provider_materialized" | "provider_temporary" | "delivered_files" | "transfer_proxy";
 export interface CacheUsage { categories: { category: CacheCategory; bytes: number; kept_bytes: number }[]; total_bytes: number; incomplete: boolean }
 export interface CacheDevice { device: DeviceKey; usage: CacheUsage }
 export interface CacheDeviceClear { device: DeviceKey; result: { removed_bytes: number; kept_bytes: number; usage: CacheUsage } }
@@ -309,8 +309,48 @@ export interface GameModeStatus {
   cursor_hiding_cause_available: boolean | null;
 }
 
+/** A phone's audio endpoints (protocol v2 AudioEndpointState), read with
+ * `mobile_audio_state`. Targets are opaque fences: pass them back unchanged. */
+export type MobileAudioDirection = 'microphone_send' | 'speaker_receive' | 'speaker_send';
+export interface MobileAudioTarget { boot: unknown; direction: MobileAudioDirection; generation: string; activation_id: number[] | null }
+/** `phase`: EndpointPhase (Off/Starting/Running/Interrupted/Failed); `reason`:
+ * EndpointCloseReason; `refusal`: ControlFailure of the phone's answer to this
+ * PC's last command for the direction, null when accepted (M22/M23). Whether
+ * the phone is the exit / sender is not here: the device card's mode (global
+ * audio configuration) says it. */
+export interface MobileEndpointState { supported: boolean; start_allowed: boolean; phase: number; reason: number; refusal?: number | null; target: MobileAudioTarget }
+export interface MobileAudioState { revision: string; owner: unknown | null; microphone_send: MobileEndpointState; speaker_receive: MobileEndpointState; speaker_send: MobileEndpointState }
+
+/** Route selection (选择线路) of one online device; see the route-selection design §6. */
+export type RouteSelection = { type: 'auto' } | { type: 'address'; ip: string };
+export type RouteRowState = 'measuring' | 'reachable' | 'unreachable';
+export interface RouteRow { ip: string; port: number; state: RouteRowState; rtt_ms: number | null; current: boolean }
+export interface MemberRoutes {
+  device: DeviceKey;
+  /** Ready with route data: direct, or relayed with its direct addresses. */
+  available: boolean;
+  relayed: boolean;
+  /** Relayed: the relaying device's display name. */
+  relay_via_name: string | null;
+  /** The current connection was dialed by the peer. */
+  passive: boolean;
+  /** Actual direct peer IP, including inbound connections. */
+  peer_ip: string | null;
+  current_rtt_ms: number | null;
+  selection: RouteSelection;
+  /** Own remembered target, independent of the current selection. */
+  remembered_ip: string | null;
+  selection_unavailable: boolean;
+  auto_choice: string | null;
+  pending_switch: string | null;
+  can_replace: boolean;
+  pending: boolean;
+  rows: RouteRow[];
+}
+
 export type ApiEvent =
   | { type: "mouse_shortcut_recorded"; data: { token: string; keys: string[] } }
+  | { type: "mobile_audio_state_changed"; data: DeviceKey }
   | { type: "no_shared_microphone" }
   | import('./layoutProfiles').LayoutProfilesEvent
   | { type: "connection_quality"; data: ConnectionQuality }
@@ -419,11 +459,11 @@ export interface AudioSettings {
   keep_local_playback: boolean;
   capture_scope: "default_output" | "global";
   quality: 'smooth' | 'quality' | 'lossless';
-  /** Local speaker source only; has no effect while this device is the exit. */
-  forwarding_enabled: boolean;
-  /** Local speaker forwarding gain, integer 0–200; 100 is unchanged. */
+  /** Local speaker forwarding gain, integer 0–200; 100 is unchanged. The
+   * forward switch itself is the global audio configuration (device cards). */
   forwarding_volume_percent: number;
   forwarding_muted: boolean;
+  echo_cancellation: boolean;
 }
 export interface AudioOutput { id: string; name: string; is_default: boolean }
 export interface AudioDeviceOutputs { device: AudioDeviceId; outputs: AudioOutput[]; capture: string }
@@ -539,7 +579,10 @@ export interface AudioCaptureLevels {
   before_gain: AudioSampleLevels; after_gain: AudioSampleLevels | null;
   wasapi_buffers: number | null; wasapi_silent_buffers: number | null;
 }
-export interface AudioClaimStamp {counter:number;owner:AudioDeviceId}
+/** Version of a global audio register: an HLC stamp taken when the choice was
+ * made, by the device where it was made; every member executes the newest
+ * (stamp, author). */
+export interface AudioRouteVersion {stamp:number;author:AudioDeviceId}
 export interface AudioProblem {code:number;native_code:number|null;retry_after_ms:number|null}
 export interface AudioStatus {
   microphone_input?: string | null;
@@ -547,7 +590,8 @@ export interface AudioStatus {
   /** This node's 3s Low pacing audio hold; speaker silence is excluded. */
   audio_activity: boolean;
   settings: AudioSettings;
-  resolution: {kind:"unknown"}|{kind:"none";barrier:AudioClaimStamp|null}|{kind:"exit";stamp:AudioClaimStamp;available:boolean};
+  /** `unknown` only when the local route setting could not be read or stored. */
+  resolution: {kind:"unknown"}|{kind:"none"}|{kind:"exit";version:AudioRouteVersion;target:AudioDeviceId;available:boolean};
   devices: AudioDeviceOutputs[];
   device_states: AudioDeviceReport[];
   capture_permission: AudioCapturePermission;

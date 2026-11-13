@@ -1,24 +1,24 @@
-//! Clipboard duplicate detection between clipboard synchronizers (0.3.x port
-//! of the 0.4.0 rules; oinkvm/oink#35).
+//! Content echo detection between clipboard synchronizers (0.4.0 user decision).
 //!
-//! Several synchronizers can share one clipboard: Apple Universal Clipboard,
-//! Logi Flow, a vendor "phone link", or two Oink devices that each also run a
-//! third-party syncer. Each one treats the others' writes as new copies, so
-//! content can circle forever.
+//! Several synchronizers can share one clipboard: Apple Universal Clipboard, a
+//! vendor "phone link", or two Oink devices that each also run a third-party
+//! syncer. Each one treats the others' writes as new copies, so content can
+//! circle forever. Oink only compares content: it never marks its own writes
+//! for other programs and has no switch for this.
 //!
-//! Duplicates are suppressed only where content is announced: the sending
-//! side. Received offers are always written. On a local change, in this order:
-//! 1. An Oink clip marker (`crate::clipboard_marker`) naming a known clip
-//!    identifies that clip: not announced (always on; exact).
-//! 2. With "Clipboard deduplication" (device-local setting, default on): a
-//!    *format subset* of the previous clipboard content is not announced,
-//!    whatever its source and however much later. Protocol v1 offers carry no
-//!    content digests, so only previous content this device read itself (its
-//!    own copy) can be compared; content Oink wrote from an offer is lazily
-//!    provided by its source device and is never read to compare: the next
-//!    change is then always announced. Data that only another device can
-//!    provide (Universal Clipboard promised data) is never read either: it
-//!    counts as unknown, never a subset.
+//! Echoes are suppressed only where content is announced: the sending side.
+//! Received offers are always written. Each device remembers the identity
+//! (content fingerprint) of its current clipboard, whether it copied that
+//! content itself or Oink wrote it from an offer (then the offer's digests are
+//! the fingerprint: the lazily written clipboard is never read to compare).
+//! On a local change, in this order:
+//! 1. An Oink clip marker naming a known clip identifies that clip: not
+//!    announced (always on; exact). This is what handles Universal Clipboard.
+//! 2. With "Clipboard deduplication" (device-local setting, default on):
+//!    a *format subset* of the current content is not announced, whatever its
+//!    source and however much later. Off: every other change is announced.
+//!    Data that only another device can provide (Universal Clipboard promised
+//!    data) is never read to compare: it counts as unknown, never a subset.
 //!
 //! The source (an Oink device, or "External") is kept for diagnostics only.
 //!
@@ -42,7 +42,7 @@ use crate::DeviceId;
 use std::fmt;
 
 /// Normalized-text digests are computed from at most this many source bytes.
-/// Larger text gets no digest and is never a duplicate.
+/// Larger text is published without a digest and is never treated as an echo.
 pub const TEXT_DIGEST_BYTES: usize = 16 * 1024 * 1024;
 /// Encoded image bytes read for a pixel digest. Larger images degrade to their
 /// dimensions when the encoded header is readable, and to nothing otherwise.
@@ -108,14 +108,55 @@ impl fmt::Debug for Entry {
 pub struct Fingerprint {
     pub entries: Vec<Entry>,
 }
+impl Fingerprint {
+    /// A single plain-text item (mobile capture and mobile writes).
+    pub fn text(text: &str) -> Self {
+        Self::rich_text(text, None, None)
+    }
+
+    /// A single text item with the rich formats it carries, as a phone
+    /// captures or writes it (2026-11-12: phones keep HTML and RTF next to
+    /// the plain text). The text entry anchors the comparison like on a PC;
+    /// HTML and RTF entries carry their byte size and a digest of their exact
+    /// bytes, so the same text with other formatting is a new copy, and the
+    /// plain text alone is a format subset of the rich content.
+    pub fn rich_text(text: &str, html: Option<&str>, rtf: Option<&str>) -> Self {
+        let (digest, size) = text_digest(text);
+        let mut entry = Entry::new(0, DigestClass::Text);
+        entry.digest = Some(digest);
+        entry.size = Some(size);
+        let mut entries = vec![entry];
+        for (class, value) in [(DigestClass::Html, html), (DigestClass::Rtf, rtf)] {
+            let Some(value) = value else { continue };
+            let mut entry = Entry::new(0, class);
+            entry.digest = Some(rich_digest(class, value.as_bytes()));
+            entry.size = Some(value.len() as u64);
+            entries.push(entry);
+        }
+        Self { entries }
+    }
+}
+
+/// Digest of a rich representation's exact bytes (no normalization: markup
+/// is compared as written).
+fn rich_digest(class: DigestClass, bytes: &[u8]) -> [u8; 32] {
+    let mut hash = blake3::Hasher::new();
+    hash.update(if class == DigestClass::Rtf {
+        b"oink/clipboard/dedupe/rtf/1"
+    } else {
+        b"oink/clipboard/dedupe/htm/1"
+    });
+    hash.update(bytes);
+    *hash.finalize().as_bytes()
+}
+
 /// Where the current clipboard content came from (diagnostics only).
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Source {
     /// An Oink device: this device for local copies, `id.clip.origin` for
     /// content received from Oink.
     Device(DeviceId),
-    /// Written by another synchronizer and recognised as such (Universal
-    /// Clipboard).
+    /// Written by another synchronizer and recognised as such.
     External,
 }
 impl fmt::Debug for Source {
@@ -133,7 +174,7 @@ pub struct Identity {
     pub source: Source,
 }
 
-/// Why a new clipboard is not a duplicate of the previous one.
+/// Why a new clipboard is not an echo of the current one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Fresh {
     Empty,
@@ -147,7 +188,51 @@ pub enum Fresh {
     Unanchored,
 }
 
-/// `Ok(())` when `new` is a duplicate of the previous clipboard content.
+/// Device-local inputs of the content rule (clipboard.md §4).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Rules {
+    /// "Clipboard deduplication" (default on).
+    pub dedupe: bool,
+    /// This device takes other devices' copies.
+    pub receive: bool,
+}
+
+/// Why a local change is announced although no marker named it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NewCopy {
+    /// "Clipboard deduplication" is off: every change is announced.
+    DedupeOff,
+    /// Receiving is off: this device cannot know the group's current
+    /// content, so content is never compared (2026-11-09 D11).
+    NotReceiving,
+    /// The held content belongs to an older clip than the group's current
+    /// one (a newer offer was accepted or seen but not written here):
+    /// copying it again is a new copy (2026-11-09 D11).
+    EarlierClip,
+    /// The content is not a format subset of the held content.
+    Fresh(Fresh),
+}
+
+/// The content rule on the sending side, after the marker rule: whether a
+/// local change is a duplicate of the content this device holds (not
+/// announced) or a new copy. Shared by the PC capture and the phone's
+/// privileged clipboard capture. `held_is_current`: as far as this device
+/// knows, the held content is the group's current clip (no current clip at
+/// all, e.g. its source went offline, is not a newer one).
+pub fn duplicate(new: &Fingerprint, held: &Identity, rules: Rules, held_is_current: bool) -> Result<(), NewCopy> {
+    if !rules.dedupe {
+        return Err(NewCopy::DedupeOff);
+    }
+    if !rules.receive {
+        return Err(NewCopy::NotReceiving);
+    }
+    if !held_is_current {
+        return Err(NewCopy::EarlierClip);
+    }
+    echo(new, held).map_err(NewCopy::Fresh)
+}
+
+/// `Ok(())` when `new` is a duplicate of the current clipboard.
 pub fn echo(new: &Fingerprint, current: &Identity) -> Result<(), Fresh> {
     subset(new, &current.fingerprint)
 }
@@ -297,10 +382,19 @@ impl PixelDigest {
         hash.update(&height.to_le_bytes());
         Self(hash)
     }
+    /// One hash update per row (a per-pixel update costs a call per pixel on
+    /// the capture path); the hashed bytes are the same.
     pub fn rgba_row(&mut self, row: &[u8]) {
-        for pixel in row.as_chunks::<4>().0 {
-            self.0.update(if pixel[3] == 0 { &[0; 4] } else { pixel });
+        let pixels = row.as_chunks::<4>().0;
+        if pixels.iter().all(|pixel| pixel[3] != 0) {
+            self.0.update(pixels.as_flattened());
+            return;
         }
+        let cleared: Vec<u8> = pixels
+            .iter()
+            .flat_map(|pixel| if pixel[3] == 0 { [0; 4] } else { *pixel })
+            .collect();
+        self.0.update(&cleared);
     }
     pub fn finish(self) -> [u8; 32] {
         *self.0.finalize().as_bytes()
@@ -310,6 +404,23 @@ impl PixelDigest {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn row_digest_hashes_the_same_bytes_as_per_pixel_updates() {
+        let rows: [&[u8]; 3] = [&[1, 2, 3, 255, 4, 5, 6, 0, 7], &[9, 9, 9, 9, 8, 8, 8, 8], &[]];
+        let mut reference = blake3::Hasher::new();
+        reference.update(b"oink/clipboard/dedupe/image/1");
+        reference.update(&2u32.to_le_bytes());
+        reference.update(&3u32.to_le_bytes());
+        let mut digest = PixelDigest::new(2, 3);
+        for row in rows {
+            for pixel in row.as_chunks::<4>().0 {
+                reference.update(if pixel[3] == 0 { &[0; 4] } else { pixel });
+            }
+            digest.rgba_row(row);
+        }
+        assert_eq!(digest.finish(), *reference.finalize().as_bytes());
+    }
 
     fn text(item: u32, value: &str) -> Entry {
         let (digest, size) = text_digest(value);
@@ -453,6 +564,61 @@ mod tests {
                 Err(Fresh::Differs(DigestClass::File))
             );
         }
+    }
+
+    #[test]
+    fn plain_text_is_a_subset_of_rich_text_but_not_the_reverse() {
+        let rich = Identity {
+            fingerprint: Fingerprint::rich_text("hello", Some("<b>hello</b>"), Some("{\\rtf1 hello}")),
+            source: A,
+        };
+        // A synchronizer kept only the plain text, or only HTML and text.
+        assert_eq!(echo(&Fingerprint::text("hello\r\n"), &rich), Ok(()));
+        assert_eq!(
+            echo(&Fingerprint::rich_text("hello", Some("<b>hello</b>"), None), &rich),
+            Ok(())
+        );
+        // The same text with other formatting is a new copy.
+        assert_eq!(
+            echo(&Fingerprint::rich_text("hello", Some("<i>hello</i>"), None), &rich),
+            Err(Fresh::Differs(DigestClass::Html))
+        );
+        // Rich content after the plain text is a new copy.
+        let plain = Identity {
+            fingerprint: Fingerprint::text("hello"),
+            source: A,
+        };
+        assert_eq!(
+            echo(&Fingerprint::rich_text("hello", Some("<b>hello</b>"), None), &plain),
+            Err(Fresh::Missing(DigestClass::Html))
+        );
+    }
+
+    #[test]
+    fn the_content_rule_yields_to_the_setting_receiving_and_a_newer_group_clip() {
+        let held = Identity {
+            fingerprint: Fingerprint::text("same"),
+            source: A,
+        };
+        let new = Fingerprint::text("same");
+        let on = Rules {
+            dedupe: true,
+            receive: true,
+        };
+        assert_eq!(duplicate(&new, &held, on, true), Ok(()));
+        assert_eq!(
+            duplicate(&new, &held, Rules { dedupe: false, ..on }, true),
+            Err(NewCopy::DedupeOff)
+        );
+        assert_eq!(
+            duplicate(&new, &held, Rules { receive: false, ..on }, true),
+            Err(NewCopy::NotReceiving)
+        );
+        assert_eq!(duplicate(&new, &held, on, false), Err(NewCopy::EarlierClip));
+        assert_eq!(
+            duplicate(&Fingerprint::text("other"), &held, on, true),
+            Err(NewCopy::Fresh(Fresh::Differs(DigestClass::Text)))
+        );
     }
 
     #[test]

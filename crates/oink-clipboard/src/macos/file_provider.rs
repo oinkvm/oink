@@ -2600,14 +2600,8 @@ mod tests {
         let source = Local::new(vec![(NodeId(1), app)]).unwrap();
         let peer = oink_foundation::DeviceId([2; 32]);
         let grants = SourceGrants::load(&temp.path().join("grants"), [(peer, [1; 32])]).unwrap();
-        grants.set_peer_safe_symlinks(
-            peer,
-            crate::negotiation::CAPABILITIES.contains(&"oink.files.safe-symlinks/1"),
-        );
-        grants.set_peer_exec_bits(
-            peer,
-            crate::negotiation::CAPABILITIES.contains(&"oink.files.exec-bits/1"),
-        );
+        grants.set_peer_safe_symlinks(peer, crate::negotiation::CAPABILITIES.contains(&"oink.clipboard/2"));
+        grants.set_peer_exec_bits(peer, crate::negotiation::CAPABILITIES.contains(&"oink.clipboard/2"));
         let token = grants.issue(peer, source.as_ref(), &[NodeId(1)]).unwrap();
         let received = grants.open(peer, token).unwrap();
         let key = "e".repeat(64);
@@ -3309,6 +3303,78 @@ mod tests {
         assert_eq!(filled.catalog.records[0].hidden, None);
     }
 
+    /// A phone's files held by its proxy PC: one received-files folder per
+    /// phone ID. Renames keep it, same-name phones get their own, the mapping
+    /// is read back from disk, and a deleted folder is recreated from the ID.
+    #[test]
+    fn phone_files_get_one_received_folder_per_phone_id() {
+        let root = tempfile::tempdir().unwrap();
+        let files = tempfile::tempdir().unwrap();
+        let photo = files.path().join("photo.jpg");
+        std::fs::write(&photo, b"jpeg").unwrap();
+        let first = oink_foundation::DeviceId([0xa1; 32]);
+        let second = oink_foundation::DeviceId([0xa2; 32]);
+        let mut batches = 0;
+        let mut deliver = |phone: oink_foundation::DeviceId| {
+            batches += 1;
+            let key = format!("{batches:064}");
+            let namespace =
+                crate::content::namespace::Local::received_from(vec![(NodeId(1), photo.clone())], phone).unwrap();
+            let (batch, _) =
+                prepare_batch(namespace, &key, "t".into(), 1, root.path().join(format!("{key}.json"))).unwrap();
+            let parent = batch.state.lock().unwrap().catalog.records[0].parent.clone();
+            // Every container generation of one device lives in that device's catalog.
+            let catalog = root.path().join(format!("source{}.json", phone.to_hex()));
+            let source: Catalog = serde_json::from_slice(&std::fs::read(catalog).unwrap()).unwrap();
+            let name = source
+                .records
+                .iter()
+                .find(|record| record.id == parent)
+                .unwrap()
+                .name
+                .clone();
+            (parent, name)
+        };
+        crate::received::remember_source(first, ".Pixel".into());
+        let (parent, name) = deliver(first);
+        assert_eq!(parent, format!("source{}", first.to_hex()));
+        assert_eq!(
+            name, "Pixel a1a1a1a1a1a1",
+            "a readable, visible name from the first display name"
+        );
+
+        crate::received::remember_source(first, "Renamed".into());
+        assert_eq!(
+            deliver(first),
+            (parent.clone(), name.clone()),
+            "a rename moved the phone's files"
+        );
+
+        crate::received::remember_source(second, ".Pixel".into());
+        let (other, other_name) = deliver(second);
+        assert_eq!(other, format!("source{}", second.to_hex()));
+        assert_eq!(other_name, "Pixel a2a2a2a2a2a2", "same-name phones share a folder");
+
+        // The mapping lives on disk, keyed by the full ID.
+        let saved: std::collections::BTreeMap<String, String> =
+            serde_json::from_slice(&std::fs::read(root.path().join("received.sources")).unwrap()).unwrap();
+        assert_eq!(saved.get(&first.to_hex()), Some(&name));
+        assert_eq!(saved.get(&second.to_hex()), Some(&other_name));
+
+        // The user deletes the phone's folder: the next file recreates it from
+        // the ID's saved name, not from the phone's current display name.
+        let source_path = root.path().join(format!("{parent}.json"));
+        let source: Catalog = serde_json::from_slice(&std::fs::read(&source_path).unwrap()).unwrap();
+        std::fs::write(
+            root.path().join(format!("{parent}.received")),
+            serde_json::to_vec(&serde_json::json!({&parent:{"record":source.records[0],"received_at":1,"handed_off":false,"materialized":false,"deleted":true}})).unwrap(),
+        )
+        .unwrap();
+        let (rebuilt, rebuilt_name) = deliver(first);
+        assert_ne!(rebuilt, parent);
+        assert!(rebuilt.starts_with(&parent));
+        assert_eq!(rebuilt_name, name);
+    }
     #[test]
     fn a_new_delivery_does_not_restore_a_trashed_source_folder_or_move_its_old_batches() {
         let data = tempfile::tempdir().unwrap();

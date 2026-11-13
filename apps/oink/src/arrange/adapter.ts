@@ -42,6 +42,7 @@ export function renderLayout(
     const resolution = displayResolution(screen.display);
     return {
       id,
+      android: screen.os === 'android',
       device: screen.key.device,
       name: screen.device_name,
       x: origin.x * RENDER_SCALE,
@@ -61,12 +62,12 @@ export function renderLayout(
 // Resolve card presentation after history so names and connectivity stay live.
 export function presentScreens(
   screens: Screen[],
-    devices: ReadonlyArray<Pick<Device, 'id' | 'name' | 'group'>>,
+    devices: ReadonlyArray<Pick<Device, 'id' | 'name' | 'group' | 'privileged'>>,
 ): Screen[] {
     const cards = new Map(devices.map(device => [device.id, device]));
     return screens.map(screen => {
         const device = cards.get(screen.device ?? '');
-        return { ...screen, name: device?.name ?? screen.name, offline: device?.group === 'offline' };
+        return { ...screen, name: device?.name ?? screen.name, privileged: device?.privileged, offline: device?.group === 'offline' || (screen.android === true && device?.privileged === false) };
     });
 }
 

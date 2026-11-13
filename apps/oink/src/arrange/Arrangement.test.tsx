@@ -611,3 +611,11 @@ describe('auto-compaction follows manual edits only', () => {
     expect(next[1].x).toBeCloseTo(1120);
   });
 });
+
+it('renders a phone with the existing Android badge and existing offline tile', () => {
+  const screens:Screen[]=[{id:'phone:android:built-in',device:'phone',name:'Phone',wallpaper:0,x:0,y:0,w:400,h:800,android:true,privileged:true,offline:true,labelWidth:400,labelHeight:800}];
+  const {container}=render(<Arrangement screens={screens} selectedId={null} onSelect={vi.fn()} onScreensChange={vi.fn()} settings={settings}/>);
+  expect(container.querySelector('.scr .os-logo[data-os="android"][data-privileged]')).toBeTruthy();
+  expect(container.querySelector('.scr__body[data-offline]')).toBeTruthy();
+  expect(container.querySelector('.scr')!.getAttribute('aria-label')).toContain('Phone');
+});

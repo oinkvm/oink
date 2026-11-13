@@ -113,6 +113,9 @@ pub enum CaptureDiscard {
     PersistFailure = 13,
     InvalidOfferId = 14,
     RegistrationFailure = 15,
+    /// A newer group offer was accepted while this capture ran (no local
+    /// change was pending): the captured clipboard is older than that offer.
+    Superseded = 16,
 }
 /// At most 1024 discarded captures plus one truncation record per minute.
 /// A pathological Busy backend cannot flood ordinary logs or the recorder.

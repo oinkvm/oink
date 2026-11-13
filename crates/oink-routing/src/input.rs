@@ -41,6 +41,21 @@ pub enum InputMsg {
         dx: f64,
         dy: f64,
     },
+    /// Pointer motion from a screenless member, in pointer units (one logical
+    /// point on the pointer base computer's primary screen, protocol §14.3).
+    /// The focus holder converts it to canvas units; otherwise like `Motion`.
+    PointerMotion {
+        seq: u64,
+        dx: f64,
+        dy: f64,
+    },
+    /// Committed input-method text (protocol §12): routed like a key press to
+    /// the focus holder, in the same ordered stream as keys. `seq` increases
+    /// per source Boot; the holder injects only newer ones.
+    Text {
+        seq: u64,
+        text: String,
+    },
     /// 物理键按下/抬起（HID Usage）。目标路由负责修饰键合并与输入转换；自动重复见 [`InputMsg::KeyRepeat`]。
     /// 目标端对同一源重复的按下是幂等的：焦点进入时源机用它发送修饰键快照。
     Key {
@@ -150,12 +165,12 @@ impl InputMsg {
 pub struct VolumeRoute {
     pub source: Boot,
     pub target: Boot,
-    pub session: std::sync::Arc<oink_protocol::v1::dto::AudioSessionContext>,
+    pub session: std::sync::Arc<oink_protocol::v2::dto::AudioSessionContext>,
 }
 impl VolumeRoute {
     /// Borrow retained fields without allocating a second DTO tree on capture.
-    pub fn from_session(session: std::sync::Arc<oink_protocol::v1::dto::AudioSessionContext>) -> Option<Self> {
-        use oink_protocol::v1::{RawMap, RawValue, schema::WireDto};
+    pub fn from_session(session: std::sync::Arc<oink_protocol::v2::dto::AudioSessionContext>) -> Option<Self> {
+        use oink_protocol::v2::{RawMap, RawValue, schema::WireDto};
         fn map(value: &RawValue) -> Option<&RawMap> {
             if let RawValue::Map(value) = value {
                 Some(value)
@@ -166,7 +181,7 @@ impl VolumeRoute {
         fn boot(value: &RawValue) -> Option<Boot> {
             let value = map(value)?;
             let device = map(value.get(&1)?)?;
-            if !matches!(device.get(&1),Some(RawValue::Text(algorithm)) if algorithm==oink_protocol::v1::dto::ED25519) {
+            if !matches!(device.get(&1),Some(RawValue::Text(algorithm)) if algorithm==oink_protocol::v2::dto::ED25519) {
                 return None;
             }
             let (RawValue::Bytes(key), RawValue::Bytes(nonce)) = (device.get(&2)?, value.get(&2)?) else {

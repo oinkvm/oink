@@ -15,7 +15,7 @@ beforeEach(()=>{
   mocks.group.mockResolvedValue({members:[]});
   mocks.state={localPreferences:{notification_level:'default',ui_language:'system',theme_mode:'system',theme_accent:{light:'#2E7BFF',dark:'#5599FF'},show_status_icon:true,confirm_quit:true,paste_as_file:true,log_level:'info',log_max_mb:1024},
     input:{event_frequency:'unlimited',wake_displays_on_input:true,cursor_trail:false,accept_contacts:true,touchpad_injection_enabled:true,mac_scroll_feel:true,device_gain:1,emergency_hold_ms:5000,hotkeys:[]},
-    clipboard:{text:true,rich_text:true,images:true,files:true,custom:true},audio:{settings:{keep_local_playback:true,receive_output:null,forwarding_enabled:true}}};
+    clipboard:{text:true,rich_text:true,images:true,files:true,custom:true},audio:{settings:{keep_local_playback:true,receive_output:null,forwarding_muted:true}}};
   mocks.call.mockResolvedValue(mocks.state.localPreferences);
 });
 afterEach(cleanup);
@@ -144,13 +144,13 @@ it('defaults sponsor visibility without persisting it, then retains only explici
   expect(mocks.call).not.toHaveBeenCalled();
 });
 
-it.each([false,true])('does not rewrite explicit forwarding=%s when loading or editing audio preferences',async enabled=>{
-  (mocks.state.audio as {settings:{forwarding_enabled:boolean}}).settings.forwarding_enabled=enabled;
+it.each([false,true])('does not rewrite an explicit forwarding mute=%s when loading or editing audio preferences',async muted=>{
+  (mocks.state.audio as {settings:{forwarding_muted:boolean}}).settings.forwarding_muted=muted;
   const {result}=renderHook(usePreferences);
   expect(mocks.audio).not.toHaveBeenCalled();
   await act(async()=>result.current.set('keepLocalPlayback',false));
   expect(mocks.audio).toHaveBeenCalledExactlyOnceWith({keep_local_playback:false});
-  expect((mocks.state.audio as {settings:{forwarding_enabled:boolean}}).settings.forwarding_enabled).toBe(enabled);
+  expect((mocks.state.audio as {settings:{forwarding_muted:boolean}}).settings.forwarding_muted).toBe(muted);
 });
 
 it.each(['disabled','minimal','default','verbose'] as const)('persists notification level %s as one device-local field',async level=>{

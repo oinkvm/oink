@@ -32,6 +32,9 @@
         "runtime"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -48,6 +51,92 @@
       "linkage": "static",
       "patentNotices": "Patent declarations are retained verbatim in COPYING; see its IETF references.",
       "modificationNotice": "The opusic-sys upstream vendor applies opus.patch to CMake runtime and OSCE build definitions. Oink makes no further Opus source changes; the patch is preserved with the native terms."
+    },
+    {
+      "id": "native:webrtc-audio-processing@d0569cfa (AEC3 subset)",
+      "name": "WebRTC audio processing (AEC3 subset)",
+      "version": "d0569cfa50c1858ee279d77b3fc8870be6902441",
+      "ecosystem": "native",
+      "repository": "https://gitlab.freedesktop.org/pulseaudio/webrtc-audio-processing",
+      "source": {
+        "url": "https://gitlab.freedesktop.org/pulseaudio/webrtc-audio-processing/-/tree/d0569cfa50c1858ee279d77b3fc8870be6902441",
+        "integrity": "sha256:1bdaff346c597092533f59f74500e620e4e74d184b0f3d106f9367126f1057e3"
+      },
+      "licenseExpression": "BSD-3-Clause",
+      "selectedLicense": "BSD-3-Clause",
+      "licenseFiles": [
+        {
+          "path": "crates/oink-audio/native/aec3/vendor/webrtc/LICENSE",
+          "sha256": "ab00a482b6a3902e40211b43c5d0441962ea99b6cc7c25c0f243fa270b78d482"
+        },
+        {
+          "path": "crates/oink-audio/native/aec3/vendor/webrtc/PATENTS",
+          "sha256": "01462e2068d1a04c2274f3389773014c14ed9bc3446b28303543bd3e3c064145"
+        },
+        {
+          "path": "crates/oink-audio/native/aec3/vendor/webrtc/AUTHORS",
+          "sha256": "705caaeede8c3bc8c8e3f76489864a5b0575b42cb4a38091f88b9126c3e6628d"
+        },
+        {
+          "path": "crates/oink-audio/native/aec3/vendor/webrtc/common_audio/third_party/ooura/LICENSE",
+          "sha256": "25b7731b70c77ecd5f3bb19303fbaa99be18860f81d44f71da670fdcd04829db"
+        },
+        {
+          "path": "crates/oink-audio/native/aec3/NOTICE",
+          "sha256": "2419ba32051d9430aaa918db7bd5cd76d976d2b2fcf4364e3e7e0aa36565d83f"
+        }
+      ],
+      "modified": true,
+      "scope": [
+        "runtime"
+      ],
+      "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
+        "macos-arm64",
+        "macos-x64",
+        "windows-x64"
+      ],
+      "linkage": "static",
+      "patentNotices": "The WebRTC additional patent grant is retained verbatim in PATENTS.",
+      "modificationNotice": "Vendored as oink-aec3 (crates/oink-audio/native/aec3): AEC3 only, fixed stereo, namespace and symbol isolation, and realtime-storage.patch; its NOTICE lists every change. Includes the Takuya Ooura FFT under its own permission notice. The source integrity is vendor-manifest.json, which pins every vendored file."
+    },
+    {
+      "id": "native:abseil-cpp@20240722.0",
+      "name": "Abseil C++ (headers used by AEC3)",
+      "version": "20240722.0",
+      "ecosystem": "native",
+      "repository": "https://github.com/abseil/abseil-cpp",
+      "source": {
+        "url": "https://github.com/abseil/abseil-cpp/archive/refs/tags/20240722.0.tar.gz",
+        "integrity": "sha256:f50e5ac311a81382da7fa75b97310e4b9006474f9560ac46f54a9967f07d4ae3"
+      },
+      "licenseExpression": "Apache-2.0",
+      "selectedLicense": "Apache-2.0",
+      "licenseFiles": [
+        {
+          "path": "crates/oink-audio/native/aec3/vendor/abseil/LICENSE",
+          "sha256": "c79a7fea0e3cac04cd43f20e7b648e5a0ff8fa5344e644b0ee09ca1162b62747"
+        },
+        {
+          "path": "crates/oink-audio/native/aec3/vendor/abseil/AUTHORS",
+          "sha256": "1fd39030c119b4c97014f59e0ad0ed65f23475bbdf55a52740f31eb82b34b4ee"
+        }
+      ],
+      "modified": false,
+      "scope": [
+        "runtime"
+      ],
+      "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
+        "macos-arm64",
+        "macos-x64",
+        "windows-x64"
+      ],
+      "linkage": "static"
     },
     {
       "id": "native:WixToolset.Firewall.wixext@5.0.2",
@@ -2010,6 +2099,113 @@
         "Copyright (c) 2026 Lucide Icons and Contributors"
       ],
       "ownership": "third-party"
+    },
+    {
+      "id": "asset:lucide-icons@0.468.0",
+      "name": "Lucide icons",
+      "version": "0.468.0",
+      "ecosystem": "asset",
+      "repository": "https://github.com/lucide-icons/lucide",
+      "source": {
+        "url": "https://registry.npmjs.org/lucide-react/-/lucide-react-0.468.0.tgz",
+        "integrity": "sha512-6koYRhnM2N0GGZIdXzSeiNwguv1gt/FAjZOiPl76roBi3xKEXa4WmfpxgQwTTL4KipXjefrnf3oV4IsYhi4JFA=="
+      },
+      "path": "apps/mobile/android/tools/export_design_icons.mjs",
+      "sha256": "d985419856253bcee25c948ca10ec144e1da872a2f3c45f838ae79a2a2872311",
+      "copies": [
+        {
+          "path": "scripts/mobile/generate-ios-ui-assets.mjs",
+          "sha256": "860274bd7e25e6409243815f8718f84b2b33d19bb8338d16c699156a8bddb076",
+          "platforms": [
+            "ios-arm64"
+          ]
+        }
+      ],
+      "licenseExpression": "ISC AND MIT",
+      "selectedLicense": "ISC AND MIT",
+      "modified": true,
+      "modificationNotice": "The mobile apps convert the lucide-react icons used by the Oink mobile design into vector path data (Android) and PDF image assets (iOS); shapes unchanged.",
+      "provenance": "Pinned to the two export scripts that bring the icons from lucide-react 0.468.0 into apps/mobile (Android DesignIconData.kt, iOS Assets.xcassets/UI). Feather-derived icons keep their MIT notice.",
+      "scope": [
+        "runtime"
+      ],
+      "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64"
+      ],
+      "licenseFiles": [
+        {
+          "path": "licenses/native/Lucide-0.468.0-LICENSE.txt",
+          "sha256": "1e7290b35280a048667bbf0ebabac1c7fd52a75300e8b2946ac165715997f2bc"
+        },
+        {
+          "path": "licenses/native/Lucide-Feather-MIT-LICENSE.txt",
+          "sha256": "57e66499f20de5d76a2c63ff5f89c5f681252bb57ca125b9612eb0ebd2c751c7"
+        }
+      ],
+      "copyright": [
+        "Copyright (c) for portions of Lucide are held by Cole Bemis 2013-2022 as part of Feather (MIT). All other copyright (c) for Lucide are held by Lucide Contributors 2022.",
+        "Copyright (c) 2013-present Cole Bemis"
+      ],
+      "ownership": "third-party"
+    },
+    {
+      "id": "asset:android-robot-head@2026-11-08",
+      "name": "Android™ robot head (adapted)",
+      "version": "2026-11-08",
+      "ecosystem": "asset",
+      "repository": "https://developer.android.com/distribute/marketing-tools/brand-guidelines",
+      "source": {
+        "url": "https://developer.android.com/static/images/brand/android-head_flat.svg",
+        "integrity": "sha256:b36cb6f703556a27526fc336ae4d8705844c87c1e5e8aaf360b49aa08d19f065"
+      },
+      "path": "apps/oink/src/devices/androidHead.ts",
+      "sha256": "b36cb6f703556a27526fc336ae4d8705844c87c1e5e8aaf360b49aa08d19f065",
+      "licenseExpression": "CC-BY-3.0",
+      "selectedLicense": "CC-BY-3.0",
+      "modified": true,
+      "modificationNotice": "Shapes unchanged; drawn in the official file's #34A853 with the eyes in the background colour as a knockout; the privileged-mode badge adds a gold crown above the head (Oink addition).",
+      "scope": [
+        "runtime"
+      ],
+      "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
+        "macos-arm64",
+        "macos-x64",
+        "windows-x64"
+      ],
+      "licenseFiles": [
+        {
+          "path": "licenses/native/CC-BY-3.0.txt",
+          "sha256": "e6bc9e9c474700b708f568bac9e5a8a9bcb2b1dad53442f5ba449fcb848b8e76"
+        }
+      ],
+      "copyright": [
+        "The Android robot is reproduced or modified from work created and shared by Google and used according to terms described in the Creative Commons 3.0 Attribution License.",
+        "Android is a trademark of Google LLC."
+      ],
+      "ownership": "third-party",
+      "compatibilityReview": "Brand artwork drawn as a separate visual asset in the device badge, not code combined with Oink GPL sources. CC BY 3.0 permits adapted redistribution with attribution, the license reference and a modification notice, all kept in this entry; the trademark notice is retained.",
+      "copies": [
+        {
+          "path": "apps/mobile/android/tools/export_design_icons.mjs",
+          "sha256": "d985419856253bcee25c948ca10ec144e1da872a2f3c45f838ae79a2a2872311",
+          "platforms": [
+            "android-arm64",
+            "android-x64"
+          ]
+        },
+        {
+          "path": "scripts/mobile/generate-ios-ui-assets.mjs",
+          "sha256": "860274bd7e25e6409243815f8718f84b2b33d19bb8338d16c699156a8bddb076",
+          "platforms": [
+            "ios-arm64"
+          ]
+        }
+      ]
     },
     {
       "id": "asset:oink-menu-audio@99177878f30d",

@@ -197,7 +197,7 @@ mod tests {
         assert!(!hidden.accepts(&ApiEvent::Audio(audio.clone())));
         assert!(!visible.accepts(&ApiEvent::Audio(audio.clone())));
         audio.problem = Some(oink_audio::Problem::new(
-            oink_protocol::v1::dto::UserFacingCode::DeviceUnavailable,
+            oink_protocol::v2::dto::UserFacingCode::DeviceUnavailable,
         ));
         assert!(hidden.accepts(&ApiEvent::Audio(audio)));
         assert!(!hidden.accepts(&ApiEvent::InputStats(Default::default())));

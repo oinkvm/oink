@@ -8,7 +8,7 @@ use oink_display::layout::{Layout, ScreenId};
 use oink_foundation::DeviceId;
 use oink_locator::projection::{NamedProjection, ProjectionOverlay, View};
 use oink_network::link::{ModuleEvent, ModulePort};
-use oink_protocol::v1;
+use oink_protocol::v2;
 pub(crate) mod model;
 pub(crate) mod wire;
 use crate::layout_profiles::{render as arrangement, types::ArrangementSnapshot};
@@ -292,7 +292,7 @@ fn receive(node: &Node, peer: DeviceId, msg: Action, now: Instant) {
                         s.rect = p.rect;
                     }
                 }
-                if crate::config_module::layout_wire::to_wire(&layout, oink_protocol::v1::dto::LayoutSource::Manual)
+                if crate::config_module::layout_wire::to_wire(&layout, oink_protocol::v2::dto::LayoutSource::Manual)
                     .is_err()
                 {
                     return;
@@ -540,7 +540,7 @@ pub(crate) fn start(node: Node, mut port: ModulePort, native: bool) -> anyhow::R
                     let opening = current_messages(&node)
                         .iter()
                         .filter_map(|action| encode_for_peer(&node, peer, action).transpose())
-                        .collect::<v1::Result<Vec<_>>>();
+                        .collect::<v2::Result<Vec<_>>>();
                     let encoded = encode_for_peer(&node, peer, message);
                     let outcome = match (&opening, &encoded) {
                         (Err(_), _) | (_, Err(_)) => "invalid_local_state",
@@ -603,11 +603,9 @@ fn current_messages(node: &Node) -> Vec<Action> {
     messages
 }
 
-fn encode_for_peer(node: &Node, peer: DeviceId, action: &Action) -> v1::Result<Option<v1::Message>> {
+fn encode_for_peer(node: &Node, peer: DeviceId, action: &Action) -> v2::Result<Option<v2::Message>> {
     let config = node.link_config().expect("started config");
-    let capable = config
-        .peer_agreement(peer)
-        .is_some_and(|a| a.contains("oink.layout.preview/1"));
+    let capable = config.peer_permits(peer, oink_protocol::v2::registry::type_id::ArrangementPreview);
     let applied = config.applied();
     encode_selected(action, capable, &applied.layout, &applied.owners)
 }
@@ -616,7 +614,7 @@ fn encode_selected(
     capable: bool,
     live: &Layout,
     owners: &arrangement::Owners,
-) -> v1::Result<Option<v1::Message>> {
+) -> v2::Result<Option<v2::Message>> {
     match action {
         Action::Arrangement { sequence, snapshot, .. } if !capable => {
             let screens = if let Some(snapshot) = snapshot {
@@ -854,7 +852,7 @@ mod integration_tests {
     use super::*;
     use crate::api::AgentApi;
     use crate::snapshot_tests::{Displays, common, start_with_clip};
-    use oink_protocol::v1::schema::WireDto;
+    use oink_protocol::v2::schema::WireDto;
 
     #[test]
     fn same_machine_projections_have_shared_numbers_and_remain_informational() {
@@ -1082,7 +1080,7 @@ mod integration_tests {
             }
             handoff.await;
             let config = a.link_config().unwrap();
-            assert!(config.peer_agreement(b.id()).unwrap().contains("oink.layout.preview/1"));
+            assert!(config.peer_agreement(b.id()).unwrap().contains("oink.layout/2"));
             let live = a.layout().0;
             let owners = config.applied().owners.clone();
             let mut snapshot = arrangement::capture(&live, &owners);
@@ -1099,9 +1097,9 @@ mod integration_tests {
             };
             let rigid = action(snapshot.clone(), 1);
             let modern = encode_selected(&rigid, true, &live, &owners).unwrap().unwrap();
-            assert!(matches!(modern, v1::Message::ArrangementPreview(_)));
+            assert!(matches!(modern, v2::Message::ArrangementPreview(_)));
             let legacy = encode_selected(&rigid, false, &live, &owners).unwrap().unwrap();
-            assert!(matches!(legacy, v1::Message::ProjectionPreview(_)));
+            assert!(matches!(legacy, v2::Message::ProjectionPreview(_)));
             if let Action::Preview {
                 screens: Some(screens), ..
             } = wire::decode(legacy).unwrap()
@@ -1124,19 +1122,19 @@ mod integration_tests {
             let native = action(snapshot.clone(), 2);
             assert!(encode_selected(&native, false, &live, &owners).unwrap().is_none());
             let message = encode_selected(&native, true, &live, &owners).unwrap().unwrap();
-            if let v1::Message::ArrangementPreview(m) = &message {
+            if let v2::Message::ArrangementPreview(m) = &message {
                 assert_eq!(
                     m.arrangement().unwrap().unwrap().raw(),
                     &match crate::layout_profiles::wire::snapshot(&snapshot).unwrap() {
-                        v1::RawValue::Map(m) => m,
+                        v2::RawValue::Map(m) => m,
                         _ => unreachable!(),
                     }
                 );
             }
-            let bytes = v1::frame::encode(&message, v1::limits::RELIABLE_FRAME).unwrap();
+            let bytes = v2::frame::encode(&message, v2::limits::RELIABLE_FRAME).unwrap();
             assert_eq!(
                 wire::decode(
-                    v1::frame::OpaqueFrame::parse_exact(&bytes, v1::limits::RELIABLE_FRAME)
+                    v2::frame::OpaqueFrame::parse_exact(&bytes, v2::limits::RELIABLE_FRAME)
                         .unwrap()
                         .decode()
                         .unwrap()

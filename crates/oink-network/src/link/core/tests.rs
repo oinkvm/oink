@@ -26,6 +26,15 @@ impl Rig {
         self.nodes[n].boot.device_id
     }
     fn connect(&mut self, a: usize, b: usize) -> ConnectionId {
+        self.connect_with(a, b, true)
+    }
+    /// Node `n` is a phone: a relay endpoint that never forwards.
+    fn phone(&mut self, n: usize) {
+        self.nodes[n].set_forwards(false);
+    }
+    /// `relay`: whether the two ends negotiated oink.relay/1. Each end sees
+    /// the other as a relay station unless the other is a phone.
+    fn connect_with(&mut self, a: usize, b: usize, relay: bool) -> ConnectionId {
         let id = ConnectionId {
             initiator_boot: self.nodes[a].boot,
             random: rand::random(),
@@ -33,9 +42,23 @@ impl Rig {
         self.connections.insert(id, (a, b));
         for (local, remote) in [(a, b), (b, a)] {
             let boot = self.nodes[remote].boot;
-            self.nodes[local].authenticated(boot, id, self.now);
+            let role = match (relay, self.nodes[remote].forwards) {
+                (false, _) => RelayRole::None,
+                (true, false) => RelayRole::Endpoint,
+                (true, true) => RelayRole::Station,
+            };
+            self.nodes[local].authenticated_at(boot, id, None, role, self.now);
         }
         id
+    }
+    fn path_requests_on(&self, connection: ConnectionId) -> usize {
+        self.observed
+            .iter()
+            .filter(|(_, e)| {
+                matches!(e, Effect::Control { connection: c, message, .. }
+                if *c == connection && matches!(**message, LinkMsg::PathRequest { .. }))
+            })
+            .count()
     }
     fn pump(&mut self) {
         self.pump_holding(&mut vec![], |_, _| false);
@@ -293,6 +316,171 @@ fn pending_relay_request_follows_direct_readiness_without_a_new_attempt() {
             assert!(r.observed.iter().all(|(_, e)| !matches!(e, Effect::DialFailed(_, _))));
             assert_eq!(r.now + RELAY_TIMEOUT, request.deadline);
         }
+    }
+}
+
+#[test]
+fn relay_search_skips_a_neighbor_that_does_not_forward() {
+    // Node 1 is a phone: a relay endpoint (or, before 0.4.0's relay endpoint,
+    // no oink.relay/1 at all), never a relay station. Node 0 searches a route
+    // to node 2, starting before and after the phone link is ready.
+    for (dial_first, relay) in [(true, false), (false, false), (true, true), (false, true)] {
+        let mut r = Rig::new(3);
+        let peer = r.peer(2);
+        if dial_first {
+            r.nodes[0]
+                .dial(peer, vec![], DialMode::PreferDirect, DialOrigin::Initial, r.now)
+                .unwrap();
+            r.pump();
+        }
+        r.phone(1);
+        let phone = r.connect_with(0, 1, relay);
+        r.pump();
+        r.ready(0, 1);
+        if !dial_first {
+            r.nodes[0]
+                .dial(peer, vec![], DialMode::PreferDirect, DialOrigin::Initial, r.now)
+                .unwrap();
+            r.pump();
+        }
+        assert!(r.nodes[0].dials[&peer].request.is_some(), "the search is live");
+        assert_eq!(r.path_requests_on(phone), 0, "a phone is never asked to relay");
+        assert!(r.nodes[0].peer_link(r.peer(1)).is_some(), "the phone link stays up");
+    }
+}
+
+#[test]
+fn relay_does_not_forward_a_request_to_a_target_without_relay() {
+    // Node 2 is a device without oink.relay/1, reachable only from node 1.
+    let mut r = Rig::new(3);
+    r.connect(0, 1);
+    r.phone(2);
+    let phone = r.connect_with(1, 2, false);
+    r.pump();
+    r.ready(0, 1);
+    r.ready(1, 2);
+    let target = r.peer(2);
+    r.nodes[0]
+        .dial(target, vec![], DialMode::PreferDirect, DialOrigin::Initial, r.now)
+        .unwrap();
+    r.pump();
+    assert_eq!(r.path_requests_on(phone), 0);
+    assert!(r.nodes[0].peer_link(target).is_none());
+    assert!(r.nodes[1].peer_link(target).is_some(), "the relay keeps its phone link");
+}
+
+#[test]
+fn a_pc_reaches_a_phone_endpoint_through_a_pc_relay_station() {
+    // Node 0 (PC A) cannot reach node 2 (phone) directly; node 1 (PC B) can.
+    // Either end may start the search: the phone also dials its members.
+    for source in [0, 2] {
+        let mut r = Rig::new(3);
+        r.phone(2);
+        r.connect(0, 1);
+        let phone = r.connect(1, 2);
+        r.pump();
+        r.ready(0, 1);
+        r.ready(1, 2);
+        let target = r.peer(2 - source);
+        r.nodes[source]
+            .dial(target, vec![], DialMode::PreferDirect, DialOrigin::Initial, r.now)
+            .unwrap();
+        r.pump();
+        for (local, remote) in [(0, 2), (2, 0)] {
+            let id = r.nodes[local].peer_link(r.peer(remote)).expect("relayed link");
+            assert_eq!(r.nodes[local].links[&id].path(), LinkPath::Relayed { via: r.peer(1) });
+        }
+        assert_eq!(r.nodes[1].transit_paths().len(), 1, "the PC carries the path");
+        if source == 0 {
+            assert_eq!(
+                r.path_requests_on(phone),
+                1,
+                "only the reserved request reaches the phone"
+            );
+        }
+        assert!(r.observed.iter().all(|(_, e)| !matches!(e, Effect::DialFailed(_, _))));
+    }
+}
+
+#[test]
+fn a_relay_endpoint_never_forwards_another_devices_path() {
+    // Node 1 is a phone with direct links to PCs 0 and 2. A search from node 0
+    // never asks it, and a request it receives anyway (a peer bug) is not
+    // forwarded.
+    let mut r = Rig::new(3);
+    r.phone(1);
+    let to_phone = r.connect(0, 1);
+    let onward = r.connect(1, 2);
+    r.pump();
+    r.ready(0, 1);
+    r.ready(1, 2);
+    let target = r.peer(2);
+    r.nodes[0]
+        .dial(target, vec![], DialMode::PreferDirect, DialOrigin::Initial, r.now)
+        .unwrap();
+    r.pump();
+    assert_eq!(r.path_requests_on(to_phone), 0, "a phone is never asked to relay");
+    let request = PathRequestId {
+        source_boot: r.nodes[0].boot,
+        random: [7; 16],
+    };
+    r.nodes[1].receive(
+        to_phone,
+        0,
+        LinkMsg::PathRequest {
+            reservation: None,
+            request_id: request,
+            expected_target_boot: None,
+            target,
+            round: 1,
+        },
+        r.now,
+    );
+    r.pump();
+    assert_eq!(r.path_requests_on(onward), 0, "the phone forwards nothing");
+    assert!(r.nodes[1].transit_paths().is_empty());
+    r.now += RELAY_TIMEOUT;
+    r.nodes[0].tick(r.now);
+    r.pump();
+    assert!(r.nodes[0].peer_link(target).is_none());
+    assert!(
+        r.observed
+            .iter()
+            .any(|(n, e)| *n == 0 && matches!(e, Effect::DialFailed(peer, DialFailure::Unreachable) if *peer == target))
+    );
+}
+
+#[test]
+fn losing_the_relay_station_takes_the_relayed_phone_link_down() {
+    let mut r = Rig::new(3);
+    r.phone(2);
+    let station = r.connect(0, 1);
+    r.connect(1, 2);
+    r.pump();
+    r.ready(0, 1);
+    r.ready(1, 2);
+    let phone = r.peer(2);
+    r.nodes[0]
+        .dial(phone, vec![], DialMode::PreferDirect, DialOrigin::Initial, r.now)
+        .unwrap();
+    r.pump();
+    let relayed = r.link(0, 2);
+    let at_phone = r.link(2, 0);
+    // PC A loses its connection to the relay station: the relayed link ends
+    // at A, and the station tells the phone so its end goes too.
+    r.nodes[0].connection_lost(station, r.now);
+    r.nodes[1].connection_lost(station, r.now);
+    r.pump();
+    assert!(r.nodes[0].peer_link(phone).is_none());
+    assert!(!r.nodes[2].links.contains_key(&at_phone));
+    assert!(r.nodes[1].transit_paths().is_empty());
+    for (n, link) in [(0, relayed), (2, at_phone)] {
+        assert!(
+            r.observed
+                .iter()
+                .any(|(m, e)| *m == n && matches!(e, Effect::Lost { link: l, .. } if *l == link)),
+            "node {n} reports the relayed link lost"
+        );
     }
 }
 
@@ -1404,6 +1592,121 @@ fn lost_decision_identifies_binding_and_distinguishes_unobserved_from_recent_dat
         assert!(logs.iter().any(|row| row.contains(&("kind".into(), "link_lost".into()))
             && row.contains(&("peer_data_known".into(), "false".into()))));
     });
+}
+
+/// Review M8: a standby recorded beside a selection that still waited for its
+/// relay-to-direct cut-over outlived that selection and blocked every later
+/// direct candidate, so the link stayed relayed for good.
+#[test]
+fn a_selection_waiting_for_relay_admission_keeps_no_standby() {
+    let mut r = Rig::new(3);
+    r.relay();
+    let peer = r.peer(2);
+    // The relayed link is installed but not admitted (C0 is slow); a direct
+    // candidate is selected and waits for the relay-to-direct cut-over.
+    let first = r.connect(0, 2);
+    r.pump();
+    assert!(r.nodes[0].selected_connection_id(first));
+    let second = r.connect(2, 0);
+    r.pump();
+    assert!(!r.nodes[0].standby(peer, second));
+    // The selected connection dies before the relayed link is admitted.
+    let now = r.now;
+    for n in [0, 2] {
+        r.nodes[n].connection_lost(first, now);
+    }
+    r.pump();
+    let third = r.connect(0, 2);
+    r.pump();
+    assert!(r.nodes[0].selected_connection_id(third));
+    assert!(r.nodes[2].selected_connection_id(third));
+}
+
+/// Review H3, change plan 6.1: a connection that carries another path (the
+/// first hop of a relayed link, or one end of a transit) is in use, and no
+/// switch, automatic or manual, moves a link away from it: the source's own
+/// choice and the relay's own choice remain remembered but cannot move
+/// traffic until the shared-path guard clears.
+#[test]
+fn no_route_switch_leaves_a_relayed_path_on_a_standby() {
+    let mut r = Rig::new(3);
+    r.relay();
+    r.ready(0, 2);
+    let old = r.nodes[0].links[&r.link(0, 1)].hop.connection_id;
+    let onward = r.nodes[1].links[&r.link(1, 2)].hop.connection_id;
+    assert_eq!(r.nodes[0].links[&r.link(0, 2)].hop.connection_id, old);
+    assert_eq!(r.nodes[1].transit.len(), 1);
+    assert!(r.nodes[0].connection_in_use(old));
+    assert!(r.nodes[1].connection_in_use(old) && r.nodes[1].connection_in_use(onward));
+    // A second address on each hop of the relayed path, dialed by `dialer`.
+    fn second(r: &mut Rig, dialer: usize, acceptor: usize, last: u8) -> (std::net::Ipv4Addr, ConnectionId) {
+        let ip = std::net::Ipv4Addr::new(10, 77, 0, last);
+        let id = ConnectionId {
+            initiator_boot: r.nodes[dialer].boot,
+            random: rand::random(),
+        };
+        r.connections.insert(id, (dialer, acceptor));
+        let now = r.now;
+        for (local, remote) in [(dialer, acceptor), (acceptor, dialer)] {
+            let boot = r.nodes[remote].boot;
+            r.nodes[local].authenticated_at(boot, id, Some(SocketAddr::from((ip, 47470))), RelayRole::Station, now);
+        }
+        r.pump();
+        assert!(r.nodes[dialer].standby(r.peer(acceptor), id));
+        (ip, id)
+    }
+    let now = r.now;
+    // Node 0 (arbiter of its pair with the relay) picks the relay's second address.
+    let (ip, _) = second(&mut r, 0, 1, 2);
+    let relay = r.peer(1);
+    assert!(r.nodes[0].set_route(relay, RouteChoice::Pin(ip), now));
+    // The relay (arbiter of its pair with node 2) picks node 2's second address.
+    let (ip, _) = second(&mut r, 1, 2, 3);
+    let target = r.peer(2);
+    assert!(r.nodes[1].set_route(target, RouteChoice::Pin(ip), now));
+    // Node 2 (follower of that pair) asks for its own second connection.
+    let (ip, _) = second(&mut r, 2, 1, 4);
+    assert!(r.nodes[2].set_route(relay, RouteChoice::Pin(ip), now));
+    r.pump();
+    assert_eq!(
+        r.nodes[2].route_view(r.link(2, 1)).unwrap().pin,
+        Some(RouteRecord::Dial(ip))
+    );
+    assert_eq!(r.nodes[0].links[&r.link(0, 1)].hop.connection_id, old);
+    assert_eq!(r.nodes[1].links[&r.link(1, 0)].hop.connection_id, old);
+    assert_eq!(r.nodes[1].links[&r.link(1, 2)].hop.connection_id, onward);
+    assert_eq!(r.nodes[1].transit.len(), 1);
+    // Revoking node 0 at the relay retires the transit it carries.
+    let b = r.link(1, 0);
+    r.nodes[1].retire_authority(b);
+    assert!(r.nodes[1].transit.is_empty());
+}
+
+#[path = "route_tests.rs"]
+mod route_tests;
+
+#[test]
+fn relay_role_reads_the_peers_own_station_announcement() {
+    use oink_protocol::v2::admission::Agreement;
+    let caps = |ids: &[&str]| ids.iter().map(|id| id.to_string()).collect::<Vec<_>>();
+    let agreed = |ids: &[&str]| Agreement::new(caps(ids)).unwrap();
+    // PC to PC: both offer the station role; it is also agreed.
+    let pcs = agreed(&["oink.core/2", RELAY_ENDPOINT, RELAY_TRANSIT]);
+    assert_eq!(
+        RelayRole::of(&pcs, &caps(&[RELAY_ENDPOINT, RELAY_TRANSIT])),
+        RelayRole::Station
+    );
+    // PC and phone: only the endpoint is agreed. The PC sees an endpoint;
+    // the phone sees the PC's own announcement and may ask it to relay.
+    let mixed = agreed(&["oink.core/2", RELAY_ENDPOINT]);
+    assert_eq!(RelayRole::of(&mixed, &caps(&[RELAY_ENDPOINT])), RelayRole::Endpoint);
+    assert_eq!(
+        RelayRole::of(&mixed, &caps(&[RELAY_ENDPOINT, RELAY_TRANSIT])),
+        RelayRole::Station
+    );
+    // No relay path protocol: no role, whatever the peer announces.
+    let none = agreed(&["oink.core/2"]);
+    assert_eq!(RelayRole::of(&none, &caps(&[RELAY_TRANSIT])), RelayRole::None);
 }
 
 #[test]

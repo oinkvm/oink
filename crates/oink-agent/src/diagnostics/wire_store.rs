@@ -1,6 +1,6 @@
 //! Retained peer CBOR lives only in a detached export, never the local recorder.
 use super::*;
-use oink_protocol::v1::{
+use oink_protocol::v2::{
     self, RawMap, RawValue, dto as w,
     schema::{WireDto, WireValue, required},
 };
@@ -27,10 +27,10 @@ pub(in crate::diagnostics) fn json_map(map: &RawMap) -> serde_json::Value {
 }
 // DiagnosticSegment::decode has already validated all nested row/event fields.
 // Reading timestamps must not clone and validate the entire event list again.
-pub(in crate::diagnostics) fn rows(segment: &w::DiagnosticSegment) -> v1::Result<&[RawValue]> {
+pub(in crate::diagnostics) fn rows(segment: &w::DiagnosticSegment) -> v2::Result<&[RawValue]> {
     match segment.raw().get(&8) {
         Some(RawValue::Array(rows)) => Ok(rows),
-        _ => Err(v1::ErrorCode::MalformedFrame.into()),
+        _ => Err(v2::ErrorCode::MalformedFrame.into()),
     }
 }
 pub(in crate::diagnostics) fn segment(bytes: &[u8]) -> anyhow::Result<w::DiagnosticSegment> {
@@ -87,7 +87,7 @@ impl Store {
             .checked_add(bytes as u64)
             .ok_or_else(|| anyhow::anyhow!("member:size_limit"))?;
         anyhow::ensure!(
-            self.network_received <= v1::limits::DIAGNOSTIC_COLLECTION as u64,
+            self.network_received <= v2::limits::DIAGNOSTIC_COLLECTION as u64,
             "member:size_limit"
         );
         Ok(())
@@ -98,7 +98,7 @@ impl Store {
             .checked_add(bytes as u64)
             .ok_or_else(|| anyhow::anyhow!("member:size_limit"))?;
         anyhow::ensure!(
-            self.network_expanded <= v1::limits::DIAGNOSTIC_COLLECTION as u64,
+            self.network_expanded <= v2::limits::DIAGNOSTIC_COLLECTION as u64,
             "member:size_limit"
         );
         Ok(())
@@ -436,8 +436,8 @@ mod tests {
             .into(),
         )
         .unwrap();
-        let expected = end.encode(v1::limits::LOW_FRAME).unwrap();
-        assert!(expected.len() > v1::limits::RELIABLE_FRAME);
+        let expected = end.encode(v2::limits::LOW_FRAME).unwrap();
+        assert!(expected.len() > v2::limits::RELIABLE_FRAME);
         local.network_ends.insert("b".repeat(24), end);
         let bundle = local.export(Reason::Manual, 0, 0).unwrap();
         let mut zip = zip::ZipArchive::new(File::open(bundle.path).unwrap()).unwrap();
@@ -450,7 +450,7 @@ mod tests {
             bytes, expected,
             "retain the peer's complete coverage without coalescing"
         );
-        let retained = w::DiagnosticsEnd::decode(&bytes, v1::limits::LOW_FRAME).unwrap();
+        let retained = w::DiagnosticsEnd::decode(&bytes, v2::limits::LOW_FRAME).unwrap();
         assert_eq!(retained.coverage().unwrap().0.len(), ranges);
     }
     #[test]
@@ -651,10 +651,10 @@ mod tests {
     fn all_peers_share_one_compressed_and_expanded_collection_budget() {
         let dir = tempfile::tempdir().unwrap();
         let mut local = Store::open(dir.path().into(), "a".repeat(24), true).unwrap();
-        local.receive_bytes(v1::limits::DIAGNOSTIC_COLLECTION - 1).unwrap();
+        local.receive_bytes(v2::limits::DIAGNOSTIC_COLLECTION - 1).unwrap();
         local.receive_bytes(1).unwrap();
         assert!(local.receive_bytes(1).is_err());
-        local.receive_expanded(v1::limits::DIAGNOSTIC_COLLECTION - 1).unwrap();
+        local.receive_expanded(v2::limits::DIAGNOSTIC_COLLECTION - 1).unwrap();
         local.receive_expanded(1).unwrap();
         assert!(local.receive_expanded(1).is_err());
         assert!(local.segments.is_empty());

@@ -26,6 +26,7 @@ const RETENTION_MS: u64 = 24 * 60 * 60 * 1000;
 const RECORD: &str = ".oink-cache.json";
 static ROOT: OnceLock<PathBuf> = OnceLock::new();
 mod cleanup;
+pub(super) mod mobile;
 pub(crate) use cleanup::cache_usage;
 use cleanup::{ClipboardIdentity, Record, maintain};
 
@@ -118,6 +119,15 @@ impl SmallFiles {
         let Some(files) = spec.file_contents.as_ref().and_then(|files| files.namespace()) else {
             return Ok(None);
         };
+        // A phone's files reach a PC through its proxy PC, which announces
+        // them under its own clip ID. They belong in the phone's received-files
+        // folder (received-files.md §3), never in this ordinary cache.
+        if files
+            .origin()
+            .is_some_and(|origin| origin != spec.inventory.id.clip.origin)
+        {
+            return Ok(None);
+        }
         if files.roots() != spec.inventory.roots {
             return Err(content::unavailable(Unavailable::Superseded));
         }

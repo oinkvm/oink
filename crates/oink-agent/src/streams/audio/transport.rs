@@ -114,7 +114,7 @@ mod split_tests {
     use oink_audio::media::Kind;
     use oink_network::link::{LinkId, QueueSpec};
     use oink_protocol::frame::{StreamKind, StreamTag};
-    use oink_protocol::v1::hot::{self, Value};
+    use oink_protocol::v2::hot::{self, Value};
 
     #[test]
     #[ignore = "slow: requires injected packet arrival timestamps"]
@@ -157,11 +157,11 @@ mod split_tests {
             let (len, arrived) = speaker.take_timed_into(&mut bytes).unwrap().unwrap();
             assert!(arrived >= before && arrived <= after, "queueing retains ingress time");
             let message =
-                oink_protocol::v1::frame::OpaqueFrame::parse_exact(&bytes[..len], oink_audio::media::FRAME_CAPACITY)
+                oink_protocol::v2::frame::OpaqueFrame::parse_exact(&bytes[..len], oink_audio::media::FRAME_CAPACITY)
                     .unwrap()
                     .decode()
                     .unwrap();
-            let oink_protocol::v1::Message::AudioSleep(sleep) = message else {
+            let oink_protocol::v2::Message::AudioSleep(sleep) = message else {
                 panic!("wrong lane")
             };
             assert_eq!(sleep.sequence(), Ok(sequence));

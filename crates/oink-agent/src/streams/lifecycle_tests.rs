@@ -6,7 +6,7 @@ use oink_foundation::{DeviceId, realtime::Tier, session::Boot};
 use oink_network::{group_state::State as GroupState, identity::Identity, link::*, negotiation::OfferProfile};
 use oink_protocol::{
     frame::{StreamCode, StreamKind, StreamTag},
-    v1::{
+    v2::{
         self, Message, RawValue as V, dto,
         schema::{WireDto, WireValue},
     },
@@ -77,13 +77,29 @@ impl<O: Owner> Fixture<O> {
         Self::start_profile(count, None).await
     }
     pub(crate) async fn start_profile(count: u8, omitted_capability: Option<&str>) -> Self {
-        Self::start_topology(count, omitted_capability, false).await
+        Self::start_topology(count, omitted_capability, false, 0, false).await
     }
     pub(crate) async fn start_relayed() -> Self {
-        Self::start_topology(3, None, true).await
+        Self::start_topology(3, None, true, 0, false).await
     }
-    async fn start_topology(count: u8, omitted_capability: Option<&str>, relayed: bool) -> Self {
-        let identities = (41..41 + count)
+    /// `absent` further roster members never start, so no node ever links to them.
+    pub(crate) async fn start_with_absent(count: u8, absent: u8) -> Self {
+        Self::start_topology(count, None, false, absent, false).await
+    }
+    /// Three running members where the first and the last never link, not
+    /// even through a relay (like a PC and a phone on another subnet that only
+    /// links directly to a second PC). Both link to the middle member.
+    pub(crate) async fn start_partitioned() -> Self {
+        Self::start_topology(3, Some("oink.relay/1"), false, 0, true).await
+    }
+    async fn start_topology(
+        count: u8,
+        omitted_capability: Option<&str>,
+        relayed: bool,
+        absent: u8,
+        partitioned: bool,
+    ) -> Self {
+        let mut identities = (41..41 + count + absent)
             .map(|n| Arc::new(Identity::from_seed([n; 32])))
             .collect::<Vec<_>>();
         let mut state = GroupState::create(&identities[0], "synthetic", "test-os", 100).unwrap();
@@ -94,6 +110,8 @@ impl<O: Owner> Fixture<O> {
                 .unwrap();
             state = state.with_roster(&roster).unwrap();
         }
+        identities.truncate(usize::from(count));
+        let started: std::collections::BTreeSet<_> = identities.iter().map(|identity| identity.id()).collect();
         let mut pending = Vec::new();
         for (i, identity) in identities.into_iter().enumerate() {
             let directory = tempfile::tempdir().unwrap();
@@ -103,7 +121,7 @@ impl<O: Owner> Fixture<O> {
             // probing and closing them leaves a gap before network startup.
             let network = oink_test_support::network_config(directory.path().into(), "synthetic", 0);
             let profile = OfferProfile {
-                capabilities: v1::registry::CAPABILITIES
+                capabilities: v2::registry::CAPABILITIES
                     .iter()
                     .filter(|cap| i == 0 || Some(**cap) != omitted_capability)
                     .map(|s| (*s).to_owned())
@@ -136,6 +154,12 @@ impl<O: Owner> Fixture<O> {
             oink_network::link::testing::set_direct_blocked(&pending[0].3, pending[1].1.id(), true);
             oink_network::link::testing::set_direct_blocked(&pending[1].3, pending[0].1.id(), true);
         }
+        let unlinked = partitioned.then(|| (pending[0].1.id(), pending[pending.len() - 1].1.id()));
+        if let Some((first, last)) = unlinked {
+            oink_network::link::testing::set_direct_blocked(&pending[0].3, last, true);
+            oink_network::link::testing::set_direct_blocked(&pending[pending.len() - 1].3, first, true);
+        }
+        let reachable = |a: DeviceId, b: DeviceId| unlinked.is_none_or(|pair| pair != (a, b) && pair != (b, a));
         let addresses = pending
             .iter()
             .map(|(_, id, _, links, _, _)| (id.id(), vec![links.local_addr()]))
@@ -162,6 +186,7 @@ impl<O: Owner> Fixture<O> {
                     port: config_port,
                     identity,
                     application: application.clone(),
+                    pairing: true,
                 },
                 network,
             )
@@ -183,7 +208,9 @@ impl<O: Owner> Fixture<O> {
                         .members()
                         .members
                         .iter()
-                        .filter(|m| !m.is_self)
+                        .filter(|m| {
+                            !m.is_self && started.contains(&m.device) && reachable(n.links.boot().device_id, m.device)
+                        })
                         .all(|m| m.online && m.facts.is_some() && n.group.peer_agreement(m.device).is_some())
                 }) {
                     break;
@@ -325,14 +352,14 @@ impl<O: Owner> Fixture<O> {
         }
     }
 }
-fn encode(message: &Message) -> v1::Result<Vec<u8>> {
-    v1::frame::encode(message, v1::limits::RELIABLE_FRAME)
+fn encode(message: &Message) -> v2::Result<Vec<u8>> {
+    v2::frame::encode(message, v2::limits::RELIABLE_FRAME)
 }
 async fn read(rx: &mut RecvStream) -> Message {
     tokio::time::timeout(Duration::from_secs(3), async {
         loop {
             if let Some(bytes) = rx.take().expect("stream remains open") {
-                return v1::frame::OpaqueFrame::parse_exact(&bytes, v1::limits::RELIABLE_FRAME)
+                return v2::frame::OpaqueFrame::parse_exact(&bytes, v2::limits::RELIABLE_FRAME)
                     .unwrap()
                     .decode()
                     .unwrap();
@@ -423,9 +450,6 @@ pub(super) fn message(kind: StreamKind, sequence: u64) -> Message {
                 .into(),
             )
             .unwrap();
-            let digest = oink_clipboard::wire::digest(
-                *blake3::hash(&inventory.encode(v1::limits::INVENTORY).unwrap()).as_bytes(),
-            );
             Message::ClipboardOffer(
                 dto::ClipboardOffer::from_raw(
                     [
@@ -433,9 +457,16 @@ pub(super) fn message(kind: StreamKind, sequence: u64) -> Message {
                         (2, 0u64.write()),
                         (3, sequence.write()),
                         (4, dto::Sensitivity::Normal.write()),
-                        (5, digest.write()),
                         (6, inventory.write()),
                         (7, sequence.write()),
+                        (
+                            8,
+                            oink_network::wire_identity::device(Identity::from_seed([41; 32]).id()).write(),
+                        ),
+                        (10, oink_protocol::v2::schema::FixedBytes([0; 16]).write()),
+                        (11, oink_protocol::v2::schema::FixedBytes([1; 16]).write()),
+                        (12, 0u32.write()),
+                        (13, V::Array(vec![])),
                     ]
                     .into(),
                 )
@@ -599,28 +630,75 @@ pub(super) async fn replacement_and_pause<O: Owner>() {
     f.owner.pause_changed(true);
     let obeys = !matches!(O::KIND, StreamKind::Audio | StreamKind::Diagnostics);
     assert_eq!(f.owner.current(f.peer).is_none(), obeys);
-    assert_eq!(f.owner.incoming(f.peer), Some(new));
-    new_tx.post(encode(&message(O::KIND, 4)).unwrap()).unwrap();
-    // Clipboard retains state while paused; other owners still deliver inbound
-    // telemetry. Posting to a real stream is not a receive-completion barrier.
     if matches!(O::KIND, StreamKind::Clipboard) {
-        tokio::time::sleep(Duration::from_millis(30)).await;
-        assert!(f.owner.tick(Instant::now()).is_empty());
+        // B0 closes both ways while paused: nothing on it can be answered.
+        assert_eq!(f.owner.incoming(f.peer), None);
+        f.owner.pause_changed(false);
     } else {
+        assert_eq!(f.owner.incoming(f.peer), Some(new));
+        new_tx.post(encode(&message(O::KIND, 4)).unwrap()).unwrap();
+        // Other owners still deliver inbound telemetry. Posting to a real
+        // stream is not a receive-completion barrier.
         assert_eq!(f.deliveries().await.last().unwrap().1, message(O::KIND, 4));
+        f.owner.pause_changed(false);
+        assert_eq!(f.owner.incoming(f.peer), Some(new));
     }
-    f.owner.pause_changed(false);
-    if matches!(O::KIND, StreamKind::Clipboard) {
-        assert_eq!(
-            f.deliveries().await.last().unwrap().1,
-            message(O::KIND, 4),
-            "resume uses retained state without peer retransmission"
-        );
-    }
-    assert_eq!(f.owner.incoming(f.peer), Some(new));
     f.owner.link_lost(f.link, f.peer, LinkLost::Stopped);
     assert_eq!(f.owner.current(f.peer), None);
     assert_eq!(f.owner.incoming(f.peer), None);
+    f.stop().await;
+}
+
+/// Waits until the peer (node 1) sees its stream `id` closed, while node 0's
+/// owner keeps handling its own events.
+async fn peer_closed<O: Owner>(f: &mut Fixture<O>, id: StreamId) -> StreamClosed {
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            f.pump().await;
+            if let Ok(Some(ModuleEvent::StreamClosed { stream, reason })) =
+                tokio::time::timeout(Duration::from_millis(5), f.nodes[1].port.next()).await
+                && stream == id
+            {
+                return reason;
+            }
+        }
+    })
+    .await
+    .expect("the peer learns at once that its stream closed")
+}
+
+/// The peer's side of a paused B0: its open stream is closed and a new one
+/// is refused, both with `Paused`, at once.
+pub(super) async fn paused_b0_refuses_with_reason() {
+    let mut f = Fixture::<super::clipboard::ClipboardStreams>::start().await;
+    let first = f.inbound(1, &message(StreamKind::Clipboard, 1)).await;
+    f.owner.pause_changed(true);
+    assert_eq!(
+        peer_closed(&mut f, first.id()).await,
+        StreamClosed::Peer(StreamCode::Paused)
+    );
+    let (second, _) = f.nodes[1]
+        .links
+        .open_stream(
+            f.remote_link,
+            StreamKind::Clipboard.priority(),
+            StreamTag {
+                kind: StreamKind::Clipboard,
+                ordinal: 2,
+            },
+            QueueSpec::reliable(StreamKind::Clipboard).0,
+            None,
+        )
+        .unwrap();
+    let _ = second.post(encode(&message(StreamKind::Clipboard, 2)).unwrap());
+    assert_eq!(
+        peer_closed(&mut f, second.id()).await,
+        StreamClosed::Peer(StreamCode::Paused)
+    );
+    assert_eq!(f.owner.incoming(f.peer), None);
+    // Resumed: the peer's next stream is accepted again.
+    f.owner.pause_changed(false);
+    f.inbound(3, &message(StreamKind::Clipboard, 3)).await;
     f.stop().await;
 }
 
@@ -827,6 +905,16 @@ async fn no_low(port: &mut ModulePort, duration: Duration) {
     );
 }
 #[test]
+fn clipboard_pause_closes_and_refuses_b0_with_paused() {
+    crate::test_watchdog::run(
+        module_path!(),
+        "clipboard_pause_closes_and_refuses_b0_with_paused",
+        None,
+        paused_b0_refuses_with_reason(),
+    );
+}
+
+#[test]
 fn wallpaper_latest_during_open_in_both_roles_and_receiving_while_paused() {
     crate::test_watchdog::run(
         module_path!(),
@@ -974,7 +1062,7 @@ async fn dnd_pause_blocks_own_low_but_keeps_serving_peer_and_input_replacement_c
 
 async fn capability_changes<O: Owner>() {
     let capability = match O::KIND {
-        StreamKind::Audio => "oink.audio/1",
+        StreamKind::Audio => "oink.audio/2",
         _ => unreachable!(),
     };
     // Optional capabilities belong to a connection's negotiated agreement.
@@ -1008,6 +1096,70 @@ fn audio_obeys_negotiated_capabilities_across_new_links() {
 async fn audio_obeys_negotiated_capabilities_across_new_links_scenario() {
     capability_changes::<super::audio::AudioStreams>().await;
 }
+/// 2026-11-12 (a Windows test machine offer 1302): after a newer group clip replaced this
+/// device's own offer (accepted and written here, or only observed with
+/// receiving off), a B0 that opens later must not carry the old offer: a phone
+/// reads it automatically as this PC's current clip and the read fails.
+#[test]
+fn clipboard_own_offer_superseded_by_a_newer_group_clip_is_not_announced_again() {
+    crate::test_watchdog::run(
+        module_path!(),
+        "clipboard_own_offer_superseded_by_a_newer_group_clip_is_not_announced_again",
+        None,
+        clipboard_own_offer_superseded_by_a_newer_group_clip_is_not_announced_again_scenario(),
+    );
+}
+
+async fn clipboard_own_offer_superseded_by_a_newer_group_clip_is_not_announced_again_scenario() {
+    let mut f = Fixture::<super::clipboard::ClipboardStreams>::start().await;
+    // Offers order by (clock, origin); `message` uses the clock as sequence.
+    let offer = |clock| match message(StreamKind::Clipboard, clock) {
+        Message::ClipboardOffer(offer) => offer,
+        _ => unreachable!(),
+    };
+    let own = offer(10);
+    let rx = f.opened(Message::ClipboardOffer(own.clone())).await;
+    assert_eq!(f.owner.announced_offer(), Some(&own));
+
+    let newer = offer(12);
+    assert!(f.owner.witness_offer(&newer));
+    assert_eq!(f.owner.announced_offer(), None, "the replaced own offer is withdrawn");
+    assert_eq!(f.owner.witnessed_offer(), Some(&newer));
+    // Republishing the unchanged own offer (resume after a pause on a device
+    // that does not receive) does not bring it back, nor forget the newer clip.
+    f.owner.set_offer(Some(own.clone()));
+    assert_eq!(f.owner.announced_offer(), None);
+    assert_eq!(f.owner.witnessed_offer(), Some(&newer));
+    // An older offer seen later changes nothing.
+    assert!(!f.owner.witness_offer(&offer(11)));
+    assert_eq!(f.owner.witnessed_offer(), Some(&newer));
+
+    // The B0 reopens (the peer asked for a resend, like a phone connecting
+    // anew): it carries no offer until this device copies again.
+    let old = f.owner.current(f.peer).unwrap();
+    f.nodes[1].links.close_stream(rx.id(), StreamCode::Resend);
+    f.closed(old).await;
+    let due = f.owner.retry().unwrap();
+    f.owner.tick(due);
+    let reopened = f.owner.current(f.peer).expect("B0 reopens");
+    assert_ne!(reopened, old);
+    // A new local copy orders after the newer clip and is announced on it.
+    let fresh = offer(13);
+    f.owner.set_offer(Some(fresh.clone()));
+    assert_eq!(f.owner.announced_offer(), Some(&fresh));
+    assert_eq!(f.owner.witnessed_offer(), Some(&fresh));
+    let (mut rx, _) = f.remote_inbound(StreamKind::Clipboard).await.accept(
+        QueueSpec::reliable(StreamKind::Clipboard).1,
+        QueueSpec::datagram(StreamKind::Clipboard),
+    );
+    assert_eq!(
+        read(&mut rx).await,
+        Message::ClipboardOffer(fresh),
+        "the reopened B0 carried nothing before the new copy"
+    );
+    f.stop().await;
+}
+
 #[test]
 fn clipboard_file_operation_interruption_retains_binding_and_reopens_at_requested_offset() {
     crate::test_watchdog::run(
@@ -1052,6 +1204,7 @@ async fn clipboard_file_operation_interruption_retains_binding_and_reopens_at_re
     let offer = oink_clipboard::sync::Ordering::new(f.peer, 0)
         .capture(
             oink_clipboard::wire::inventory(&inventory).unwrap(),
+            vec![],
             1,
             Sensitivity::Normal,
             0,
@@ -1115,9 +1268,15 @@ async fn clipboard_file_operation_interruption_retains_binding_and_reopens_at_re
         drop(remote);
         drop(channel);
         match reason {
-            0 => f.owner.pause_changed(false),
-            1 => {
+            0 => {
+                f.owner.pause_changed(false);
+                // Pausing closed the peer's B0 too (StreamCode::Paused); the
+                // peer reopens it once this device is back.
                 writer = f.inbound(2, &Message::ClipboardOffer(offer.clone())).await;
+                f.deliveries().await;
+            }
+            1 => {
+                writer = f.inbound(3, &Message::ClipboardOffer(offer.clone())).await;
                 f.deliveries().await;
             }
             _ => {}
@@ -1196,6 +1355,7 @@ fn large_clipboard_offer(origin: DeviceId, sequence: u64) -> dto::ClipboardOffer
     oink_clipboard::sync::Ordering::new(origin, sequence - 1)
         .capture(
             oink_clipboard::wire::inventory(&inventory).unwrap(),
+            vec![],
             sequence,
             Sensitivity::Normal,
             0,
@@ -1249,6 +1409,7 @@ fn clipboard_unadmitted_tail_expires_and_retires_with_its_link() {
                 let offer = oink_clipboard::sync::Ordering::new(source, 0)
                     .capture(
                         oink_clipboard::wire::inventory(&inventory).unwrap(),
+                        vec![],
                         1,
                         Sensitivity::Normal,
                         0,
@@ -1391,7 +1552,7 @@ fn clipboard_new_tail_before_replacement_stream_keeps_its_matching_head() {
             let offer = Message::ClipboardOffer(large_clipboard_offer(f.peer, 2));
             let (head, tail) = crate::attachment::split(7, offer.clone()).unwrap();
             let tail = tail.unwrap();
-            let bytes = v1::frame::encode(&tail, v1::limits::LOW_FRAME).unwrap().len();
+            let bytes = v2::frame::encode(&tail, v2::limits::LOW_FRAME).unwrap().len();
             let max = oink_foundation::transfer::LowOptions::message_bytes(bytes);
             let mut transfer = f.nodes[1]
                 .links
@@ -1417,6 +1578,98 @@ fn clipboard_new_tail_before_replacement_stream_keeps_its_matching_head() {
             let received = f.deliveries().await;
             assert_eq!(received, vec![(f.peer, offer)]);
             drop((old, next, transfer));
+            f.stop().await;
+        },
+    );
+}
+
+/// The local owner's pause in this device's Facts, as the device-control owner
+/// publishes it.
+fn publish_pause(config: &ConfigModule, paused: bool) {
+    let facts = config.local_facts();
+    let old = facts.pause().unwrap().unwrap();
+    let state = dto::LocalPauseState::from_raw(
+        [
+            (1, paused.write()),
+            (
+                2,
+                (if paused {
+                    dto::PauseReason::LocalUser
+                } else {
+                    dto::PauseReason::None
+                })
+                .write(),
+            ),
+            (3, (old.revision().unwrap() + 1).write()),
+        ]
+        .into(),
+    )
+    .unwrap();
+    config
+        .publish_local_owner(facts.preferences().unwrap().unwrap().0, state)
+        .unwrap();
+}
+impl<O: Owner> Fixture<O> {
+    /// Wait until this device's configuration holds the peer's Facts with `paused`.
+    async fn peer_pause_seen(&self, paused: bool) {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !self.nodes[0]
+                .group
+                .members()
+                .members
+                .iter()
+                .find(|member| member.device == self.peer)
+                .and_then(|member| member.facts.as_ref())
+                .and_then(|facts| facts.pause().ok().flatten())
+                .is_some_and(|pause| pause.paused() == Ok(paused))
+            {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .expect("the peer's pause Facts arrived");
+    }
+}
+
+/// The opener reopens B0 while the peer is paused; the peer refuses it as
+/// `Paused`. That refusal travels on its own stream and can reach the opener
+/// after the peer's resumed Facts. Applied to the current B0 it parked it as
+/// "peer paused" with nothing left to wake it until a later Facts change or
+/// a B0 the peer opens. The Facts and the refusal are delivered in that order.
+#[test]
+fn a_paused_b0_refusal_arriving_after_the_resume_does_not_park_the_opener() {
+    crate::test_watchdog::run(
+        module_path!(),
+        "a_paused_b0_refusal_arriving_after_the_resume_does_not_park_the_opener",
+        Some(4),
+        async {
+            let mut f = Fixture::<super::clipboard::ClipboardStreams>::start().await;
+            let rx = f.opened(message(StreamKind::Clipboard, 1)).await;
+            let first = f.owner.current(f.peer).unwrap();
+            // The peer pauses clipboard sharing: its Facts show it, and it
+            // closes the B0 it reads with `Paused`.
+            publish_pause(&f.nodes[1].group, true);
+            f.peer_pause_seen(true).await;
+            rx.close_with(StreamCode::Paused);
+            f.closed(first).await;
+            assert_eq!(f.owner.current(f.peer), None, "no retry while the peer is paused");
+            // Its paused Facts reach the owner, which asks again (the peer
+            // may have resumed); the peer is still paused.
+            f.owner.facts_changed(f.peer, false);
+            let refused = f.owner.current(f.peer).expect("B0 reopened on new Facts");
+            assert!(refused.tag.ordinal > first.tag.ordinal);
+            // The peer resumes: its Facts arrive, then its refusal of that B0.
+            publish_pause(&f.nodes[1].group, false);
+            f.peer_pause_seen(false).await;
+            f.owner.facts_changed(f.peer, false);
+            f.owner.stream_closed(refused, StreamClosed::Peer(StreamCode::Paused));
+            assert!(
+                f.owner
+                    .current(f.peer)
+                    .is_some_and(|stream| stream.tag.ordinal > refused.tag.ordinal),
+                "a Paused refusal that arrived after the peer resumed parked B0"
+            );
+            drop(rx);
             f.stop().await;
         },
     );

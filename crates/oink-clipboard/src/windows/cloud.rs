@@ -1065,6 +1065,8 @@ impl Service {
         for request in self.requests.lock().unwrap().values() {
             request.cancelled.store(true, Ordering::Release);
         }
+        // Wake native directory waits before disconnect drains CF callbacks.
+        self.received.lock().unwrap().move_watches.clear();
         let key = self.connection.lock().unwrap().take();
         if let Some(key) = key {
             // SAFETY: this is our connection; no mutex is held while native
@@ -4612,6 +4614,65 @@ mod tests {
                 .unwrap()
                 .iter()
                 .all(|(_, _, status)| *status == STATUS_CLOUD_FILE_REQUEST_CANCELED)
+        );
+    }
+    /// A phone's files held by its proxy PC: one received-files folder per
+    /// phone ID. Renames keep it, same-name phones get their own, a restarted
+    /// service reads the mapping back, and a folder the user renamed or
+    /// deleted is recreated under the ID's saved name.
+    #[test]
+    fn phone_files_get_one_received_folder_per_phone_id() {
+        let _serial = SERIAL.lock().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let photo = temp.path().join("photo.jpg");
+        std::fs::write(&photo, b"jpeg").unwrap();
+        let first = oink_foundation::DeviceId([0xb1; 32]);
+        let second = oink_foundation::DeviceId([0xb2; 32]);
+        let publish = |service: &Arc<Service>, phone| {
+            let namespace =
+                crate::content::namespace::Local::received_from(vec![(crate::model::NodeId(1), photo.clone())], phone)
+                    .unwrap();
+            let files =
+                crate::content::namespace::Files::new(namespace, crate::sync::files::TargetOs::Windows).unwrap();
+            let delivery = service.publish(files.roots().to_vec(), files, Instant::now()).unwrap();
+            let source = delivery.path.parent().unwrap();
+            assert_eq!(source.parent().unwrap(), service.root);
+            source.file_name().unwrap().to_string_lossy().into_owned()
+        };
+        let (service, _) = fake(temp.path().join("CloudFiles"));
+        crate::received::remember_source(first, "Pixel".into());
+        let name = publish(&service, first);
+        assert_eq!(name, "Pixel b1b1b1b1b1b1");
+        crate::received::remember_source(first, "Renamed".into());
+        assert_eq!(publish(&service, first), name, "a rename moved the phone's files");
+        crate::received::remember_source(second, "Pixel".into());
+        assert_eq!(
+            publish(&service, second),
+            "Pixel b2b2b2b2b2b2",
+            "same-name phones share a folder"
+        );
+        drop(service);
+
+        // A new service keeps nothing in memory; the mapping beside the root
+        // (`received.sources`) is all that names the folder.
+        let (service, _) = fake(temp.path().join("CloudFiles-restarted"));
+        assert_eq!(publish(&service, first), name, "a restart lost the phone's folder");
+
+        std::fs::rename(service.root.join(&name), service.root.join("Mine")).unwrap();
+        assert_eq!(
+            publish(&service, first),
+            name,
+            "a renamed folder is recreated from the ID"
+        );
+        assert!(
+            service.root.join("Mine").is_dir(),
+            "the user's renamed folder is left alone"
+        );
+        std::fs::remove_dir_all(service.root.join(&name)).unwrap();
+        assert_eq!(
+            publish(&service, first),
+            name,
+            "a deleted folder is recreated from the ID"
         );
     }
     #[test]

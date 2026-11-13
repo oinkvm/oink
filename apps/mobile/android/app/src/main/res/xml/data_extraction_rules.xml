@@ -1,0 +1,28 @@
+<!-- Android 12+. Only transfer history and settings leave this phone
+     (backup_rules.xml is the Android 11 copy of cloud-backup; keep in step).
+     Everything not excluded is included.
+     - core/device-only/: device.key, the group and pairing files that name it,
+       and the custom device name (crates/oink-mobile-ffi/src/device_only.rs).
+       A second phone with this identity would share this phone's group.
+     - core/mobile-session.lock: process lock.
+     - audio-permissions: this phone's permission prompts.
+     - privilege_recovery (device-protected): ADB keys wrapped by an Android
+       Keystore key that does not migrate.
+     - Attachments (core/transfers/, received/) only move by device transfer:
+       cloud backup has a 25 MB quota. The history database itself is backed up. -->
+<data-extraction-rules>
+    <cloud-backup>
+        <exclude domain="file" path="core/device-only/" />
+        <exclude domain="file" path="core/mobile-session.lock" />
+        <exclude domain="sharedpref" path="audio-permissions.xml" />
+        <exclude domain="device_sharedpref" path="privilege_recovery.xml" />
+        <exclude domain="file" path="core/transfers/" />
+        <exclude domain="file" path="received/" />
+    </cloud-backup>
+    <device-transfer>
+        <exclude domain="file" path="core/device-only/" />
+        <exclude domain="file" path="core/mobile-session.lock" />
+        <exclude domain="sharedpref" path="audio-permissions.xml" />
+        <exclude domain="device_sharedpref" path="privilege_recovery.xml" />
+    </device-transfer>
+</data-extraction-rules>

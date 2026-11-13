@@ -102,8 +102,28 @@
 .os-logo[data-os="mac"] { width: 20px; height: 20px; color: var(--ok-text); }
 .os-logo[data-os="win"] { width: 17px; height: 17px; color: #0078D4; }
 :root[data-theme="dark"] .os-logo[data-os="win"] { color: #4CA6EE; }
+/* Android: the official robot head in the green of Google's own SVG file (both themes; the
+   brand page's lighter green was too bright on white); eyes knocked out. Privileged mode adds a
+   gold crown: fill --c-crown over a 0.5 px rim of --c-crown-edge, which gives the bright
+   gold a 3:1 outline on light surfaces (dark needs none, so the edge is the fill colour). */
+:root { --c-os-android: #34A853; --c-crown: #F0B400; --c-crown-edge: #A87500; }
+:root[data-theme="dark"] { --c-crown: #F5B400; --c-crown-edge: #F5B400; }
+.os-logo[data-os="android"] { width: 21.4px; height: 12.5px; color: var(--c-os-android); }
+/* Same head width and position: the crowned viewBox is 24 units taller above and below. */
+.os-logo[data-os="android"][data-privileged] { height: 19.27px; }
+.os-logo__crown-edge { fill: var(--c-crown-edge); stroke: var(--c-crown-edge); }
+.os-logo__crown { fill: var(--c-crown); }
+.os-logo__knock { fill: var(--dev-bg, var(--ok-surface)); transition: fill var(--ok-dur-2) var(--ok-ease-out); }
+/* iPhone / iPad: the Apple logo plus a corner device badge with a cut-out ring,
+   the phone app's 32 × 36 slot geometry scaled by 20/28 into this 24 px slot. */
+.os-apple { position: relative; display: grid; place-items: center; width: 24px; height: 24px; color: var(--ok-text); }
+.os-apple__corner { position: absolute; right: 2px; bottom: .6px; width: 8.6px; height: 11.4px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; background: var(--dev-bg, var(--ok-surface)); border-radius: 1.8px; box-shadow: 0 0 0 1px var(--dev-bg, var(--ok-surface)); transition: background-color var(--ok-dur-2) var(--ok-ease-out), box-shadow var(--ok-dur-2) var(--ok-ease-out); }
+.os-apple[data-device="ipad"] .os-apple__corner { right: 3px; bottom: -.5px; width: 9.3px; height: 11.4px; transform: rotate(90deg); }
+.dev[data-group="offline"] .os-apple { color: var(--ok-text-3); }
 
 .dev[data-group="offline"] .os-logo { color: var(--ok-text-3); }
+.os-upgrade { position: absolute; right: -8px; bottom: -7px; width: 15px; height: 15px; color: var(--ok-warning, #c78300); background: var(--dev-bg); border-radius: 50%; line-height: 0; }
+.os-upgrade > svg { width: 15px; height: 15px; fill: none; stroke: currentColor; stroke-width: 1.25; stroke-linecap: round; stroke-linejoin: round; }
 
 .dev__text { flex: 1; min-width: 0; display: grid; gap: 5px; }
 .dev__name { font: 600 13px/1.3 var(--ok-font); color: var(--ok-text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
@@ -319,6 +339,23 @@ button.dev__accessibility { cursor: pointer; }
 
 /* Optical alignment includes the microphone badge; preserve the shared layout gap. */
 .dev-ico[data-glyph="microphone"] { translate: -2.5px; }
+
+/* Route selection submenu (选择线路) */
+/* Every row keeps the single-line item's own vertical inset: a menu item is
+   --ok-h-item tall around one 1.4em label line, so a row with a hint line
+   grows by the hint instead of losing its padding. */
+.devmenu__route-item { padding-block: calc((var(--ok-h-item) - 1.4em) / 2); }
+.devmenu__route { display: grid; gap: 2px; min-width: 0; }
+.devmenu__route-hint { font: 450 11.5px/1.25 var(--ok-font); color: var(--ok-text-3); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 260px; }
+.devmenu__route-ip, .devmenu__route-ms { font-family: var(--ok-font-mono); font-variant-numeric: tabular-nums; }
+/* Latency tiers and colours of the device list's signal (latency.ts). */
+.devmenu__route-ms[data-tone="good"] { color: var(--ok-success); }
+.devmenu__route-ms[data-tone="fair"] { color: var(--ok-warning); }
+.devmenu__route-ms[data-tone="poor"] { color: var(--ok-danger); }
+/* No measurement: measuring, no response, timed out. */
+.devmenu__route-ms[data-tone="none"] { color: var(--ok-text-3); }
+/* Hosts the tooltip of an aria-disabled item. */
+.devmenu__tipwrap { display: block; }
 
 /* Online rows reorder by press-and-drag; the line marks the drop slot in the 4px gap. */
 .devs__list > li { position: relative; }

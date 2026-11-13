@@ -522,6 +522,10 @@ impl Injector {
                 );
                 result
             }
+            InjectEvent::Text(text) => {
+                st.pending_position = None;
+                super::text::post_text(self.src(), &text.0, |event| self.post(event))
+            }
             InjectEvent::Volume { .. } => unreachable!("volume is ordinary and handled before the injection ledger"),
             InjectEvent::Gesture(g) => {
                 st.pending_position = None;

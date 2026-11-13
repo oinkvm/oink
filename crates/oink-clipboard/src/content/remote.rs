@@ -15,8 +15,10 @@ mod tree;
 
 #[derive(Clone)]
 pub struct Remote(Arc<Inner>);
+type OnMaterialized = Arc<dyn Fn(RepresentationId, FileReader) + Send + Sync>;
 struct Inner {
     inventory: Inventory,
+    materialized: std::sync::OnceLock<OnMaterialized>,
     target: ClipPlatform,
     batch_id: BatchId,
     link: Arc<dyn BulkLink>,
@@ -24,6 +26,9 @@ struct Inner {
     slots: Mutex<HashMap<RepresentationId, Arc<Slot>>>,
     demand: Mutex<Demand>,
     receiver: Mutex<Option<oink_foundation::DeviceId>>,
+    /// The device the content came from when another device announced it on
+    /// its behalf (a phone's upload re-announced by its proxy PC).
+    sender: std::sync::OnceLock<oink_foundation::DeviceId>,
     cancelled: AtomicBool,
     terminal: std::sync::atomic::AtomicU8,
     changed: tokio::sync::Notify,
@@ -37,7 +42,6 @@ struct Inner {
     report_drag: bool,
     drop_report: std::sync::OnceLock<Option<std::time::Instant>>,
     drop_report_ended: AtomicBool,
-    receipt: Mutex<Option<[u8; 32]>>,
     representations: Mutex<HashMap<RepresentationId, Arc<memory::Bytes>>>,
     memory: Arc<memory::Budget>,
     received: Mutex<HashMap<RepresentationId, u64>>,
@@ -80,6 +84,40 @@ impl Translator for NoTranslation {
     }
 }
 impl Remote {
+    /// A completed non-file representation, including automatic clipboard reads.
+    /// The receiver owns the reader and performs any disk work off this task.
+    pub fn on_materialized(&self, callback: OnMaterialized) {
+        let _ = self.0.materialized.set(callback);
+        self.replay_materialized();
+    }
+    /// Replay already-completed bytes when their history metadata arrives.
+    /// This never starts a native or network read.
+    pub fn replay_materialized(&self) {
+        let Some(callback) = self.0.materialized.get() else {
+            return;
+        };
+        for item in &self.0.inventory.items {
+            for rep in &item.representations {
+                if let RepresentationData::Inline(bytes) = &rep.data {
+                    callback(rep.id, Box::new(io::Cursor::new(bytes.clone())));
+                }
+            }
+        }
+        let completed: Vec<_> = self
+            .0
+            .representations
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(id, bytes)| (*id, bytes.clone()))
+            .collect();
+        for (id, bytes) in completed {
+            callback(id, bytes.reader());
+        }
+    }
+    pub fn stored(&self) -> bool {
+        self.0.terminal.load(Ordering::Acquire) == 2
+    }
     /// Read-only, nonblocking failure diagnostics. Do not acquire the progress
     /// watch's read lock: a stuck writer is one reason a watchdog may be firing.
     #[cfg(debug_assertions)]
@@ -98,13 +136,12 @@ impl Remote {
                 .collect::<Vec<_>>()
         });
         format!(
-            "remote terminal={} cancelled={} delivery_started={} demand={:?} receiver={:?} receipt={:?} slots={slots:?}\n{}",
+            "remote terminal={} cancelled={} delivery_started={} demand={:?} receiver={:?} slots={slots:?}\n{}",
             self.0.terminal.load(Ordering::Acquire),
             self.0.cancelled.load(Ordering::Acquire),
             self.0.delivery_started.load(Ordering::Acquire),
             self.0.demand.try_lock(),
             self.0.receiver.try_lock(),
-            self.0.receipt.try_lock().map(|r| r.is_some()),
             self.0
                 .files
                 .as_ref()
@@ -140,7 +177,7 @@ impl Remote {
     pub fn on_wire_runtime(
         data: &Path,
         batch: BatchId,
-        wire_inventory: oink_protocol::v1::dto::Inventory,
+        wire_inventory: oink_protocol::v2::dto::Inventory,
         target: ClipPlatform,
         link: Arc<dyn BulkLink>,
         demand: Demand,
@@ -188,6 +225,7 @@ impl Remote {
             slots: Mutex::default(),
             demand: Mutex::new(demand),
             receiver: Mutex::new(None),
+            sender: std::sync::OnceLock::new(),
             cancelled: AtomicBool::new(false),
             terminal: std::sync::atomic::AtomicU8::new(0),
             changed: tokio::sync::Notify::new(),
@@ -201,8 +239,8 @@ impl Remote {
             report_drag: !matches!(demand, Demand::Clipboard),
             drop_report: std::sync::OnceLock::new(),
             drop_report_ended: AtomicBool::new(false),
-            receipt: Mutex::new(None),
             representations: Mutex::new(HashMap::new()),
+            materialized: Default::default(),
             received: Mutex::default(),
         })))
     }
@@ -219,6 +257,12 @@ impl Remote {
             "delivery receiver is immutable"
         );
         *current = Some(receiver);
+    }
+    /// Name the offer's authenticated real sender. Received files are filed
+    /// under that device, not under the device that announced the offer.
+    /// One offer (one clip ID) has one sender; a reused Remote keeps it.
+    pub fn set_sender(&self, sender: oink_foundation::DeviceId) {
+        let _ = self.0.sender.set(sender);
     }
     fn delivery_id(&self) -> io::Result<oink_foundation::content::DeliveryId> {
         let (receiver, sequence) = match *self.0.demand.lock().unwrap() {
@@ -371,7 +415,11 @@ impl Remote {
                 }
                 if done.is_none() {
                     *done = Some(result.map(|bytes| {
-                        content.0.representations.lock().unwrap().insert(id, Arc::new(bytes));
+                        let bytes = Arc::new(bytes);
+                        if let Some(callback) = content.0.materialized.get() {
+                            callback(id, bytes.reader());
+                        }
+                        content.0.representations.lock().unwrap().insert(id, bytes);
                     }));
                 }
                 ready.ready.notify_all();
@@ -454,9 +502,9 @@ impl Remote {
             target: self.0.target,
             demand,
         };
-        let send_max = oink_protocol::v1::frame::encode(
+        let send_max = oink_protocol::v2::frame::encode(
             &crate::wire::content(&request).map_err(|_| unavailable(Unavailable::InvalidData))?,
-            oink_protocol::v1::limits::LOW_FRAME,
+            oink_protocol::v2::limits::LOW_FRAME,
         )
         .map_err(|_| unavailable(Unavailable::InvalidData))?
         .len() as u64;
@@ -723,7 +771,24 @@ impl Remote {
 }
 impl Provider for Remote {
     fn inventory(&self) -> Inventory {
-        self.0.inventory.clone()
+        let mut inventory = self.0.inventory.clone();
+        let completed = self.0.representations.lock().unwrap();
+        for item in &mut inventory.items {
+            for rep in &mut item.representations {
+                if matches!(
+                    rep.data,
+                    RepresentationData::Reader {
+                        size: ContentSize::Unknown
+                    }
+                ) && let Some(bytes) = completed.get(&rep.id)
+                {
+                    rep.data = RepresentationData::Reader {
+                        size: ContentSize::Known(bytes.size),
+                    };
+                }
+            }
+        }
+        inventory
     }
     fn open(&self, id: RepresentationId) -> io::Result<FileReader> {
         self.open_until(id, None)

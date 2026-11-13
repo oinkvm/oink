@@ -13,7 +13,7 @@ use oink_foundation::{
     DeviceId,
     session::{Boot, PairId},
 };
-use oink_protocol::v1::{
+use oink_protocol::v2::{
     self, Message, RawMap, RawValue, dto,
     schema::{WireDto, WireValue},
 };
@@ -21,7 +21,7 @@ use std::{collections::HashMap, time::Instant};
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("invalid merge protocol: {0}")]
-    Wire(#[from] v1::Error),
+    Wire(#[from] v2::Error),
     #[error("merge decision persistence failed: {0}")]
     Journal(#[from] crate::pair_journal::Error),
 }
@@ -70,10 +70,10 @@ pub struct Transactions {
     completed: std::collections::VecDeque<PairId>,
 }
 fn conflict() -> Error {
-    v1::ErrorCode::StateConflict.into()
+    v2::ErrorCode::StateConflict.into()
 }
-impl From<v1::ErrorCode> for Error {
-    fn from(value: v1::ErrorCode) -> Self {
+impl From<v2::ErrorCode> for Error {
+    fn from(value: v2::ErrorCode) -> Self {
         Self::Wire(value.into())
     }
 }
@@ -83,7 +83,7 @@ fn send(flow: &Flow, message: Message) -> Effect {
         message,
     }
 }
-fn context(pair: PairId) -> v1::Result<dto::ObjectContext> {
+fn context(pair: PairId) -> v2::Result<dto::ObjectContext> {
     dto::ObjectContext::from_raw(
         [
             (1, dto::ObjectContextKind::PairId.write()),
@@ -92,13 +92,13 @@ fn context(pair: PairId) -> v1::Result<dto::ObjectContext> {
         .into(),
     )
 }
-fn object_pair(context: &dto::ObjectContext) -> v1::Result<PairId> {
-    if context.variant()? != v1::schema::Open::Known(dto::ObjectContextKind::PairId) {
-        return Err(v1::ErrorCode::AuthenticationFailed.into());
+fn object_pair(context: &dto::ObjectContext) -> v2::Result<PairId> {
+    if context.variant()? != v2::schema::Open::Known(dto::ObjectContextKind::PairId) {
+        return Err(v2::ErrorCode::AuthenticationFailed.into());
     }
     wire::read_pair(&dto::ObjectPairContext::from_raw(context.body()?)?.pair_id()?)
 }
-fn transfer<T: WireDto>(pair: PairId, kind: dto::ObjectKind, value: &T) -> v1::Result<(dto::ObjectRef, Vec<Message>)> {
+fn transfer<T: WireDto>(pair: PairId, kind: dto::ObjectKind, value: &T) -> v2::Result<(dto::ObjectRef, Vec<Message>)> {
     pair_objects::transfer(context(pair)?, kind, value.raw())
 }
 impl Transactions {
@@ -443,7 +443,7 @@ impl Transactions {
                     return Err(conflict());
                 }
                 let outcome = reply.outcome()?;
-                if outcome.variant()? != v1::schema::Open::Known(dto::DecisionKind::Aborted) {
+                if outcome.variant()? != v2::schema::Open::Known(dto::DecisionKind::Aborted) {
                     return Err(conflict());
                 }
                 let reason = dto::DecisionAborted::from_raw(outcome.body()?)?.problem()?;
@@ -498,13 +498,13 @@ impl Transactions {
                 }
                 Ok(effects)
             }
-            _ => Err(v1::ErrorCode::InvalidChannel.into()),
+            _ => Err(v2::ErrorCode::InvalidChannel.into()),
         }
     }
     fn flow(&mut self, pair: PairId, peer: Boot) -> Result<&mut Flow> {
         let flow = self.flows.get_mut(&pair).ok_or_else(conflict)?;
         if flow.view.peer != peer {
-            return Err(v1::ErrorCode::AuthenticationFailed.into());
+            return Err(v2::ErrorCode::AuthenticationFailed.into());
         }
         Ok(flow)
     }
@@ -811,6 +811,15 @@ impl Transactions {
     pub fn bundle(&self, pair: PairId) -> Option<&dto::MergeTransferBundle> {
         self.flows.get(&pair)?.bundle.as_ref()
     }
+
+    /// Return the durable merge waiting for admission on this authenticated
+    /// peer. The C0 responder uses this to bind its ConfigRequest/Done
+    /// exchange to the already verified pair flow.
+    pub fn pending_admission(&self, peer: Boot) -> Option<PairId> {
+        self.flows.iter().find_map(|(pair, flow)| {
+            (flow.view.peer == peer && flow.bundle.is_some() && !flow.admitted).then_some(*pair)
+        })
+    }
 }
 
 #[cfg(test)]
@@ -860,6 +869,7 @@ mod tests {
             attempts_left: 3,
             feedback: dto::PairFeedbackKind::Verified,
             terminal: None,
+            accepted: true,
         }
     }
     fn effects(
@@ -873,8 +883,8 @@ mod tests {
             match effect {
                 Effect::Send { peer, message } => {
                     assert_eq!(peer, sides[1 - index].boot);
-                    let bytes = v1::frame::encode(&message, v1::limits::CONFIG_FRAME).unwrap();
-                    let decoded = v1::frame::OpaqueFrame::parse_exact(&bytes, v1::limits::CONFIG_FRAME)
+                    let bytes = v2::frame::encode(&message, v2::limits::CONFIG_FRAME).unwrap();
+                    let decoded = v2::frame::OpaqueFrame::parse_exact(&bytes, v2::limits::CONFIG_FRAME)
                         .unwrap()
                         .decode()
                         .unwrap();
@@ -885,7 +895,7 @@ mod tests {
                     let roster = wire.roster().unwrap();
                     let anchor = crate::roster::Anchor {
                         group: oink_foundation::GroupId(roster.group().unwrap().0),
-                        root: roster.root_id().unwrap().0,
+                        root: crate::roster::root_id(&roster).unwrap(),
                     };
                     sides[index].state = State::verify(wire, anchor).unwrap();
                     sides[index]
@@ -894,9 +904,8 @@ mod tests {
                         .unwrap();
                 }
                 Effect::Admit { pair, .. } => {
-                    let hash = [0; 32];
                     let Message::ConfigRequest(request) =
-                        admission::request(&sides[0].state, sides[0].identity.id(), hash, 0).unwrap()
+                        admission::request(&sides[0].state, sides[0].identity.id(), 0).unwrap()
                     else {
                         panic!()
                     };
@@ -905,11 +914,9 @@ mod tests {
                         &request,
                         sides[1].identity.id(),
                         sides[0].identity.id(),
-                        hash,
                     )
                     .unwrap();
-                    let Message::ConfigReply(reply) =
-                        admission::reply(&accepted, sides[1].identity.id(), hash, 0).unwrap()
+                    let Message::ConfigReply(reply) = admission::reply(&accepted, sides[1].identity.id(), 0).unwrap()
                     else {
                         panic!()
                     };
@@ -919,13 +926,12 @@ mod tests {
                         &reply,
                         sides[0].identity.id(),
                         sides[1].identity.id(),
-                        hash,
                     )
                     .unwrap();
-                    let Message::ConfigDone(done) = admission::done(&accepted.acknowledged, hash).unwrap() else {
+                    let Message::ConfigDone(done) = admission::done(&accepted.acknowledged).unwrap() else {
                         panic!()
                     };
-                    admission::receive_done(&sides[1].state, &done, hash).unwrap();
+                    admission::receive_done(&sides[1].state, &done).unwrap();
                     for i in [1, 0] {
                         let result = sides[i].transactions.admitted(pair).unwrap();
                         effects(i, result, sides, queue, completed);

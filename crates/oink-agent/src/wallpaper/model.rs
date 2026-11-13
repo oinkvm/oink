@@ -1,5 +1,5 @@
 //! In-memory JPEG thumbnails. Debug output never includes display IDs or image data.
-use oink_protocol::v1::{
+use oink_protocol::v2::{
     self, Message, RawValue as V, dto,
     schema::{WireDto, WireValue},
 };
@@ -22,12 +22,12 @@ impl std::fmt::Debug for ScreenWallpaper {
         )
     }
 }
-pub(crate) fn encode(revision: u64, screens: &[ScreenWallpaper]) -> v1::Result<dto::WallpaperSet> {
+pub(crate) fn encode(revision: u64, screens: &[ScreenWallpaper]) -> v2::Result<dto::WallpaperSet> {
     let screens = screens
         .iter()
         .map(|s| {
             if !s.jpeg.starts_with(&[0xff, 0xd8]) {
-                return Err(v1::ErrorCode::UnsupportedValue.into());
+                return Err(v2::ErrorCode::UnsupportedValue.into());
             }
             dto::ScreenWallpaper::from_raw(
                 [
@@ -40,12 +40,12 @@ pub(crate) fn encode(revision: u64, screens: &[ScreenWallpaper]) -> v1::Result<d
             )
             .map(|v| v.write())
         })
-        .collect::<v1::Result<Vec<_>>>()?;
+        .collect::<v2::Result<Vec<_>>>()?;
     dto::WallpaperSet::from_raw([(1, revision.write()), (2, V::Array(screens)), (3, V::from(FORMAT))].into())
 }
-pub(crate) fn decode(message: &dto::WallpaperSet) -> v1::Result<Vec<ScreenWallpaper>> {
+pub(crate) fn decode(message: &dto::WallpaperSet) -> v2::Result<Vec<ScreenWallpaper>> {
     if message.format()?.0 != FORMAT {
-        return Err(v1::ErrorCode::UnsupportedValue.into());
+        return Err(v2::ErrorCode::UnsupportedValue.into());
     }
     message
         .screens()?
@@ -54,7 +54,7 @@ pub(crate) fn decode(message: &dto::WallpaperSet) -> v1::Result<Vec<ScreenWallpa
         .map(|s| {
             let jpeg = s.bytes()?.0;
             if !jpeg.starts_with(&[0xff, 0xd8]) {
-                return Err(v1::ErrorCode::UnsupportedValue.into());
+                return Err(v2::ErrorCode::UnsupportedValue.into());
             }
             Ok(ScreenWallpaper {
                 display: s.display()?.0,
@@ -92,9 +92,9 @@ mod tests {
                 raw.insert(3, V::from("mime:image/unknown"));
             })
             .unwrap();
-        assert_eq!(decode(&future).unwrap_err().code, v1::ErrorCode::UnsupportedValue);
+        assert_eq!(decode(&future).unwrap_err().code, v2::ErrorCode::UnsupportedValue);
         let mut invalid = screens;
         invalid[0].jpeg = vec![1, 2];
-        assert_eq!(encode(9, &invalid).unwrap_err().code, v1::ErrorCode::UnsupportedValue);
+        assert_eq!(encode(9, &invalid).unwrap_err().code, v2::ErrorCode::UnsupportedValue);
     }
 }

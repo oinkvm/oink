@@ -10,7 +10,7 @@ use crate::{
     api::{DeviceKey, GroupKey},
     node::{Node, lock},
 };
-use oink_protocol::v1::dto;
+use oink_protocol::v2::dto;
 use serde::{Deserialize, Serialize};
 use std::{io::Read, path::Path};
 
@@ -27,6 +27,16 @@ pub(super) struct Join {
     pub source_members: std::collections::BTreeSet<DeviceKey>,
     #[serde(default)]
     pub target_members: std::collections::BTreeSet<DeviceKey>,
+    /// The acceptor keeps no layout profiles (a phone) and this node is the
+    /// smallest joining desktop: it merges the joining list into the target
+    /// catalog in the acceptor's place and delivers the result (H8).
+    #[serde(default)]
+    pub self_merge: bool,
+    /// Another target member keeps profiles: its catalog arrives first and the
+    /// joining list is merged into it. Otherwise the merge starts the target's
+    /// first catalog.
+    #[serde(default)]
+    pub target_has_profiles: bool,
 }
 fn failure(e: impl std::fmt::Display) -> ProfileError {
     ProfileError::new(ErrorCode::PersistenceFailed, format!("Profile join: {e}"))
@@ -175,12 +185,60 @@ impl Node {
             .gate
             .try_lock()
             .map_err(|_| ProfileError::new(ErrorCode::Busy, "Profile operation in progress"))?;
-        // Only the source initiator transmits a saved list. A target or observer
-        // can still be awaiting a previous join's catalog when this merge commits.
-        // Requiring that catalog here would block projection and admission, which
-        // are needed before the new members can exchange the missing catalog.
+        let target_roster = oink_network::roster::Roster::verify(
+            target_base.roster().map_err(wire::invalid)?,
+            oink_network::roster::Anchor {
+                group: target.0,
+                root: oink_network::roster::root_id(&target_base.roster().map_err(wire::invalid)?)
+                    .map_err(wire::invalid)?,
+            },
+        )
+        .map_err(wire::invalid)?;
+        let source_members = intent
+            .members()
+            .map_err(wire::invalid)?
+            .0
+            .iter()
+            .map(|m| {
+                oink_network::wire_identity::read_device(&m.device().map_err(wire::invalid)?)
+                    .map(DeviceKey)
+                    .map_err(wire::invalid)
+            })
+            .collect::<Result<std::collections::BTreeSet<_>>>()?;
+        // Phones do not speak oink.layout/2 (profiles exist only on desktops).
+        let mobile = |os: Option<&str>| matches!(os, Some("android" | "ios"));
+        let acceptor_keeps_profiles = target_roster
+            .member(acceptor.0)
+            .is_some_and(|member| !mobile(member.os.as_deref()));
+        // An acceptor without layout profiles cannot merge the joining list.
+        // The smallest joining desktop does it instead and delivers the result
+        // (change plan §2.4, H8). The prepare runs before projection, while this
+        // node's member table still describes the joining group.
+        let merger = if acceptor_keeps_profiles {
+            None
+        } else {
+            let table = self.link_config().map_err(super::state::unavailable)?.members();
+            source_members
+                .iter()
+                .copied()
+                .filter(|device| {
+                    device.0 == self.id()
+                        || table
+                            .members
+                            .iter()
+                            .any(|member| member.device == device.0 && !member.is_mobile())
+                })
+                .min()
+        };
+        let self_merge = merger.is_some_and(|device| device.0 == self.id());
+        let target_has_profiles = target_roster.members().any(|member| !mobile(member.os.as_deref()));
+        // Only the source initiator transmits a saved list (and the substitute
+        // merger keeps the list it merges). A target or observer can still be
+        // awaiting a previous join's catalog when this merge commits. Requiring
+        // that catalog here would block projection and admission, which are
+        // needed before the new members can exchange the missing catalog.
         // Persist their join binding without inventing or replacing a saved list.
-        let catalog = if initiator.0 == self.id() {
+        let catalog = if initiator.0 == self.id() || self_merge {
             Some(store::load(&self.inner.data_dir, source)?.ok_or_else(|| failure("pre-join catalog unavailable"))?)
         } else {
             None
@@ -199,32 +257,95 @@ impl Node {
                 acceptor,
                 joining_member,
                 catalog,
-                source_members: intent
-                    .members()
-                    .map_err(wire::invalid)?
-                    .0
-                    .iter()
-                    .map(|m| {
-                        oink_network::wire_identity::read_device(&m.device().map_err(wire::invalid)?)
-                            .map(DeviceKey)
-                            .map_err(wire::invalid)
-                    })
-                    .collect::<Result<_>>()?,
-                target_members: oink_network::roster::Roster::verify(
-                    target_base.roster().map_err(wire::invalid)?,
-                    oink_network::roster::Anchor {
-                        group: target.0,
-                        root: target_base.roster().and_then(|r| r.root_id()).map_err(wire::invalid)?.0,
-                    },
-                )
-                .map_err(wire::invalid)?
-                .members()
-                .map(|m| DeviceKey(m.device))
-                .collect(),
+                source_members,
+                target_members: target_roster.members().map(|m| DeviceKey(m.device)).collect(),
+                self_merge,
+                target_has_profiles,
             },
         )?;
         self.inner.profiles.wake.notify_waiters();
         Ok(())
+    }
+
+    /// Merge the joining list in an acceptor's place (H8) once the target's
+    /// catalog is known: delivered by a target desktop, or the target's first
+    /// catalog when it has none. Returns the merged catalog when it changed.
+    pub(super) fn substitute_merge(
+        &self,
+        group: GroupKey,
+        observation: &super::state::Observation,
+    ) -> Result<Option<Catalog>> {
+        let Some(join) = list(&self.inner.data_dir, group)?
+            .into_iter()
+            .find(|join| join.self_merge)
+        else {
+            return Ok(None);
+        };
+        let source = join
+            .catalog
+            .as_ref()
+            .ok_or_else(|| failure("pre-join catalog unavailable"))?;
+        let merged = match store::load(&self.inner.data_dir, group)? {
+            Some(current) if current.completed_joins.contains_key(&join.id) => return Ok(None),
+            Some(current) => {
+                // Catalog participants are desktops, but controllable phones'
+                // retained arrangement geometry is part of those catalogs too.
+                let table = self.link_config().map_err(super::state::unavailable)?.members();
+                let arranged_member = |device: &DeviceKey| {
+                    observation.snapshot.placements.iter().any(|p| p.device == *device)
+                        || device.0 == self.id()
+                        || table
+                            .members
+                            .iter()
+                            .any(|member| member.device == device.0 && !member.is_mobile())
+                };
+                let only = |set: &std::collections::BTreeSet<DeviceKey>| {
+                    set.iter()
+                        .copied()
+                        .filter(|d| arranged_member(d))
+                        .collect::<std::collections::BTreeSet<_>>()
+                };
+                let current_members = self.group_members().into_iter().map(DeviceKey).collect();
+                current.merge_group_with_context(
+                    source,
+                    &join.id,
+                    self.id().into(),
+                    &super::composition::MergeContext {
+                        source_members: &only(&join.source_members),
+                        target_members: &only(&join.target_members),
+                        current_members: &only(&current_members),
+                        live: &observation.snapshot,
+                    },
+                )?
+            }
+            None if join.target_has_profiles => return Ok(None),
+            // The target has no saved list at all (only phones): the joining
+            // list continues as the target group's list.
+            None => {
+                let mut next = source.clone();
+                let old = next.group;
+                next.group = group;
+                for profile in &mut next.profiles {
+                    if profile.default_group == Some(old) {
+                        profile.default_group = Some(group);
+                    }
+                }
+                next.advance(self.id().into())?;
+                next.completed_joins.insert(
+                    join.id.clone(),
+                    super::model::CompletedJoin {
+                        version: next.version.clone(),
+                        default_profile: next.default_profile().map(|p| p.id.clone()),
+                        dropped_defaults: Default::default(),
+                        appends: Vec::new(),
+                    },
+                );
+                next.validate()?;
+                next
+            }
+        };
+        store::save(&self.inner.data_dir, &merged)?;
+        Ok(Some(merged))
     }
 
     pub(super) fn pending_profile_joins(&self, peer: oink_foundation::DeviceId) -> Result<Vec<Join>> {
@@ -286,6 +407,8 @@ mod tests {
             catalog: None,
             source_members: Default::default(),
             target_members: Default::default(),
+            self_merge: false,
+            target_has_profiles: false,
         };
         let mut raw = serde_json::to_value(&old).unwrap();
         raw.as_object_mut().unwrap().remove("source_members");

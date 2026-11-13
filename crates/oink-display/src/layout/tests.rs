@@ -2476,3 +2476,56 @@ fn hidden_geometry_does_not_collide_or_push_during_edits() {
         assert_eq!(edited.screen(&sid(B, "hidden")).unwrap().rect.x, 0.3);
     }
 }
+
+#[test]
+fn phone_native_rotation_retains_scale_and_repairs_only_the_changed_device() {
+    let pc = display("pc", Rect::new(0., 0., 1000., 800.), (1000, 800), None);
+    let portrait = display(
+        oink_foundation::display::ANDROID_INPUT_DISPLAY,
+        Rect::new(0., 0., 400., 800.),
+        (400, 800),
+        None,
+    );
+    let mut landscape = portrait.clone();
+    landscape.bounds = Rect::new(0., 0., 800., 400.);
+    landscape.pixel_width = 800;
+    landscape.pixel_height = 400;
+    landscape.rotation_deg = 90;
+    let mut layout = Layout::auto(&[(A, vec![pc]), (B, vec![portrait.clone()])]);
+    layout.place_device(A, Point::default(), 0.001, true);
+    layout.place_device(B, Point::new(-0.4, 0.), 0.001, true);
+    let stationary = layout.device_transform(A);
+    layout.sync_device(B, std::slice::from_ref(&landscape));
+    assert!(layout.overlaps().is_empty());
+    assert_eq!(layout.device_transform(A), stationary);
+    let repaired = layout.device_transform(B).unwrap();
+    assert!((repaired.1 - 0.001).abs() < 1e-15);
+    for _ in 0..100 {
+        layout.sync_device(B, std::slice::from_ref(&portrait));
+        layout.sync_device(B, std::slice::from_ref(&landscape));
+        assert_eq!(layout.device_transform(A), stationary);
+        assert_eq!(layout.device_transform(B).unwrap(), repaired);
+        assert!(layout.overlaps().is_empty());
+    }
+}
+
+#[test]
+fn new_phone_is_placed_beside_visible_devices_ignoring_hidden_geometry() {
+    let pc = display("pc", Rect::new(0., 0., 1000., 800.), (1000, 800), None);
+    let phone = display(
+        oink_foundation::display::ANDROID_INPUT_DISPLAY,
+        Rect::new(0., 0., 400., 800.),
+        (400, 800),
+        None,
+    );
+    let mut layout = Layout::auto(&[(A, vec![pc.clone()]), (X, vec![pc])]);
+    for screen in layout.screens.iter_mut().filter(|s| s.id.device == X) {
+        screen.device_hidden = true;
+        screen.device_visibility_known = true;
+        screen.translate(100., 0.);
+    }
+    let pc_right = layout.device_bounds(A).unwrap().right();
+    layout.sync_device(B, &[phone]);
+    assert!((layout.device_bounds(B).unwrap().x - pc_right).abs() < 1e-12);
+    assert!(layout.overlaps().is_empty());
+}

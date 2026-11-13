@@ -1,0 +1,44 @@
+--- a/webrtc/modules/audio_processing/aec3/comfort_noise_generator.cc
++++ b/webrtc/modules/audio_processing/aec3/comfort_noise_generator.cc
+@@ -147,9 +147,11 @@
+       }
+     }
+ 
+-    if (N2_initial_) {
++    if (initial_estimate_active_) {
+       if (++N2_counter_ == 1000) {
+-        N2_initial_.reset();
++        // Oink: retain storage until control-thread destruction. This is
++        // numerically identical to reset(), without freeing on the DSP thread.
++        initial_estimate_active_ = false;
+       } else {
+         // Compute the N2_initial from N2.
+         for (size_t ch = 0; ch < num_capture_channels_; ++ch) {
+@@ -166,7 +168,7 @@
+       for (auto& n : N2_[ch]) {
+         n = std::max(n, noise_floor_);
+       }
+-      if (N2_initial_) {
++      if (initial_estimate_active_) {
+         for (auto& n : (*N2_initial_)[ch]) {
+           n = std::max(n, noise_floor_);
+         }
+@@ -175,7 +177,7 @@
+   }
+ 
+   // Choose N2 estimate to use.
+-  const auto& N2 = N2_initial_ ? (*N2_initial_) : N2_;
++  const auto& N2 = initial_estimate_active_ ? (*N2_initial_) : N2_;
+ 
+   for (size_t ch = 0; ch < num_capture_channels_; ++ch) {
+     GenerateComfortNoise(optimization_, N2[ch], &seed_, &lower_band_noise[ch],
+--- a/webrtc/modules/audio_processing/aec3/comfort_noise_generator.h
++++ b/webrtc/modules/audio_processing/aec3/comfort_noise_generator.h
+@@ -70,6 +70,7 @@
+   std::vector<std::array<float, kFftLengthBy2Plus1>> Y2_smoothed_;
+   std::vector<std::array<float, kFftLengthBy2Plus1>> N2_;
+   int N2_counter_ = 0;
++  bool initial_estimate_active_ = true;
+ };
+ 
+ }  // namespace webrtc

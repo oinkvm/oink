@@ -33,9 +33,6 @@ impl Remote {
     pub fn progress(&self) -> tokio::sync::watch::Receiver<super::super::TransferProgress> {
         self.0.progress.subscribe()
     }
-    pub fn receipt(&self) -> Option<[u8; 32]> {
-        *self.0.receipt.lock().unwrap()
-    }
     pub(super) fn deadline(&self) -> tokio::time::Instant {
         *self.0.last_progress.lock().unwrap() + Duration::from_millis(NO_PROGRESS_MS)
     }
@@ -81,7 +78,7 @@ impl Remote {
         self.0.runtime.spawn(async move {
             let _update_activity = update_activity;
             match remote.deliver().await {
-                Ok(receipt) => {
+                Ok(()) => {
                     // Serialize cancel against publishing Stored. The manifest
                     // itself is already durable; a cancel that won this race
                     // prevents acknowledgement and leaves cleanup a known owner.
@@ -92,7 +89,6 @@ impl Remote {
                         .is_ok()
                     {
                         remote.record_delivery(crate::timing::Outcome::Completed);
-                        *remote.0.receipt.lock().unwrap() = Some(receipt);
                         remote.update_progress(true, |p| {
                             p.phase = super::super::TransferPhase::Stored;
                             p.enumerating = false;
@@ -105,15 +101,12 @@ impl Remote {
         });
         true
     }
-    /// Retry the durable receipt independently of focus and application readers.
-    /// Losing its ACK does not undo Stored. The source has its own bounded
-    /// no-progress obligation and remembers duplicate receipts after cleanup.
+    /// Retry the terminal delivery status independently of focus and readers.
     async fn report_terminal(&self) {
         let Ok(delivery) = self.delivery_id() else { return };
-        let receipt = self.receipt();
-        let message = match receipt {
-            Some(receipt) => ContentMsg::TargetStored { delivery, receipt },
-            None => ContentMsg::Failed {
+        let message = match self.0.terminal.load(Ordering::Acquire) {
+            2 => ContentMsg::TargetStored { delivery },
+            _ => ContentMsg::Failed {
                 delivery,
                 reason: self.0.progress.borrow().failure.unwrap_or(Unavailable::Cancelled),
             },
@@ -133,7 +126,7 @@ impl Remote {
                     .open_with_options(delivery.offer.clip.origin, options)
                     .await?;
                 channel.send(&message.clone()).await?;
-                let expected = ContentMsg::TerminalAck { delivery, receipt };
+                let expected = ContentMsg::TerminalAck { delivery };
                 if channel.recv().await? != Some(expected) {
                     return Err(unavailable(Unavailable::InvalidData));
                 }
@@ -209,7 +202,7 @@ impl Remote {
         }
         Ok(())
     }
-    async fn deliver(&self) -> io::Result<[u8; 32]> {
+    async fn deliver(&self) -> io::Result<()> {
         // The native OS provider owns every received file. This task requests
         // hydration and observes completion; it never allocates a backing file.
         let mut digest = blake3::Hasher::new();
@@ -312,6 +305,6 @@ impl Remote {
             p.bytes = total;
             p.enumerating = false;
         });
-        Ok(*digest.finalize().as_bytes())
+        Ok(())
     }
 }

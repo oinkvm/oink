@@ -4,9 +4,46 @@
   "tools": {
     "cargoAbout": "0.9.2",
     "npmScanner": "lockfile-v1",
+    "gradleScanner": "releaseRuntimeClasspath-v1",
     "spdxExpressionParse": "5.0.0"
   },
   "components": [
+    {
+      "id": "asset:android-robot-head@2026-11-08",
+      "name": "Android™ robot head (adapted)",
+      "version": "2026-11-08",
+      "ecosystem": "asset",
+      "repository": "https://developer.android.com/distribute/marketing-tools/brand-guidelines",
+      "source": {
+        "url": "https://developer.android.com/static/images/brand/android-head_flat.svg",
+        "integrity": "sha256:b36cb6f703556a27526fc336ae4d8705844c87c1e5e8aaf360b49aa08d19f065"
+      },
+      "licenseExpression": "CC-BY-3.0",
+      "selectedLicense": "CC-BY-3.0",
+      "modified": true,
+      "modificationNotice": "Shapes unchanged; drawn in the official file's #34A853 with the eyes in the background colour as a knockout; the privileged-mode badge adds a gold crown above the head (Oink addition).",
+      "scope": [
+        "runtime"
+      ],
+      "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
+        "macos-arm64",
+        "macos-x64",
+        "windows-x64"
+      ],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/e6bc9e9c474700b708f568bac9e5a8a9bcb2b1dad53442f5ba449fcb848b8e76.txt",
+          "sha256": "e6bc9e9c474700b708f568bac9e5a8a9bcb2b1dad53442f5ba449fcb848b8e76"
+        }
+      ],
+      "copyright": [
+        "The Android robot is reproduced or modified from work created and shared by Google and used according to terms described in the Creative Commons 3.0 Attribution License.",
+        "Android is a trademark of Google LLC."
+      ]
+    },
     {
       "id": "asset:lucide-fold-horizontal@1.31.0",
       "name": "Lucide fold-horizontal icon (adapted)",
@@ -37,6 +74,44 @@
       ],
       "copyright": [
         "Copyright (c) 2026 Lucide Icons and Contributors"
+      ]
+    },
+    {
+      "id": "asset:lucide-icons@0.468.0",
+      "name": "Lucide icons",
+      "version": "0.468.0",
+      "ecosystem": "asset",
+      "repository": "https://github.com/lucide-icons/lucide",
+      "source": {
+        "url": "https://registry.npmjs.org/lucide-react/-/lucide-react-0.468.0.tgz",
+        "integrity": "sha512-6koYRhnM2N0GGZIdXzSeiNwguv1gt/FAjZOiPl76roBi3xKEXa4WmfpxgQwTTL4KipXjefrnf3oV4IsYhi4JFA=="
+      },
+      "licenseExpression": "ISC AND MIT",
+      "selectedLicense": "ISC AND MIT",
+      "modified": true,
+      "modificationNotice": "The mobile apps convert the lucide-react icons used by the Oink mobile design into vector path data (Android) and PDF image assets (iOS); shapes unchanged.",
+      "provenance": "Pinned to the two export scripts that bring the icons from lucide-react 0.468.0 into apps/mobile (Android DesignIconData.kt, iOS Assets.xcassets/UI). Feather-derived icons keep their MIT notice.",
+      "scope": [
+        "runtime"
+      ],
+      "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64"
+      ],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/1e7290b35280a048667bbf0ebabac1c7fd52a75300e8b2946ac165715997f2bc.txt",
+          "sha256": "1e7290b35280a048667bbf0ebabac1c7fd52a75300e8b2946ac165715997f2bc"
+        },
+        {
+          "path": "licenses/texts/57e66499f20de5d76a2c63ff5f89c5f681252bb57ca125b9612eb0ebd2c751c7.txt",
+          "sha256": "57e66499f20de5d76a2c63ff5f89c5f681252bb57ca125b9612eb0ebd2c751c7"
+        }
+      ],
+      "copyright": [
+        "Copyright (c) for portions of Lucide are held by Cole Bemis 2013-2022 as part of Feather (MIT). All other copyright (c) for Lucide are held by Lucide Contributors 2022.",
+        "Copyright (c) 2013-present Cole Bemis"
       ]
     },
     {
@@ -220,6 +295,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -237,6 +315,160 @@
         {
           "path": "licenses/texts/8ada45cd9f843acf64e4722ae262c622a2b3b3007c7310ef36ac1061a30f6adb.txt",
           "sha256": "8ada45cd9f843acf64e4722ae262c622a2b3b3007c7310ef36ac1061a30f6adb"
+        }
+      ]
+    },
+    {
+      "id": "cargo:aead@0.5.2",
+      "name": "aead",
+      "version": "0.5.2",
+      "ecosystem": "cargo",
+      "repository": "https://github.com/RustCrypto/traits",
+      "source": {
+        "url": "https://crates.io/api/v1/crates/aead/0.5.2/download",
+        "integrity": "sha256:d122413f284cf2d62fb1b7db97e02edb8cda96d769b16e443a4f6195e35662b0"
+      },
+      "licenseExpression": "MIT OR Apache-2.0",
+      "selectedLicense": "MIT",
+      "modified": false,
+      "scope": [
+        "runtime"
+      ],
+      "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
+        "macos-arm64",
+        "macos-x64",
+        "windows-x64"
+      ],
+      "copyright": [
+        "Copyright (c) 2019 MobileCoin, LLC",
+        "Copyright (c) 2019 The RustCrypto Project Developers"
+      ],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/949ab7b3e7140fee216f06fe3a2bd67d68dd511f8ea73c1e01c98cb348e9c8ae.txt",
+          "sha256": "949ab7b3e7140fee216f06fe3a2bd67d68dd511f8ea73c1e01c98cb348e9c8ae"
+        },
+        {
+          "path": "licenses/texts/b1cf9a3333ca78152b859012cd4a804156e5243e9ca20ad1df7327ba5ea7405c.txt",
+          "sha256": "b1cf9a3333ca78152b859012cd4a804156e5243e9ca20ad1df7327ba5ea7405c"
+        }
+      ]
+    },
+    {
+      "id": "cargo:aes-gcm@0.10.3",
+      "name": "aes-gcm",
+      "version": "0.10.3",
+      "ecosystem": "cargo",
+      "repository": "https://github.com/RustCrypto/AEADs",
+      "source": {
+        "url": "https://crates.io/api/v1/crates/aes-gcm/0.10.3/download",
+        "integrity": "sha256:831010a0f742e1209b3bcea8fab6a8e149051ba6099432c8cb2cc117dec3ead1"
+      },
+      "licenseExpression": "Apache-2.0 OR MIT",
+      "selectedLicense": "MIT",
+      "modified": false,
+      "scope": [
+        "runtime"
+      ],
+      "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
+        "macos-arm64",
+        "macos-x64",
+        "windows-x64"
+      ],
+      "copyright": [
+        "Copyright (c) 2019 The RustCrypto Project Developers"
+      ],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/3c0dfa33fd2e6976038555b52095699452653b1fcabe113074f14e0848a6b11e.txt",
+          "sha256": "3c0dfa33fd2e6976038555b52095699452653b1fcabe113074f14e0848a6b11e"
+        },
+        {
+          "path": "licenses/texts/a9040321c3712d8fd0b09cf52b17445de04a23a10165049ae187cd39e5c86be5.txt",
+          "sha256": "a9040321c3712d8fd0b09cf52b17445de04a23a10165049ae187cd39e5c86be5"
+        }
+      ]
+    },
+    {
+      "id": "cargo:aes@0.8.4",
+      "name": "aes",
+      "version": "0.8.4",
+      "ecosystem": "cargo",
+      "repository": "https://github.com/RustCrypto/block-ciphers",
+      "source": {
+        "url": "https://crates.io/api/v1/crates/aes/0.8.4/download",
+        "integrity": "sha256:b169f7a6d4742236a0a00c541b845991d0ac43e546831af1249753ab4c3aa3a0"
+      },
+      "licenseExpression": "MIT OR Apache-2.0",
+      "selectedLicense": "MIT",
+      "modified": false,
+      "scope": [
+        "runtime"
+      ],
+      "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
+        "macos-arm64",
+        "macos-x64",
+        "windows-x64"
+      ],
+      "copyright": [
+        "Copyright (c) 2018 Artyom Pavlov"
+      ],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/a9040321c3712d8fd0b09cf52b17445de04a23a10165049ae187cd39e5c86be5.txt",
+          "sha256": "a9040321c3712d8fd0b09cf52b17445de04a23a10165049ae187cd39e5c86be5"
+        },
+        {
+          "path": "licenses/texts/f7e8ab639afef15573680c97f796166835cbeb3865175882fea41c60d106b733.txt",
+          "sha256": "f7e8ab639afef15573680c97f796166835cbeb3865175882fea41c60d106b733"
+        }
+      ]
+    },
+    {
+      "id": "cargo:ahash@0.8.12",
+      "name": "ahash",
+      "version": "0.8.12",
+      "ecosystem": "cargo",
+      "repository": "https://github.com/tkaitchuck/ahash",
+      "source": {
+        "url": "https://crates.io/api/v1/crates/ahash/0.8.12/download",
+        "integrity": "sha256:5a15f179cd60c4584b8a8c596927aadc462e27f2ca70c04e0071964a73ba7a75"
+      },
+      "licenseExpression": "MIT OR Apache-2.0",
+      "selectedLicense": "MIT",
+      "modified": false,
+      "scope": [
+        "runtime",
+        "test"
+      ],
+      "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
+        "macos-arm64",
+        "macos-x64",
+        "windows-x64"
+      ],
+      "copyright": [
+        "Copyright (c) 2018 Tom Kaitchuck"
+      ],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/0444c6991eead6822f7b9102e654448d51624431119546492e8b231db42c48bb.txt",
+          "sha256": "0444c6991eead6822f7b9102e654448d51624431119546492e8b231db42c48bb"
+        },
+        {
+          "path": "licenses/texts/a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2.txt",
+          "sha256": "a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2"
         }
       ]
     },
@@ -259,6 +491,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -525,6 +760,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -559,6 +797,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -627,6 +868,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -636,6 +880,42 @@
         {
           "path": "licenses/texts/4da95ec4ecb65b738d470b7d762894ad9c97da93e6cbfb18b570fc2c96f4b871.txt",
           "sha256": "4da95ec4ecb65b738d470b7d762894ad9c97da93e6cbfb18b570fc2c96f4b871"
+        },
+        {
+          "path": "licenses/texts/a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2.txt",
+          "sha256": "a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2"
+        }
+      ]
+    },
+    {
+      "id": "cargo:async-compat@0.2.6",
+      "name": "async-compat",
+      "version": "0.2.6",
+      "ecosystem": "cargo",
+      "repository": "https://github.com/smol-rs/async-compat",
+      "source": {
+        "url": "https://crates.io/api/v1/crates/async-compat/0.2.6/download",
+        "integrity": "sha256:4c97d7ff3c25d6c10d64170c12acaf5d4245e76dece3779c1d92b153a64f11df"
+      },
+      "licenseExpression": "Apache-2.0 OR MIT",
+      "selectedLicense": "MIT",
+      "modified": false,
+      "scope": [
+        "runtime"
+      ],
+      "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
+        "macos-arm64",
+        "macos-x64",
+        "windows-x64"
+      ],
+      "copyright": [],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3.txt",
+          "sha256": "23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3"
         },
         {
           "path": "licenses/texts/a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2.txt",
@@ -733,6 +1013,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -805,6 +1088,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -878,6 +1164,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -916,6 +1205,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -953,6 +1245,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -1026,6 +1321,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -1062,6 +1360,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -1106,6 +1407,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -1143,6 +1447,7 @@
         "test"
       ],
       "platforms": [
+        "ios-arm64",
         "macos-arm64",
         "macos-x64"
       ],
@@ -1270,9 +1575,13 @@
       "selectedLicense": "MIT",
       "modified": false,
       "scope": [
-        "runtime"
+        "runtime",
+        "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -1309,6 +1618,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -1349,6 +1661,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -1426,6 +1741,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -1518,6 +1836,9 @@
         "runtime"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -1569,6 +1890,42 @@
       ]
     },
     {
+      "id": "cargo:cargo-platform@0.3.3",
+      "name": "cargo-platform",
+      "version": "0.3.3",
+      "ecosystem": "cargo",
+      "repository": "https://github.com/rust-lang/cargo",
+      "source": {
+        "url": "https://crates.io/api/v1/crates/cargo-platform/0.3.3/download",
+        "integrity": "sha256:dd0061da739915fae12ea00e16397555ed4371a6bb285431aab930f61b0aa4ba"
+      },
+      "licenseExpression": "MIT OR Apache-2.0",
+      "selectedLicense": "MIT",
+      "modified": false,
+      "scope": [
+        "runtime"
+      ],
+      "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
+        "macos-arm64",
+        "macos-x64",
+        "windows-x64"
+      ],
+      "copyright": [],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3.txt",
+          "sha256": "23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3"
+        },
+        {
+          "path": "licenses/texts/8ada45cd9f843acf64e4722ae262c622a2b3b3007c7310ef36ac1061a30f6adb.txt",
+          "sha256": "8ada45cd9f843acf64e4722ae262c622a2b3b3007c7310ef36ac1061a30f6adb"
+        }
+      ]
+    },
+    {
       "id": "cargo:cargo_metadata@0.19.2",
       "name": "cargo_metadata",
       "version": "0.19.2",
@@ -1586,6 +1943,38 @@
         "runtime"
       ],
       "platforms": [
+        "macos-arm64",
+        "macos-x64",
+        "windows-x64"
+      ],
+      "copyright": [],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3.txt",
+          "sha256": "23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3"
+        }
+      ]
+    },
+    {
+      "id": "cargo:cargo_metadata@0.23.1",
+      "name": "cargo_metadata",
+      "version": "0.23.1",
+      "ecosystem": "cargo",
+      "repository": "https://github.com/oli-obk/cargo_metadata",
+      "source": {
+        "url": "https://crates.io/api/v1/crates/cargo_metadata/0.23.1/download",
+        "integrity": "sha256:ef987d17b0a113becdd19d3d0022d04d7ef41f9efe4f3fb63ac44ba61df3ade9"
+      },
+      "licenseExpression": "MIT",
+      "selectedLicense": "MIT",
+      "modified": false,
+      "scope": [
+        "runtime"
+      ],
+      "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -1649,6 +2038,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -1664,6 +2056,53 @@
         {
           "path": "licenses/texts/a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2.txt",
           "sha256": "a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2"
+        }
+      ]
+    },
+    {
+      "id": "cargo:cesu8@1.1.0",
+      "name": "cesu8",
+      "version": "1.1.0",
+      "ecosystem": "cargo",
+      "repository": "https://github.com/emk/cesu8-rs",
+      "source": {
+        "url": "https://crates.io/api/v1/crates/cesu8/1.1.0/download",
+        "integrity": "sha256:6d43a04d8753f35258c91f8ec639f792891f748a1edbd759cf1dcea3382ad83c"
+      },
+      "licenseExpression": "Apache-2.0 OR MIT",
+      "selectedLicense": "MIT",
+      "modified": false,
+      "scope": [
+        "runtime",
+        "test"
+      ],
+      "platforms": [
+        "android-arm64",
+        "android-x64"
+      ],
+      "copyright": [
+        "\"Copyright (c) 2011 Google Inc.\"",
+        "Copyright (C) 2000-2010 Julian Seward.  All rights",
+        "Copyright (C) 2002-2014 Jason Evans",
+        "Copyright (C) 2007-2012 Mozilla Foundation.",
+        "Copyright (C) 2008-2010 Tachyon Technologies.",
+        "Copyright (C) 2009-2014 Facebook, Inc.",
+        "Copyright (C) 2012-2014 Free Software Foundation, Inc.",
+        "Copyright (c) 2003-2013 University of Illinois at",
+        "Copyright (c) 2008, Natacha Porté",
+        "Copyright (c) 2009-2014 by the contributors listed in",
+        "Copyright (c) 2011, Vicent Martí",
+        "Copyright (c) 2013, Devin Torres and the Hoedown authors",
+        "The Rust Project is copyright 2014, The Rust Project"
+      ],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/5ca77347e58205d3b543c04a9c5bdd11d20a9f3108a7b246640edffa999b5f35.txt",
+          "sha256": "5ca77347e58205d3b543c04a9c5bdd11d20a9f3108a7b246640edffa999b5f35"
+        },
+        {
+          "path": "licenses/texts/b05785f9f18e6716bab63424b11454513b9943a222595b70411009202fc592b5.txt",
+          "sha256": "b05785f9f18e6716bab63424b11454513b9943a222595b70411009202fc592b5"
         }
       ]
     },
@@ -1718,6 +2157,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -1754,6 +2196,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -1790,6 +2235,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -1805,6 +2253,44 @@
         {
           "path": "licenses/texts/b8c6939380a400f53e11923d50fcc4dd2fa1ba8339fd9d04cda38a0251b6c9b0.txt",
           "sha256": "b8c6939380a400f53e11923d50fcc4dd2fa1ba8339fd9d04cda38a0251b6c9b0"
+        }
+      ]
+    },
+    {
+      "id": "cargo:cipher@0.4.4",
+      "name": "cipher",
+      "version": "0.4.4",
+      "ecosystem": "cargo",
+      "repository": "https://github.com/RustCrypto/traits",
+      "source": {
+        "url": "https://crates.io/api/v1/crates/cipher/0.4.4/download",
+        "integrity": "sha256:773f3b9af64447d2ce9850330c473515014aa235e6a783b02db81ff39e4a3dad"
+      },
+      "licenseExpression": "MIT OR Apache-2.0",
+      "selectedLicense": "MIT",
+      "modified": false,
+      "scope": [
+        "runtime"
+      ],
+      "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
+        "macos-arm64",
+        "macos-x64",
+        "windows-x64"
+      ],
+      "copyright": [
+        "Copyright (c) 2016-2020 RustCrypto Developers"
+      ],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/5c7bd92d1f096f12203dc1b601e3cb17484fa1b023e30b6b8edcc80e416237ec.txt",
+          "sha256": "5c7bd92d1f096f12203dc1b601e3cb17484fa1b023e30b6b8edcc80e416237ec"
+        },
+        {
+          "path": "licenses/texts/a9040321c3712d8fd0b09cf52b17445de04a23a10165049ae187cd39e5c86be5.txt",
+          "sha256": "a9040321c3712d8fd0b09cf52b17445de04a23a10165049ae187cd39e5c86be5"
         }
       ]
     },
@@ -1987,6 +2473,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -2039,6 +2528,37 @@
       ]
     },
     {
+      "id": "cargo:combine@4.6.8",
+      "name": "combine",
+      "version": "4.6.8",
+      "ecosystem": "cargo",
+      "repository": "https://github.com/Marwes/combine",
+      "source": {
+        "url": "https://crates.io/api/v1/crates/combine/4.6.8/download",
+        "integrity": "sha256:cfc320937d09e6de266b31b9afb480f197d7a861be86be7cb2ea7e5d1bfffc5e"
+      },
+      "licenseExpression": "MIT",
+      "selectedLicense": "MIT",
+      "modified": false,
+      "scope": [
+        "runtime",
+        "test"
+      ],
+      "platforms": [
+        "android-arm64",
+        "android-x64"
+      ],
+      "copyright": [
+        "Copyright (c) 2015 Markus Westerlind"
+      ],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/9bbc1b3dc4674a9ebb12c2a62f54fe3c08672539717f8d05828f684b6cc419a3.txt",
+          "sha256": "9bbc1b3dc4674a9ebb12c2a62f54fe3c08672539717f8d05828f684b6cc419a3"
+        }
+      ]
+    },
+    {
       "id": "cargo:const-oid@0.9.6",
       "name": "const-oid",
       "version": "0.9.6",
@@ -2056,6 +2576,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -2092,6 +2615,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -2376,6 +2902,7 @@
         "test"
       ],
       "platforms": [
+        "ios-arm64",
         "macos-arm64",
         "macos-x64"
       ],
@@ -2411,6 +2938,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -2441,6 +2971,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -2477,6 +3010,7 @@
         "test"
       ],
       "platforms": [
+        "android-x64",
         "macos-x64",
         "windows-x64"
       ],
@@ -2512,6 +3046,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -2548,6 +3085,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -2589,6 +3129,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -2625,6 +3168,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -2661,6 +3207,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -2774,6 +3323,45 @@
       ]
     },
     {
+      "id": "cargo:ctr@0.9.2",
+      "name": "ctr",
+      "version": "0.9.2",
+      "ecosystem": "cargo",
+      "repository": "https://github.com/RustCrypto/block-modes",
+      "source": {
+        "url": "https://crates.io/api/v1/crates/ctr/0.9.2/download",
+        "integrity": "sha256:0369ee1ad671834580515889b80f2ea915f23b8be8d0daa4bbaf2ac5c7590835"
+      },
+      "licenseExpression": "MIT OR Apache-2.0",
+      "selectedLicense": "MIT",
+      "modified": false,
+      "scope": [
+        "runtime"
+      ],
+      "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
+        "macos-arm64",
+        "macos-x64",
+        "windows-x64"
+      ],
+      "copyright": [
+        "Copyright (c) 2018 Artyom Pavlov",
+        "Copyright (c) 2018-2022 RustCrypto Developers"
+      ],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/63af4bea227c94d021e99427f6ca3a4b8efddadcca93ab6130f708cf6138cf68.txt",
+          "sha256": "63af4bea227c94d021e99427f6ca3a4b8efddadcca93ab6130f708cf6138cf68"
+        },
+        {
+          "path": "licenses/texts/a9040321c3712d8fd0b09cf52b17445de04a23a10165049ae187cd39e5c86be5.txt",
+          "sha256": "a9040321c3712d8fd0b09cf52b17445de04a23a10165049ae187cd39e5c86be5"
+        }
+      ]
+    },
+    {
       "id": "cargo:curve25519-dalek-derive@0.1.1",
       "name": "curve25519-dalek-derive",
       "version": "0.1.1",
@@ -2791,6 +3379,7 @@
         "test"
       ],
       "platforms": [
+        "android-x64",
         "macos-x64",
         "windows-x64"
       ],
@@ -2824,6 +3413,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -2958,6 +3550,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -3051,6 +3646,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -3087,6 +3685,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -3124,6 +3725,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -3225,6 +3829,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -3334,6 +3941,7 @@
         "test"
       ],
       "platforms": [
+        "ios-arm64",
         "macos-arm64",
         "macos-x64"
       ],
@@ -3608,6 +4216,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -3640,6 +4251,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -3815,9 +4429,13 @@
       "modified": false,
       "scope": [
         "build",
-        "runtime"
+        "runtime",
+        "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -3888,6 +4506,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64"
       ],
@@ -3919,9 +4540,15 @@
       "selectedLicense": "MIT",
       "modified": false,
       "scope": [
-        "runtime"
+        "runtime",
+        "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
+        "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -3931,6 +4558,45 @@
         {
           "path": "licenses/texts/0816e154b159ba255c563f7c8c7df5bbb8cc5fc96f5ab8cf9f4743b4f41fe7eb.txt",
           "sha256": "0816e154b159ba255c563f7c8c7df5bbb8cc5fc96f5ab8cf9f4743b4f41fe7eb"
+        },
+        {
+          "path": "licenses/texts/c6596eb7be8581c18be736c846fb9173b69eccf6ef94c5135893ec56bd92ba08.txt",
+          "sha256": "c6596eb7be8581c18be736c846fb9173b69eccf6ef94c5135893ec56bd92ba08"
+        }
+      ]
+    },
+    {
+      "id": "cargo:fallible-streaming-iterator@0.1.9",
+      "name": "fallible-streaming-iterator",
+      "version": "0.1.9",
+      "ecosystem": "cargo",
+      "repository": "https://github.com/sfackler/fallible-streaming-iterator",
+      "source": {
+        "url": "https://crates.io/api/v1/crates/fallible-streaming-iterator/0.1.9/download",
+        "integrity": "sha256:7360491ce676a36bf9bb3c56c1aa791658183a54d2744120f27285738d90465a"
+      },
+      "licenseExpression": "MIT OR Apache-2.0",
+      "selectedLicense": "MIT",
+      "modified": false,
+      "scope": [
+        "runtime",
+        "test"
+      ],
+      "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
+        "macos-arm64",
+        "macos-x64",
+        "windows-x64"
+      ],
+      "copyright": [
+        "Copyright (c) 2016 The fallible-streaming-iterator Developers"
+      ],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/8dcec5569a9be5b0e086c80faed6f1aefa670af0ec29cecc2f714303096887e0.txt",
+          "sha256": "8dcec5569a9be5b0e086c80faed6f1aefa670af0ec29cecc2f714303096887e0"
         },
         {
           "path": "licenses/texts/c6596eb7be8581c18be736c846fb9173b69eccf6ef94c5135893ec56bd92ba08.txt",
@@ -3957,6 +4623,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -3991,6 +4660,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -4023,6 +4695,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -4057,6 +4732,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -4093,6 +4771,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -4123,6 +4804,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -4191,6 +4875,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -4226,6 +4913,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -4449,6 +5139,42 @@
       ]
     },
     {
+      "id": "cargo:fs-err@3.3.2",
+      "name": "fs-err",
+      "version": "3.3.2",
+      "ecosystem": "cargo",
+      "repository": "https://github.com/andrewhickman/fs-err",
+      "source": {
+        "url": "https://crates.io/api/v1/crates/fs-err/3.3.2/download",
+        "integrity": "sha256:b5c95b673b8f6f7235229ae11c5642d81b04c2e64c1e2fb417bc0cf73ca45f29"
+      },
+      "licenseExpression": "MIT OR Apache-2.0",
+      "selectedLicense": "MIT",
+      "modified": false,
+      "scope": [
+        "runtime"
+      ],
+      "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
+        "macos-arm64",
+        "macos-x64",
+        "windows-x64"
+      ],
+      "copyright": [],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/36516aefdc84c5d5a1e7485425913a22dbda69eb1930c5e84d6ae4972b5194b9.txt",
+          "sha256": "36516aefdc84c5d5a1e7485425913a22dbda69eb1930c5e84d6ae4972b5194b9"
+        },
+        {
+          "path": "licenses/texts/7cfd738c53d61c79f07e348f622bf7707c9084237054d37fbe07788a75f5881c.txt",
+          "sha256": "7cfd738c53d61c79f07e348f622bf7707c9084237054d37fbe07788a75f5881c"
+        }
+      ]
+    },
+    {
       "id": "cargo:fs2@0.4.3",
       "name": "fs2",
       "version": "0.4.3",
@@ -4466,6 +5192,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -4569,6 +5298,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -4640,6 +5372,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -4714,6 +5449,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -4825,6 +5563,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -4857,6 +5598,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -4887,6 +5631,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -4924,6 +5671,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -4962,6 +5712,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -4978,6 +5731,44 @@
         {
           "path": "licenses/texts/aaff376532ea30a0cd5330b9502ad4a4c8bf769c539c87ffe78819d188a18ebf.txt",
           "sha256": "aaff376532ea30a0cd5330b9502ad4a4c8bf769c539c87ffe78819d188a18ebf"
+        }
+      ]
+    },
+    {
+      "id": "cargo:ghash@0.5.1",
+      "name": "ghash",
+      "version": "0.5.1",
+      "ecosystem": "cargo",
+      "repository": "https://github.com/RustCrypto/universal-hashes",
+      "source": {
+        "url": "https://crates.io/api/v1/crates/ghash/0.5.1/download",
+        "integrity": "sha256:f0d8a4362ccb29cb0b265253fb0a2728f592895ee6854fd9bc13f2ffda266ff1"
+      },
+      "licenseExpression": "Apache-2.0 OR MIT",
+      "selectedLicense": "MIT",
+      "modified": false,
+      "scope": [
+        "runtime"
+      ],
+      "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
+        "macos-arm64",
+        "macos-x64",
+        "windows-x64"
+      ],
+      "copyright": [
+        "Copyright (c) 2019 RustCrypto Developers"
+      ],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/a9040321c3712d8fd0b09cf52b17445de04a23a10165049ae187cd39e5c86be5.txt",
+          "sha256": "a9040321c3712d8fd0b09cf52b17445de04a23a10165049ae187cd39e5c86be5"
+        },
+        {
+          "path": "licenses/texts/c0fabcc308b450cb6fe62c9f56fae6abbeb9768eb80d992484c857d744846c2e.txt",
+          "sha256": "c0fabcc308b450cb6fe62c9f56fae6abbeb9768eb80d992484c857d744846c2e"
         }
       ]
     },
@@ -5032,6 +5823,9 @@
         "runtime"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -5068,6 +5862,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -5121,23 +5918,26 @@
       ]
     },
     {
-      "id": "cargo:hashbrown@0.17.1",
+      "id": "cargo:hashbrown@0.14.5",
       "name": "hashbrown",
-      "version": "0.17.1",
+      "version": "0.14.5",
       "ecosystem": "cargo",
       "repository": "https://github.com/rust-lang/hashbrown",
       "source": {
-        "url": "https://crates.io/api/v1/crates/hashbrown/0.17.1/download",
-        "integrity": "sha256:ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
+        "url": "https://crates.io/api/v1/crates/hashbrown/0.14.5/download",
+        "integrity": "sha256:e5274423e17b7c9fc20b6e7e208532f9b19825d82dfd615708b70edd83df41f1"
       },
       "licenseExpression": "MIT OR Apache-2.0",
       "selectedLicense": "MIT",
       "modified": false,
       "scope": [
-        "build",
-        "runtime"
+        "runtime",
+        "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -5153,6 +5953,83 @@
         {
           "path": "licenses/texts/ff8f68cb076caf8cefe7a6430d4ac086ce6af2ca8ce2c4e5a2004d4552ef52a2.txt",
           "sha256": "ff8f68cb076caf8cefe7a6430d4ac086ce6af2ca8ce2c4e5a2004d4552ef52a2"
+        }
+      ]
+    },
+    {
+      "id": "cargo:hashbrown@0.17.1",
+      "name": "hashbrown",
+      "version": "0.17.1",
+      "ecosystem": "cargo",
+      "repository": "https://github.com/rust-lang/hashbrown",
+      "source": {
+        "url": "https://crates.io/api/v1/crates/hashbrown/0.17.1/download",
+        "integrity": "sha256:ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
+      },
+      "licenseExpression": "MIT OR Apache-2.0",
+      "selectedLicense": "MIT",
+      "modified": false,
+      "scope": [
+        "build",
+        "runtime",
+        "test"
+      ],
+      "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
+        "macos-arm64",
+        "macos-x64",
+        "windows-x64"
+      ],
+      "copyright": [
+        "Copyright (c) 2016 Amanieu d'Antras"
+      ],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2.txt",
+          "sha256": "a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2"
+        },
+        {
+          "path": "licenses/texts/ff8f68cb076caf8cefe7a6430d4ac086ce6af2ca8ce2c4e5a2004d4552ef52a2.txt",
+          "sha256": "ff8f68cb076caf8cefe7a6430d4ac086ce6af2ca8ce2c4e5a2004d4552ef52a2"
+        }
+      ]
+    },
+    {
+      "id": "cargo:hashlink@0.9.1",
+      "name": "hashlink",
+      "version": "0.9.1",
+      "ecosystem": "cargo",
+      "repository": "https://github.com/kyren/hashlink",
+      "source": {
+        "url": "https://crates.io/api/v1/crates/hashlink/0.9.1/download",
+        "integrity": "sha256:6ba4ff7128dee98c7dc9794b6a411377e1404dba1c97deb8d1a55297bd25d8af"
+      },
+      "licenseExpression": "MIT OR Apache-2.0",
+      "selectedLicense": "MIT",
+      "modified": false,
+      "scope": [
+        "runtime",
+        "test"
+      ],
+      "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
+        "macos-arm64",
+        "macos-x64",
+        "windows-x64"
+      ],
+      "copyright": [],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/c144680885b29e4719e2a51f0aab5439a1e02d980692b5aaf086cae12727f28b.txt",
+          "sha256": "c144680885b29e4719e2a51f0aab5439a1e02d980692b5aaf086cae12727f28b"
+        },
+        {
+          "path": "licenses/texts/e915669a595b11a200873df8286561881b0e04932f6412a585db6297ba0bc97c.txt",
+          "sha256": "e915669a595b11a200873df8286561881b0e04932f6412a585db6297ba0bc97c"
         }
       ]
     },
@@ -5174,6 +6051,9 @@
         "runtime"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -5210,6 +6090,9 @@
         "runtime"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -5247,6 +6130,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -5284,6 +6170,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -6006,6 +6895,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -6043,6 +6935,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -6080,6 +6975,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -6179,9 +7077,13 @@
       "modified": false,
       "scope": [
         "build",
-        "runtime"
+        "runtime",
+        "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -6229,6 +7131,45 @@
         {
           "path": "licenses/texts/270b0d81891aa44c7e8726cf9432dade9556a01c848bacd2f3ef839c9c1a1859.txt",
           "sha256": "270b0d81891aa44c7e8726cf9432dade9556a01c848bacd2f3ef839c9c1a1859"
+        }
+      ]
+    },
+    {
+      "id": "cargo:inout@0.1.4",
+      "name": "inout",
+      "version": "0.1.4",
+      "ecosystem": "cargo",
+      "repository": "https://github.com/RustCrypto/utils",
+      "source": {
+        "url": "https://crates.io/api/v1/crates/inout/0.1.4/download",
+        "integrity": "sha256:879f10e63c20629ecabbb64a8010319738c66a5cd0c29b02d63d272b03751d01"
+      },
+      "licenseExpression": "MIT OR Apache-2.0",
+      "selectedLicense": "MIT",
+      "modified": false,
+      "scope": [
+        "runtime"
+      ],
+      "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
+        "macos-arm64",
+        "macos-x64",
+        "windows-x64"
+      ],
+      "copyright": [
+        "Copyright (c) 2022 Artyom Pavlov",
+        "Copyright (c) 2022 The RustCrypto Project Developers"
+      ],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/304b898acad7f02e03d6d8832d682a3b43ee729ab5d3a069af5a36979083b6b4.txt",
+          "sha256": "304b898acad7f02e03d6d8832d682a3b43ee729ab5d3a069af5a36979083b6b4"
+        },
+        {
+          "path": "licenses/texts/a9040321c3712d8fd0b09cf52b17445de04a23a10165049ae187cd39e5c86be5.txt",
+          "sha256": "a9040321c3712d8fd0b09cf52b17445de04a23a10165049ae187cd39e5c86be5"
         }
       ]
     },
@@ -6353,6 +7294,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -6366,6 +7310,140 @@
         {
           "path": "licenses/texts/62c7a1e35f56406896d7aa7ca52d0cc0d272ac022b5d2796e7d6905db8a3636a.txt",
           "sha256": "62c7a1e35f56406896d7aa7ca52d0cc0d272ac022b5d2796e7d6905db8a3636a"
+        }
+      ]
+    },
+    {
+      "id": "cargo:jni-sys-macros@0.4.1",
+      "name": "jni-sys-macros",
+      "version": "0.4.1",
+      "ecosystem": "cargo",
+      "repository": "https://github.com/jni-rs/jni-sys",
+      "source": {
+        "url": "https://crates.io/api/v1/crates/jni-sys-macros/0.4.1/download",
+        "integrity": "sha256:38c0b942f458fe50cdac086d2f946512305e5631e720728f2a61aabcd47a6264"
+      },
+      "licenseExpression": "MIT OR Apache-2.0",
+      "selectedLicense": "MIT",
+      "modified": false,
+      "scope": [
+        "runtime",
+        "test"
+      ],
+      "platforms": [
+        "android-arm64",
+        "android-x64"
+      ],
+      "copyright": [],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/b05785f9f18e6716bab63424b11454513b9943a222595b70411009202fc592b5.txt",
+          "sha256": "b05785f9f18e6716bab63424b11454513b9943a222595b70411009202fc592b5"
+        }
+      ]
+    },
+    {
+      "id": "cargo:jni-sys@0.3.1",
+      "name": "jni-sys",
+      "version": "0.3.1",
+      "ecosystem": "cargo",
+      "repository": "https://github.com/jni-rs/jni-sys",
+      "source": {
+        "url": "https://crates.io/api/v1/crates/jni-sys/0.3.1/download",
+        "integrity": "sha256:41a652e1f9b6e0275df1f15b32661cf0d4b78d4d87ddec5e0c3c20f097433258"
+      },
+      "licenseExpression": "MIT OR Apache-2.0",
+      "selectedLicense": "MIT",
+      "modified": false,
+      "scope": [
+        "runtime",
+        "test"
+      ],
+      "platforms": [
+        "android-arm64",
+        "android-x64"
+      ],
+      "copyright": [
+        "Copyright (c) 2015 The rust-jni-sys Developers"
+      ],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/1d85bd754b04ceec93e98e890edd1fa3c6a22e81bcb32135806beeccefa51cd1.txt",
+          "sha256": "1d85bd754b04ceec93e98e890edd1fa3c6a22e81bcb32135806beeccefa51cd1"
+        },
+        {
+          "path": "licenses/texts/c6596eb7be8581c18be736c846fb9173b69eccf6ef94c5135893ec56bd92ba08.txt",
+          "sha256": "c6596eb7be8581c18be736c846fb9173b69eccf6ef94c5135893ec56bd92ba08"
+        }
+      ]
+    },
+    {
+      "id": "cargo:jni-sys@0.4.1",
+      "name": "jni-sys",
+      "version": "0.4.1",
+      "ecosystem": "cargo",
+      "repository": "https://github.com/jni-rs/jni-sys",
+      "source": {
+        "url": "https://crates.io/api/v1/crates/jni-sys/0.4.1/download",
+        "integrity": "sha256:c6377a88cb3910bee9b0fa88d4f42e1d2da8e79915598f65fb0c7ee14c878af2"
+      },
+      "licenseExpression": "MIT OR Apache-2.0",
+      "selectedLicense": "MIT",
+      "modified": false,
+      "scope": [
+        "runtime",
+        "test"
+      ],
+      "platforms": [
+        "android-arm64",
+        "android-x64"
+      ],
+      "copyright": [
+        "Copyright (c) 2015 The rust-jni-sys Developers"
+      ],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/1d85bd754b04ceec93e98e890edd1fa3c6a22e81bcb32135806beeccefa51cd1.txt",
+          "sha256": "1d85bd754b04ceec93e98e890edd1fa3c6a22e81bcb32135806beeccefa51cd1"
+        },
+        {
+          "path": "licenses/texts/c6596eb7be8581c18be736c846fb9173b69eccf6ef94c5135893ec56bd92ba08.txt",
+          "sha256": "c6596eb7be8581c18be736c846fb9173b69eccf6ef94c5135893ec56bd92ba08"
+        }
+      ]
+    },
+    {
+      "id": "cargo:jni@0.21.1",
+      "name": "jni",
+      "version": "0.21.1",
+      "ecosystem": "cargo",
+      "repository": "https://github.com/jni-rs/jni-rs",
+      "source": {
+        "url": "https://crates.io/api/v1/crates/jni/0.21.1/download",
+        "integrity": "sha256:1a87aa2bb7d2af34197c04845522473242e1aa17c12f4935d5856491a7fb8c97"
+      },
+      "licenseExpression": "MIT OR Apache-2.0",
+      "selectedLicense": "MIT",
+      "modified": false,
+      "scope": [
+        "runtime",
+        "test"
+      ],
+      "platforms": [
+        "android-arm64",
+        "android-x64"
+      ],
+      "copyright": [
+        "Copyright (c) 2016 Prevoty, Inc. and jni-rs contributors"
+      ],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2.txt",
+          "sha256": "a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2"
+        },
+        {
+          "path": "licenses/texts/fea1d5bf3dd71605ce5d7d2ff695c1837e914c77195e523a86b5391716477960.txt",
+          "sha256": "fea1d5bf3dd71605ce5d7d2ff695c1837e914c77195e523a86b5391716477960"
         }
       ]
     },
@@ -6531,6 +7609,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -6568,6 +7649,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -6581,6 +7665,168 @@
         {
           "path": "licenses/texts/62c7a1e35f56406896d7aa7ca52d0cc0d272ac022b5d2796e7d6905db8a3636a.txt",
           "sha256": "62c7a1e35f56406896d7aa7ca52d0cc0d272ac022b5d2796e7d6905db8a3636a"
+        }
+      ]
+    },
+    {
+      "id": "cargo:libm@0.2.16",
+      "name": "libm",
+      "version": "0.2.16",
+      "ecosystem": "cargo",
+      "repository": "https://github.com/rust-lang/compiler-builtins",
+      "source": {
+        "url": "https://crates.io/api/v1/crates/libm/0.2.16/download",
+        "integrity": "sha256:b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
+      },
+      "licenseExpression": "MIT",
+      "selectedLicense": "MIT",
+      "modified": false,
+      "scope": [
+        "runtime"
+      ],
+      "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
+        "macos-arm64",
+        "macos-x64",
+        "windows-x64"
+      ],
+      "copyright": [
+        "Copyright (c) 2018 Jorge Aparicio",
+        "Copyright © 1993,2004 Sun Microsystems or",
+        "Copyright © 2003-2009 Bruce D. Evans or",
+        "Copyright © 2003-2009 Steven G. Kargl or",
+        "Copyright © 2003-2011 David Schultz or",
+        "Copyright © 2005-2020 Rich Felker, et al.",
+        "Copyright © 2008 Stephen L. Moshier or",
+        "Copyright © 2017-2018 Arm Limited"
+      ],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/3823dda7cf046602f4b4e77ec8e227863dc4736037cc85bb33d9f19febe16bb7.txt",
+          "sha256": "3823dda7cf046602f4b4e77ec8e227863dc4736037cc85bb33d9f19febe16bb7"
+        },
+        {
+          "path": "licenses/texts/b05785f9f18e6716bab63424b11454513b9943a222595b70411009202fc592b5.txt",
+          "sha256": "b05785f9f18e6716bab63424b11454513b9943a222595b70411009202fc592b5"
+        }
+      ]
+    },
+    {
+      "id": "cargo:libsqlite3-sys@0.30.1",
+      "name": "libsqlite3-sys",
+      "version": "0.30.1",
+      "ecosystem": "cargo",
+      "repository": "https://github.com/rusqlite/rusqlite",
+      "source": {
+        "url": "https://crates.io/api/v1/crates/libsqlite3-sys/0.30.1/download",
+        "integrity": "sha256:2e99fb7a497b1e3339bc746195567ed8d3e24945ecd636e3619d20b9de9e9149"
+      },
+      "licenseExpression": "MIT",
+      "selectedLicense": "MIT",
+      "modified": false,
+      "scope": [
+        "runtime",
+        "test"
+      ],
+      "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
+        "macos-arm64",
+        "macos-x64",
+        "windows-x64"
+      ],
+      "copyright": [
+        "Copyright (c) 2014-2021 The rusqlite developers"
+      ],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/f59ba65550f2a5adff98ec6478d783402c8e0a3eb515025c0b3438f3d30dc39e.txt",
+          "sha256": "f59ba65550f2a5adff98ec6478d783402c8e0a3eb515025c0b3438f3d30dc39e"
+        }
+      ]
+    },
+    {
+      "id": "cargo:linux-raw-sys@0.12.1",
+      "name": "linux-raw-sys",
+      "version": "0.12.1",
+      "ecosystem": "cargo",
+      "repository": "https://github.com/sunfishcode/linux-raw-sys",
+      "source": {
+        "url": "https://crates.io/api/v1/crates/linux-raw-sys/0.12.1/download",
+        "integrity": "sha256:32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
+      },
+      "licenseExpression": "Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT",
+      "selectedLicense": "MIT",
+      "modified": false,
+      "scope": [
+        "runtime",
+        "test"
+      ],
+      "platforms": [
+        "android-arm64",
+        "android-x64"
+      ],
+      "copyright": [],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3.txt",
+          "sha256": "23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3"
+        },
+        {
+          "path": "licenses/texts/268872b9816f90fd8e85db5a28d33f8150ebb8dd016653fb39ef1f94f2686bc5.txt",
+          "sha256": "268872b9816f90fd8e85db5a28d33f8150ebb8dd016653fb39ef1f94f2686bc5"
+        },
+        {
+          "path": "licenses/texts/3290ae0fbc9ddb77d2239121d710f0bb9d31b3b4744e6d97fe01e652b4c1870b.txt",
+          "sha256": "3290ae0fbc9ddb77d2239121d710f0bb9d31b3b4744e6d97fe01e652b4c1870b"
+        },
+        {
+          "path": "licenses/texts/a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2.txt",
+          "sha256": "a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2"
+        }
+      ]
+    },
+    {
+      "id": "cargo:linux-raw-sys@0.4.15",
+      "name": "linux-raw-sys",
+      "version": "0.4.15",
+      "ecosystem": "cargo",
+      "repository": "https://github.com/sunfishcode/linux-raw-sys",
+      "source": {
+        "url": "https://crates.io/api/v1/crates/linux-raw-sys/0.4.15/download",
+        "integrity": "sha256:d26c52dbd32dccf2d10cac7725f8eae5296885fb5703b261f7d0a0739ec807ab"
+      },
+      "licenseExpression": "Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT",
+      "selectedLicense": "MIT",
+      "modified": false,
+      "scope": [
+        "runtime",
+        "test"
+      ],
+      "platforms": [
+        "android-arm64",
+        "android-x64"
+      ],
+      "copyright": [],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3.txt",
+          "sha256": "23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3"
+        },
+        {
+          "path": "licenses/texts/268872b9816f90fd8e85db5a28d33f8150ebb8dd016653fb39ef1f94f2686bc5.txt",
+          "sha256": "268872b9816f90fd8e85db5a28d33f8150ebb8dd016653fb39ef1f94f2686bc5"
+        },
+        {
+          "path": "licenses/texts/3290ae0fbc9ddb77d2239121d710f0bb9d31b3b4744e6d97fe01e652b4c1870b.txt",
+          "sha256": "3290ae0fbc9ddb77d2239121d710f0bb9d31b3b4744e6d97fe01e652b4c1870b"
+        },
+        {
+          "path": "licenses/texts/a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2.txt",
+          "sha256": "a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2"
         }
       ]
     },
@@ -6637,6 +7883,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -6674,6 +7923,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -6710,6 +7962,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -6785,6 +8040,7 @@
         "test"
       ],
       "platforms": [
+        "ios-arm64",
         "macos-arm64",
         "macos-x64"
       ],
@@ -6893,6 +8149,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -6925,6 +8184,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -6962,6 +8224,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -7071,6 +8336,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -7187,6 +8455,11 @@
         "runtime"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
+        "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -7225,6 +8498,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -7273,6 +8549,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -7321,6 +8600,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -7353,6 +8635,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -7482,6 +8767,93 @@
       ]
     },
     {
+      "id": "cargo:ndk-context@0.1.1",
+      "name": "ndk-context",
+      "version": "0.1.1",
+      "ecosystem": "cargo",
+      "repository": "https://github.com/rust-windowing/android-ndk-rs",
+      "source": {
+        "url": "https://crates.io/api/v1/crates/ndk-context/0.1.1/download",
+        "integrity": "sha256:27b02d87554356db9e9a873add8782d4ea6e3e58ea071a9adb9a2e8ddb884a8b"
+      },
+      "licenseExpression": "MIT OR Apache-2.0",
+      "selectedLicense": "MIT",
+      "modified": false,
+      "scope": [
+        "runtime",
+        "test"
+      ],
+      "platforms": [
+        "android-arm64",
+        "android-x64"
+      ],
+      "copyright": [],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/b05785f9f18e6716bab63424b11454513b9943a222595b70411009202fc592b5.txt",
+          "sha256": "b05785f9f18e6716bab63424b11454513b9943a222595b70411009202fc592b5"
+        }
+      ]
+    },
+    {
+      "id": "cargo:ndk-sys@0.6.0+11769913",
+      "name": "ndk-sys",
+      "version": "0.6.0+11769913",
+      "ecosystem": "cargo",
+      "repository": "https://github.com/rust-mobile/ndk",
+      "source": {
+        "url": "https://crates.io/api/v1/crates/ndk-sys/0.6.0+11769913/download",
+        "integrity": "sha256:ee6cda3051665f1fb8d9e08fc35c96d5a244fb1be711a03b71118828afc9a873"
+      },
+      "licenseExpression": "MIT OR Apache-2.0",
+      "selectedLicense": "MIT",
+      "modified": false,
+      "scope": [
+        "runtime",
+        "test"
+      ],
+      "platforms": [
+        "android-arm64",
+        "android-x64"
+      ],
+      "copyright": [],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/b05785f9f18e6716bab63424b11454513b9943a222595b70411009202fc592b5.txt",
+          "sha256": "b05785f9f18e6716bab63424b11454513b9943a222595b70411009202fc592b5"
+        }
+      ]
+    },
+    {
+      "id": "cargo:ndk@0.9.0",
+      "name": "ndk",
+      "version": "0.9.0",
+      "ecosystem": "cargo",
+      "repository": "https://github.com/rust-mobile/ndk",
+      "source": {
+        "url": "https://crates.io/api/v1/crates/ndk/0.9.0/download",
+        "integrity": "sha256:c3f42e7bbe13d351b6bead8286a43aac9534b82bd3cc43e47037f012ebfd62d4"
+      },
+      "licenseExpression": "MIT OR Apache-2.0",
+      "selectedLicense": "MIT",
+      "modified": false,
+      "scope": [
+        "runtime",
+        "test"
+      ],
+      "platforms": [
+        "android-arm64",
+        "android-x64"
+      ],
+      "copyright": [],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/b05785f9f18e6716bab63424b11454513b9943a222595b70411009202fc592b5.txt",
+          "sha256": "b05785f9f18e6716bab63424b11454513b9943a222595b70411009202fc592b5"
+        }
+      ]
+    },
+    {
       "id": "cargo:new_debug_unreachable@1.0.6",
       "name": "new_debug_unreachable",
       "version": "1.0.6",
@@ -7527,7 +8899,8 @@
       "selectedLicense": "MIT",
       "modified": false,
       "scope": [
-        "runtime"
+        "runtime",
+        "test"
       ],
       "platforms": [
         "macos-arm64",
@@ -7560,6 +8933,11 @@
         "runtime"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
+        "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -7653,6 +9031,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -7665,6 +9046,44 @@
         {
           "path": "licenses/texts/284465860407420254e39be4e1bdcaaf2e7f2d18e06f9bab75bc75341a5d8501.txt",
           "sha256": "284465860407420254e39be4e1bdcaaf2e7f2d18e06f9bab75bc75341a5d8501"
+        }
+      ]
+    },
+    {
+      "id": "cargo:num-bigint-dig@0.8.6",
+      "name": "num-bigint-dig",
+      "version": "0.8.6",
+      "ecosystem": "cargo",
+      "repository": "https://github.com/dignifiedquire/num-bigint",
+      "source": {
+        "url": "https://crates.io/api/v1/crates/num-bigint-dig/0.8.6/download",
+        "integrity": "sha256:e661dda6640fad38e827a6d4a310ff4763082116fe217f279885c97f511bb0b7"
+      },
+      "licenseExpression": "MIT OR Apache-2.0",
+      "selectedLicense": "MIT",
+      "modified": false,
+      "scope": [
+        "runtime"
+      ],
+      "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
+        "macos-arm64",
+        "macos-x64",
+        "windows-x64"
+      ],
+      "copyright": [
+        "Copyright (c) 2014 The Rust Project Developers"
+      ],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/6485b8ed310d3f0340bf1ad1f47645069ce4069dcc6bb46c7d5c6faf41de1fdb.txt",
+          "sha256": "6485b8ed310d3f0340bf1ad1f47645069ce4069dcc6bb46c7d5c6faf41de1fdb"
+        },
+        {
+          "path": "licenses/texts/a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2.txt",
+          "sha256": "a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2"
         }
       ]
     },
@@ -7687,6 +9106,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -7717,9 +9139,88 @@
       "selectedLicense": "MIT",
       "modified": false,
       "scope": [
+        "runtime",
+        "test"
+      ],
+      "platforms": [
+        "android-arm64",
+        "android-x64",
+        "windows-x64"
+      ],
+      "copyright": [
+        "Copyright (c) 2014 The Rust Project Developers"
+      ],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/6485b8ed310d3f0340bf1ad1f47645069ce4069dcc6bb46c7d5c6faf41de1fdb.txt",
+          "sha256": "6485b8ed310d3f0340bf1ad1f47645069ce4069dcc6bb46c7d5c6faf41de1fdb"
+        },
+        {
+          "path": "licenses/texts/a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2.txt",
+          "sha256": "a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2"
+        }
+      ]
+    },
+    {
+      "id": "cargo:num-integer@0.1.47",
+      "name": "num-integer",
+      "version": "0.1.47",
+      "ecosystem": "cargo",
+      "repository": "https://github.com/rust-num/num-integer",
+      "source": {
+        "url": "https://crates.io/api/v1/crates/num-integer/0.1.47/download",
+        "integrity": "sha256:7ce2d95d4b3734dc35aa2f45e1aa22cd416814592a4f9d9205e11affd5b8e10b"
+      },
+      "licenseExpression": "MIT OR Apache-2.0",
+      "selectedLicense": "MIT",
+      "modified": false,
+      "scope": [
         "runtime"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
+        "macos-arm64",
+        "macos-x64",
+        "windows-x64"
+      ],
+      "copyright": [
+        "Copyright (c) 2014 The Rust Project Developers"
+      ],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/6485b8ed310d3f0340bf1ad1f47645069ce4069dcc6bb46c7d5c6faf41de1fdb.txt",
+          "sha256": "6485b8ed310d3f0340bf1ad1f47645069ce4069dcc6bb46c7d5c6faf41de1fdb"
+        },
+        {
+          "path": "licenses/texts/a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2.txt",
+          "sha256": "a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2"
+        }
+      ]
+    },
+    {
+      "id": "cargo:num-iter@0.1.46",
+      "name": "num-iter",
+      "version": "0.1.46",
+      "ecosystem": "cargo",
+      "repository": "https://github.com/rust-num/num-iter",
+      "source": {
+        "url": "https://crates.io/api/v1/crates/num-iter/0.1.46/download",
+        "integrity": "sha256:c92800bd69a1eac91786bcfe9da64a897eb72911b8dc3095decbd07429e8048b"
+      },
+      "licenseExpression": "MIT OR Apache-2.0",
+      "selectedLicense": "MIT",
+      "modified": false,
+      "scope": [
+        "runtime"
+      ],
+      "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
+        "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -7755,6 +9256,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -7770,6 +9274,84 @@
         {
           "path": "licenses/texts/a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2.txt",
           "sha256": "a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2"
+        }
+      ]
+    },
+    {
+      "id": "cargo:num_enum@0.7.6",
+      "name": "num_enum",
+      "version": "0.7.6",
+      "ecosystem": "cargo",
+      "repository": "https://github.com/illicitonion/num_enum",
+      "source": {
+        "url": "https://crates.io/api/v1/crates/num_enum/0.7.6/download",
+        "integrity": "sha256:5d0bca838442ec211fa11de3a8b0e0e8f3a4522575b5c4c06ed722e005036f26"
+      },
+      "licenseExpression": "BSD-3-Clause OR MIT OR Apache-2.0",
+      "selectedLicense": "MIT",
+      "modified": false,
+      "scope": [
+        "runtime",
+        "test"
+      ],
+      "platforms": [
+        "android-arm64",
+        "android-x64"
+      ],
+      "copyright": [
+        "Copyright (c) 2018, Daniel Wagner-Hall"
+      ],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/0be96d891d00e0ae0df75d7f3289b12871c000a1f5ac744f3b570768d4bb277c.txt",
+          "sha256": "0be96d891d00e0ae0df75d7f3289b12871c000a1f5ac744f3b570768d4bb277c"
+        },
+        {
+          "path": "licenses/texts/23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3.txt",
+          "sha256": "23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3"
+        },
+        {
+          "path": "licenses/texts/62c7a1e35f56406896d7aa7ca52d0cc0d272ac022b5d2796e7d6905db8a3636a.txt",
+          "sha256": "62c7a1e35f56406896d7aa7ca52d0cc0d272ac022b5d2796e7d6905db8a3636a"
+        }
+      ]
+    },
+    {
+      "id": "cargo:num_enum_derive@0.7.6",
+      "name": "num_enum_derive",
+      "version": "0.7.6",
+      "ecosystem": "cargo",
+      "repository": "https://github.com/illicitonion/num_enum",
+      "source": {
+        "url": "https://crates.io/api/v1/crates/num_enum_derive/0.7.6/download",
+        "integrity": "sha256:680998035259dcfcafe653688bf2aa6d3e2dc05e98be6ab46afb089dc84f1df8"
+      },
+      "licenseExpression": "BSD-3-Clause OR MIT OR Apache-2.0",
+      "selectedLicense": "MIT",
+      "modified": false,
+      "scope": [
+        "runtime",
+        "test"
+      ],
+      "platforms": [
+        "android-arm64",
+        "android-x64"
+      ],
+      "copyright": [
+        "Copyright (c) 2018, Daniel Wagner-Hall"
+      ],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/0be96d891d00e0ae0df75d7f3289b12871c000a1f5ac744f3b570768d4bb277c.txt",
+          "sha256": "0be96d891d00e0ae0df75d7f3289b12871c000a1f5ac744f3b570768d4bb277c"
+        },
+        {
+          "path": "licenses/texts/23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3.txt",
+          "sha256": "23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3"
+        },
+        {
+          "path": "licenses/texts/62c7a1e35f56406896d7aa7ca52d0cc0d272ac022b5d2796e7d6905db8a3636a.txt",
+          "sha256": "62c7a1e35f56406896d7aa7ca52d0cc0d272ac022b5d2796e7d6905db8a3636a"
         }
       ]
     },
@@ -7792,6 +9374,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64"
       ],
@@ -7857,8 +9442,37 @@
         "test"
       ],
       "platforms": [
+        "ios-arm64",
         "macos-arm64",
         "macos-x64"
+      ],
+      "copyright": [],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/b05785f9f18e6716bab63424b11454513b9943a222595b70411009202fc592b5.txt",
+          "sha256": "b05785f9f18e6716bab63424b11454513b9943a222595b70411009202fc592b5"
+        }
+      ]
+    },
+    {
+      "id": "cargo:objc2-avf-audio@0.3.2",
+      "name": "objc2-avf-audio",
+      "version": "0.3.2",
+      "ecosystem": "cargo",
+      "repository": "https://github.com/madsmtm/objc2",
+      "source": {
+        "url": "https://crates.io/api/v1/crates/objc2-avf-audio/0.3.2/download",
+        "integrity": "sha256:13a380031deed8e99db00065c45937da434ca987c034e13b87e4441f9e4090be"
+      },
+      "licenseExpression": "Zlib OR Apache-2.0 OR MIT",
+      "selectedLicense": "MIT",
+      "modified": false,
+      "scope": [
+        "runtime",
+        "test"
+      ],
+      "platforms": [
+        "ios-arm64"
       ],
       "copyright": [],
       "licenseFiles": [
@@ -7886,6 +9500,7 @@
         "test"
       ],
       "platforms": [
+        "ios-arm64",
         "macos-arm64",
         "macos-x64"
       ],
@@ -7915,6 +9530,7 @@
         "test"
       ],
       "platforms": [
+        "ios-arm64",
         "macos-arm64",
         "macos-x64"
       ],
@@ -7945,6 +9561,7 @@
         "test"
       ],
       "platforms": [
+        "ios-arm64",
         "macos-arm64",
         "macos-x64"
       ],
@@ -8004,6 +9621,7 @@
         "test"
       ],
       "platforms": [
+        "ios-arm64",
         "macos-arm64",
         "macos-x64"
       ],
@@ -8034,6 +9652,7 @@
         "test"
       ],
       "platforms": [
+        "ios-arm64",
         "macos-arm64",
         "macos-x64"
       ],
@@ -8064,6 +9683,7 @@
         "test"
       ],
       "platforms": [
+        "ios-arm64",
         "macos-arm64",
         "macos-x64"
       ],
@@ -8094,6 +9714,7 @@
         "test"
       ],
       "platforms": [
+        "ios-arm64",
         "macos-arm64",
         "macos-x64"
       ],
@@ -8267,6 +9888,7 @@
         "test"
       ],
       "platforms": [
+        "ios-arm64",
         "macos-arm64",
         "macos-x64"
       ],
@@ -8332,6 +9954,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -8376,6 +10001,44 @@
         {
           "path": "licenses/texts/c6596eb7be8581c18be736c846fb9173b69eccf6ef94c5135893ec56bd92ba08.txt",
           "sha256": "c6596eb7be8581c18be736c846fb9173b69eccf6ef94c5135893ec56bd92ba08"
+        }
+      ]
+    },
+    {
+      "id": "cargo:opaque-debug@0.3.1",
+      "name": "opaque-debug",
+      "version": "0.3.1",
+      "ecosystem": "cargo",
+      "repository": "https://github.com/RustCrypto/utils",
+      "source": {
+        "url": "https://crates.io/api/v1/crates/opaque-debug/0.3.1/download",
+        "integrity": "sha256:c08d65885ee38876c4f86fa503fb49d7b507c2b62552df7c70b2fce627e06381"
+      },
+      "licenseExpression": "MIT OR Apache-2.0",
+      "selectedLicense": "MIT",
+      "modified": false,
+      "scope": [
+        "runtime"
+      ],
+      "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
+        "macos-arm64",
+        "macos-x64",
+        "windows-x64"
+      ],
+      "copyright": [
+        "Copyright (c) 2018-2024 The RustCrypto Project Developers"
+      ],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/a9040321c3712d8fd0b09cf52b17445de04a23a10165049ae187cd39e5c86be5.txt",
+          "sha256": "a9040321c3712d8fd0b09cf52b17445de04a23a10165049ae187cd39e5c86be5"
+        },
+        {
+          "path": "licenses/texts/f59f5a78193597e04fd932ee9af86254d14d08be5c9d0e003ab888feccce2161.txt",
+          "sha256": "f59f5a78193597e04fd932ee9af86254d14d08be5c9d0e003ab888feccce2161"
         }
       ]
     },
@@ -8427,6 +10090,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -8463,6 +10129,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -8556,6 +10225,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -8593,6 +10265,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -8658,6 +10333,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -8694,6 +10372,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -8727,6 +10408,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -8954,6 +10638,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -8967,6 +10654,44 @@
         {
           "path": "licenses/texts/23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3.txt",
           "sha256": "23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3"
+        }
+      ]
+    },
+    {
+      "id": "cargo:pkcs1@0.7.5",
+      "name": "pkcs1",
+      "version": "0.7.5",
+      "ecosystem": "cargo",
+      "repository": "https://github.com/RustCrypto/formats/tree/master/pkcs1",
+      "source": {
+        "url": "https://crates.io/api/v1/crates/pkcs1/0.7.5/download",
+        "integrity": "sha256:c8ffb9f10fa047879315e6625af03c164b16962a5368d724ed16323b68ace47f"
+      },
+      "licenseExpression": "Apache-2.0 OR MIT",
+      "selectedLicense": "MIT",
+      "modified": false,
+      "scope": [
+        "runtime"
+      ],
+      "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
+        "macos-arm64",
+        "macos-x64",
+        "windows-x64"
+      ],
+      "copyright": [
+        "Copyright (c) 2021-2023 The RustCrypto Project Developers"
+      ],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/a9040321c3712d8fd0b09cf52b17445de04a23a10165049ae187cd39e5c86be5.txt",
+          "sha256": "a9040321c3712d8fd0b09cf52b17445de04a23a10165049ae187cd39e5c86be5"
+        },
+        {
+          "path": "licenses/texts/c995204cc6bad2ed67dd41f7d89bb9f1a9d48e0edd745732b30640d7912089a4.txt",
+          "sha256": "c995204cc6bad2ed67dd41f7d89bb9f1a9d48e0edd745732b30640d7912089a4"
         }
       ]
     },
@@ -8988,6 +10713,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -9003,6 +10731,45 @@
         {
           "path": "licenses/texts/ad64fcb9589f162720f3cc5010ad76ca6ad3764e11861f9192c489df176bb71d.txt",
           "sha256": "ad64fcb9589f162720f3cc5010ad76ca6ad3764e11861f9192c489df176bb71d"
+        }
+      ]
+    },
+    {
+      "id": "cargo:pkg-config@0.3.34",
+      "name": "pkg-config",
+      "version": "0.3.34",
+      "ecosystem": "cargo",
+      "repository": "https://github.com/rust-lang/pkg-config-rs",
+      "source": {
+        "url": "https://crates.io/api/v1/crates/pkg-config/0.3.34/download",
+        "integrity": "sha256:f6b464fbc74e149a392436b17d523f769e057cb6877f6a5c4618bc6f11800548"
+      },
+      "licenseExpression": "MIT OR Apache-2.0",
+      "selectedLicense": "MIT",
+      "modified": false,
+      "scope": [
+        "build",
+        "test"
+      ],
+      "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
+        "macos-arm64",
+        "macos-x64",
+        "windows-x64"
+      ],
+      "copyright": [
+        "Copyright (c) 2014 Alex Crichton"
+      ],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/378f5840b258e2779c39418f3f2d7b2ba96f1c7917dd6be0713f88305dbda397.txt",
+          "sha256": "378f5840b258e2779c39418f3f2d7b2ba96f1c7917dd6be0713f88305dbda397"
+        },
+        {
+          "path": "licenses/texts/a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2.txt",
+          "sha256": "a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2"
         }
       ]
     },
@@ -9092,6 +10859,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -9107,6 +10877,44 @@
         {
           "path": "licenses/texts/eaf40297c75da471f7cda1f3458e8d91b4b2ec866e609527a13acfa93b638652.txt",
           "sha256": "eaf40297c75da471f7cda1f3458e8d91b4b2ec866e609527a13acfa93b638652"
+        }
+      ]
+    },
+    {
+      "id": "cargo:polyval@0.6.2",
+      "name": "polyval",
+      "version": "0.6.2",
+      "ecosystem": "cargo",
+      "repository": "https://github.com/RustCrypto/universal-hashes",
+      "source": {
+        "url": "https://crates.io/api/v1/crates/polyval/0.6.2/download",
+        "integrity": "sha256:9d1fe60d06143b2430aa532c94cfe9e29783047f06c0d7fd359a9a51b729fa25"
+      },
+      "licenseExpression": "Apache-2.0 OR MIT",
+      "selectedLicense": "MIT",
+      "modified": false,
+      "scope": [
+        "runtime"
+      ],
+      "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
+        "macos-arm64",
+        "macos-x64",
+        "windows-x64"
+      ],
+      "copyright": [
+        "Copyright (c) 2019-2023 RustCrypto Developers"
+      ],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/a291b6910744d262a9e953c3b5868d74510e20161359f649a11e1791fde84fcd.txt",
+          "sha256": "a291b6910744d262a9e953c3b5868d74510e20161359f649a11e1791fde84fcd"
+        },
+        {
+          "path": "licenses/texts/a9040321c3712d8fd0b09cf52b17445de04a23a10165049ae187cd39e5c86be5.txt",
+          "sha256": "a9040321c3712d8fd0b09cf52b17445de04a23a10165049ae187cd39e5c86be5"
         }
       ]
     },
@@ -9163,6 +10971,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -9200,6 +11011,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -9252,6 +11066,39 @@
       ]
     },
     {
+      "id": "cargo:proc-macro-crate@3.5.0",
+      "name": "proc-macro-crate",
+      "version": "3.5.0",
+      "ecosystem": "cargo",
+      "repository": "https://github.com/bkchr/proc-macro-crate",
+      "source": {
+        "url": "https://crates.io/api/v1/crates/proc-macro-crate/3.5.0/download",
+        "integrity": "sha256:e67ba7e9b2b56446f1d419b1d807906278ffa1a658a8a5d8a39dcb1f5a78614f"
+      },
+      "licenseExpression": "MIT OR Apache-2.0",
+      "selectedLicense": "MIT",
+      "modified": false,
+      "scope": [
+        "runtime",
+        "test"
+      ],
+      "platforms": [
+        "android-arm64",
+        "android-x64"
+      ],
+      "copyright": [],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3.txt",
+          "sha256": "23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3"
+        },
+        {
+          "path": "licenses/texts/8ada45cd9f843acf64e4722ae262c622a2b3b3007c7310ef36ac1061a30f6adb.txt",
+          "sha256": "8ada45cd9f843acf64e4722ae262c622a2b3b3007c7310ef36ac1061a30f6adb"
+        }
+      ]
+    },
+    {
       "id": "cargo:proc-macro2@1.0.107",
       "name": "proc-macro2",
       "version": "1.0.107",
@@ -9270,6 +11117,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -9345,6 +11195,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -9435,6 +11288,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -9470,6 +11326,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -9506,6 +11365,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -9574,6 +11436,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -9610,6 +11475,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -9646,6 +11514,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -9683,6 +11554,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -9717,6 +11591,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -9758,6 +11635,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -9798,6 +11678,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -9839,6 +11722,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -9879,6 +11765,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -9921,6 +11810,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -9961,6 +11853,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -10001,6 +11896,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -10042,6 +11940,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -10082,6 +11983,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -10152,9 +12056,12 @@
       "selectedLicense": "MIT",
       "modified": false,
       "scope": [
-        "runtime"
+        "runtime",
+        "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -10196,6 +12103,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -10233,6 +12143,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -10270,6 +12183,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -10447,6 +12363,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -10582,6 +12501,41 @@
       ]
     },
     {
+      "id": "cargo:rusqlite@0.32.1",
+      "name": "rusqlite",
+      "version": "0.32.1",
+      "ecosystem": "cargo",
+      "repository": "https://github.com/rusqlite/rusqlite",
+      "source": {
+        "url": "https://crates.io/api/v1/crates/rusqlite/0.32.1/download",
+        "integrity": "sha256:7753b721174eb8ff87a9a0e799e2d7bc3749323e773db92e0984debb00019d6e"
+      },
+      "licenseExpression": "MIT",
+      "selectedLicense": "MIT",
+      "modified": false,
+      "scope": [
+        "runtime",
+        "test"
+      ],
+      "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
+        "macos-arm64",
+        "macos-x64",
+        "windows-x64"
+      ],
+      "copyright": [
+        "Copyright (c) 2014-2021 The rusqlite developers"
+      ],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/f59ba65550f2a5adff98ec6478d783402c8e0a3eb515025c0b3438f3d30dc39e.txt",
+          "sha256": "f59ba65550f2a5adff98ec6478d783402c8e0a3eb515025c0b3438f3d30dc39e"
+        }
+      ]
+    },
+    {
       "id": "cargo:rustc-hash@2.1.3",
       "name": "rustc-hash",
       "version": "2.1.3",
@@ -10600,6 +12554,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -10634,6 +12591,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -10670,6 +12630,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64"
       ],
@@ -10711,6 +12674,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64"
       ],
@@ -10752,6 +12718,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -10789,6 +12758,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -10821,6 +12793,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -10863,6 +12838,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -10896,6 +12874,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -10967,9 +12948,12 @@
       "modified": false,
       "scope": [
         "build",
-        "runtime"
+        "runtime",
+        "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -11110,6 +13094,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -11145,6 +13132,11 @@
         "runtime"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
+        "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [],
@@ -11172,6 +13164,11 @@
         "runtime"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
+        "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -11301,6 +13298,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -11370,6 +13370,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -11405,6 +13408,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -11440,6 +13446,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -11509,6 +13518,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -11609,6 +13621,9 @@
         "runtime"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -11855,6 +13870,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -11893,6 +13911,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -11925,6 +13946,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -11962,6 +13986,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64"
       ],
@@ -11997,6 +14024,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -12033,6 +14063,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -12135,6 +14168,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -12176,6 +14212,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -12209,6 +14248,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -12274,6 +14316,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -12306,6 +14351,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -12375,6 +14423,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -12411,6 +14462,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -12443,6 +14497,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -12495,6 +14552,44 @@
         {
           "path": "licenses/texts/a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2.txt",
           "sha256": "a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2"
+        }
+      ]
+    },
+    {
+      "id": "cargo:static_assertions@1.1.0",
+      "name": "static_assertions",
+      "version": "1.1.0",
+      "ecosystem": "cargo",
+      "repository": "https://github.com/nvzqz/static-assertions-rs",
+      "source": {
+        "url": "https://crates.io/api/v1/crates/static_assertions/1.1.0/download",
+        "integrity": "sha256:a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
+      },
+      "licenseExpression": "MIT OR Apache-2.0",
+      "selectedLicense": "MIT",
+      "modified": false,
+      "scope": [
+        "runtime"
+      ],
+      "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
+        "macos-arm64",
+        "macos-x64",
+        "windows-x64"
+      ],
+      "copyright": [
+        "Copyright (c) 2017 Nikolai Vazquez"
+      ],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30.txt",
+          "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+        },
+        {
+          "path": "licenses/texts/ea084a2373ebc1f0902c09266e7bf25a05ab3814c1805bb017ffa7308f90c061.txt",
+          "sha256": "ea084a2373ebc1f0902c09266e7bf25a05ab3814c1805bb017ffa7308f90c061"
         }
       ]
     },
@@ -12696,6 +14791,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -12806,6 +14904,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -12841,6 +14942,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -13321,6 +15425,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -13376,6 +15483,39 @@
       ]
     },
     {
+      "id": "cargo:thiserror-impl@1.0.69",
+      "name": "thiserror-impl",
+      "version": "1.0.69",
+      "ecosystem": "cargo",
+      "repository": "https://github.com/dtolnay/thiserror",
+      "source": {
+        "url": "https://crates.io/api/v1/crates/thiserror-impl/1.0.69/download",
+        "integrity": "sha256:4fee6c4efc90059e10f81e6d42c60a18f76588c3d74cb83a0b242a2b6c7504c1"
+      },
+      "licenseExpression": "MIT OR Apache-2.0",
+      "selectedLicense": "MIT",
+      "modified": false,
+      "scope": [
+        "runtime",
+        "test"
+      ],
+      "platforms": [
+        "android-arm64",
+        "android-x64"
+      ],
+      "copyright": [],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3.txt",
+          "sha256": "23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3"
+        },
+        {
+          "path": "licenses/texts/62c7a1e35f56406896d7aa7ca52d0cc0d272ac022b5d2796e7d6905db8a3636a.txt",
+          "sha256": "62c7a1e35f56406896d7aa7ca52d0cc0d272ac022b5d2796e7d6905db8a3636a"
+        }
+      ]
+    },
+    {
       "id": "cargo:thiserror-impl@2.0.21",
       "name": "thiserror-impl",
       "version": "2.0.21",
@@ -13394,9 +15534,45 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
+      ],
+      "copyright": [],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3.txt",
+          "sha256": "23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3"
+        },
+        {
+          "path": "licenses/texts/62c7a1e35f56406896d7aa7ca52d0cc0d272ac022b5d2796e7d6905db8a3636a.txt",
+          "sha256": "62c7a1e35f56406896d7aa7ca52d0cc0d272ac022b5d2796e7d6905db8a3636a"
+        }
+      ]
+    },
+    {
+      "id": "cargo:thiserror@1.0.69",
+      "name": "thiserror",
+      "version": "1.0.69",
+      "ecosystem": "cargo",
+      "repository": "https://github.com/dtolnay/thiserror",
+      "source": {
+        "url": "https://crates.io/api/v1/crates/thiserror/1.0.69/download",
+        "integrity": "sha256:b6aaf5339b578ea85b50e080feb250a3e8ae8cfcdff9a461c9ec2904bc923f52"
+      },
+      "licenseExpression": "MIT OR Apache-2.0",
+      "selectedLicense": "MIT",
+      "modified": false,
+      "scope": [
+        "runtime",
+        "test"
+      ],
+      "platforms": [
+        "android-arm64",
+        "android-x64"
       ],
       "copyright": [],
       "licenseFiles": [
@@ -13429,6 +15605,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -13463,6 +15642,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -13499,6 +15681,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -13532,6 +15717,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -13567,6 +15755,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -13602,6 +15793,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -13736,6 +15930,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -13776,6 +15973,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -13840,6 +16040,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -13877,6 +16080,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -13907,6 +16113,9 @@
         "runtime"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -13938,12 +16147,49 @@
       "modified": false,
       "scope": [
         "build",
-        "runtime"
+        "runtime",
+        "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
+      ],
+      "copyright": [],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/6efb0476a1cc085077ed49357026d8c173bf33017278ef440f222fb9cbcb66e6.txt",
+          "sha256": "6efb0476a1cc085077ed49357026d8c173bf33017278ef440f222fb9cbcb66e6"
+        },
+        {
+          "path": "licenses/texts/c6596eb7be8581c18be736c846fb9173b69eccf6ef94c5135893ec56bd92ba08.txt",
+          "sha256": "c6596eb7be8581c18be736c846fb9173b69eccf6ef94c5135893ec56bd92ba08"
+        }
+      ]
+    },
+    {
+      "id": "cargo:toml_edit@0.25.15+spec-1.1.0",
+      "name": "toml_edit",
+      "version": "0.25.15+spec-1.1.0",
+      "ecosystem": "cargo",
+      "repository": "https://github.com/toml-rs/toml",
+      "source": {
+        "url": "https://crates.io/api/v1/crates/toml_edit/0.25.15+spec-1.1.0/download",
+        "integrity": "sha256:1340ea94a5856333492c9064b02c778b191dd2c853778d9609debdcdfea3a614"
+      },
+      "licenseExpression": "MIT OR Apache-2.0",
+      "selectedLicense": "MIT",
+      "modified": false,
+      "scope": [
+        "runtime",
+        "test"
+      ],
+      "platforms": [
+        "android-arm64",
+        "android-x64"
       ],
       "copyright": [],
       "licenseFiles": [
@@ -13972,9 +16218,13 @@
       "modified": false,
       "scope": [
         "build",
-        "runtime"
+        "runtime",
+        "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -14009,6 +16259,9 @@
         "runtime"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -14171,6 +16424,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -14203,6 +16459,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -14240,6 +16499,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -14272,6 +16534,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -14304,6 +16569,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -14404,9 +16672,13 @@
       "selectedLicense": "MIT",
       "modified": false,
       "scope": [
-        "runtime"
+        "runtime",
+        "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -14475,6 +16747,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -14515,6 +16790,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -14579,6 +16857,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -14639,6 +16920,236 @@
       ]
     },
     {
+      "id": "cargo:uniffi@0.32.2",
+      "name": "uniffi",
+      "version": "0.32.2",
+      "ecosystem": "cargo",
+      "repository": "https://github.com/mozilla/uniffi-rs",
+      "source": {
+        "url": "https://crates.io/api/v1/crates/uniffi/0.32.2/download",
+        "integrity": "sha256:76407f5f396a2c949a069eff4a9fca9ce462410eb872bffef4c2b7b89804a77a"
+      },
+      "licenseExpression": "MPL-2.0",
+      "selectedLicense": "MPL-2.0",
+      "modified": false,
+      "scope": [
+        "runtime"
+      ],
+      "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
+        "macos-arm64",
+        "macos-x64",
+        "windows-x64"
+      ],
+      "copyright": [],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/66a3107d5ad6a058aab753eaac2047ccb2ed0e39465dd0fe5844da3e300d5172.txt",
+          "sha256": "66a3107d5ad6a058aab753eaac2047ccb2ed0e39465dd0fe5844da3e300d5172"
+        }
+      ]
+    },
+    {
+      "id": "cargo:uniffi_core@0.32.2",
+      "name": "uniffi_core",
+      "version": "0.32.2",
+      "ecosystem": "cargo",
+      "repository": "https://github.com/mozilla/uniffi-rs",
+      "source": {
+        "url": "https://crates.io/api/v1/crates/uniffi_core/0.32.2/download",
+        "integrity": "sha256:f7530ae8efeaaa488622865966763fe0294832779fff80508c36d69c6a874a6a"
+      },
+      "licenseExpression": "MPL-2.0",
+      "selectedLicense": "MPL-2.0",
+      "modified": false,
+      "scope": [
+        "runtime"
+      ],
+      "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
+        "macos-arm64",
+        "macos-x64",
+        "windows-x64"
+      ],
+      "copyright": [],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/66a3107d5ad6a058aab753eaac2047ccb2ed0e39465dd0fe5844da3e300d5172.txt",
+          "sha256": "66a3107d5ad6a058aab753eaac2047ccb2ed0e39465dd0fe5844da3e300d5172"
+        }
+      ]
+    },
+    {
+      "id": "cargo:uniffi_internal_macros@0.32.2",
+      "name": "uniffi_internal_macros",
+      "version": "0.32.2",
+      "ecosystem": "cargo",
+      "repository": "https://github.com/mozilla/uniffi-rs",
+      "source": {
+        "url": "https://crates.io/api/v1/crates/uniffi_internal_macros/0.32.2/download",
+        "integrity": "sha256:0f4bad017164375d99450d70495014810d15a84ba9da6ed14b9628b1424223ba"
+      },
+      "licenseExpression": "MPL-2.0",
+      "selectedLicense": "MPL-2.0",
+      "modified": false,
+      "scope": [
+        "runtime"
+      ],
+      "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
+        "macos-arm64",
+        "macos-x64",
+        "windows-x64"
+      ],
+      "copyright": [],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/66a3107d5ad6a058aab753eaac2047ccb2ed0e39465dd0fe5844da3e300d5172.txt",
+          "sha256": "66a3107d5ad6a058aab753eaac2047ccb2ed0e39465dd0fe5844da3e300d5172"
+        }
+      ]
+    },
+    {
+      "id": "cargo:uniffi_macros@0.32.2",
+      "name": "uniffi_macros",
+      "version": "0.32.2",
+      "ecosystem": "cargo",
+      "repository": "https://github.com/mozilla/uniffi-rs",
+      "source": {
+        "url": "https://crates.io/api/v1/crates/uniffi_macros/0.32.2/download",
+        "integrity": "sha256:5b855a58da153739ce6e863f6e296edc3716a093768c4d3d957f17f5e4317c60"
+      },
+      "licenseExpression": "MPL-2.0",
+      "selectedLicense": "MPL-2.0",
+      "modified": false,
+      "scope": [
+        "runtime"
+      ],
+      "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
+        "macos-arm64",
+        "macos-x64",
+        "windows-x64"
+      ],
+      "copyright": [],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/66a3107d5ad6a058aab753eaac2047ccb2ed0e39465dd0fe5844da3e300d5172.txt",
+          "sha256": "66a3107d5ad6a058aab753eaac2047ccb2ed0e39465dd0fe5844da3e300d5172"
+        }
+      ]
+    },
+    {
+      "id": "cargo:uniffi_meta@0.32.2",
+      "name": "uniffi_meta",
+      "version": "0.32.2",
+      "ecosystem": "cargo",
+      "repository": "https://github.com/mozilla/uniffi-rs",
+      "source": {
+        "url": "https://crates.io/api/v1/crates/uniffi_meta/0.32.2/download",
+        "integrity": "sha256:af0c88664a9cb9559856f5a250283c9708923b303170e2e5c7db8f4ad65e9459"
+      },
+      "licenseExpression": "MPL-2.0",
+      "selectedLicense": "MPL-2.0",
+      "modified": false,
+      "scope": [
+        "runtime"
+      ],
+      "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
+        "macos-arm64",
+        "macos-x64",
+        "windows-x64"
+      ],
+      "copyright": [],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/66a3107d5ad6a058aab753eaac2047ccb2ed0e39465dd0fe5844da3e300d5172.txt",
+          "sha256": "66a3107d5ad6a058aab753eaac2047ccb2ed0e39465dd0fe5844da3e300d5172"
+        }
+      ]
+    },
+    {
+      "id": "cargo:uniffi_pipeline@0.32.2",
+      "name": "uniffi_pipeline",
+      "version": "0.32.2",
+      "ecosystem": "cargo",
+      "repository": "https://github.com/mozilla/uniffi-rs",
+      "source": {
+        "url": "https://crates.io/api/v1/crates/uniffi_pipeline/0.32.2/download",
+        "integrity": "sha256:d00f5c044b4a3dca0b1226c92ddaeea626f337470e22180dd182160c87a06b0b"
+      },
+      "licenseExpression": "MPL-2.0",
+      "selectedLicense": "MPL-2.0",
+      "modified": false,
+      "scope": [
+        "runtime"
+      ],
+      "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
+        "macos-arm64",
+        "macos-x64",
+        "windows-x64"
+      ],
+      "copyright": [],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/66a3107d5ad6a058aab753eaac2047ccb2ed0e39465dd0fe5844da3e300d5172.txt",
+          "sha256": "66a3107d5ad6a058aab753eaac2047ccb2ed0e39465dd0fe5844da3e300d5172"
+        }
+      ]
+    },
+    {
+      "id": "cargo:universal-hash@0.5.1",
+      "name": "universal-hash",
+      "version": "0.5.1",
+      "ecosystem": "cargo",
+      "repository": "https://github.com/RustCrypto/traits",
+      "source": {
+        "url": "https://crates.io/api/v1/crates/universal-hash/0.5.1/download",
+        "integrity": "sha256:fc1de2c688dc15305988b563c3854064043356019f97a4b46276fe734c4f07ea"
+      },
+      "licenseExpression": "MIT OR Apache-2.0",
+      "selectedLicense": "MIT",
+      "modified": false,
+      "scope": [
+        "runtime"
+      ],
+      "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
+        "macos-arm64",
+        "macos-x64",
+        "windows-x64"
+      ],
+      "copyright": [
+        "Copyright (c) 2019-2020 RustCrypto Developers"
+      ],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/6b50510a0400c72172355cc5d2ba0f2c5c2eb33149b8f96539dc345fdc484920.txt",
+          "sha256": "6b50510a0400c72172355cc5d2ba0f2c5c2eb33149b8f96539dc345fdc484920"
+        },
+        {
+          "path": "licenses/texts/a9040321c3712d8fd0b09cf52b17445de04a23a10165049ae187cd39e5c86be5.txt",
+          "sha256": "a9040321c3712d8fd0b09cf52b17445de04a23a10165049ae187cd39e5c86be5"
+        }
+      ]
+    },
+    {
       "id": "cargo:untrusted@0.9.0",
       "name": "untrusted",
       "version": "0.9.0",
@@ -14656,6 +17167,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -14887,6 +17401,45 @@
       ]
     },
     {
+      "id": "cargo:vcpkg@0.2.15",
+      "name": "vcpkg",
+      "version": "0.2.15",
+      "ecosystem": "cargo",
+      "repository": "https://github.com/mcgoo/vcpkg-rs",
+      "source": {
+        "url": "https://crates.io/api/v1/crates/vcpkg/0.2.15/download",
+        "integrity": "sha256:accd4ea62f7bb7a82fe23066fb0957d48ef677f6eeb8215f372f52e48bb32426"
+      },
+      "licenseExpression": "MIT OR Apache-2.0",
+      "selectedLicense": "MIT",
+      "modified": false,
+      "scope": [
+        "build",
+        "test"
+      ],
+      "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
+        "macos-arm64",
+        "macos-x64",
+        "windows-x64"
+      ],
+      "copyright": [
+        "Copyright (c) 2017 Jim McGrath"
+      ],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/016d20f335060a70e79d9fcf8dfaa6201114d65d592211f4bdfb8ae9ca2bc1dc.txt",
+          "sha256": "016d20f335060a70e79d9fcf8dfaa6201114d65d592211f4bdfb8ae9ca2bc1dc"
+        },
+        {
+          "path": "licenses/texts/60c93a31f490375aadf64098b75f10715010379541021e00261045d7800611d3.txt",
+          "sha256": "60c93a31f490375aadf64098b75f10715010379541021e00261045d7800611d3"
+        }
+      ]
+    },
+    {
       "id": "cargo:version_check@0.9.5",
       "name": "version_check",
       "version": "0.9.5",
@@ -14904,6 +17457,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -14997,6 +17553,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -15030,9 +17589,12 @@
       "modified": false,
       "scope": [
         "build",
-        "runtime"
+        "runtime",
+        "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -15289,6 +17851,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -16047,9 +18612,13 @@
       "modified": false,
       "scope": [
         "build",
-        "runtime"
+        "runtime",
+        "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -16186,6 +18755,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -16254,6 +18826,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -16352,6 +18927,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -16393,6 +18971,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -16502,6 +19083,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -16538,6 +19122,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -16672,9 +19259,13 @@
       "selectedLicense": "MIT",
       "modified": false,
       "scope": [
-        "runtime"
+        "runtime",
+        "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -16707,6 +19298,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -16738,6 +19332,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -16764,9 +19361,13 @@
       "selectedLicense": "Apache-2.0",
       "modified": false,
       "scope": [
-        "runtime"
+        "runtime",
+        "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -16799,6 +19400,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -16829,6 +19433,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -16867,6 +19474,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -16897,6 +19507,9 @@
         "test"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -16914,6 +19527,1914 @@
         {
           "path": "licenses/texts/d30047bca3b516639339a3c279bb84c3483124fb5a9dafe3c75056a85090e745.txt",
           "sha256": "d30047bca3b516639339a3c279bb84c3483124fb5a9dafe3c75056a85090e745"
+        }
+      ]
+    },
+    {
+      "id": "maven:androidx.activity:activity-compose@1.10.1",
+      "name": "androidx.activity:activity-compose",
+      "version": "1.10.1",
+      "ecosystem": "maven",
+      "repository": "https://cs.android.com/androidx/platform/frameworks/support",
+      "source": {
+        "url": "https://dl.google.com/dl/android/maven2/androidx/activity/activity-compose/1.10.1/activity-compose-1.10.1.aar",
+        "integrity": "sha256:f89af1b26ccc834634387c857c2dd4f4654d37650890039c527c2fed07db6a61"
+      },
+      "licenseExpression": "Apache-2.0",
+      "selectedLicense": "Apache-2.0",
+      "modified": false,
+      "scope": [
+        "runtime"
+      ],
+      "platforms": [
+        "android-arm64",
+        "android-x64"
+      ],
+      "copyright": [],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/809fa1ed21450f59827d1e9aec720bbc4b687434fa22283c6cb5dd82a47ab9c0.txt",
+          "sha256": "809fa1ed21450f59827d1e9aec720bbc4b687434fa22283c6cb5dd82a47ab9c0"
+        }
+      ]
+    },
+    {
+      "id": "maven:androidx.activity:activity-ktx@1.10.1",
+      "name": "androidx.activity:activity-ktx",
+      "version": "1.10.1",
+      "ecosystem": "maven",
+      "repository": "https://cs.android.com/androidx/platform/frameworks/support",
+      "source": {
+        "url": "https://dl.google.com/dl/android/maven2/androidx/activity/activity-ktx/1.10.1/activity-ktx-1.10.1.aar",
+        "integrity": "sha256:f396f58dbd772c065b873696b74a3d4d087554b3766280e63b49b25dbb53ab16"
+      },
+      "licenseExpression": "Apache-2.0",
+      "selectedLicense": "Apache-2.0",
+      "modified": false,
+      "scope": [
+        "runtime"
+      ],
+      "platforms": [
+        "android-arm64",
+        "android-x64"
+      ],
+      "copyright": [],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/809fa1ed21450f59827d1e9aec720bbc4b687434fa22283c6cb5dd82a47ab9c0.txt",
+          "sha256": "809fa1ed21450f59827d1e9aec720bbc4b687434fa22283c6cb5dd82a47ab9c0"
+        }
+      ]
+    },
+    {
+      "id": "maven:androidx.activity:activity@1.10.1",
+      "name": "androidx.activity:activity",
+      "version": "1.10.1",
+      "ecosystem": "maven",
+      "repository": "https://cs.android.com/androidx/platform/frameworks/support",
+      "source": {
+        "url": "https://dl.google.com/dl/android/maven2/androidx/activity/activity/1.10.1/activity-1.10.1.aar",
+        "integrity": "sha256:b62b528c917de9be497eb6f88830197c20e9d21267c3916c613492e5ee837d4d"
+      },
+      "licenseExpression": "Apache-2.0",
+      "selectedLicense": "Apache-2.0",
+      "modified": false,
+      "scope": [
+        "runtime"
+      ],
+      "platforms": [
+        "android-arm64",
+        "android-x64"
+      ],
+      "copyright": [],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/809fa1ed21450f59827d1e9aec720bbc4b687434fa22283c6cb5dd82a47ab9c0.txt",
+          "sha256": "809fa1ed21450f59827d1e9aec720bbc4b687434fa22283c6cb5dd82a47ab9c0"
+        }
+      ]
+    },
+    {
+      "id": "maven:androidx.annotation:annotation-experimental@1.4.1",
+      "name": "androidx.annotation:annotation-experimental",
+      "version": "1.4.1",
+      "ecosystem": "maven",
+      "repository": "https://cs.android.com/androidx/platform/frameworks/support",
+      "source": {
+        "url": "https://dl.google.com/dl/android/maven2/androidx/annotation/annotation-experimental/1.4.1/annotation-experimental-1.4.1.aar",
+        "integrity": "sha256:6bd4c7c7476f8260cd3bdbb81183583e93fc9f790c27dea7dc314181cbf87aa0"
+      },
+      "licenseExpression": "Apache-2.0",
+      "selectedLicense": "Apache-2.0",
+      "modified": false,
+      "scope": [
+        "runtime"
+      ],
+      "platforms": [
+        "android-arm64",
+        "android-x64"
+      ],
+      "copyright": [],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/809fa1ed21450f59827d1e9aec720bbc4b687434fa22283c6cb5dd82a47ab9c0.txt",
+          "sha256": "809fa1ed21450f59827d1e9aec720bbc4b687434fa22283c6cb5dd82a47ab9c0"
+        }
+      ]
+    },
+    {
+      "id": "maven:androidx.annotation:annotation-jvm@1.9.1",
+      "name": "androidx.annotation:annotation-jvm",
+      "version": "1.9.1",
+      "ecosystem": "maven",
+      "repository": "https://cs.android.com/androidx/platform/frameworks/support",
+      "source": {
+        "url": "https://dl.google.com/dl/android/maven2/androidx/annotation/annotation-jvm/1.9.1/annotation-jvm-1.9.1.jar",
+        "integrity": "sha256:1e343917ebf27ba96fe4dc52b1cad7fd32b738fbc6355bb6cd5b3b305d7212d0"
+      },
+      "licenseExpression": "Apache-2.0",
+      "selectedLicense": "Apache-2.0",
+      "modified": false,
+      "scope": [
+        "runtime"
+      ],
+      "platforms": [
+        "android-arm64",
+        "android-x64"
+      ],
+      "copyright": [],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/809fa1ed21450f59827d1e9aec720bbc4b687434fa22283c6cb5dd82a47ab9c0.txt",
+          "sha256": "809fa1ed21450f59827d1e9aec720bbc4b687434fa22283c6cb5dd82a47ab9c0"
+        }
+      ]
+    },
+    {
+      "id": "maven:androidx.arch.core:core-common@2.2.0",
+      "name": "androidx.arch.core:core-common",
+      "version": "2.2.0",
+      "ecosystem": "maven",
+      "repository": "https://cs.android.com/androidx/platform/frameworks/support",
+      "source": {
+        "url": "https://dl.google.com/dl/android/maven2/androidx/arch/core/core-common/2.2.0/core-common-2.2.0.jar",
+        "integrity": "sha256:65308a06b1c00ee186cb9e19321383f043b993813f1522c47f4a3e3303bdba41"
+      },
+      "licenseExpression": "Apache-2.0",
+      "selectedLicense": "Apache-2.0",
+      "modified": false,
+      "scope": [
+        "runtime"
+      ],
+      "platforms": [
+        "android-arm64",
+        "android-x64"
+      ],
+      "copyright": [],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/809fa1ed21450f59827d1e9aec720bbc4b687434fa22283c6cb5dd82a47ab9c0.txt",
+          "sha256": "809fa1ed21450f59827d1e9aec720bbc4b687434fa22283c6cb5dd82a47ab9c0"
+        }
+      ]
+    },
+    {
+      "id": "maven:androidx.arch.core:core-runtime@2.2.0",
+      "name": "androidx.arch.core:core-runtime",
+      "version": "2.2.0",
+      "ecosystem": "maven",
+      "repository": "https://cs.android.com/androidx/platform/frameworks/support",
+      "source": {
+        "url": "https://dl.google.com/dl/android/maven2/androidx/arch/core/core-runtime/2.2.0/core-runtime-2.2.0.aar",
+        "integrity": "sha256:a1be5e0caa2b07623862af6ae21b3ab0718123245184d0e30dea81b53f990a47"
+      },
+      "licenseExpression": "Apache-2.0",
+      "selectedLicense": "Apache-2.0",
+      "modified": false,
+      "scope": [
+        "runtime"
+      ],
+      "platforms": [
+        "android-arm64",
+        "android-x64"
+      ],
+      "copyright": [],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/809fa1ed21450f59827d1e9aec720bbc4b687434fa22283c6cb5dd82a47ab9c0.txt",
+          "sha256": "809fa1ed21450f59827d1e9aec720bbc4b687434fa22283c6cb5dd82a47ab9c0"
+        }
+      ]
+    },
+    {
+      "id": "maven:androidx.autofill:autofill@1.0.0",
+      "name": "androidx.autofill:autofill",
+      "version": "1.0.0",
+      "ecosystem": "maven",
+      "repository": "http://source.android.com",
+      "source": {
+        "url": "https://dl.google.com/dl/android/maven2/androidx/autofill/autofill/1.0.0/autofill-1.0.0.aar",
+        "integrity": "sha256:c9468f56e05006ea151a426c54957cd0799b8b83a579d2846dd22061f33e5ecd"
+      },
+      "licenseExpression": "Apache-2.0",
+      "selectedLicense": "Apache-2.0",
+      "modified": false,
+      "scope": [
+        "runtime"
+      ],
+      "platforms": [
+        "android-arm64",
+        "android-x64"
+      ],
+      "copyright": [],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/809fa1ed21450f59827d1e9aec720bbc4b687434fa22283c6cb5dd82a47ab9c0.txt",
+          "sha256": "809fa1ed21450f59827d1e9aec720bbc4b687434fa22283c6cb5dd82a47ab9c0"
+        }
+      ]
+    },
+    {
+      "id": "maven:androidx.collection:collection-jvm@1.5.0",
+      "name": "androidx.collection:collection-jvm",
+      "version": "1.5.0",
+      "ecosystem": "maven",
+      "repository": "https://cs.android.com/androidx/platform/frameworks/support",
+      "source": {
+        "url": "https://dl.google.com/dl/android/maven2/androidx/collection/collection-jvm/1.5.0/collection-jvm-1.5.0.jar",
+        "integrity": "sha256:70b35924e4babcdffa37d0e575ee039c56a2d97123342624c48b603233704341"
+      },
+      "licenseExpression": "Apache-2.0",
+      "selectedLicense": "Apache-2.0",
+      "modified": false,
+      "scope": [
+        "runtime"
+      ],
+      "platforms": [
+        "android-arm64",
+        "android-x64"
+      ],
+      "copyright": [],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/809fa1ed21450f59827d1e9aec720bbc4b687434fa22283c6cb5dd82a47ab9c0.txt",
+          "sha256": "809fa1ed21450f59827d1e9aec720bbc4b687434fa22283c6cb5dd82a47ab9c0"
+        }
+      ]
+    },
+    {
+      "id": "maven:androidx.collection:collection-ktx@1.5.0",
+      "name": "androidx.collection:collection-ktx",
+      "version": "1.5.0",
+      "ecosystem": "maven",
+      "repository": "https://cs.android.com/androidx/platform/frameworks/support",
+      "source": {
+        "url": "https://dl.google.com/dl/android/maven2/androidx/collection/collection-ktx/1.5.0/collection-ktx-1.5.0.jar",
+        "integrity": "sha256:939b4a8697640e77d83e4e8b4c4a9d18f8130198c5961194af8dd9db9dc7c353"
+      },
+      "licenseExpression": "Apache-2.0",
+      "selectedLicense": "Apache-2.0",
+      "modified": false,
+      "scope": [
+        "runtime"
+      ],
+      "platforms": [
+        "android-arm64",
+        "android-x64"
+      ],
+      "copyright": [],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/809fa1ed21450f59827d1e9aec720bbc4b687434fa22283c6cb5dd82a47ab9c0.txt",
+          "sha256": "809fa1ed21450f59827d1e9aec720bbc4b687434fa22283c6cb5dd82a47ab9c0"
+        }
+      ]
+    },
+    {
+      "id": "maven:androidx.compose.animation:animation-android@1.8.2",
+      "name": "androidx.compose.animation:animation-android",
+      "version": "1.8.2",
+      "ecosystem": "maven",
+      "repository": "https://cs.android.com/androidx/platform/frameworks/support",
+      "source": {
+        "url": "https://dl.google.com/dl/android/maven2/androidx/compose/animation/animation-android/1.8.2/animation-release.aar",
+        "integrity": "sha256:407ab5ea6518c6fef659146bf0a507471ded63c5d6528dc95187220027e1f417"
+      },
+      "licenseExpression": "Apache-2.0",
+      "selectedLicense": "Apache-2.0",
+      "modified": false,
+      "scope": [
+        "runtime"
+      ],
+      "platforms": [
+        "android-arm64",
+        "android-x64"
+      ],
+      "copyright": [],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/809fa1ed21450f59827d1e9aec720bbc4b687434fa22283c6cb5dd82a47ab9c0.txt",
+          "sha256": "809fa1ed21450f59827d1e9aec720bbc4b687434fa22283c6cb5dd82a47ab9c0"
+        }
+      ]
+    },
+    {
+      "id": "maven:androidx.compose.animation:animation-core-android@1.8.2",
+      "name": "androidx.compose.animation:animation-core-android",
+      "version": "1.8.2",
+      "ecosystem": "maven",
+      "repository": "https://cs.android.com/androidx/platform/frameworks/support",
+      "source": {
+        "url": "https://dl.google.com/dl/android/maven2/androidx/compose/animation/animation-core-android/1.8.2/animation-core-release.aar",
+        "integrity": "sha256:49af9201eeaf590d889e742bb43dd8e01efa3fbe478cb812f5887f978f400261"
+      },
+      "licenseExpression": "Apache-2.0",
+      "selectedLicense": "Apache-2.0",
+      "modified": false,
+      "scope": [
+        "runtime"
+      ],
+      "platforms": [
+        "android-arm64",
+        "android-x64"
+      ],
+      "copyright": [],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/809fa1ed21450f59827d1e9aec720bbc4b687434fa22283c6cb5dd82a47ab9c0.txt",
+          "sha256": "809fa1ed21450f59827d1e9aec720bbc4b687434fa22283c6cb5dd82a47ab9c0"
+        }
+      ]
+    },
+    {
+      "id": "maven:androidx.compose.foundation:foundation-android@1.8.2",
+      "name": "androidx.compose.foundation:foundation-android",
+      "version": "1.8.2",
+      "ecosystem": "maven",
+      "repository": "https://cs.android.com/androidx/platform/frameworks/support",
+      "source": {
+        "url": "https://dl.google.com/dl/android/maven2/androidx/compose/foundation/foundation-android/1.8.2/foundation-release.aar",
+        "integrity": "sha256:96acc3363c121dfbfddc5cab946f7e45705c1cce98424b50e28edf16d55a3c9e"
+      },
+      "licenseExpression": "Apache-2.0",
+      "selectedLicense": "Apache-2.0",
+      "modified": false,
+      "scope": [
+        "runtime"
+      ],
+      "platforms": [
+        "android-arm64",
+        "android-x64"
+      ],
+      "copyright": [],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/809fa1ed21450f59827d1e9aec720bbc4b687434fa22283c6cb5dd82a47ab9c0.txt",
+          "sha256": "809fa1ed21450f59827d1e9aec720bbc4b687434fa22283c6cb5dd82a47ab9c0"
+        }
+      ]
+    },
+    {
+      "id": "maven:androidx.compose.foundation:foundation-layout-android@1.8.2",
+      "name": "androidx.compose.foundation:foundation-layout-android",
+      "version": "1.8.2",
+      "ecosystem": "maven",
+      "repository": "https://cs.android.com/androidx/platform/frameworks/support",
+      "source": {
+        "url": "https://dl.google.com/dl/android/maven2/androidx/compose/foundation/foundation-layout-android/1.8.2/foundation-layout-release.aar",
+        "integrity": "sha256:97d474baf35fe803a086489c32df0eb35154448e091bc6543b34ff17aa529477"
+      },
+      "licenseExpression": "Apache-2.0",
+      "selectedLicense": "Apache-2.0",
+      "modified": false,
+      "scope": [
+        "runtime"
+      ],
+      "platforms": [
+        "android-arm64",
+        "android-x64"
+      ],
+      "copyright": [],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/809fa1ed21450f59827d1e9aec720bbc4b687434fa22283c6cb5dd82a47ab9c0.txt",
+          "sha256": "809fa1ed21450f59827d1e9aec720bbc4b687434fa22283c6cb5dd82a47ab9c0"
+        }
+      ]
+    },
+    {
+      "id": "maven:androidx.compose.material3:material3-android@1.3.2",
+      "name": "androidx.compose.material3:material3-android",
+      "version": "1.3.2",
+      "ecosystem": "maven",
+      "repository": "https://cs.android.com/androidx/platform/frameworks/support",
+      "source": {
+        "url": "https://dl.google.com/dl/android/maven2/androidx/compose/material3/material3-android/1.3.2/material3-release.aar",
+        "integrity": "sha256:847666d9fc2d4348b6ec76a6a6094f14fb60de631ee4f6992004ec71a4f44336"
+      },
+      "licenseExpression": "Apache-2.0",
+      "selectedLicense": "Apache-2.0",
+      "modified": false,
+      "scope": [
+        "runtime"
+      ],
+      "platforms": [
+        "android-arm64",
+        "android-x64"
+      ],
+      "copyright": [],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/809fa1ed21450f59827d1e9aec720bbc4b687434fa22283c6cb5dd82a47ab9c0.txt",
+          "sha256": "809fa1ed21450f59827d1e9aec720bbc4b687434fa22283c6cb5dd82a47ab9c0"
+        }
+      ]
+    },
+    {
+      "id": "maven:androidx.compose.material:material-icons-core-android@1.7.8",
+      "name": "androidx.compose.material:material-icons-core-android",
+      "version": "1.7.8",
+      "ecosystem": "maven",
+      "repository": "https://cs.android.com/androidx/platform/frameworks/support",
+      "source": {
+        "url": "https://dl.google.com/dl/android/maven2/androidx/compose/material/material-icons-core-android/1.7.8/material-icons-core-release.aar",
+        "integrity": "sha256:332c06b25e662cc417fb087e76b8faa5cb249f4992ffa3360084a3d4ab882284"
+      },
+      "licenseExpression": "Apache-2.0",
+      "selectedLicense": "Apache-2.0",
+      "modified": false,
+      "scope": [
+        "runtime"
+      ],
+      "platforms": [
+        "android-arm64",
+        "android-x64"
+      ],
+      "copyright": [],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/809fa1ed21450f59827d1e9aec720bbc4b687434fa22283c6cb5dd82a47ab9c0.txt",
+          "sha256": "809fa1ed21450f59827d1e9aec720bbc4b687434fa22283c6cb5dd82a47ab9c0"
+        }
+      ]
+    },
+    {
+      "id": "maven:androidx.compose.material:material-ripple-android@1.8.2",
+      "name": "androidx.compose.material:material-ripple-android",
+      "version": "1.8.2",
+      "ecosystem": "maven",
+      "repository": "https://cs.android.com/androidx/platform/frameworks/support",
+      "source": {
+        "url": "https://dl.google.com/dl/android/maven2/androidx/compose/material/material-ripple-android/1.8.2/material-ripple-release.aar",
+        "integrity": "sha256:eff3802ab6a9c4f2ad6dd15539fc9f47e385dfae656efdca89b8716d744140a1"
+      },
+      "licenseExpression": "Apache-2.0",
+      "selectedLicense": "Apache-2.0",
+      "modified": false,
+      "scope": [
+        "runtime"
+      ],
+      "platforms": [
+        "android-arm64",
+        "android-x64"
+      ],
+      "copyright": [],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/809fa1ed21450f59827d1e9aec720bbc4b687434fa22283c6cb5dd82a47ab9c0.txt",
+          "sha256": "809fa1ed21450f59827d1e9aec720bbc4b687434fa22283c6cb5dd82a47ab9c0"
+        }
+      ]
+    },
+    {
+      "id": "maven:androidx.compose.runtime:runtime-android@1.8.2",
+      "name": "androidx.compose.runtime:runtime-android",
+      "version": "1.8.2",
+      "ecosystem": "maven",
+      "repository": "https://cs.android.com/androidx/platform/frameworks/support",
+      "source": {
+        "url": "https://dl.google.com/dl/android/maven2/androidx/compose/runtime/runtime-android/1.8.2/runtime-release.aar",
+        "integrity": "sha256:3db5d4ffb54df029e71fb22d260d03a7793dd0b7b38194bf99289a1289a2d851"
+      },
+      "licenseExpression": "Apache-2.0",
+      "selectedLicense": "Apache-2.0",
+      "modified": false,
+      "scope": [
+        "runtime"
+      ],
+      "platforms": [
+        "android-arm64",
+        "android-x64"
+      ],
+      "copyright": [],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/809fa1ed21450f59827d1e9aec720bbc4b687434fa22283c6cb5dd82a47ab9c0.txt",
+          "sha256": "809fa1ed21450f59827d1e9aec720bbc4b687434fa22283c6cb5dd82a47ab9c0"
+        }
+      ]
+    },
+    {
+      "id": "maven:androidx.compose.runtime:runtime-saveable-android@1.8.2",
+      "name": "androidx.compose.runtime:runtime-saveable-android",
+      "version": "1.8.2",
+      "ecosystem": "maven",
+      "repository": "https://cs.android.com/androidx/platform/frameworks/support",
+      "source": {
+        "url": "https://dl.google.com/dl/android/maven2/androidx/compose/runtime/runtime-saveable-android/1.8.2/runtime-saveable-release.aar",
+        "integrity": "sha256:45189b6b3e3c4fff7d6a8200de278cde73d508d712e6f9f3fa896126c5cab5f8"
+      },
+      "licenseExpression": "Apache-2.0",
+      "selectedLicense": "Apache-2.0",
+      "modified": false,
+      "scope": [
+        "runtime"
+      ],
+      "platforms": [
+        "android-arm64",
+        "android-x64"
+      ],
+      "copyright": [],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/809fa1ed21450f59827d1e9aec720bbc4b687434fa22283c6cb5dd82a47ab9c0.txt",
+          "sha256": "809fa1ed21450f59827d1e9aec720bbc4b687434fa22283c6cb5dd82a47ab9c0"
+        }
+      ]
+    },
+    {
+      "id": "maven:androidx.compose.ui:ui-android@1.8.2",
+      "name": "androidx.compose.ui:ui-android",
+      "version": "1.8.2",
+      "ecosystem": "maven",
+      "repository": "https://cs.android.com/androidx/platform/frameworks/support",
+      "source": {
+        "url": "https://dl.google.com/dl/android/maven2/androidx/compose/ui/ui-android/1.8.2/ui-release.aar",
+        "integrity": "sha256:7b2e0aff2b575004536e9c7634b51868545d4873e4627432878835b0a7e56851"
+      },
+      "licenseExpression": "Apache-2.0",
+      "selectedLicense": "Apache-2.0",
+      "modified": false,
+      "scope": [
+        "runtime"
+      ],
+      "platforms": [
+        "android-arm64",
+        "android-x64"
+      ],
+      "copyright": [],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/809fa1ed21450f59827d1e9aec720bbc4b687434fa22283c6cb5dd82a47ab9c0.txt",
+          "sha256": "809fa1ed21450f59827d1e9aec720bbc4b687434fa22283c6cb5dd82a47ab9c0"
+        }
+      ]
+    },
+    {
+      "id": "maven:androidx.compose.ui:ui-geometry-android@1.8.2",
+      "name": "androidx.compose.ui:ui-geometry-android",
+      "version": "1.8.2",
+      "ecosystem": "maven",
+      "repository": "https://cs.android.com/androidx/platform/frameworks/support",
+      "source": {
+        "url": "https://dl.google.com/dl/android/maven2/androidx/compose/ui/ui-geometry-android/1.8.2/ui-geometry-release.aar",
+        "integrity": "sha256:89f007fce695ec260dea4ab7e3fbb8216a49523203459e2bc51e8933be51da0e"
+      },
+      "licenseExpression": "Apache-2.0",
+      "selectedLicense": "Apache-2.0",
+      "modified": false,
+      "scope": [
+        "runtime"
+      ],
+      "platforms": [
+        "android-arm64",
+        "android-x64"
+      ],
+      "copyright": [],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/809fa1ed21450f59827d1e9aec720bbc4b687434fa22283c6cb5dd82a47ab9c0.txt",
+          "sha256": "809fa1ed21450f59827d1e9aec720bbc4b687434fa22283c6cb5dd82a47ab9c0"
+        }
+      ]
+    },
+    {
+      "id": "maven:androidx.compose.ui:ui-graphics-android@1.8.2",
+      "name": "androidx.compose.ui:ui-graphics-android",
+      "version": "1.8.2",
+      "ecosystem": "maven",
+      "repository": "https://cs.android.com/androidx/platform/frameworks/support",
+      "source": {
+        "url": "https://dl.google.com/dl/android/maven2/androidx/compose/ui/ui-graphics-android/1.8.2/ui-graphics-release.aar",
+        "integrity": "sha256:dfe879e55ac0ad953593ace30f8960d0dfca5324f0ed607adb95fca6bb4b911d"
+      },
+      "licenseExpression": "Apache-2.0",
+      "selectedLicense": "Apache-2.0",
+      "modified": false,
+      "scope": [
+        "runtime"
+      ],
+      "platforms": [
+        "android-arm64",
+        "android-x64"
+      ],
+      "copyright": [],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/809fa1ed21450f59827d1e9aec720bbc4b687434fa22283c6cb5dd82a47ab9c0.txt",
+          "sha256": "809fa1ed21450f59827d1e9aec720bbc4b687434fa22283c6cb5dd82a47ab9c0"
+        }
+      ]
+    },
+    {
+      "id": "maven:androidx.compose.ui:ui-text-android@1.8.2",
+      "name": "androidx.compose.ui:ui-text-android",
+      "version": "1.8.2",
+      "ecosystem": "maven",
+      "repository": "https://cs.android.com/androidx/platform/frameworks/support",
+      "source": {
+        "url": "https://dl.google.com/dl/android/maven2/androidx/compose/ui/ui-text-android/1.8.2/ui-text-release.aar",
+        "integrity": "sha256:911c40b7cc1cfb96b050dc59a9c5ab62f72570f4ad9062675e22d4df62642da9"
+      },
+      "licenseExpression": "Apache-2.0",
+      "selectedLicense": "Apache-2.0",
+      "modified": false,
+      "scope": [
+        "runtime"
+      ],
+      "platforms": [
+        "android-arm64",
+        "android-x64"
+      ],
+      "copyright": [],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/809fa1ed21450f59827d1e9aec720bbc4b687434fa22283c6cb5dd82a47ab9c0.txt",
+          "sha256": "809fa1ed21450f59827d1e9aec720bbc4b687434fa22283c6cb5dd82a47ab9c0"
+        }
+      ]
+    },
+    {
+      "id": "maven:androidx.compose.ui:ui-tooling-preview-android@1.8.2",
+      "name": "androidx.compose.ui:ui-tooling-preview-android",
+      "version": "1.8.2",
+      "ecosystem": "maven",
+      "repository": "https://cs.android.com/androidx/platform/frameworks/support",
+      "source": {
+        "url": "https://dl.google.com/dl/android/maven2/androidx/compose/ui/ui-tooling-preview-android/1.8.2/ui-tooling-preview-release.aar",
+        "integrity": "sha256:72a1229beb45cc7d43e4a0929b47ee2d0657a636d49987c346153edeb9d8c5c2"
+      },
+      "licenseExpression": "Apache-2.0",
+      "selectedLicense": "Apache-2.0",
+      "modified": false,
+      "scope": [
+        "runtime"
+      ],
+      "platforms": [
+        "android-arm64",
+        "android-x64"
+      ],
+      "copyright": [],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/809fa1ed21450f59827d1e9aec720bbc4b687434fa22283c6cb5dd82a47ab9c0.txt",
+          "sha256": "809fa1ed21450f59827d1e9aec720bbc4b687434fa22283c6cb5dd82a47ab9c0"
+        }
+      ]
+    },
+    {
+      "id": "maven:androidx.compose.ui:ui-unit-android@1.8.2",
+      "name": "androidx.compose.ui:ui-unit-android",
+      "version": "1.8.2",
+      "ecosystem": "maven",
+      "repository": "https://cs.android.com/androidx/platform/frameworks/support",
+      "source": {
+        "url": "https://dl.google.com/dl/android/maven2/androidx/compose/ui/ui-unit-android/1.8.2/ui-unit-release.aar",
+        "integrity": "sha256:4b6f792fce8003607b12db5c3fb969087fd4114b675991d3fb2b05e42cbb5ddd"
+      },
+      "licenseExpression": "Apache-2.0",
+      "selectedLicense": "Apache-2.0",
+      "modified": false,
+      "scope": [
+        "runtime"
+      ],
+      "platforms": [
+        "android-arm64",
+        "android-x64"
+      ],
+      "copyright": [],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/809fa1ed21450f59827d1e9aec720bbc4b687434fa22283c6cb5dd82a47ab9c0.txt",
+          "sha256": "809fa1ed21450f59827d1e9aec720bbc4b687434fa22283c6cb5dd82a47ab9c0"
+        }
+      ]
+    },
+    {
+      "id": "maven:androidx.compose.ui:ui-util-android@1.8.2",
+      "name": "androidx.compose.ui:ui-util-android",
+      "version": "1.8.2",
+      "ecosystem": "maven",
+      "repository": "https://cs.android.com/androidx/platform/frameworks/support",
+      "source": {
+        "url": "https://dl.google.com/dl/android/maven2/androidx/compose/ui/ui-util-android/1.8.2/ui-util-release.aar",
+        "integrity": "sha256:f00e8f04e3b486b9722c04324c2541938162af5ffed67f2d15b472cfed596c9f"
+      },
+      "licenseExpression": "Apache-2.0",
+      "selectedLicense": "Apache-2.0",
+      "modified": false,
+      "scope": [
+        "runtime"
+      ],
+      "platforms": [
+        "android-arm64",
+        "android-x64"
+      ],
+      "copyright": [],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/809fa1ed21450f59827d1e9aec720bbc4b687434fa22283c6cb5dd82a47ab9c0.txt",
+          "sha256": "809fa1ed21450f59827d1e9aec720bbc4b687434fa22283c6cb5dd82a47ab9c0"
+        }
+      ]
+    },
+    {
+      "id": "maven:androidx.concurrent:concurrent-futures@1.1.0",
+      "name": "androidx.concurrent:concurrent-futures",
+      "version": "1.1.0",
+      "ecosystem": "maven",
+      "repository": "http://source.android.com",
+      "source": {
+        "url": "https://dl.google.com/dl/android/maven2/androidx/concurrent/concurrent-futures/1.1.0/concurrent-futures-1.1.0.jar",
+        "integrity": "sha256:0ce067c514a0d1049d1bebdf709e344ed3266fe9744275682937cdcb13334e9e"
+      },
+      "licenseExpression": "Apache-2.0",
+      "selectedLicense": "Apache-2.0",
+      "modified": false,
+      "scope": [
+        "runtime"
+      ],
+      "platforms": [
+        "android-arm64",
+        "android-x64"
+      ],
+      "copyright": [],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/809fa1ed21450f59827d1e9aec720bbc4b687434fa22283c6cb5dd82a47ab9c0.txt",
+          "sha256": "809fa1ed21450f59827d1e9aec720bbc4b687434fa22283c6cb5dd82a47ab9c0"
+        }
+      ]
+    },
+    {
+      "id": "maven:androidx.core:core-ktx@1.16.0",
+      "name": "androidx.core:core-ktx",
+      "version": "1.16.0",
+      "ecosystem": "maven",
+      "repository": "https://cs.android.com/androidx/platform/frameworks/support",
+      "source": {
+        "url": "https://dl.google.com/dl/android/maven2/androidx/core/core-ktx/1.16.0/core-ktx-1.16.0.aar",
+        "integrity": "sha256:1766dbd82f64a12dcd359ecb6f15f3cf35db4d66d22961a7c51b2ffc6468314c"
+      },
+      "licenseExpression": "Apache-2.0",
+      "selectedLicense": "Apache-2.0",
+      "modified": false,
+      "scope": [
+        "runtime"
+      ],
+      "platforms": [
+        "android-arm64",
+        "android-x64"
+      ],
+      "copyright": [],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/809fa1ed21450f59827d1e9aec720bbc4b687434fa22283c6cb5dd82a47ab9c0.txt",
+          "sha256": "809fa1ed21450f59827d1e9aec720bbc4b687434fa22283c6cb5dd82a47ab9c0"
+        }
+      ]
+    },
+    {
+      "id": "maven:androidx.core:core-viewtree@1.0.0",
+      "name": "androidx.core:core-viewtree",
+      "version": "1.0.0",
+      "ecosystem": "maven",
+      "repository": "https://cs.android.com/androidx/platform/frameworks/support",
+      "source": {
+        "url": "https://dl.google.com/dl/android/maven2/androidx/core/core-viewtree/1.0.0/core-viewtree-1.0.0.aar",
+        "integrity": "sha256:dc1b678d58ebcf2bfa1587be68ff826694ce3d221251b9ef30d4d4b36297e6de"
+      },
+      "licenseExpression": "Apache-2.0",
+      "selectedLicense": "Apache-2.0",
+      "modified": false,
+      "scope": [
+        "runtime"
+      ],
+      "platforms": [
+        "android-arm64",
+        "android-x64"
+      ],
+      "copyright": [],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/809fa1ed21450f59827d1e9aec720bbc4b687434fa22283c6cb5dd82a47ab9c0.txt",
+          "sha256": "809fa1ed21450f59827d1e9aec720bbc4b687434fa22283c6cb5dd82a47ab9c0"
+        }
+      ]
+    },
+    {
+      "id": "maven:androidx.core:core@1.16.0",
+      "name": "androidx.core:core",
+      "version": "1.16.0",
+      "ecosystem": "maven",
+      "repository": "https://cs.android.com/androidx/platform/frameworks/support",
+      "source": {
+        "url": "https://dl.google.com/dl/android/maven2/androidx/core/core/1.16.0/core-1.16.0.aar",
+        "integrity": "sha256:6bf03d39dbe3744acce227d3b697374c3625aae1025fbec8ad9fd7bd58bce431"
+      },
+      "licenseExpression": "Apache-2.0",
+      "selectedLicense": "Apache-2.0",
+      "modified": false,
+      "scope": [
+        "runtime"
+      ],
+      "platforms": [
+        "android-arm64",
+        "android-x64"
+      ],
+      "copyright": [],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/809fa1ed21450f59827d1e9aec720bbc4b687434fa22283c6cb5dd82a47ab9c0.txt",
+          "sha256": "809fa1ed21450f59827d1e9aec720bbc4b687434fa22283c6cb5dd82a47ab9c0"
+        }
+      ]
+    },
+    {
+      "id": "maven:androidx.customview:customview-poolingcontainer@1.0.0",
+      "name": "androidx.customview:customview-poolingcontainer",
+      "version": "1.0.0",
+      "ecosystem": "maven",
+      "repository": "https://cs.android.com/androidx/platform/frameworks/support",
+      "source": {
+        "url": "https://dl.google.com/dl/android/maven2/androidx/customview/customview-poolingcontainer/1.0.0/customview-poolingcontainer-1.0.0.aar",
+        "integrity": "sha256:3584102fc49bf399c56e3b7be4bfe12000c46112320cd8cf85cc0a8f93f3e752"
+      },
+      "licenseExpression": "Apache-2.0",
+      "selectedLicense": "Apache-2.0",
+      "modified": false,
+      "scope": [
+        "runtime"
+      ],
+      "platforms": [
+        "android-arm64",
+        "android-x64"
+      ],
+      "copyright": [],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/809fa1ed21450f59827d1e9aec720bbc4b687434fa22283c6cb5dd82a47ab9c0.txt",
+          "sha256": "809fa1ed21450f59827d1e9aec720bbc4b687434fa22283c6cb5dd82a47ab9c0"
+        }
+      ]
+    },
+    {
+      "id": "maven:androidx.emoji2:emoji2@1.4.0",
+      "name": "androidx.emoji2:emoji2",
+      "version": "1.4.0",
+      "ecosystem": "maven",
+      "repository": "https://cs.android.com/androidx/platform/frameworks/support",
+      "source": {
+        "url": "https://dl.google.com/dl/android/maven2/androidx/emoji2/emoji2/1.4.0/emoji2-1.4.0.aar",
+        "integrity": "sha256:433febd3434a45667176c76a64f3f205ca6335a6b544c5b5d57f25a38a375242"
+      },
+      "licenseExpression": "Apache-2.0",
+      "selectedLicense": "Apache-2.0",
+      "modified": false,
+      "scope": [
+        "runtime"
+      ],
+      "platforms": [
+        "android-arm64",
+        "android-x64"
+      ],
+      "copyright": [],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/809fa1ed21450f59827d1e9aec720bbc4b687434fa22283c6cb5dd82a47ab9c0.txt",
+          "sha256": "809fa1ed21450f59827d1e9aec720bbc4b687434fa22283c6cb5dd82a47ab9c0"
+        }
+      ]
+    },
+    {
+      "id": "maven:androidx.exifinterface:exifinterface@1.3.6",
+      "name": "androidx.exifinterface:exifinterface",
+      "version": "1.3.6",
+      "ecosystem": "maven",
+      "repository": "https://cs.android.com/androidx/platform/frameworks/support",
+      "source": {
+        "url": "https://dl.google.com/dl/android/maven2/androidx/exifinterface/exifinterface/1.3.6/exifinterface-1.3.6.aar",
+        "integrity": "sha256:1804105e9e05fdd8f760413bad5de498c381aa329f4f9d94c851bc891ac654c6"
+      },
+      "licenseExpression": "Apache-2.0",
+      "selectedLicense": "Apache-2.0",
+      "modified": false,
+      "scope": [
+        "runtime"
+      ],
+      "platforms": [
+        "android-arm64",
+        "android-x64"
+      ],
+      "copyright": [],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/809fa1ed21450f59827d1e9aec720bbc4b687434fa22283c6cb5dd82a47ab9c0.txt",
+          "sha256": "809fa1ed21450f59827d1e9aec720bbc4b687434fa22283c6cb5dd82a47ab9c0"
+        }
+      ]
+    },
+    {
+      "id": "maven:androidx.graphics:graphics-path@1.0.1",
+      "name": "androidx.graphics:graphics-path",
+      "version": "1.0.1",
+      "ecosystem": "maven",
+      "repository": "https://cs.android.com/androidx/platform/frameworks/support",
+      "source": {
+        "url": "https://dl.google.com/dl/android/maven2/androidx/graphics/graphics-path/1.0.1/graphics-path-1.0.1.aar",
+        "integrity": "sha256:8ca4032b6d79b351f0b59ad4b580eddbb9423e1652f7c958830687f1eee2ec03"
+      },
+      "licenseExpression": "Apache-2.0",
+      "selectedLicense": "Apache-2.0",
+      "modified": false,
+      "scope": [
+        "runtime"
+      ],
+      "platforms": [
+        "android-arm64",
+        "android-x64"
+      ],
+      "copyright": [],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/809fa1ed21450f59827d1e9aec720bbc4b687434fa22283c6cb5dd82a47ab9c0.txt",
+          "sha256": "809fa1ed21450f59827d1e9aec720bbc4b687434fa22283c6cb5dd82a47ab9c0"
+        }
+      ]
+    },
+    {
+      "id": "maven:androidx.interpolator:interpolator@1.0.0",
+      "name": "androidx.interpolator:interpolator",
+      "version": "1.0.0",
+      "ecosystem": "maven",
+      "repository": "http://source.android.com",
+      "source": {
+        "url": "https://dl.google.com/dl/android/maven2/androidx/interpolator/interpolator/1.0.0/interpolator-1.0.0.aar",
+        "integrity": "sha256:33193135a64fe21fa2c35eec6688f1a76e512606c0fc83dc1b689e37add7732a"
+      },
+      "licenseExpression": "Apache-2.0",
+      "selectedLicense": "Apache-2.0",
+      "modified": false,
+      "scope": [
+        "runtime"
+      ],
+      "platforms": [
+        "android-arm64",
+        "android-x64"
+      ],
+      "copyright": [],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/809fa1ed21450f59827d1e9aec720bbc4b687434fa22283c6cb5dd82a47ab9c0.txt",
+          "sha256": "809fa1ed21450f59827d1e9aec720bbc4b687434fa22283c6cb5dd82a47ab9c0"
+        }
+      ]
+    },
+    {
+      "id": "maven:androidx.lifecycle:lifecycle-common-java8@2.9.0",
+      "name": "androidx.lifecycle:lifecycle-common-java8",
+      "version": "2.9.0",
+      "ecosystem": "maven",
+      "repository": "https://cs.android.com/androidx/platform/frameworks/support",
+      "source": {
+        "url": "https://dl.google.com/dl/android/maven2/androidx/lifecycle/lifecycle-common-java8/2.9.0/lifecycle-common-java8-2.9.0.jar",
+        "integrity": "sha256:497dd84de9f2fd46324f25f9a3af032d3a23d087e87af515c4b19435f6d6a651"
+      },
+      "licenseExpression": "Apache-2.0",
+      "selectedLicense": "Apache-2.0",
+      "modified": false,
+      "scope": [
+        "runtime"
+      ],
+      "platforms": [
+        "android-arm64",
+        "android-x64"
+      ],
+      "copyright": [],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/809fa1ed21450f59827d1e9aec720bbc4b687434fa22283c6cb5dd82a47ab9c0.txt",
+          "sha256": "809fa1ed21450f59827d1e9aec720bbc4b687434fa22283c6cb5dd82a47ab9c0"
+        }
+      ]
+    },
+    {
+      "id": "maven:androidx.lifecycle:lifecycle-common-jvm@2.9.0",
+      "name": "androidx.lifecycle:lifecycle-common-jvm",
+      "version": "2.9.0",
+      "ecosystem": "maven",
+      "repository": "https://cs.android.com/androidx/platform/frameworks/support",
+      "source": {
+        "url": "https://dl.google.com/dl/android/maven2/androidx/lifecycle/lifecycle-common-jvm/2.9.0/lifecycle-common-jvm-2.9.0.jar",
+        "integrity": "sha256:37d89b2101f074ac6c260917dabb185607645ee200aa3018c7c5bde70edcf184"
+      },
+      "licenseExpression": "Apache-2.0",
+      "selectedLicense": "Apache-2.0",
+      "modified": false,
+      "scope": [
+        "runtime"
+      ],
+      "platforms": [
+        "android-arm64",
+        "android-x64"
+      ],
+      "copyright": [],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/809fa1ed21450f59827d1e9aec720bbc4b687434fa22283c6cb5dd82a47ab9c0.txt",
+          "sha256": "809fa1ed21450f59827d1e9aec720bbc4b687434fa22283c6cb5dd82a47ab9c0"
+        }
+      ]
+    },
+    {
+      "id": "maven:androidx.lifecycle:lifecycle-livedata-core@2.9.0",
+      "name": "androidx.lifecycle:lifecycle-livedata-core",
+      "version": "2.9.0",
+      "ecosystem": "maven",
+      "repository": "https://cs.android.com/androidx/platform/frameworks/support",
+      "source": {
+        "url": "https://dl.google.com/dl/android/maven2/androidx/lifecycle/lifecycle-livedata-core/2.9.0/lifecycle-livedata-core-2.9.0.aar",
+        "integrity": "sha256:64f96b52c70895807f3020e2e8fa11f3ec2da9c157f62aae21a2c9d3b484a747"
+      },
+      "licenseExpression": "Apache-2.0",
+      "selectedLicense": "Apache-2.0",
+      "modified": false,
+      "scope": [
+        "runtime"
+      ],
+      "platforms": [
+        "android-arm64",
+        "android-x64"
+      ],
+      "copyright": [],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/809fa1ed21450f59827d1e9aec720bbc4b687434fa22283c6cb5dd82a47ab9c0.txt",
+          "sha256": "809fa1ed21450f59827d1e9aec720bbc4b687434fa22283c6cb5dd82a47ab9c0"
+        }
+      ]
+    },
+    {
+      "id": "maven:androidx.lifecycle:lifecycle-process@2.9.0",
+      "name": "androidx.lifecycle:lifecycle-process",
+      "version": "2.9.0",
+      "ecosystem": "maven",
+      "repository": "https://cs.android.com/androidx/platform/frameworks/support",
+      "source": {
+        "url": "https://dl.google.com/dl/android/maven2/androidx/lifecycle/lifecycle-process/2.9.0/lifecycle-process-2.9.0.aar",
+        "integrity": "sha256:c15ce972cc28936a596a9cd256b32f22768a61d5dd810fa56ba945522a0ee7a5"
+      },
+      "licenseExpression": "Apache-2.0",
+      "selectedLicense": "Apache-2.0",
+      "modified": false,
+      "scope": [
+        "runtime"
+      ],
+      "platforms": [
+        "android-arm64",
+        "android-x64"
+      ],
+      "copyright": [],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/809fa1ed21450f59827d1e9aec720bbc4b687434fa22283c6cb5dd82a47ab9c0.txt",
+          "sha256": "809fa1ed21450f59827d1e9aec720bbc4b687434fa22283c6cb5dd82a47ab9c0"
+        }
+      ]
+    },
+    {
+      "id": "maven:androidx.lifecycle:lifecycle-runtime-android@2.9.0",
+      "name": "androidx.lifecycle:lifecycle-runtime-android",
+      "version": "2.9.0",
+      "ecosystem": "maven",
+      "repository": "https://cs.android.com/androidx/platform/frameworks/support",
+      "source": {
+        "url": "https://dl.google.com/dl/android/maven2/androidx/lifecycle/lifecycle-runtime-android/2.9.0/lifecycle-runtime-release.aar",
+        "integrity": "sha256:d4223ae6a8447677267dff22863b6d6988ca68b4d27ca6d74b81046b04794257"
+      },
+      "licenseExpression": "Apache-2.0",
+      "selectedLicense": "Apache-2.0",
+      "modified": false,
+      "scope": [
+        "runtime"
+      ],
+      "platforms": [
+        "android-arm64",
+        "android-x64"
+      ],
+      "copyright": [],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/809fa1ed21450f59827d1e9aec720bbc4b687434fa22283c6cb5dd82a47ab9c0.txt",
+          "sha256": "809fa1ed21450f59827d1e9aec720bbc4b687434fa22283c6cb5dd82a47ab9c0"
+        }
+      ]
+    },
+    {
+      "id": "maven:androidx.lifecycle:lifecycle-runtime-compose-android@2.9.0",
+      "name": "androidx.lifecycle:lifecycle-runtime-compose-android",
+      "version": "2.9.0",
+      "ecosystem": "maven",
+      "repository": "https://cs.android.com/androidx/platform/frameworks/support",
+      "source": {
+        "url": "https://dl.google.com/dl/android/maven2/androidx/lifecycle/lifecycle-runtime-compose-android/2.9.0/lifecycle-runtime-compose-release.aar",
+        "integrity": "sha256:5f68bcea0cf1daac5320a2fd57157237e30945cf7e6586717fbc714b35b32e6f"
+      },
+      "licenseExpression": "Apache-2.0",
+      "selectedLicense": "Apache-2.0",
+      "modified": false,
+      "scope": [
+        "runtime"
+      ],
+      "platforms": [
+        "android-arm64",
+        "android-x64"
+      ],
+      "copyright": [],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/809fa1ed21450f59827d1e9aec720bbc4b687434fa22283c6cb5dd82a47ab9c0.txt",
+          "sha256": "809fa1ed21450f59827d1e9aec720bbc4b687434fa22283c6cb5dd82a47ab9c0"
+        }
+      ]
+    },
+    {
+      "id": "maven:androidx.lifecycle:lifecycle-runtime-ktx-android@2.9.0",
+      "name": "androidx.lifecycle:lifecycle-runtime-ktx-android",
+      "version": "2.9.0",
+      "ecosystem": "maven",
+      "repository": "https://cs.android.com/androidx/platform/frameworks/support",
+      "source": {
+        "url": "https://dl.google.com/dl/android/maven2/androidx/lifecycle/lifecycle-runtime-ktx-android/2.9.0/lifecycle-runtime-ktx.aar",
+        "integrity": "sha256:333fa2ce6db70ac372b791dfeba99c02c0d97b1a8b4ab4a84d4762466d12b207"
+      },
+      "licenseExpression": "Apache-2.0",
+      "selectedLicense": "Apache-2.0",
+      "modified": false,
+      "scope": [
+        "runtime"
+      ],
+      "platforms": [
+        "android-arm64",
+        "android-x64"
+      ],
+      "copyright": [],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/809fa1ed21450f59827d1e9aec720bbc4b687434fa22283c6cb5dd82a47ab9c0.txt",
+          "sha256": "809fa1ed21450f59827d1e9aec720bbc4b687434fa22283c6cb5dd82a47ab9c0"
+        }
+      ]
+    },
+    {
+      "id": "maven:androidx.lifecycle:lifecycle-viewmodel-android@2.9.0",
+      "name": "androidx.lifecycle:lifecycle-viewmodel-android",
+      "version": "2.9.0",
+      "ecosystem": "maven",
+      "repository": "https://cs.android.com/androidx/platform/frameworks/support",
+      "source": {
+        "url": "https://dl.google.com/dl/android/maven2/androidx/lifecycle/lifecycle-viewmodel-android/2.9.0/lifecycle-viewmodel-release.aar",
+        "integrity": "sha256:fa9d7511a8fe0d5edc53099706d64f37621dcfeb9f2c557369ed83645fc87a23"
+      },
+      "licenseExpression": "Apache-2.0",
+      "selectedLicense": "Apache-2.0",
+      "modified": false,
+      "scope": [
+        "runtime"
+      ],
+      "platforms": [
+        "android-arm64",
+        "android-x64"
+      ],
+      "copyright": [],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/809fa1ed21450f59827d1e9aec720bbc4b687434fa22283c6cb5dd82a47ab9c0.txt",
+          "sha256": "809fa1ed21450f59827d1e9aec720bbc4b687434fa22283c6cb5dd82a47ab9c0"
+        }
+      ]
+    },
+    {
+      "id": "maven:androidx.lifecycle:lifecycle-viewmodel-ktx@2.9.0",
+      "name": "androidx.lifecycle:lifecycle-viewmodel-ktx",
+      "version": "2.9.0",
+      "ecosystem": "maven",
+      "repository": "https://cs.android.com/androidx/platform/frameworks/support",
+      "source": {
+        "url": "https://dl.google.com/dl/android/maven2/androidx/lifecycle/lifecycle-viewmodel-ktx/2.9.0/lifecycle-viewmodel-ktx-2.9.0.aar",
+        "integrity": "sha256:af42fd84f4e52b44dcabaf9ecf94120553929bc1a059beb2240a9ec1dbee814f"
+      },
+      "licenseExpression": "Apache-2.0",
+      "selectedLicense": "Apache-2.0",
+      "modified": false,
+      "scope": [
+        "runtime"
+      ],
+      "platforms": [
+        "android-arm64",
+        "android-x64"
+      ],
+      "copyright": [],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/809fa1ed21450f59827d1e9aec720bbc4b687434fa22283c6cb5dd82a47ab9c0.txt",
+          "sha256": "809fa1ed21450f59827d1e9aec720bbc4b687434fa22283c6cb5dd82a47ab9c0"
+        }
+      ]
+    },
+    {
+      "id": "maven:androidx.lifecycle:lifecycle-viewmodel-savedstate-android@2.9.0",
+      "name": "androidx.lifecycle:lifecycle-viewmodel-savedstate-android",
+      "version": "2.9.0",
+      "ecosystem": "maven",
+      "repository": "https://cs.android.com/androidx/platform/frameworks/support",
+      "source": {
+        "url": "https://dl.google.com/dl/android/maven2/androidx/lifecycle/lifecycle-viewmodel-savedstate-android/2.9.0/lifecycle-viewmodel-savedstate-release.aar",
+        "integrity": "sha256:db367838716e55866823c6deed62fcec23fce487bf2a8fa565a36f149ab3d1ef"
+      },
+      "licenseExpression": "Apache-2.0",
+      "selectedLicense": "Apache-2.0",
+      "modified": false,
+      "scope": [
+        "runtime"
+      ],
+      "platforms": [
+        "android-arm64",
+        "android-x64"
+      ],
+      "copyright": [],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/809fa1ed21450f59827d1e9aec720bbc4b687434fa22283c6cb5dd82a47ab9c0.txt",
+          "sha256": "809fa1ed21450f59827d1e9aec720bbc4b687434fa22283c6cb5dd82a47ab9c0"
+        }
+      ]
+    },
+    {
+      "id": "maven:androidx.media3:media3-common@1.8.0",
+      "name": "androidx.media3:media3-common",
+      "version": "1.8.0",
+      "ecosystem": "maven",
+      "repository": "https://github.com/androidx/media",
+      "source": {
+        "url": "https://dl.google.com/dl/android/maven2/androidx/media3/media3-common/1.8.0/media3-common-1.8.0.aar",
+        "integrity": "sha256:001efb6ce0d21965a32c17b9c5be317c07c8722fb680601b19906f64064536b2"
+      },
+      "licenseExpression": "Apache-2.0",
+      "selectedLicense": "Apache-2.0",
+      "modified": false,
+      "scope": [
+        "runtime"
+      ],
+      "platforms": [
+        "android-arm64",
+        "android-x64"
+      ],
+      "copyright": [],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/809fa1ed21450f59827d1e9aec720bbc4b687434fa22283c6cb5dd82a47ab9c0.txt",
+          "sha256": "809fa1ed21450f59827d1e9aec720bbc4b687434fa22283c6cb5dd82a47ab9c0"
+        }
+      ]
+    },
+    {
+      "id": "maven:androidx.media3:media3-container@1.8.0",
+      "name": "androidx.media3:media3-container",
+      "version": "1.8.0",
+      "ecosystem": "maven",
+      "repository": "https://github.com/androidx/media",
+      "source": {
+        "url": "https://dl.google.com/dl/android/maven2/androidx/media3/media3-container/1.8.0/media3-container-1.8.0.aar",
+        "integrity": "sha256:3860a15aa5b2a2baf2dcde38c3b638a384a84daf4855ac47867714c9dac0368d"
+      },
+      "licenseExpression": "Apache-2.0",
+      "selectedLicense": "Apache-2.0",
+      "modified": false,
+      "scope": [
+        "runtime"
+      ],
+      "platforms": [
+        "android-arm64",
+        "android-x64"
+      ],
+      "copyright": [],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/809fa1ed21450f59827d1e9aec720bbc4b687434fa22283c6cb5dd82a47ab9c0.txt",
+          "sha256": "809fa1ed21450f59827d1e9aec720bbc4b687434fa22283c6cb5dd82a47ab9c0"
+        }
+      ]
+    },
+    {
+      "id": "maven:androidx.media3:media3-database@1.8.0",
+      "name": "androidx.media3:media3-database",
+      "version": "1.8.0",
+      "ecosystem": "maven",
+      "repository": "https://github.com/androidx/media",
+      "source": {
+        "url": "https://dl.google.com/dl/android/maven2/androidx/media3/media3-database/1.8.0/media3-database-1.8.0.aar",
+        "integrity": "sha256:13bf4ccce6bc9e8ef8e04a62e90fa6c1589b89bee8633f0db9f61ae2c23f6ef6"
+      },
+      "licenseExpression": "Apache-2.0",
+      "selectedLicense": "Apache-2.0",
+      "modified": false,
+      "scope": [
+        "runtime"
+      ],
+      "platforms": [
+        "android-arm64",
+        "android-x64"
+      ],
+      "copyright": [],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/809fa1ed21450f59827d1e9aec720bbc4b687434fa22283c6cb5dd82a47ab9c0.txt",
+          "sha256": "809fa1ed21450f59827d1e9aec720bbc4b687434fa22283c6cb5dd82a47ab9c0"
+        }
+      ]
+    },
+    {
+      "id": "maven:androidx.media3:media3-datasource@1.8.0",
+      "name": "androidx.media3:media3-datasource",
+      "version": "1.8.0",
+      "ecosystem": "maven",
+      "repository": "https://github.com/androidx/media",
+      "source": {
+        "url": "https://dl.google.com/dl/android/maven2/androidx/media3/media3-datasource/1.8.0/media3-datasource-1.8.0.aar",
+        "integrity": "sha256:9bb676ab1f259b822b30f00755879c6111d7e88466622f9041d588fc7aeb6915"
+      },
+      "licenseExpression": "Apache-2.0",
+      "selectedLicense": "Apache-2.0",
+      "modified": false,
+      "scope": [
+        "runtime"
+      ],
+      "platforms": [
+        "android-arm64",
+        "android-x64"
+      ],
+      "copyright": [],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/809fa1ed21450f59827d1e9aec720bbc4b687434fa22283c6cb5dd82a47ab9c0.txt",
+          "sha256": "809fa1ed21450f59827d1e9aec720bbc4b687434fa22283c6cb5dd82a47ab9c0"
+        }
+      ]
+    },
+    {
+      "id": "maven:androidx.media3:media3-decoder@1.8.0",
+      "name": "androidx.media3:media3-decoder",
+      "version": "1.8.0",
+      "ecosystem": "maven",
+      "repository": "https://github.com/androidx/media",
+      "source": {
+        "url": "https://dl.google.com/dl/android/maven2/androidx/media3/media3-decoder/1.8.0/media3-decoder-1.8.0.aar",
+        "integrity": "sha256:ffa96597c2418de39d6b24975c788d3aa4bdab00fb89e6b5b22aef2a49a919e8"
+      },
+      "licenseExpression": "Apache-2.0",
+      "selectedLicense": "Apache-2.0",
+      "modified": false,
+      "scope": [
+        "runtime"
+      ],
+      "platforms": [
+        "android-arm64",
+        "android-x64"
+      ],
+      "copyright": [],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/809fa1ed21450f59827d1e9aec720bbc4b687434fa22283c6cb5dd82a47ab9c0.txt",
+          "sha256": "809fa1ed21450f59827d1e9aec720bbc4b687434fa22283c6cb5dd82a47ab9c0"
+        }
+      ]
+    },
+    {
+      "id": "maven:androidx.media3:media3-exoplayer@1.8.0",
+      "name": "androidx.media3:media3-exoplayer",
+      "version": "1.8.0",
+      "ecosystem": "maven",
+      "repository": "https://github.com/androidx/media",
+      "source": {
+        "url": "https://dl.google.com/dl/android/maven2/androidx/media3/media3-exoplayer/1.8.0/media3-exoplayer-1.8.0.aar",
+        "integrity": "sha256:606275b20c57e5991834470457a23576ffd0e92db5bfa2a4562ac1782d2166fb"
+      },
+      "licenseExpression": "Apache-2.0",
+      "selectedLicense": "Apache-2.0",
+      "modified": false,
+      "scope": [
+        "runtime"
+      ],
+      "platforms": [
+        "android-arm64",
+        "android-x64"
+      ],
+      "copyright": [],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/809fa1ed21450f59827d1e9aec720bbc4b687434fa22283c6cb5dd82a47ab9c0.txt",
+          "sha256": "809fa1ed21450f59827d1e9aec720bbc4b687434fa22283c6cb5dd82a47ab9c0"
+        }
+      ]
+    },
+    {
+      "id": "maven:androidx.media3:media3-extractor@1.8.0",
+      "name": "androidx.media3:media3-extractor",
+      "version": "1.8.0",
+      "ecosystem": "maven",
+      "repository": "https://github.com/androidx/media",
+      "source": {
+        "url": "https://dl.google.com/dl/android/maven2/androidx/media3/media3-extractor/1.8.0/media3-extractor-1.8.0.aar",
+        "integrity": "sha256:778312cd8a9975debd50c86a20ae4ed7b0770ff43e9b72acfb6664b6ed36d3ae"
+      },
+      "licenseExpression": "Apache-2.0",
+      "selectedLicense": "Apache-2.0",
+      "modified": false,
+      "scope": [
+        "runtime"
+      ],
+      "platforms": [
+        "android-arm64",
+        "android-x64"
+      ],
+      "copyright": [],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/809fa1ed21450f59827d1e9aec720bbc4b687434fa22283c6cb5dd82a47ab9c0.txt",
+          "sha256": "809fa1ed21450f59827d1e9aec720bbc4b687434fa22283c6cb5dd82a47ab9c0"
+        }
+      ]
+    },
+    {
+      "id": "maven:androidx.profileinstaller:profileinstaller@1.4.0",
+      "name": "androidx.profileinstaller:profileinstaller",
+      "version": "1.4.0",
+      "ecosystem": "maven",
+      "repository": "https://cs.android.com/androidx/platform/frameworks/support",
+      "source": {
+        "url": "https://dl.google.com/dl/android/maven2/androidx/profileinstaller/profileinstaller/1.4.0/profileinstaller-1.4.0.aar",
+        "integrity": "sha256:d502141fcce902430f62b674c32aecd0f75262e7ee2cd15c74adb617cd13130a"
+      },
+      "licenseExpression": "Apache-2.0",
+      "selectedLicense": "Apache-2.0",
+      "modified": false,
+      "scope": [
+        "runtime"
+      ],
+      "platforms": [
+        "android-arm64",
+        "android-x64"
+      ],
+      "copyright": [],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/809fa1ed21450f59827d1e9aec720bbc4b687434fa22283c6cb5dd82a47ab9c0.txt",
+          "sha256": "809fa1ed21450f59827d1e9aec720bbc4b687434fa22283c6cb5dd82a47ab9c0"
+        }
+      ]
+    },
+    {
+      "id": "maven:androidx.savedstate:savedstate-android@1.3.0",
+      "name": "androidx.savedstate:savedstate-android",
+      "version": "1.3.0",
+      "ecosystem": "maven",
+      "repository": "https://cs.android.com/androidx/platform/frameworks/support",
+      "source": {
+        "url": "https://dl.google.com/dl/android/maven2/androidx/savedstate/savedstate-android/1.3.0/savedstate-release.aar",
+        "integrity": "sha256:210b6909bbd515dbf415905cbb220fca93a87fa546838f754077ebc8e0488590"
+      },
+      "licenseExpression": "Apache-2.0",
+      "selectedLicense": "Apache-2.0",
+      "modified": false,
+      "scope": [
+        "runtime"
+      ],
+      "platforms": [
+        "android-arm64",
+        "android-x64"
+      ],
+      "copyright": [],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/809fa1ed21450f59827d1e9aec720bbc4b687434fa22283c6cb5dd82a47ab9c0.txt",
+          "sha256": "809fa1ed21450f59827d1e9aec720bbc4b687434fa22283c6cb5dd82a47ab9c0"
+        }
+      ]
+    },
+    {
+      "id": "maven:androidx.savedstate:savedstate-ktx@1.3.0",
+      "name": "androidx.savedstate:savedstate-ktx",
+      "version": "1.3.0",
+      "ecosystem": "maven",
+      "repository": "https://cs.android.com/androidx/platform/frameworks/support",
+      "source": {
+        "url": "https://dl.google.com/dl/android/maven2/androidx/savedstate/savedstate-ktx/1.3.0/savedstate-ktx-1.3.0.aar",
+        "integrity": "sha256:45c5f6412840f50de7bf7d9b1c4a8c81ea236832487a1138cb320b8c997416f2"
+      },
+      "licenseExpression": "Apache-2.0",
+      "selectedLicense": "Apache-2.0",
+      "modified": false,
+      "scope": [
+        "runtime"
+      ],
+      "platforms": [
+        "android-arm64",
+        "android-x64"
+      ],
+      "copyright": [],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/809fa1ed21450f59827d1e9aec720bbc4b687434fa22283c6cb5dd82a47ab9c0.txt",
+          "sha256": "809fa1ed21450f59827d1e9aec720bbc4b687434fa22283c6cb5dd82a47ab9c0"
+        }
+      ]
+    },
+    {
+      "id": "maven:androidx.startup:startup-runtime@1.1.1",
+      "name": "androidx.startup:startup-runtime",
+      "version": "1.1.1",
+      "ecosystem": "maven",
+      "repository": "https://cs.android.com/androidx/platform/frameworks/support",
+      "source": {
+        "url": "https://dl.google.com/dl/android/maven2/androidx/startup/startup-runtime/1.1.1/startup-runtime-1.1.1.aar",
+        "integrity": "sha256:e0a6329a371262fe4c450372b70fdaf33b769ef6917094723787cfce896b1dd3"
+      },
+      "licenseExpression": "Apache-2.0",
+      "selectedLicense": "Apache-2.0",
+      "modified": false,
+      "scope": [
+        "runtime"
+      ],
+      "platforms": [
+        "android-arm64",
+        "android-x64"
+      ],
+      "copyright": [],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/809fa1ed21450f59827d1e9aec720bbc4b687434fa22283c6cb5dd82a47ab9c0.txt",
+          "sha256": "809fa1ed21450f59827d1e9aec720bbc4b687434fa22283c6cb5dd82a47ab9c0"
+        }
+      ]
+    },
+    {
+      "id": "maven:androidx.tracing:tracing@1.2.0",
+      "name": "androidx.tracing:tracing",
+      "version": "1.2.0",
+      "ecosystem": "maven",
+      "repository": "https://cs.android.com/androidx/platform/frameworks/support",
+      "source": {
+        "url": "https://dl.google.com/dl/android/maven2/androidx/tracing/tracing/1.2.0/tracing-1.2.0.aar",
+        "integrity": "sha256:6faa90390d1fdbf0adb9a99bf99de67b94c6c6f35aea9510593a9d17973736a2"
+      },
+      "licenseExpression": "Apache-2.0",
+      "selectedLicense": "Apache-2.0",
+      "modified": false,
+      "scope": [
+        "runtime"
+      ],
+      "platforms": [
+        "android-arm64",
+        "android-x64"
+      ],
+      "copyright": [],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/809fa1ed21450f59827d1e9aec720bbc4b687434fa22283c6cb5dd82a47ab9c0.txt",
+          "sha256": "809fa1ed21450f59827d1e9aec720bbc4b687434fa22283c6cb5dd82a47ab9c0"
+        }
+      ]
+    },
+    {
+      "id": "maven:androidx.versionedparcelable:versionedparcelable@1.1.1",
+      "name": "androidx.versionedparcelable:versionedparcelable",
+      "version": "1.1.1",
+      "ecosystem": "maven",
+      "repository": "http://source.android.com",
+      "source": {
+        "url": "https://dl.google.com/dl/android/maven2/androidx/versionedparcelable/versionedparcelable/1.1.1/versionedparcelable-1.1.1.aar",
+        "integrity": "sha256:57e8d93260d18d5b9007c9eed3c64ad159de90c8609ebfc74a347cbd514535a4"
+      },
+      "licenseExpression": "Apache-2.0",
+      "selectedLicense": "Apache-2.0",
+      "modified": false,
+      "scope": [
+        "runtime"
+      ],
+      "platforms": [
+        "android-arm64",
+        "android-x64"
+      ],
+      "copyright": [],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/809fa1ed21450f59827d1e9aec720bbc4b687434fa22283c6cb5dd82a47ab9c0.txt",
+          "sha256": "809fa1ed21450f59827d1e9aec720bbc4b687434fa22283c6cb5dd82a47ab9c0"
+        }
+      ]
+    },
+    {
+      "id": "maven:com.google.guava:failureaccess@1.0.2",
+      "name": "com.google.guava:failureaccess",
+      "version": "1.0.2",
+      "ecosystem": "maven",
+      "repository": null,
+      "source": {
+        "url": "https://repo1.maven.org/maven2/com/google/guava/failureaccess/1.0.2/failureaccess-1.0.2.jar",
+        "integrity": "sha256:8a8f81cf9b359e3f6dfa691a1e776985c061ef2f223c9b2c80753e1b458e8064"
+      },
+      "licenseExpression": "Apache-2.0",
+      "selectedLicense": "Apache-2.0",
+      "modified": false,
+      "scope": [
+        "runtime"
+      ],
+      "platforms": [
+        "android-arm64",
+        "android-x64"
+      ],
+      "copyright": [],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/809fa1ed21450f59827d1e9aec720bbc4b687434fa22283c6cb5dd82a47ab9c0.txt",
+          "sha256": "809fa1ed21450f59827d1e9aec720bbc4b687434fa22283c6cb5dd82a47ab9c0"
+        }
+      ]
+    },
+    {
+      "id": "maven:com.google.guava:guava@33.3.1-android",
+      "name": "com.google.guava:guava",
+      "version": "33.3.1-android",
+      "ecosystem": "maven",
+      "repository": "https://github.com/google/guava",
+      "source": {
+        "url": "https://repo1.maven.org/maven2/com/google/guava/guava/33.3.1-android/guava-33.3.1-android.jar",
+        "integrity": "sha256:2c3e41d1b380f2044d257947a3aa82dabf3ae4b978622745254aa18b6cf89ab0"
+      },
+      "licenseExpression": "Apache-2.0",
+      "selectedLicense": "Apache-2.0",
+      "modified": false,
+      "scope": [
+        "runtime"
+      ],
+      "platforms": [
+        "android-arm64",
+        "android-x64"
+      ],
+      "copyright": [],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/809fa1ed21450f59827d1e9aec720bbc4b687434fa22283c6cb5dd82a47ab9c0.txt",
+          "sha256": "809fa1ed21450f59827d1e9aec720bbc4b687434fa22283c6cb5dd82a47ab9c0"
+        }
+      ]
+    },
+    {
+      "id": "maven:com.google.guava:listenablefuture@9999.0-empty-to-avoid-conflict-with-guava",
+      "name": "com.google.guava:listenablefuture",
+      "version": "9999.0-empty-to-avoid-conflict-with-guava",
+      "ecosystem": "maven",
+      "repository": null,
+      "source": {
+        "url": "https://repo1.maven.org/maven2/com/google/guava/listenablefuture/9999.0-empty-to-avoid-conflict-with-guava/listenablefuture-9999.0-empty-to-avoid-conflict-with-guava.jar",
+        "integrity": "sha256:b372a037d4230aa57fbeffdef30fd6123f9c0c2db85d0aced00c91b974f33f99"
+      },
+      "licenseExpression": "Apache-2.0",
+      "selectedLicense": "Apache-2.0",
+      "modified": false,
+      "scope": [
+        "runtime"
+      ],
+      "platforms": [
+        "android-arm64",
+        "android-x64"
+      ],
+      "copyright": [],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/809fa1ed21450f59827d1e9aec720bbc4b687434fa22283c6cb5dd82a47ab9c0.txt",
+          "sha256": "809fa1ed21450f59827d1e9aec720bbc4b687434fa22283c6cb5dd82a47ab9c0"
+        }
+      ]
+    },
+    {
+      "id": "maven:net.java.dev.jna:jna@5.17.0",
+      "name": "net.java.dev.jna:jna",
+      "version": "5.17.0",
+      "ecosystem": "maven",
+      "repository": "https://github.com/java-native-access/jna",
+      "source": {
+        "url": "https://repo1.maven.org/maven2/net/java/dev/jna/jna/5.17.0/jna-5.17.0.aar",
+        "integrity": "sha256:4dbeffffa665d97ad5aa7eee297531d3c841a86716ab7f774fd6956422b3cf38"
+      },
+      "licenseExpression": "LGPL-2.1-or-later OR Apache-2.0",
+      "selectedLicense": "Apache-2.0",
+      "modified": false,
+      "scope": [
+        "runtime"
+      ],
+      "platforms": [
+        "android-arm64",
+        "android-x64"
+      ],
+      "copyright": [],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/07c938b23950ab7d47a24ef35f9f5da3a05ae164278dc959ad6994135ed59ff1.txt",
+          "sha256": "07c938b23950ab7d47a24ef35f9f5da3a05ae164278dc959ad6994135ed59ff1"
+        },
+        {
+          "path": "licenses/texts/809fa1ed21450f59827d1e9aec720bbc4b687434fa22283c6cb5dd82a47ab9c0.txt",
+          "sha256": "809fa1ed21450f59827d1e9aec720bbc4b687434fa22283c6cb5dd82a47ab9c0"
+        }
+      ]
+    },
+    {
+      "id": "maven:org.jetbrains.kotlin:kotlin-stdlib@2.1.20",
+      "name": "org.jetbrains.kotlin:kotlin-stdlib",
+      "version": "2.1.20",
+      "ecosystem": "maven",
+      "repository": "https://github.com/JetBrains/kotlin",
+      "source": {
+        "url": "https://repo1.maven.org/maven2/org/jetbrains/kotlin/kotlin-stdlib/2.1.20/kotlin-stdlib-2.1.20.jar",
+        "integrity": "sha256:1bcc74e8ce84e2c25eaafde10f1248349cce3062b6e36978cbeec610db1e930a"
+      },
+      "licenseExpression": "Apache-2.0",
+      "selectedLicense": "Apache-2.0",
+      "modified": false,
+      "scope": [
+        "runtime"
+      ],
+      "platforms": [
+        "android-arm64",
+        "android-x64"
+      ],
+      "copyright": [],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/809fa1ed21450f59827d1e9aec720bbc4b687434fa22283c6cb5dd82a47ab9c0.txt",
+          "sha256": "809fa1ed21450f59827d1e9aec720bbc4b687434fa22283c6cb5dd82a47ab9c0"
+        }
+      ]
+    },
+    {
+      "id": "maven:org.jetbrains.kotlinx:kotlinx-coroutines-android@1.10.2",
+      "name": "org.jetbrains.kotlinx:kotlinx-coroutines-android",
+      "version": "1.10.2",
+      "ecosystem": "maven",
+      "repository": "https://github.com/Kotlin/kotlinx.coroutines",
+      "source": {
+        "url": "https://repo1.maven.org/maven2/org/jetbrains/kotlinx/kotlinx-coroutines-android/1.10.2/kotlinx-coroutines-android-1.10.2.jar",
+        "integrity": "sha256:e713f1f874244115a07571065cffa0f24f5e78300e9720fea16de3af1d75fd41"
+      },
+      "licenseExpression": "Apache-2.0",
+      "selectedLicense": "Apache-2.0",
+      "modified": false,
+      "scope": [
+        "runtime"
+      ],
+      "platforms": [
+        "android-arm64",
+        "android-x64"
+      ],
+      "copyright": [],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/809fa1ed21450f59827d1e9aec720bbc4b687434fa22283c6cb5dd82a47ab9c0.txt",
+          "sha256": "809fa1ed21450f59827d1e9aec720bbc4b687434fa22283c6cb5dd82a47ab9c0"
+        }
+      ]
+    },
+    {
+      "id": "maven:org.jetbrains.kotlinx:kotlinx-coroutines-core-jvm@1.10.2",
+      "name": "org.jetbrains.kotlinx:kotlinx-coroutines-core-jvm",
+      "version": "1.10.2",
+      "ecosystem": "maven",
+      "repository": "https://github.com/Kotlin/kotlinx.coroutines",
+      "source": {
+        "url": "https://repo1.maven.org/maven2/org/jetbrains/kotlinx/kotlinx-coroutines-core-jvm/1.10.2/kotlinx-coroutines-core-jvm-1.10.2.jar",
+        "integrity": "sha256:5ca175b38df331fd64155b35cd8cae1251fa9ee369709b36d42e0a288ccce3fd"
+      },
+      "licenseExpression": "Apache-2.0",
+      "selectedLicense": "Apache-2.0",
+      "modified": false,
+      "scope": [
+        "runtime"
+      ],
+      "platforms": [
+        "android-arm64",
+        "android-x64"
+      ],
+      "copyright": [],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/809fa1ed21450f59827d1e9aec720bbc4b687434fa22283c6cb5dd82a47ab9c0.txt",
+          "sha256": "809fa1ed21450f59827d1e9aec720bbc4b687434fa22283c6cb5dd82a47ab9c0"
+        }
+      ]
+    },
+    {
+      "id": "maven:org.jetbrains.kotlinx:kotlinx-serialization-core-jvm@1.7.3",
+      "name": "org.jetbrains.kotlinx:kotlinx-serialization-core-jvm",
+      "version": "1.7.3",
+      "ecosystem": "maven",
+      "repository": "https://github.com/Kotlin/kotlinx.serialization",
+      "source": {
+        "url": "https://repo1.maven.org/maven2/org/jetbrains/kotlinx/kotlinx-serialization-core-jvm/1.7.3/kotlinx-serialization-core-jvm-1.7.3.jar",
+        "integrity": "sha256:f0adde45864144475385cf4aa7e0b7feb27f61fcf9472665ed98cc971b06b1eb"
+      },
+      "licenseExpression": "Apache-2.0",
+      "selectedLicense": "Apache-2.0",
+      "modified": false,
+      "scope": [
+        "runtime"
+      ],
+      "platforms": [
+        "android-arm64",
+        "android-x64"
+      ],
+      "copyright": [],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/809fa1ed21450f59827d1e9aec720bbc4b687434fa22283c6cb5dd82a47ab9c0.txt",
+          "sha256": "809fa1ed21450f59827d1e9aec720bbc4b687434fa22283c6cb5dd82a47ab9c0"
+        }
+      ]
+    },
+    {
+      "id": "maven:org.jetbrains:annotations@23.0.0",
+      "name": "org.jetbrains:annotations",
+      "version": "23.0.0",
+      "ecosystem": "maven",
+      "repository": "https://github.com/JetBrains/java-annotations",
+      "source": {
+        "url": "https://repo1.maven.org/maven2/org/jetbrains/annotations/23.0.0/annotations-23.0.0.jar",
+        "integrity": "sha256:7b0f19724082cbfcbc66e5abea2b9bc92cf08a1ea11e191933ed43801eb3cd05"
+      },
+      "licenseExpression": "Apache-2.0",
+      "selectedLicense": "Apache-2.0",
+      "modified": false,
+      "scope": [
+        "runtime"
+      ],
+      "platforms": [
+        "android-arm64",
+        "android-x64"
+      ],
+      "copyright": [],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/809fa1ed21450f59827d1e9aec720bbc4b687434fa22283c6cb5dd82a47ab9c0.txt",
+          "sha256": "809fa1ed21450f59827d1e9aec720bbc4b687434fa22283c6cb5dd82a47ab9c0"
+        }
+      ]
+    },
+    {
+      "id": "maven:org.jspecify:jspecify@1.0.0",
+      "name": "org.jspecify:jspecify",
+      "version": "1.0.0",
+      "ecosystem": "maven",
+      "repository": "https://github.com/jspecify/jspecify/",
+      "source": {
+        "url": "https://repo1.maven.org/maven2/org/jspecify/jspecify/1.0.0/jspecify-1.0.0.jar",
+        "integrity": "sha256:1fad6e6be7557781e4d33729d49ae1cdc8fdda6fe477bb0cc68ce351eafdfbab"
+      },
+      "licenseExpression": "Apache-2.0",
+      "selectedLicense": "Apache-2.0",
+      "modified": false,
+      "scope": [
+        "runtime"
+      ],
+      "platforms": [
+        "android-arm64",
+        "android-x64"
+      ],
+      "copyright": [],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/809fa1ed21450f59827d1e9aec720bbc4b687434fa22283c6cb5dd82a47ab9c0.txt",
+          "sha256": "809fa1ed21450f59827d1e9aec720bbc4b687434fa22283c6cb5dd82a47ab9c0"
         }
       ]
     },
@@ -16948,6 +21469,9 @@
         "runtime"
       ],
       "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
         "macos-arm64",
         "macos-x64",
         "windows-x64"
@@ -17045,6 +21569,42 @@
       "copyright": []
     },
     {
+      "id": "native:abseil-cpp@20240722.0",
+      "name": "Abseil C++ (headers used by AEC3)",
+      "version": "20240722.0",
+      "ecosystem": "native",
+      "repository": "https://github.com/abseil/abseil-cpp",
+      "source": {
+        "url": "https://github.com/abseil/abseil-cpp/archive/refs/tags/20240722.0.tar.gz",
+        "integrity": "sha256:f50e5ac311a81382da7fa75b97310e4b9006474f9560ac46f54a9967f07d4ae3"
+      },
+      "licenseExpression": "Apache-2.0",
+      "selectedLicense": "Apache-2.0",
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/1fd39030c119b4c97014f59e0ad0ed65f23475bbdf55a52740f31eb82b34b4ee.txt",
+          "sha256": "1fd39030c119b4c97014f59e0ad0ed65f23475bbdf55a52740f31eb82b34b4ee"
+        },
+        {
+          "path": "licenses/texts/c79a7fea0e3cac04cd43f20e7b648e5a0ff8fa5344e644b0ee09ca1162b62747.txt",
+          "sha256": "c79a7fea0e3cac04cd43f20e7b648e5a0ff8fa5344e644b0ee09ca1162b62747"
+        }
+      ],
+      "modified": false,
+      "scope": [
+        "runtime"
+      ],
+      "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
+        "macos-arm64",
+        "macos-x64",
+        "windows-x64"
+      ],
+      "copyright": []
+    },
+    {
       "id": "native:libASPL@3.1.2+633e0f7",
       "name": "libASPL",
       "version": "3.1.2+633e0f7",
@@ -17081,6 +21641,58 @@
       "copyright": [
         "Copyright (C) 2012 Apple Inc. All Rights Reserved.",
         "Copyright © 2020 Apple Inc."
+      ]
+    },
+    {
+      "id": "native:webrtc-audio-processing@d0569cfa (AEC3 subset)",
+      "name": "WebRTC audio processing (AEC3 subset)",
+      "version": "d0569cfa50c1858ee279d77b3fc8870be6902441",
+      "ecosystem": "native",
+      "repository": "https://gitlab.freedesktop.org/pulseaudio/webrtc-audio-processing",
+      "source": {
+        "url": "https://gitlab.freedesktop.org/pulseaudio/webrtc-audio-processing/-/tree/d0569cfa50c1858ee279d77b3fc8870be6902441",
+        "integrity": "sha256:1bdaff346c597092533f59f74500e620e4e74d184b0f3d106f9367126f1057e3"
+      },
+      "licenseExpression": "BSD-3-Clause",
+      "selectedLicense": "BSD-3-Clause",
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/01462e2068d1a04c2274f3389773014c14ed9bc3446b28303543bd3e3c064145.txt",
+          "sha256": "01462e2068d1a04c2274f3389773014c14ed9bc3446b28303543bd3e3c064145"
+        },
+        {
+          "path": "licenses/texts/2419ba32051d9430aaa918db7bd5cd76d976d2b2fcf4364e3e7e0aa36565d83f.txt",
+          "sha256": "2419ba32051d9430aaa918db7bd5cd76d976d2b2fcf4364e3e7e0aa36565d83f"
+        },
+        {
+          "path": "licenses/texts/25b7731b70c77ecd5f3bb19303fbaa99be18860f81d44f71da670fdcd04829db.txt",
+          "sha256": "25b7731b70c77ecd5f3bb19303fbaa99be18860f81d44f71da670fdcd04829db"
+        },
+        {
+          "path": "licenses/texts/705caaeede8c3bc8c8e3f76489864a5b0575b42cb4a38091f88b9126c3e6628d.txt",
+          "sha256": "705caaeede8c3bc8c8e3f76489864a5b0575b42cb4a38091f88b9126c3e6628d"
+        },
+        {
+          "path": "licenses/texts/ab00a482b6a3902e40211b43c5d0441962ea99b6cc7c25c0f243fa270b78d482.txt",
+          "sha256": "ab00a482b6a3902e40211b43c5d0441962ea99b6cc7c25c0f243fa270b78d482"
+        }
+      ],
+      "modified": true,
+      "scope": [
+        "runtime"
+      ],
+      "platforms": [
+        "android-arm64",
+        "android-x64",
+        "ios-arm64",
+        "macos-arm64",
+        "macos-x64",
+        "windows-x64"
+      ],
+      "modificationNotice": "Vendored as oink-aec3 (crates/oink-audio/native/aec3): AEC3 only, fixed stereo, namespace and symbol isolation, and realtime-storage.patch; its NOTICE lists every change. Includes the Takuya Ooura FFT under its own permission notice. The source integrity is vendor-manifest.json, which pins every vendored file.",
+      "copyright": [
+        "Copyright (c) 2011, The WebRTC project authors. All rights reserved.",
+        "Takuya OOURA FFT, Copyright 1996-2001. See"
       ]
     },
     {

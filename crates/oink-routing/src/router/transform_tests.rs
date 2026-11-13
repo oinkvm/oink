@@ -932,3 +932,112 @@ fn forwarded_replacement_local_up_also_retires_the_local_physical_observation() 
     assert!(!source.lock_escape_keys.contains(&KeyCode::LEFT_GUI));
     assert!(!source.keyboard_pointer_modifiers().contains(&KeyCode::LEFT_GUI));
 }
+
+#[test]
+fn android_default_maps_mac_command_to_ctrl_but_preserves_explicit_choices() {
+    let mut r = router(Os::Android);
+    r.test_connect(SOURCE, 0);
+    r.peers.get_mut(&SOURCE).unwrap().os = Os::MacOS;
+    for settings in [
+        None,
+        Some(InputTransform::default()),
+        Some(InputTransform::initial("macos")),
+    ] {
+        r.set_input_transforms(settings.map(|s| (SOURCE, s)).into_iter().collect());
+        for (physical, output) in [
+            (KeyCode::LEFT_GUI, KeyCode::LEFT_CTRL),
+            (KeyCode::RIGHT_GUI, KeyCode::RIGHT_CTRL),
+        ] {
+            r.target_key(SOURCE, physical, true);
+            r.target_key(SOURCE, KeyCode::keyboard(0x28), true);
+            r.target_key(SOURCE, KeyCode::keyboard(0x28), false);
+            r.target_key(SOURCE, physical, false);
+            assert_eq!(
+                keys(&mut r),
+                [
+                    (output, true),
+                    (KeyCode::keyboard(0x28), true),
+                    (KeyCode::keyboard(0x28), false),
+                    (output, false)
+                ]
+            );
+        }
+    }
+    for keyboard in [
+        KeyboardMapping::default(),
+        custom(KeyCode::LEFT_GUI, KeyCode::LEFT_ALT),
+        KeyboardMapping::preset(KeyPreset::WinFeel, "macos", "android"),
+    ] {
+        let expected = keyboard.map(KeyCode::LEFT_GUI);
+        let s = InputTransform {
+            android: Some(oink_foundation::input_transform::TargetTransform {
+                keyboard,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        r.set_input_transforms([(SOURCE, s)].into());
+        r.target_key(SOURCE, KeyCode::LEFT_GUI, true);
+        r.target_key(SOURCE, KeyCode::LEFT_GUI, false);
+        assert_eq!(keys(&mut r), [(expected, true), (expected, false)]);
+    }
+    let mut s = InputTransform::default();
+    s.overrides.push(TargetOverride {
+        target: ME,
+        reverse_wheel: None,
+        keyboard: Some(KeyboardMapping::default()),
+    });
+    r.set_input_transforms([(SOURCE, s)].into());
+    assert_eq!(r.map_key(SOURCE, KeyCode::LEFT_GUI), KeyCode::LEFT_GUI);
+    r.peers.get_mut(&SOURCE).unwrap().os = Os::Windows;
+    r.set_input_transforms([(SOURCE, InputTransform::default())].into());
+    assert_eq!(r.map_key(SOURCE, KeyCode::LEFT_GUI), KeyCode::LEFT_GUI);
+}
+
+#[test]
+fn android_presets_replace_modifiers_only_without_rewriting_shortcuts() {
+    let mut r = router(Os::Android);
+    r.test_connect(SOURCE, 0);
+    r.peers.get_mut(&SOURCE).unwrap().os = Os::MacOS;
+    for (preset, pairs) in [
+        (
+            KeyPreset::MacFeel,
+            [
+                (KeyCode::LEFT_GUI, KeyCode::LEFT_CTRL),
+                (KeyCode::LEFT_ALT, KeyCode::LEFT_ALT),
+                (KeyCode::LEFT_CTRL, KeyCode::LEFT_GUI),
+            ],
+        ),
+        (
+            KeyPreset::WinFeel,
+            [
+                (KeyCode::LEFT_GUI, KeyCode::LEFT_ALT),
+                (KeyCode::LEFT_ALT, KeyCode::LEFT_GUI),
+                (KeyCode::LEFT_CTRL, KeyCode::LEFT_CTRL),
+            ],
+        ),
+    ] {
+        let s = InputTransform {
+            android: Some(oink_foundation::input_transform::TargetTransform {
+                keyboard: KeyboardMapping::preset(preset, "macos", "android"),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        r.set_input_transforms([(SOURCE, s)].into());
+        // Tab, arrows, Backspace, Space, Enter: only the held modifier changes.
+        for (physical, output) in pairs {
+            for key in [0x2b, 0x50, 0x4f, 0x2a, 0x2c, 0x52, 0x28] {
+                let key = KeyCode::keyboard(key);
+                r.target_key(SOURCE, physical, true);
+                r.target_key(SOURCE, key, true);
+                r.target_key(SOURCE, key, false);
+                r.target_key(SOURCE, physical, false);
+                assert_eq!(
+                    keys(&mut r),
+                    [(output, true), (key, true), (key, false), (output, false)]
+                );
+            }
+        }
+    }
+}

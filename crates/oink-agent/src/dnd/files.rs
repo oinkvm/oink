@@ -2,8 +2,7 @@
 use oink_clipboard::sync::files::BulkLink;
 use oink_foundation::content::DeliveryId;
 use std::sync::{Arc, Mutex};
-type Receipts =
-    std::collections::HashMap<oink_foundation::content::DeliveryId, (Option<[u8; 32]>, tokio::time::Instant)>;
+type Receipts = std::collections::HashMap<oink_foundation::content::DeliveryId, (bool, tokio::time::Instant)>;
 /// Shared by the platform glue and bulk server; pause retires a whole generation.
 pub(crate) struct DndFiles {
     pub(crate) native: Arc<oink_clipboard::content::Registry>,
@@ -102,7 +101,7 @@ impl DndFiles {
         &self,
         peer: oink_foundation::DeviceId,
         delivery: oink_foundation::content::DeliveryId,
-        receipt: Option<[u8; 32]>,
+        success: bool,
     ) -> bool {
         if delivery.receiver != peer {
             return false;
@@ -112,7 +111,7 @@ impl DndFiles {
         receipts
             .retain(|_, (_, at)| now.duration_since(*at).as_millis() < oink_clipboard::model::NO_PROGRESS_MS as u128);
         if let Some((old, _)) = receipts.get(&delivery) {
-            return *old == receipt;
+            return *old == success;
         }
         let Some(input) = self.input.lock().unwrap().clone() else {
             return false;
@@ -121,7 +120,7 @@ impl DndFiles {
         input.send(crate::threads::input::InputCommand::DndDeliveryReceipt {
             peer,
             delivery,
-            success: receipt.is_some(),
+            success,
             reply,
         });
         if ready.await != Ok(true) {
@@ -132,7 +131,7 @@ impl DndFiles {
         {
             receipts.remove(&oldest);
         }
-        receipts.insert(delivery, (receipt, now));
+        receipts.insert(delivery, (success, now));
         true
     }
 
@@ -182,13 +181,13 @@ impl BulkLink for LocalLink {
                     return;
                 };
                 let terminal = match request {
-                    ContentMsg::TargetStored { delivery, receipt } => Some((delivery, Some(receipt))),
-                    ContentMsg::Failed { delivery, .. } => Some((delivery, None)),
+                    ContentMsg::TargetStored { delivery } => Some((delivery, true)),
+                    ContentMsg::Failed { delivery, .. } => Some((delivery, false)),
                     _ => None,
                 };
                 if let Some((delivery, receipt)) = terminal {
                     if delivery.offer == offer && files.receipt(peer, delivery, receipt).await {
-                        let _ = server.send(&ContentMsg::TerminalAck { delivery, receipt }).await;
+                        let _ = server.send(&ContentMsg::TerminalAck { delivery }).await;
                     }
                 } else if request.persistent_request() {
                     let _ = files.native.serve(peer, request, &mut server).await;

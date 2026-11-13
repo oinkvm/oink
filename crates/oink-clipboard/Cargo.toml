@@ -24,8 +24,7 @@ serde_json.workspace = true
 getrandom = "0.3"
 # 同步逻辑（src/sync*）：内容哈希
 blake3 = "1"
-# Clipboard deduplication: decoded-pixel digests (src/dedupe.rs); also the
-# Windows bitmap conversions.
+# Clipboard echo detection: decoded-pixel digests (src/dedupe.rs).
 png = "0.18"
 # Native content transfers run on ordinary background tasks.
 tokio.workspace = true
@@ -58,6 +57,9 @@ windows = { version = "0.62", features = [
     "Win32_Globalization",
     "Win32_Graphics_Gdi",
     "Win32_Graphics_Dwm",
+    # image_file.rs: WIC decodes proxied photos (HEIC/JPEG/…) to a bitmap
+    "Win32_Graphics_Imaging",
+    "Win32_System_Variant",
     "Win32_Storage_FileSystem",
     "Win32_System_Com",
     "Win32_System_Com_Marshal",
@@ -80,7 +82,6 @@ windows = { version = "0.62", features = [
 # the product deadline under concurrent tests; release behavior stays unchanged.
 oink-foundation = { workspace = true, features = ["test-storage-retries"] }
 image = { version = "0.25", default-features = false, features = ["bmp", "jpeg", "tiff"] }
-png = "0.18"
 tokio = { workspace = true, features = ["test-util"] }
 tempfile = "3"
 tracing-subscriber.workspace = true

@@ -62,7 +62,7 @@ pub(super) fn native_files(value: &NativeFileMetadata) -> V {
     ]))
 }
 
-pub(super) fn local_native_files(value: Option<wire::NativeFileMetadata>) -> v1::Result<NativeFileMetadata> {
+pub(super) fn local_native_files(value: Option<wire::NativeFileMetadata>) -> v2::Result<NativeFileMetadata> {
     let Some(value) = value else {
         return Ok(NativeFileMetadata::default());
     };
@@ -80,7 +80,7 @@ pub(super) fn local_native_files(value: Option<wire::NativeFileMetadata>) -> v1:
                     ansi: entry.ansi()?.map(|bytes| bytes.0),
                 })
             })
-            .collect::<v1::Result<_>>()?,
+            .collect::<v2::Result<_>>()?,
         promises: value
             .promises()?
             .0
@@ -97,12 +97,12 @@ pub(super) fn local_native_files(value: Option<wire::NativeFileMetadata>) -> v1:
                                 bytes: control.bytes()?.0,
                             })
                         })
-                        .collect::<v1::Result<_>>()?,
+                        .collect::<v2::Result<_>>()?,
                     anchor: domain::NodeId(group.anchor()?),
                     roots: group.roots()?.0.into_iter().map(domain::NodeId).collect(),
                     indices: group.indices()?.0,
                 })
             })
-            .collect::<v1::Result<_>>()?,
+            .collect::<v2::Result<_>>()?,
     })
 }

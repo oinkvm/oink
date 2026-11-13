@@ -13,10 +13,15 @@
 //! 调度中心与切换 Space，这里只参考它的机制，代码独立编写）：
 //! - Dock 轻扫：类型 30（`kCGSEventDockControl`），HID 类型 23（`kIOHIDEventTypeDockSwipe`），
 //!   轻扫种类（123、165：1 左右、2 上下、3 捏合）、阶段（132、134：`IOHIDEventPhaseBits`）、累计进度（124，
-//!   135 是它的 float32 位）、结束速度（129、130）。每个 Dock 控制事件后面跟一个类型 29 的手势事件。
-//!   本机实测：合成竖直进度 −1.0 打开调度中心。Pinch 的方向还受字段 136（invertedFromDevice）控制：
-//!   136=1 时负进度显示桌面；136=0 时负进度打开 Apps。线上统一为正 = 张开、负 = 捏合，
-//!   截获按 136 归一化，重放固定使用 136=1 并转换进度与结束速度。
+//!   135 是它的 float32 位）、结束速度（129、130）。本机实录的原生触摸板（2026-11-12，1290 帧，
+//!   local validation records）：每帧前面紧挨一个
+//!   **同一时间戳**的类型 29 伴随事件（先 29 后 30）；136 恒为 1；129 = 130 = 结束速度（Began/Changed 为 0）；
+//!   终帧 115 = 0。Dock 只读 129 作速度（三个轴都是），136 第 0 位为 0 时把手势反向
+//!   （`DOCKGestureEvent`：reversed = 136 & 1 == 0，按 123、124 符号和 136 选手势）。
+//!   线上方向：左右为正 = 手指向左，竖直为负 = 向上（调度中心），捏合为负 = 捏合（Apps）、正 = 张开
+//!   （显示桌面）。重放一律 136=1：竖直原始进度 = 线上进度，左右与捏合取反（进度和速度一起）；这样
+//!   手机的方向选中的 Dock 手势与以前（左右 136=0、原样）相同。截获做逆运算，136=0 的来源先整体取反
+//!   成 136=1 形式。所以 Mac → Mac 的重放与原生帧逐字段一致（115 的离散方向脉冲除外：未生成，恒为 0）。
 //! - 捏合、旋转、智能缩放：类型 29（`kCGSEventGesture`），HID 类型 8（缩放，113 = 放大量）、5（旋转，
 //!   114 = 角度）、22（智能缩放）。
 //!
@@ -53,6 +58,8 @@ mod field {
     pub const SWIPE_PHASE: u32 = 134;
     pub const SWIPE_PROGRESS_F32: u32 = 135;
     pub const SWIPE_INVERTED_FROM_DEVICE: u32 = 136;
+    /// Dock 轻扫的离散方向脉冲（Dock 读作 movedEnough；缩放 / 旋转事件里同号字段是别的载荷）。
+    pub const SWIPE_DISCRETE_MOTION: u32 = 115;
     pub const SWIPE_MOTION_2: u32 = 165;
 }
 
@@ -166,21 +173,16 @@ pub(crate) fn parse_gesture(ty: u32, int: impl Fn(u32) -> i64, dbl: impl Fn(u32)
                 _ => return None,
             };
             let phase = phase_from_bits(int(field::PHASE))?;
-            let velocity = if phase.is_end() {
-                match axis {
-                    SwipeAxis::Vertical => dbl(field::SWIPE_EXIT_VY),
-                    _ => dbl(field::SWIPE_EXIT_VX),
-                }
-            } else {
-                0.0
-            };
-            // Pinch direction depends on field 136 (natural direction), unlike the other axes.
-            // Wire convention: positive = spread/show desktop, negative = pinch/Apps.
-            let direction = if axis == SwipeAxis::Pinch && int(field::SWIPE_INVERTED_FROM_DEVICE) != 0 {
-                -1.0
-            } else {
+            // Dock reads the velocity from 129 for every axis.
+            let velocity = if phase.is_end() { dbl(field::SWIPE_EXIT_VX) } else { 0.0 };
+            // 136 bit 0 clear makes Dock reverse the gesture: take it to the 136 = 1 form first,
+            // then to the wire's direction.
+            let natural = if int(field::SWIPE_INVERTED_FROM_DEVICE) & 1 == 1 {
                 1.0
+            } else {
+                -1.0
             };
+            let direction = natural * wire_direction(axis);
             Some(Gesture::DockSwipe {
                 axis,
                 phase,
@@ -201,6 +203,17 @@ pub(crate) fn parse_gesture(ty: u32, int: impl Fn(u32) -> i64, dbl: impl Fn(u32)
     }
 }
 
+/// The wire's direction against the raw progress in the 136 = 1 form (the native trackpad's):
+/// vertical keeps it; horizontal and pinch are the opposite. Derived from Dock's gesture choice
+/// (`DOCKGestureEvent` / the direction table in REPORT §3) so that the phone's directions keep
+/// the Dock gestures they had when horizontal was replayed with 136 = 0 and the wire's sign.
+fn wire_direction(axis: SwipeAxis) -> f64 {
+    match axis {
+        SwipeAxis::Vertical => 1.0,
+        SwipeAxis::Horizontal | SwipeAxis::Pinch => -1.0,
+    }
+}
+
 /// 一个待投递的事件：类型与字段（`true` = 按 double 写）。
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Synth {
@@ -208,7 +221,8 @@ pub(crate) struct Synth {
     pub fields: Vec<(u32, f64, bool)>,
 }
 
-/// 手势 → 要投递的事件序列（纯函数，单元测试核对字段）。
+/// 手势 → 要投递的事件序列（纯函数，单元测试核对字段）。最后一帧是手势本身；Dock 轻扫前面是
+/// 同一时间戳的类型 29 伴随事件（原生顺序）。
 pub(crate) fn synth_gesture(g: &Gesture) -> Vec<Synth> {
     let i = |f: u32, v: i64| (f, v as f64, false);
     let d = |f: u32, v: f64| (f, v, true);
@@ -224,15 +238,14 @@ pub(crate) fn synth_gesture(g: &Gesture) -> Vec<Synth> {
                 SwipeAxis::Vertical => 2,
                 SwipeAxis::Pinch => 3,
             };
-            // Dock interprets pinch progress using field 136. Always synthesize the natural
-            // direction form; invert both progress and exit velocity from the wire convention.
-            let (progress, velocity) = if axis == SwipeAxis::Pinch {
-                (-progress, -velocity)
-            } else {
-                (progress, velocity)
-            };
+            // The native trackpad's form: 136 = 1 on every axis, the raw progress and velocity in
+            // its direction (see `wire_direction`).
+            let direction = wire_direction(axis);
+            let progress = progress * direction;
+            // Began / Changed carry no velocity; the end carries the same value in 129 and 130.
+            let velocity = if phase.is_end() { velocity * direction } else { 0.0 };
             let bits = phase_to_bits(phase);
-            let mut fields = vec![
+            let fields = vec![
                 i(field::EVENT_TYPE, i64::from(TYPE_DOCK_CONTROL)),
                 i(field::HID_TYPE, hid_type::DOCK_SWIPE),
                 i(field::PHASE, bits),
@@ -241,22 +254,24 @@ pub(crate) fn synth_gesture(g: &Gesture) -> Vec<Synth> {
                 i(field::SWIPE_PROGRESS_F32, i64::from((progress as f32).to_bits())),
                 i(field::SWIPE_MOTION, motion),
                 i(field::SWIPE_MOTION_2, motion),
+                i(field::SWIPE_INVERTED_FROM_DEVICE, 1),
+                d(field::SWIPE_EXIT_VX, velocity),
+                d(field::SWIPE_EXIT_VY, velocity),
+                // The driver's discrete motion pulse (Dock's movedEnough). It is 0 on every end
+                // frame; the pulses of some Changed frames are not generated (their integrator's
+                // input is not recovered), so it is 0 throughout.
+                i(field::SWIPE_DISCRETE_MOTION, 0),
             ];
-            if matches!(axis, SwipeAxis::Vertical | SwipeAxis::Pinch) {
-                fields.push(i(field::SWIPE_INVERTED_FROM_DEVICE, 1));
-            }
-            if phase.is_end() {
-                fields.push(d(field::SWIPE_EXIT_VX, velocity));
-                fields.push(d(field::SWIPE_EXIT_VY, velocity));
-            }
+            // The native trackpad sends each Dock frame right after a type 29 event with the same
+            // timestamp (`post_gesture` gives them one).
             vec![
-                Synth {
-                    ty: TYPE_DOCK_CONTROL,
-                    fields,
-                },
                 Synth {
                     ty: TYPE_GESTURE,
                     fields: vec![i(field::EVENT_TYPE, i64::from(TYPE_GESTURE))],
+                },
+                Synth {
+                    ty: TYPE_DOCK_CONTROL,
+                    fields,
                 },
             ]
         }
@@ -288,15 +303,13 @@ pub(crate) fn synth_gesture(g: &Gesture) -> Vec<Synth> {
     }
 }
 
-/// 投递合成的手势事件（位置取当前光标，应用内手势发给光标下的窗口）。
+/// 投递合成的手势事件（位置取当前光标，应用内手势发给光标下的窗口）。一次手势的各帧先全部建好，
+/// 用同一个时间戳按顺序投递（原生 Dock 帧与它前面的类型 29 事件同一时间戳）；建不出来就一帧也不投。
 pub(crate) fn post_gesture(g: &Gesture) -> bool {
+    let mut events = Vec::new();
     for (frame, s) in synth_gesture(g).into_iter().enumerate() {
         let Some(ev): Option<CFRetained<CGEvent>> = CGEvent::new(None) else {
-            tracing::warn!(
-                ?g,
-                frame,
-                "gesture injection: event allocation failed; sequence may be incomplete"
-            );
+            tracing::warn!(?g, frame, "gesture injection: event allocation failed; nothing posted");
             return false;
         };
         CGEvent::set_type(Some(&ev), CGEventType(s.ty));
@@ -308,14 +321,22 @@ pub(crate) fn post_gesture(g: &Gesture) -> bool {
             }
         }
         CGEvent::set_integer_value_field(Some(&ev), CGEventField::EventSourceUserData, MAGIC);
+        events.push((s.ty, ev));
+    }
+    let Some(timestamp) = events.first().map(|(_, ev)| CGEvent::timestamp(Some(ev))) else {
+        return true;
+    };
+    for (frame, (event_type, ev)) in events.iter().enumerate() {
+        let ev: &CGEvent = ev;
+        CGEvent::set_timestamp(Some(ev), timestamp);
         tracing::debug!(
             ?g,
             frame,
-            event_type = s.ty,
-            timestamp_ns = CGEvent::timestamp(Some(&ev)),
+            event_type,
+            timestamp_ns = timestamp,
             "gesture injection: posting native frame (delivery unconfirmed)"
         );
-        CGEvent::post(CGEventTapLocation::SessionEventTap, Some(&ev));
+        CGEvent::post(CGEventTapLocation::SessionEventTap, Some(ev));
     }
     true
 }
@@ -400,15 +421,16 @@ mod tests {
         ];
         for g in cases {
             let synth = synth_gesture(&g);
-            let (ints, dbls) = fields_of(&synth[0]);
+            let main = synth.last().unwrap();
+            let (ints, dbls) = fields_of(main);
             let parsed = parse_gesture(
-                synth[0].ty,
+                main.ty,
                 |f| ints.get(&f).copied().unwrap_or(0),
                 |f| dbls.get(&f).copied().unwrap_or(0.0),
             );
             assert_eq!(parsed, Some(g), "{synth:?}");
-            // Dock 轻扫后面的伴随事件不是手势（不会重复上报）。
-            for extra in &synth[1..] {
+            // Dock 轻扫前面的伴随事件不是手势（不会重复上报）。
+            for extra in &synth[..synth.len() - 1] {
                 let (ints, dbls) = fields_of(extra);
                 assert_eq!(
                     parse_gesture(
@@ -490,7 +512,7 @@ mod tests {
                     velocity,
                 };
                 let synth = synth_gesture(&g);
-                let (ints, dbls) = fields_of(&synth[0]);
+                let (ints, dbls) = fields_of(synth.last().unwrap());
                 assert_eq!(ints[&field::SWIPE_INVERTED_FROM_DEVICE], 1);
                 assert_eq!(dbls[&field::SWIPE_PROGRESS], -progress);
                 assert_eq!(
@@ -503,7 +525,7 @@ mod tests {
                 }
                 assert_eq!(
                     parse_gesture(
-                        synth[0].ty,
+                        TYPE_DOCK_CONTROL,
                         |f| ints.get(&f).copied().unwrap_or(0),
                         |f| dbls.get(&f).copied().unwrap_or(0.0)
                     ),
@@ -522,14 +544,144 @@ mod tests {
             velocity: -2.0,
         });
         assert_eq!(s.len(), 2);
-        assert_eq!(s[0].ty, TYPE_DOCK_CONTROL);
-        let (ints, dbls) = fields_of(&s[0]);
+        assert_eq!(s[1].ty, TYPE_DOCK_CONTROL);
+        let (ints, dbls) = fields_of(&s[1]);
         assert_eq!(ints[&field::HID_TYPE], hid_type::DOCK_SWIPE);
         assert_eq!(ints[&field::PHASE], phase_bits::ENDED);
         assert_eq!(ints[&field::SWIPE_MOTION], 2);
         assert_eq!(ints[&field::SWIPE_PROGRESS_F32], i64::from((-1.0f32).to_bits()));
+        assert_eq!(dbls[&field::SWIPE_EXIT_VX], -2.0);
         assert_eq!(dbls[&field::SWIPE_EXIT_VY], -2.0);
-        assert_eq!(s[1].ty, TYPE_GESTURE);
+        assert_eq!(s[0].ty, TYPE_GESTURE);
+    }
+
+    /// The recorded native trackpad (macOS 26.6.2, 1290 Dock frames): every Dock frame comes
+    /// right after a type 29 event whose gesture fields are all 0; 123 = 165, 132 = 134,
+    /// 129 = 130 (0 before the end), 136 = 1 and 135 = float32(124) on every axis; 115 = 0 at
+    /// the end.
+    #[test]
+    fn dock_frames_have_the_native_order_and_fields() {
+        for axis in [SwipeAxis::Horizontal, SwipeAxis::Vertical, SwipeAxis::Pinch] {
+            for phase in [
+                GesturePhase::Began,
+                GesturePhase::Changed,
+                GesturePhase::Ended,
+                GesturePhase::Cancelled,
+            ] {
+                let s = synth_gesture(&Gesture::DockSwipe {
+                    axis,
+                    phase,
+                    progress: 0.6,
+                    velocity: 3.0,
+                });
+                assert_eq!(
+                    s.iter().map(|f| f.ty).collect::<Vec<_>>(),
+                    [TYPE_GESTURE, TYPE_DOCK_CONTROL]
+                );
+                assert_eq!(s[0].fields, vec![(field::EVENT_TYPE, f64::from(TYPE_GESTURE), false)]);
+                let (ints, dbls) = fields_of(&s[1]);
+                assert_eq!(ints[&field::SWIPE_MOTION], ints[&field::SWIPE_MOTION_2]);
+                assert_eq!(ints[&field::PHASE], ints[&field::SWIPE_PHASE]);
+                assert_eq!(ints[&field::SWIPE_INVERTED_FROM_DEVICE], 1);
+                assert_eq!(ints[&field::SWIPE_DISCRETE_MOTION], 0);
+                assert_eq!(
+                    ints[&field::SWIPE_PROGRESS_F32],
+                    i64::from((dbls[&field::SWIPE_PROGRESS] as f32).to_bits())
+                );
+                let v = dbls[&field::SWIPE_EXIT_VX];
+                assert_eq!(dbls[&field::SWIPE_EXIT_VY], v);
+                assert_eq!(v == 0.0, !phase.is_end(), "{axis:?} {phase:?}");
+                // Cancelled keeps its velocity (the driver sends it on a cancel too).
+                if phase.is_end() {
+                    assert_eq!(v.abs(), 3.0);
+                }
+            }
+        }
+    }
+
+    /// Dock's gesture choice (`DOCKGestureEvent` and the direction table of the static analysis):
+    /// axis 123, the progress's sign and 136 bit 0 pick the gesture id; 136 bit 0 clear swaps the
+    /// pair and reverses the progress Dock works with.
+    fn dock_choice(axis: i64, progress: f64, inverted: i64) -> (u8, f64) {
+        let (positive, other) = match axis {
+            1 => (3, 4),
+            2 => (1, 2),
+            _ => (6, 5),
+        };
+        let natural = inverted & 1 == 1;
+        let id = if (progress > 0.0) == natural { positive } else { other };
+        (id, if natural { progress } else { -progress })
+    }
+
+    /// Replaying with 136 = 1 on every axis keeps the Dock gesture each phone direction chose
+    /// before, when horizontal went out with 136 = 0 and the wire's sign (vertical and pinch
+    /// already used 136 = 1).
+    #[test]
+    fn replay_with_136_1_keeps_the_dock_gestures_of_the_phone_directions() {
+        for (axis, motion) in [
+            (SwipeAxis::Horizontal, 1),
+            (SwipeAxis::Vertical, 2),
+            (SwipeAxis::Pinch, 3),
+        ] {
+            for wire in [-0.7, 0.7] {
+                let before = match axis {
+                    SwipeAxis::Horizontal => dock_choice(motion, wire, 0),
+                    SwipeAxis::Vertical => dock_choice(motion, wire, 1),
+                    SwipeAxis::Pinch => dock_choice(motion, -wire, 1),
+                };
+                let s = synth_gesture(&Gesture::DockSwipe {
+                    axis,
+                    phase: GesturePhase::Changed,
+                    progress: wire,
+                    velocity: 0.0,
+                });
+                let (ints, dbls) = fields_of(&s[1]);
+                let now = dock_choice(
+                    ints[&field::SWIPE_MOTION],
+                    dbls[&field::SWIPE_PROGRESS],
+                    ints[&field::SWIPE_INVERTED_FROM_DEVICE],
+                );
+                assert_eq!(now, before, "{axis:?} {wire}");
+            }
+        }
+    }
+
+    /// A native Dock frame (recorded segment D16, a space switch) is read into the wire's
+    /// direction and replayed field for field; a source with 136 = 0 reads the same gesture.
+    #[test]
+    fn native_dock_frames_replay_unchanged() {
+        let ints = HashMap::from([
+            (field::HID_TYPE, hid_type::DOCK_SWIPE),
+            (field::SWIPE_MOTION, 1),
+            (field::PHASE, phase_bits::ENDED),
+            (field::SWIPE_INVERTED_FROM_DEVICE, 1),
+        ]);
+        let raw = |f: u32| match f {
+            field::SWIPE_PROGRESS => 1.00579833984375,
+            field::SWIPE_EXIT_VX | field::SWIPE_EXIT_VY => 1.09320068359375,
+            _ => 0.0,
+        };
+        let g = parse_gesture(TYPE_DOCK_CONTROL, |f| ints.get(&f).copied().unwrap_or(0), raw).unwrap();
+        let Gesture::DockSwipe { progress, velocity, .. } = g else {
+            panic!("{g:?}")
+        };
+        assert_eq!((progress, velocity), (-1.00579833984375, -1.09320068359375));
+        let (replayed_ints, replayed) = fields_of(&synth_gesture(&g)[1]);
+        assert_eq!(replayed[&field::SWIPE_PROGRESS], raw(field::SWIPE_PROGRESS));
+        assert_eq!(replayed[&field::SWIPE_EXIT_VX], raw(field::SWIPE_EXIT_VX));
+        assert_eq!(replayed_ints[&field::SWIPE_INVERTED_FROM_DEVICE], 1);
+
+        // The same gesture from a source whose frames carry 136 = 0 (both values reversed).
+        let mut reversed = ints.clone();
+        reversed.insert(field::SWIPE_INVERTED_FROM_DEVICE, 0);
+        assert_eq!(
+            parse_gesture(
+                TYPE_DOCK_CONTROL,
+                |f| reversed.get(&f).copied().unwrap_or(0),
+                |f| -raw(f)
+            ),
+            Some(g)
+        );
     }
 
     #[test]

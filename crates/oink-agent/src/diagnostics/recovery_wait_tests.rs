@@ -105,6 +105,7 @@ async fn recovery_peers(count: u8) -> Vec<RecoveryPeer> {
                 port,
                 identity,
                 application: Arc::new(Application),
+                pairing: true,
             },
             network,
         )

@@ -18,7 +18,7 @@ pub(crate) struct Grant {
 }
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Route {
-    pub agreement: Option<oink_protocol::v1::admission::Agreement>,
+    pub agreement: Option<oink_protocol::v2::admission::Agreement>,
     pub endpoint: Option<Endpoint>,
     pub wire: PathInstall,
     pub source: Boot,
@@ -45,10 +45,25 @@ pub(crate) struct Hub {
     pub stopped: AtomicBool,
     pub observed: ArcSwap<HashMap<ConnectionId, Option<Duration>>>,
     pub wake: Arc<Notify>,
+    /// Open Low operations per link and when the last one ended; read by the
+    /// route arbiter's idle test (a transfer keeps the link busy while open).
+    pub low_ops: std::sync::Mutex<HashMap<crate::link::LinkId, (usize, Option<std::time::Instant>)>>,
+    /// This device's sharing pause (`LinkLayer::set_sharing_paused`), read by
+    /// every send gate and Low operation.
+    pub sharing_paused: Arc<AtomicBool>,
 }
 impl Hub {
+    pub fn low_activity(&self, link: crate::link::LinkId) -> (usize, Option<std::time::Instant>) {
+        self.low_ops
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&link)
+            .copied()
+            .unwrap_or_default()
+    }
     pub fn new(wake: Arc<Notify>) -> Self {
         Self {
+            low_ops: std::sync::Mutex::new(HashMap::new()),
             view: ArcSwap::from_pointee(View::default()),
             changed: Notify::new(),
             status: ArcSwap::from_pointee(vec![]),
@@ -56,6 +71,7 @@ impl Hub {
             stopped: AtomicBool::new(false),
             observed: ArcSwap::from_pointee(HashMap::new()),
             wake,
+            sharing_paused: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -83,6 +99,10 @@ pub(crate) struct N1 {
     pub address: SocketAddr,
     pub controls: mpsc::Sender<ControlQueued>,
     pub advert: Arc<ArcSwapOption<ControlInfo>>,
+    /// Listener/pacing belongs to the authenticated physical hop, including
+    /// when N1 overtakes a logical path's installation or migration commit.
+    pub peer_info: Arc<ArcSwapOption<LowMsg>>,
+    pub peer_info_changed: Arc<Notify>,
     pub input: mpsc::Sender<Delivery>,
     pub receiver: Mutex<Option<mpsc::Receiver<Delivery>>>,
 }
@@ -91,6 +111,7 @@ impl N1 {
         connection: ConnectionId,
         neighbor: Boot,
         address: SocketAddr,
+        peer_info: Arc<ArcSwapOption<LowMsg>>,
     ) -> (Arc<Self>, mpsc::Receiver<ControlQueued>) {
         let (controls, output) = mpsc::channel(64);
         let (input, receiver) = mpsc::channel(64);
@@ -101,6 +122,8 @@ impl N1 {
                 address,
                 controls,
                 advert: Arc::new(ArcSwapOption::empty()),
+                peer_info,
+                peer_info_changed: Arc::new(Notify::new()),
                 input,
                 receiver: Mutex::new(Some(receiver)),
             }),
@@ -124,7 +147,7 @@ pub(crate) struct Port {
     pub commands: mpsc::UnboundedSender<super::super::handle::Command>,
 }
 impl Port {
-    pub fn agreement(&self, binding: LowBinding) -> Option<oink_protocol::v1::admission::Agreement> {
+    pub fn agreement(&self, binding: LowBinding) -> Option<oink_protocol::v2::admission::Agreement> {
         self.hub
             .view
             .load()
@@ -135,7 +158,7 @@ impl Port {
             .clone()
     }
     pub fn admit_kind(&self, grant: Grant, kind: StreamKind) -> bool {
-        use oink_protocol::v1::{
+        use oink_protocol::v2::{
             admission::{Context, Phase},
             registry::Transport,
         };

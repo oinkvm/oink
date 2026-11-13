@@ -1,22 +1,14 @@
 //! Executable codec profiles and their explicit v1 descriptors. Unknown codecs,
 //! parameters or frame durations never select a guessed implementation.
 use crate::dsp;
-use oink_protocol::v1::{
+use oink_protocol::v2::{
     RawMap, RawValue,
     dto::{AudioDescriptor, AudioSupport, ControlFailure},
     schema::{WireDto, WireValue},
 };
 use serde::{Deserialize, Serialize};
 
-pub const CAPABILITIES: &[&str] = &[
-    "oink.audio/1",
-    "oink.audio.microphone/1",
-    "oink.audio.media-health/1",
-    "oink.audio.quality/1",
-    "oink.audio.state/1",
-    "oink.audio.exit-volume/1",
-    "oink.audio.local-output/1",
-];
+pub const CAPABILITIES: &[&str] = &["oink.audio/2", "oink.audio.microphone/1"];
 pub const SAMPLE_RATES: &[u32] = &[
     8_000, 11_025, 12_000, 16_000, 22_050, 24_000, 32_000, 44_100, 48_000, 64_000, 88_200, 96_000, 176_400, 192_000,
 ];

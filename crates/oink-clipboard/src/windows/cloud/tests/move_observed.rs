@@ -260,3 +260,72 @@ fn observed_move_retains_copy_without_retry_after_sweep_or_reload() {
         moved::State::Removed
     ));
 }
+
+#[test]
+fn phone_move_requires_source_absence_and_follows_the_original_frn() {
+    use crate::content::namespace::{Files, Local, Namespace};
+    let _serial = SERIAL.lock().unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let cache = temp.path().join("phone.bin");
+    std::fs::write(&cache, b"phone bytes").unwrap();
+    let namespace = Local::received_from(
+        vec![(crate::model::NodeId(1), cache.clone())],
+        oink_foundation::DeviceId([37; 32]),
+    )
+    .unwrap();
+    let version = namespace.roots()[0].version;
+    let files = Files::new(namespace.clone(), crate::sync::files::TargetOs::Windows).unwrap();
+    let (service, _) = fake(temp.path().join("CloudFiles"));
+    let delivery = service.publish(files.roots().to_vec(), files, Instant::now()).unwrap();
+    let old = delivery.file_path(0);
+    // The fake native publisher owns an ordinary file. Give it the delivered
+    // version; the move-proof API itself uses real Windows file identities.
+    std::fs::copy(&cache, &old).unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(&old)
+        .unwrap()
+        .set_times(std::fs::FileTimes::new().set_modified(std::fs::metadata(&cache).unwrap().modified().unwrap()))
+        .unwrap();
+    use std::os::windows::io::AsRawHandle;
+    let handle = std::fs::File::open(&old).unwrap();
+    let mut info = BY_HANDLE_FILE_INFORMATION::default();
+    // SAFETY: live fixture-owned handle and writable information record.
+    let inspected = unsafe { GetFileInformationByHandle(handle.as_raw_handle(), &mut info) };
+    assert_ne!(inspected, 0);
+    drop(handle);
+    let volume = info.dwVolumeSerialNumber;
+    let index = ((u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow)) as i64;
+    assert!(
+        !service.track_proxy_move(&old, volume, index).unwrap(),
+        "a copy or unrelated directory event cannot authorize deletion"
+    );
+    assert!(cache.exists());
+    let target = temp.path().join("first-destination");
+    service
+        .received
+        .lock()
+        .unwrap()
+        .renames
+        .insert((volume, index), (old.clone(), target.clone()));
+    service.watch_proxy_move(&old, &target, (volume, index)).unwrap();
+    // A canceled watcher from an identical retry cannot retire its successor.
+    service.watch_proxy_move(&old, &target, (volume, index)).unwrap();
+    std::fs::rename(&old, &target).unwrap();
+    // The user moves it again and leaves an unrelated replacement at the first
+    // destination before the provider handles its native directory notification.
+    let final_target = temp.path().join("second-destination");
+    std::fs::rename(&target, &final_target).unwrap();
+    std::fs::write(&target, b"unrelated replacement").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while cache.exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(!cache.exists(), "only a real directory event can commit the handoff");
+    assert_eq!(std::fs::read(&target).unwrap(), b"unrelated replacement");
+    assert_eq!(
+        crate::content::read_all(&mut namespace.open(crate::model::NodeId(1), version, 0).unwrap()).unwrap(),
+        b"phone bytes"
+    );
+    service.stop();
+}

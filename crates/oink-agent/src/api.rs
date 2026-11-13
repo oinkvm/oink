@@ -35,6 +35,10 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 // ───────────────────────────── 标识 ─────────────────────────────
 
+pub use crate::audio::mobile_endpoints::{
+    MobileAudioDirection, MobileAudioState, MobileAudioTarget, MobileEndpointState,
+};
+
 /// 界面 API 中的设备 ID：序列化为 64 位十六进制字符串（`DeviceId` 本身序列化为字节数组，用于协议）。
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct DeviceKey(pub DeviceId);
@@ -290,6 +294,8 @@ pub enum Os {
     Macos,
     Windows,
     Linux,
+    Android,
+    Ios,
     Other,
 }
 
@@ -491,6 +497,68 @@ pub struct BulkUnavailableInfo {
     pub reason: String,
     pub port: Option<u16>,
     pub message: String,
+}
+
+/// 线路选择（「选择线路」）中本机的选中项。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum RouteSelection {
+    Auto,
+    /// 本机拨向对端的这个地址，并固定在它上面。
+    Address {
+        ip: String,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RouteRowState {
+    Measuring,
+    Reachable,
+    Unreachable,
+}
+
+/// 对端的一个地址（本机拨出）。
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RouteRow {
+    pub ip: String,
+    pub port: u16,
+    pub state: RouteRowState,
+    /// 最近 6 轮样本的中位数。
+    pub rtt_ms: Option<f64>,
+    /// 本机拨出的这条连接正是当前线路。
+    pub current: bool,
+}
+
+/// 一个在线设备的线路选择视图（设计 §6）。
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct MemberRoutes {
+    pub device: DeviceKey,
+    /// 链路就绪且有线路数据（直连，或中转时的直连地址）。
+    pub available: bool,
+    /// 走中转：菜单显示「中转」行，直连地址照常列出。
+    pub relayed: bool,
+    /// 走中转时，中转设备的显示名。
+    pub relay_via_name: Option<String>,
+    /// 当前连接是对端拨入的。
+    pub passive: bool,
+    /// 当前直连的实际远端 IP（接入说明也使用此地址）。
+    pub peer_ip: Option<String>,
+    pub current_rtt_ms: Option<f64>,
+    pub selection: RouteSelection,
+    /// 本机记住的手动目标；尚未切回时 selection 仍为 Auto。
+    pub remembered_ip: Option<String>,
+    /// 有固定但当前线路不是固定的那条（暂时不可用，自动兜底）。
+    pub selection_unavailable: bool,
+    /// 选「自动」时会用的本机拨出线路。
+    pub auto_choice: Option<String>,
+    /// 有更好的线路，等空闲后切换。
+    pub pending_switch: Option<String>,
+    /// 本机至少有一条可达的自拨线路。
+    pub can_replace: bool,
+    /// 本机的手动操作还在进行。
+    pub pending: bool,
+    pub rows: Vec<RouteRow>,
 }
 
 /// 本组的一个成员（包括本机）。
@@ -793,6 +861,8 @@ fn bounds_of_rects(rects: &[Rect]) -> Option<Rect> {
 pub struct InputTransform {
     pub macos: oink_foundation::input_transform::TargetTransform,
     pub windows: oink_foundation::input_transform::TargetTransform,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub android: Option<oink_foundation::input_transform::TargetTransform>,
     pub overrides: Vec<InputTargetOverride>,
     /// Read-only per-entry self limitations; ignored when sending an edit.
     #[serde(default, skip_deserializing)]
@@ -850,6 +920,7 @@ impl From<oink_foundation::input_transform::InputTransform> for InputTransform {
             local_exclusions: Vec::new(),
             macos: value.macos,
             windows: value.windows,
+            android: value.android,
             overrides: value
                 .overrides
                 .into_iter()
@@ -867,6 +938,7 @@ impl From<InputTransform> for oink_foundation::input_transform::InputTransform {
         Self {
             macos: value.macos,
             windows: value.windows,
+            android: value.android,
             overrides: value
                 .overrides
                 .into_iter()
@@ -1705,6 +1777,7 @@ pub enum ApiEvent {
     LayoutProfileOperation(crate::layout_profiles::types::OperationEvent),
     ConnectionQuality(ConnectionQuality),
     AudioQuality(AudioQuality),
+    MobileAudioStateChanged(DeviceKey),
     NearbyChanged {
         revision: crate::device_cards::DecimalU64,
         upserts: Vec<pairing::NearbyRow>,
@@ -1892,6 +1965,19 @@ pub trait AgentApi: Send + Sync {
         volume_percent: u8,
         muted: bool,
     ) -> ApiResult<crate::device_cards::DeviceControlReply>;
+    fn mobile_audio_state(&self, _device: DeviceKey) -> ApiResult<Option<MobileAudioState>> {
+        Ok(None)
+    }
+    fn start_mobile_audio_endpoint(&self, _target: MobileAudioTarget) -> ApiResult<()> {
+        Err(ApiError::Unsupported {
+            message: "mobile audio unavailable".into(),
+        })
+    }
+    fn release_mobile_audio_endpoint(&self, _target: MobileAudioTarget) -> ApiResult<()> {
+        Err(ApiError::Unsupported {
+            message: "mobile audio unavailable".into(),
+        })
+    }
     fn set_local_paused(&self, request_id: String, paused: bool) -> ApiResult<crate::device_cards::DeviceControlReply>;
     fn set_device_paused(
         &self,
@@ -1901,6 +1987,10 @@ pub trait AgentApi: Send + Sync {
     ) -> ApiResult<crate::device_cards::DeviceControlReply>;
     fn pause_all(&self, request_id: String) -> ApiResult<crate::device_cards::PauseAllAccepted>;
     fn member_addresses(&self, device: DeviceKey) -> ApiResult<Vec<String>>;
+    /// The latest background measurement; reading it never probes.
+    fn member_routes(&self, device: DeviceKey) -> ApiResult<MemberRoutes>;
+    /// Apply at once; `false` when the choice is not possible now.
+    fn set_member_route(&self, device: DeviceKey, selection: RouteSelection) -> ApiResult<bool>;
     fn set_member_address(&self, device: DeviceKey, address: String) -> ApiResult<()>;
     /// Move one member in the group-wide device list order.
     fn move_device_order(&self, device: DeviceKey, placement: DeviceOrderPlacement) -> ApiResult<()>;
@@ -1972,6 +2062,8 @@ pub trait AgentApi: Send + Sync {
     fn set_focus_locked(&self, locked: bool) -> ApiResult<()>;
     /// Admit a handoff to this target followed by a group focus lock.
     fn lock_focus_to(&self, device: DeviceKey) -> ApiResult<()>;
+    /// Explicitly move input focus to an online target without locking focus.
+    fn move_pointer_to(&self, device: DeviceKey) -> ApiResult<()>;
     /// Explicitly recall the pointer, ending any group focus lock first.
     fn return_pointer_home(&self) -> ApiResult<()>;
     fn game_mode(&self) -> ApiResult<GameModeStatus>;
@@ -2195,6 +2287,15 @@ pub enum Request {
     ConnectionQuality,
     AudioQuality,
     DeviceCards,
+    MobileAudioState {
+        device: DeviceKey,
+    },
+    StartMobileAudioEndpoint {
+        target: MobileAudioTarget,
+    },
+    ReleaseMobileAudioEndpoint {
+        target: MobileAudioTarget,
+    },
     #[serde(rename_all = "camelCase")]
     InvokeDeviceCardAction {
         request_id: String,
@@ -2233,6 +2334,13 @@ pub enum Request {
     },
     MemberAddresses {
         device: DeviceKey,
+    },
+    MemberRoutes {
+        device: DeviceKey,
+    },
+    SetMemberRoute {
+        device: DeviceKey,
+        selection: RouteSelection,
     },
     SetMemberAddress {
         device: DeviceKey,
@@ -2347,6 +2455,9 @@ pub enum Request {
     Overview,
     PauseStatus,
     LockFocusTo {
+        device: DeviceKey,
+    },
+    MovePointerTo {
         device: DeviceKey,
     },
     SetFocusLocked {
@@ -2501,9 +2612,12 @@ pub enum Reply {
     ConnectionQuality(ConnectionQuality),
     AudioQuality(AudioQuality),
     DeviceCards(crate::device_cards::DeviceCardsView),
+    MobileAudioState(Option<MobileAudioState>),
     InvokeDeviceCardAction(crate::device_cards::DeviceControlReply),
     PauseAll(crate::device_cards::PauseAllAccepted),
     MemberAddresses(Vec<String>),
+    MemberRoutes(MemberRoutes),
+    RouteAccepted(bool),
     Nearby(pairing::NearbySnapshot),
     RefreshNearby(pairing::PairReply<pairing::Accepted>),
     StartPairing(pairing::PairReply<pairing::Started>),
@@ -2598,6 +2712,9 @@ pub fn dispatch<A: AgentApi + ?Sized>(api: &A, req: Request) -> ApiResult<Reply>
             .map(Reply::LayoutProfile),
 
         R::DeviceCards => api.device_cards().map(Reply::DeviceCards),
+        R::MobileAudioState { device } => api.mobile_audio_state(device).map(Reply::MobileAudioState),
+        R::StartMobileAudioEndpoint { target } => unit(api.start_mobile_audio_endpoint(target)),
+        R::ReleaseMobileAudioEndpoint { target } => unit(api.release_mobile_audio_endpoint(target)),
         R::InvokeDeviceCardAction { request_id, token } => api
             .invoke_device_card_action(request_id, token)
             .map(Reply::InvokeDeviceCardAction),
@@ -2624,18 +2741,36 @@ pub fn dispatch<A: AgentApi + ?Sized>(api: &A, req: Request) -> ApiResult<Reply>
         } => api
             .set_exit_volume(request_id, version_token, volume_percent, muted)
             .map(Reply::InvokeDeviceCardAction),
-        R::SetLocalPaused { request_id, paused } => api
-            .set_local_paused(request_id, paused)
-            .map(Reply::InvokeDeviceCardAction),
+        R::SetLocalPaused { request_id, paused } => {
+            // The app UI and the command-line client both arrive here; the
+            // client id tells their connections apart in one log.
+            tracing::info!(
+                paused,
+                source = "local_ipc",
+                client = %request_context::current().iter().map(|b| format!("{b:02x}")).collect::<String>(),
+                "sharing pause requested"
+            );
+            api.set_local_paused(request_id, paused)
+                .map(Reply::InvokeDeviceCardAction)
+        }
         R::SetDevicePaused {
             request_id,
             token,
             paused,
-        } => api
-            .set_device_paused(request_id, token, paused)
-            .map(Reply::InvokeDeviceCardAction),
+        } => {
+            tracing::info!(
+                paused,
+                source = "local_ipc_card",
+                client = %request_context::current().iter().map(|b| format!("{b:02x}")).collect::<String>(),
+                "device card pause requested"
+            );
+            api.set_device_paused(request_id, token, paused)
+                .map(Reply::InvokeDeviceCardAction)
+        }
         R::PauseAll { request_id } => api.pause_all(request_id).map(Reply::PauseAll),
         R::MemberAddresses { device } => api.member_addresses(device).map(Reply::MemberAddresses),
+        R::MemberRoutes { device } => api.member_routes(device).map(Reply::MemberRoutes),
+        R::SetMemberRoute { device, selection } => api.set_member_route(device, selection).map(Reply::RouteAccepted),
         R::SetMemberAddress { device, address } => unit(api.set_member_address(device, address)),
         R::MoveDeviceOrder { device, placement } => unit(api.move_device_order(device, placement)),
         R::Nearby => api.nearby().map(Reply::Nearby),
@@ -2697,6 +2832,7 @@ pub fn dispatch<A: AgentApi + ?Sized>(api: &A, req: Request) -> ApiResult<Reply>
         R::PauseStatus => api.pause_status().map(Reply::Pause),
         R::SetFocusLocked { locked } => unit(api.set_focus_locked(locked)),
         R::LockFocusTo { device } => unit(api.lock_focus_to(device)),
+        R::MovePointerTo { device } => unit(api.move_pointer_to(device)),
         R::ReturnPointerHome => unit(api.return_pointer_home()),
         R::GameMode => api.game_mode().map(Reply::GameMode),
         R::SetScreenDisabled { device, disabled } => unit(api.set_screen_disabled(device, disabled)),

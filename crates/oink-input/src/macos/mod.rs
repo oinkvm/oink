@@ -37,6 +37,8 @@ pub(crate) use session::authoritative as session_locked_authoritative;
 mod sysevent;
 mod system;
 mod tap;
+pub(crate) mod text;
+pub(crate) mod text_focus;
 
 use std::sync::Mutex;
 

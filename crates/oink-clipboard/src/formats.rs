@@ -153,6 +153,9 @@ pub fn mac_custom(name: &str) -> bool {
             | "com.agilebits.onepassword"
             | "com.typeit4me.clipping"
             | "Pasteboard generator type"
+            // Universal Clipboard provenance of the source Mac; re-creating it
+            // on another Mac would claim the content came from Apple's sync.
+            | crate::dedupe::UNIVERSAL_CLIPBOARD
     ) && !name.starts_with("com.hachiwii.oink.")
         && !name.starts_with("CorePasteboardFlavorType ")
         && !name.starts_with("com.apple.pasteboard.promised-")

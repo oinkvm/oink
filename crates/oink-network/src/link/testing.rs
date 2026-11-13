@@ -1,12 +1,13 @@
 //! In-process handle pairs for other crates' tests: the real queues and handles without a
 //! network thread, a link or QUIC. What one end posts the other end takes, in order, with
 //! the same "full" and "closed" answers as on a link.
+use super::gate::Gate;
 use super::queue::Queue;
 use super::{
     stream::{DatagramRecv, DatagramSend, RecvStream, SendStream},
     types::{LinkId, QueueSpec, StreamDir, StreamId},
 };
-use oink_protocol::frame::StreamTag;
+use oink_protocol::{frame::StreamTag, v2::registry::Transport};
 use std::sync::Arc;
 
 /// One reliable stream: capacity is `queue` in total. Dropping either end closes the other.
@@ -20,6 +21,7 @@ pub fn reliable_pair(link: LinkId, tag: StreamTag, queue: QueueSpec) -> (SendStr
                 dir: StreamDir::Out,
             },
             queue: queue.clone(),
+            gate: Gate::unrestricted(tag.kind as u16, Transport::Reliable),
         },
         RecvStream {
             id: StreamId {
@@ -37,6 +39,7 @@ pub fn datagram_pair(link: LinkId, tag: StreamTag, queue: QueueSpec) -> (Datagra
     let queue = super::queue::DatagramQueue::new(queue);
     (
         DatagramSend {
+            gate: Gate::unrestricted(tag.kind as u16, Transport::Datagram),
             _owner: Arc::new(super::stream::DatagramOwner(queue.clone())),
             parent: None,
             follows: StreamId {
@@ -63,6 +66,18 @@ pub fn datagram_pair(link: LinkId, tag: StreamTag, queue: QueueSpec) -> (Datagra
 /// Simulate an unreachable direct path while retaining real TLS relay paths.
 pub fn set_direct_blocked(links: &super::LinkLayer, peer: oink_foundation::DeviceId, blocked: bool) {
     links.0.send(super::handle::Command::BlockDirect(peer, blocked));
+}
+
+/// End the network thread as on a dead endpoint driver (`NetworkFatal`): its
+/// remaining links are lost with `Stopped` and `LinkLayer::exited` returns the error.
+/// The detection itself is covered by the network crate's own tests.
+pub fn inject_fatal(links: &super::LinkLayer) {
+    links.0.send(super::handle::Command::InjectFatal(
+        super::NetworkFatal::EndpointDriverStopped {
+            detected_by: "test",
+            local_address: links.0.address.get().copied(),
+        },
+    ));
 }
 
 /// Hold one peer's I0 header before assigning its logical reader identity, while
@@ -106,6 +121,7 @@ pub fn partitioned_datagram_pair(
     let queue = super::queue::DatagramQueue::new_partitioned(spec, types);
     let owner = Arc::new(super::stream::DatagramOwner(queue.clone()));
     let sender = DatagramSend {
+        gate: Gate::unrestricted(tag.kind as u16, Transport::Datagram),
         _owner: Arc::new(super::stream::DatagramOwner(queue.clone())),
         parent: None,
         follows: StreamId {

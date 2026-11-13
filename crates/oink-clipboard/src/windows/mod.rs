@@ -116,6 +116,55 @@ impl ClipboardBackend for WinClipboard {
     fn write_native(&self, spec: crate::NativeSpec) -> Result<u64, ClipboardError> {
         self.write_native_guarded(spec, Arc::new(|| Ok(())))
     }
+    fn write_mobile_guarded(
+        &self,
+        spec: crate::NativeSpec,
+        guard: crate::content::ReaderGuard,
+    ) -> Result<u64, ClipboardError> {
+        // Received file batches already own their local FileContents. Reuse
+        // the regular virtual-file target so OLE gets the same descriptor and
+        // native MOVE lifecycle as a PC clipboard publication; the mobile
+        // caller removes only its transfer staging after this returns.
+        if !spec.files.is_empty() {
+            return self
+                .worker
+                .run(move |_| content::target::set_clipboard_guarded(spec, guard))?;
+        }
+        // Windows owns text/PNG HGLOBAL data synchronously. Reading the
+        // provider before entering the STA ensures the transfer directory can
+        // be released after return and avoids a delayed reader outliving it.
+        let translator = spec.contents.translator();
+        let mut items = Vec::new();
+        for rep in spec.inventory.items.iter().flat_map(|item| &item.representations) {
+            let mut bytes = Vec::new();
+            let mut reader = crate::content::terminal_reader(
+                spec.contents
+                    .open(rep.id)
+                    .map_err(|error| ClipboardError::ContentUnavailable(crate::content::reason(&error)))?,
+            );
+            std::io::Read::read_to_end(&mut reader, &mut bytes)
+                .map_err(|error| ClipboardError::ContentUnavailable(crate::content::reason(&error)))?;
+            items.extend(
+                translator
+                    .standard(rep, &bytes)
+                    .map_err(|error| ClipboardError::ContentUnavailable(crate::content::reason(&error)))?,
+            );
+        }
+        let mut payload = prepare(&items, spec.sensitivity);
+        // The Oink clip marker, as on every other Oink write (the file path
+        // above writes it through the virtual-file target).
+        if let Some(marker) = crate::dedupe::marker(spec.inventory.id)
+            && let Some(cf) = content::format_id(&crate::model::NativeFormat::WindowsRegistered(
+                crate::dedupe::MARKER_WINDOWS.into(),
+            ))
+        {
+            payload.push((u32::from(cf), marker));
+        }
+        self.worker.run(move |hwnd| {
+            guard().map_err(|_| ClipboardError::Busy)?;
+            write_on_worker(hwnd, &payload)
+        })?
+    }
     fn write_native_guarded(
         &self,
         spec: crate::NativeSpec,
@@ -327,6 +376,16 @@ fn read_dword(format: u32) -> Option<u32> {
 }
 
 /// ANSI（系统代码页）→ Unicode。
+/// Straight RGBA rows → PNG, for decoders outside this module (image_file).
+pub(crate) fn encode_rgba_png(width: u32, height: u32, data: Vec<u8>) -> Result<Vec<u8>, String> {
+    self::image::encode_png(&self::image::Rgba {
+        pixels_per_meter: None,
+        width,
+        height,
+        data,
+    })
+}
+
 pub(crate) fn ansi_to_string(b: &[u8]) -> String {
     codepage_to_string(b, CP_ACP)
 }

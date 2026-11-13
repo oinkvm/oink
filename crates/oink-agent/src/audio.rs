@@ -1,5 +1,6 @@
 //! Audio worker: platform calls never run on the input-routing task.
 mod link;
+pub(crate) use link::mobile_endpoints;
 pub(crate) use link::{DriverChangeGuard, Handle as LinkHandle, start_link_runtime};
 
 #[derive(Clone, Debug)]
@@ -24,7 +25,7 @@ use oink_audio::{
     OutputDevice, OutputLatency, Settings, Status, dsp,
 };
 use oink_foundation::DeviceId;
-use oink_protocol::v1::{
+use oink_protocol::v2::{
     self, Message, RawValue, dto,
     schema::{WireDto, WireValue},
 };
@@ -49,14 +50,32 @@ struct Negotiated {
     generation: u64,
 }
 
+/// The source mute of one forwarding session while its capture is rebuilt.
+/// Dropping it ends that mute: local output is restored, media paused first.
+trait HeldMute: Send {
+    /// Restore local output now; returns an unconfirmed-restoration error.
+    fn finish(self: Box<Self>) -> Option<String>;
+    fn into_any(self: Box<Self>) -> Box<dyn std::any::Any + Send>;
+}
+#[cfg(any(target_os = "macos", windows))]
+impl HeldMute for oink_audio::HeldSourceMute {
+    fn finish(self: Box<Self>) -> Option<String> {
+        oink_audio::HeldSourceMute::finish(*self)
+    }
+    fn into_any(self: Box<Self>) -> Box<dyn std::any::Any + Send> {
+        self
+    }
+}
+
 // Private seams keep lifecycle tests entirely independent of OS audio and sockets.
 trait CaptureStream {
-    /// Native frames intentionally omitted from PCM delivery during digital silence.
-    fn omitted_silent_frames(&self) -> u64 {
-        0
-    }
     fn finish(&mut self) -> Option<String> {
         None
+    }
+    /// Retire for a rebuild within the same forwarding: keep the source mute
+    /// for the replacement capture. Platforms without a handover restore here.
+    fn finish_keep_mute(&mut self) -> (Option<String>, Option<Box<dyn HeldMute>>) {
+        (self.finish(), None)
     }
     fn default_output_changed(&self) -> bool {
         false
@@ -77,15 +96,10 @@ trait CaptureStream {
     fn error(&self) -> Option<String>;
 }
 impl CaptureStream for Capture {
-    fn omitted_silent_frames(&self) -> u64 {
-        #[cfg(target_os = "macos")]
-        {
-            Capture::omitted_silent_frames(self)
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            0
-        }
+    #[cfg(any(target_os = "macos", windows))]
+    fn finish_keep_mute(&mut self) -> (Option<String>, Option<Box<dyn HeldMute>>) {
+        let (cleanup, held) = Capture::finish_keep_mute(self);
+        (cleanup, held.map(|held| Box::new(held) as Box<dyn HeldMute>))
     }
     fn finish(&mut self) -> Option<String> {
         #[cfg(any(windows, target_os = "macos"))]
@@ -139,6 +153,15 @@ impl CaptureStream for Capture {
     }
 }
 trait PlaybackStream: Send {
+    fn echo_input(&self, _: bool) -> Result<oink_audio::echo::CaseAInput, String> {
+        Err("desktop AEC is unavailable on this playback implementation".into())
+    }
+    fn echo_system_reference(&self) -> Option<oink_audio::echo::SystemReference> {
+        None
+    }
+    fn echo_control(&self) -> Option<Arc<oink_audio::echo::Control>> {
+        None
+    }
     fn set_output_quality_counters(&self, _: Arc<oink_audio::sink::DropoutCounters>) {}
     fn begin_idle_drain(&self) {}
     fn cancel_idle_drain(&self) {}
@@ -160,6 +183,15 @@ trait PlaybackStream: Send {
     fn error(&self) -> Option<String>;
 }
 impl PlaybackStream for oink_audio::sink::Sink {
+    fn echo_input(&self, enabled: bool) -> Result<oink_audio::echo::CaseAInput, String> {
+        self.echo_input(enabled)
+    }
+    fn echo_system_reference(&self) -> Option<oink_audio::echo::SystemReference> {
+        Some(self.echo_system_reference())
+    }
+    fn echo_control(&self) -> Option<Arc<oink_audio::echo::Control>> {
+        Some(self.echo_control())
+    }
     fn set_output_quality_counters(&self, counters: Arc<oink_audio::sink::DropoutCounters>) {
         self.set_output_quality_counters(counters);
     }
@@ -202,11 +234,14 @@ trait AudioPlatform: Send + Sync {
             native_code: None,
         })
     }
+    /// `held` is the source mute retained from the previous capture of this
+    /// forwarding; it is passed only for a muted capture.
     fn capture_encoded(
         &self,
         _: oink_audio::source::Encoder,
         _: bool,
         _: CaptureScope,
+        _: Option<Box<dyn HeldMute>>,
     ) -> Result<Box<dyn CaptureStream>, String> {
         Err("real-time capture unsupported".into())
     }
@@ -282,13 +317,22 @@ impl AudioPlatform for SystemAudio {
         encoder: oink_audio::source::Encoder,
         mute_source: bool,
         scope: CaptureScope,
+        held: Option<Box<dyn HeldMute>>,
     ) -> Result<Box<dyn CaptureStream>, String> {
         #[cfg(windows)]
         let capture = {
+            // An unmuted capture ends a held mute: `filter` drops (restores) it
+            // before the new capture starts.
+            let held = held
+                .and_then(|held| held.into_any().downcast::<oink_audio::HeldSourceMute>().ok())
+                .filter(|_| mute_source);
             if scope == CaptureScope::Global {
                 return Err("global capture scope is unsupported on Windows".into());
             }
-            Capture::start_encoded(encoder, mute_source, self.recovery_dir.clone())
+            match held {
+                Some(held) => Capture::continue_encoded(encoder, *held, self.recovery_dir.clone()),
+                None => Capture::start_encoded(encoder, mute_source, self.recovery_dir.clone()),
+            }
         };
         #[cfg(target_os = "macos")]
         let capture = {
@@ -301,11 +345,19 @@ impl AudioPlatform for SystemAudio {
                 },
             };
             options.recovery_dir = Some(self.recovery_dir.clone());
-            Capture::start_encoded(encoder, mute_source, options)
+            // An unmuted capture ends a held mute: `filter` drops (restores) it
+            // before the new capture starts.
+            let held = held
+                .and_then(|held| held.into_any().downcast::<oink_audio::HeldSourceMute>().ok())
+                .filter(|_| mute_source);
+            match held {
+                Some(held) => Capture::continue_encoded(encoder, *held, options),
+                None => Capture::start_encoded(encoder, mute_source, options),
+            }
         };
         #[cfg(not(any(windows, target_os = "macos")))]
         let capture: Result<Capture, String> = {
-            let _ = (encoder, mute_source, scope);
+            let _ = (encoder, mute_source, scope, held);
             Err("system capture unsupported".into())
         };
         capture.map(|capture| Box::new(capture) as Box<dyn CaptureStream>)

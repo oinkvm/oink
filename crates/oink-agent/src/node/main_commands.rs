@@ -420,7 +420,7 @@ impl Node {
                     .get()
                     .map(|diagnostics| diagnostics.recorder.clone());
                 self.inner.rt.spawn(async move {
-                    use oink_protocol::v1::dto::ControlFailure;
+                    use oink_protocol::v2::dto::ControlFailure;
                     let result = match receipt {
                         Some(receipt) => receipt.await.unwrap_or(Err(ControlFailure::ApplyFailed)),
                         None => Err(ControlFailure::OutputUnavailable),
@@ -452,6 +452,9 @@ impl Node {
             }
             MainCommand::ResumeSharing { epoch } => {
                 let safety = self.input_backend().input_safety();
+                if safety.paused && safety.epoch == epoch {
+                    tracing::info!(source = "resume_hotkey", "sharing resume requested");
+                }
                 if safety.paused
                     && safety.epoch == epoch
                     && let Err(error) = crate::api::AgentApi::set_local_paused(
@@ -500,6 +503,11 @@ impl Node {
         self.notification_status(&status);
         match status {
             StatusEvent::FocusLock { .. } | StatusEvent::LocalGameMode(_) | StatusEvent::LocalPointerLock(_) => {}
+            // Only a screenless member (the phone's embedded router) reports these.
+            StatusEvent::NoTarget
+            | StatusEvent::Edge { .. }
+            | StatusEvent::TextRefused { .. }
+            | StatusEvent::TextFocus { .. } => {}
             StatusEvent::TouchpadContacts {
                 mode,
                 frames,

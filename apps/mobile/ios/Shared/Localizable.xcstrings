@@ -1,0 +1,72 @@
+{
+  "sourceLanguage" : "zh-Hans",
+  "strings" : {
+    "剪贴板" : {
+      "comment" : "Shortcuts category of the one-tap copy action; also a search keyword.",
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "剪贴板"
+          }
+        }
+      }
+    },
+    "复制" : {
+      "comment" : "Search keyword of the one-tap copy action.",
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "复制"
+          }
+        }
+      }
+    },
+    "最新共享内容" : {
+      "comment" : "Name of the one-tap copy action's output, and the short title of its App Shortcut.",
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "最新共享内容"
+          }
+        }
+      }
+    },
+    "粘贴" : {
+      "comment" : "Search keyword of the one-tap copy action.",
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "粘贴"
+          }
+        }
+      }
+    },
+    "获取其它设备最新共享的文字或图片，接着用「拷贝到剪贴板」放到本机剪贴板。支持文字和图片，文件请在传输页下载。" : {
+      "comment" : "Description of the one-tap copy shortcut action.",
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "获取其它设备最新共享的文字或图片，接着用「拷贝到剪贴板」放到本机剪贴板。支持文字和图片，文件请在传输页下载。"
+          }
+        }
+      }
+    },
+    "获取最新共享内容" : {
+      "comment" : "Title of the one-tap copy shortcut action.",
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "获取最新共享内容"
+          }
+        }
+      }
+    }
+  },
+  "version" : "1.0"
+}

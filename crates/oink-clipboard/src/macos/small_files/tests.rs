@@ -857,3 +857,203 @@ fn source_lease_still_protects_expired_cache() {
     let unprotected = maintain(root.path(), false, u64::MAX).unwrap();
     assert_reclaimed(&file, &unprotected);
 }
+
+/// A proxy PC publishes a phone's photos the way pictures copied on this Mac
+/// look (user 2026-11-12): every image is its own pasteboard item with its
+/// bitmap (PNG + TIFF) and the URL of the file the proxy already holds locally
+/// (no File Provider, no second copy); a non-image file is a file URL only.
+#[test]
+fn mobile_files_publish_their_local_url_next_to_the_bitmap() {
+    use crate::{
+        ClipboardBackend,
+        content::Provider,
+        model::{Inventory, RepresentationData, RepresentationId},
+    };
+    const CHILD: &str = "OINK_TEST_MOBILE_FILE_URL_CHILD";
+    const NAME: &str = "macos::small_files::tests::mobile_files_publish_their_local_url_next_to_the_bitmap";
+    if std::env::var_os(CHILD).is_none() {
+        assert!(
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", NAME])
+                .env(CHILD, "1")
+                .status()
+                .unwrap()
+                .success()
+        );
+        return;
+    }
+    struct Photos {
+        inventory: Inventory,
+        pngs: HashMap<RepresentationId, Vec<u8>>,
+        files: Arc<dyn Namespace>,
+    }
+    struct Portable;
+    impl content::Translator for Portable {
+        fn standard(&self, rep: &crate::model::Representation, bytes: &[u8]) -> io::Result<Vec<crate::ClipData>> {
+            content::decode_standard(rep, bytes)
+        }
+    }
+    impl Provider for Photos {
+        fn inventory(&self) -> Inventory {
+            self.inventory.clone()
+        }
+        fn open(&self, id: RepresentationId) -> io::Result<crate::FileReader> {
+            Ok(Box::new(io::Cursor::new(self.pngs[&id].clone())))
+        }
+        fn translator(&self) -> Arc<dyn content::Translator> {
+            Arc::new(Portable)
+        }
+        fn namespace(&self) -> Option<Arc<dyn Namespace>> {
+            Some(self.files.clone())
+        }
+    }
+    let png = |red: u8| {
+        let mut png = Vec::new();
+        {
+            let mut encoder = png::Encoder::new(&mut png, 1, 1);
+            encoder.set_color(png::ColorType::Rgba);
+            encoder.set_depth(png::BitDepth::Eight);
+            encoder
+                .write_header()
+                .unwrap()
+                .write_image_data(&[red, 2, 3, 255])
+                .unwrap();
+        }
+        png
+    };
+    objc2::rc::autoreleasepool(|_| {
+        let directory = tempfile::tempdir().unwrap();
+        ROOT.set(directory.path().join("cache")).unwrap();
+        for count in [1, 3] {
+            // `count` photos, with a document after the first one.
+            let mut kinds = vec![true];
+            if count > 1 {
+                kinds.push(false);
+                kinds.extend(std::iter::repeat_n(true, count - 1));
+            }
+            let mut inventory = crate::model::file_images::inventory(&kinds);
+            let paths: Vec<_> = inventory
+                .roots
+                .iter()
+                .map(|root| {
+                    let path = directory.path().join(format!("{count}")).join(&root.name);
+                    fs::create_dir_all(path.parent().unwrap()).unwrap();
+                    fs::write(&path, b"file").unwrap();
+                    (root.id, path)
+                })
+                .collect();
+            let local = content::namespace::Local::new(paths.clone()).unwrap();
+            let native =
+                content::namespace::Files::new(local.clone(), crate::sync::files::TargetOs::current()).unwrap();
+            let mut entries = native.roots().to_vec();
+            for (entry, (_, path)) in entries.iter_mut().zip(&paths) {
+                entry.local_path = Some(path.clone());
+            }
+            inventory.roots = local.roots();
+            let mut pngs = HashMap::new();
+            for rep in inventory.items.iter_mut().flat_map(|item| &mut item.representations) {
+                let bytes = png(rep.id.0 as u8 * 40);
+                rep.data = RepresentationData::Reader {
+                    size: ContentSize::Known(bytes.len() as u64),
+                };
+                pngs.insert(rep.id, bytes);
+            }
+            let board = crate::macos::test_pasteboard::new();
+            let backend = crate::macos::MacClipboard {
+                name: Some(board.name().to_string()),
+                watcher: Mutex::new(None),
+                registration: Arc::new(Mutex::new(None)),
+                local: Arc::new(Mutex::new(None)),
+            };
+            backend
+                .write_mobile_guarded(
+                    NativeSpec {
+                        inventory: inventory.clone(),
+                        contents: Arc::new(Photos {
+                            inventory,
+                            pngs: pngs.clone(),
+                            files: local,
+                        }),
+                        files: entries,
+                        file_contents: Some(native),
+                        sensitivity: crate::Sensitivity::Normal,
+                    },
+                    Arc::new(|| Ok(())),
+                )
+                .unwrap();
+            // One item per file, in the phone's order: Finder pastes every
+            // file, image apps every bitmap.
+            let items = board.pasteboardItems().unwrap();
+            assert_eq!(items.len(), kinds.len());
+            let ty = |name: &str| objc2_foundation::NSString::from_str(name);
+            for (index, (image, (_, file))) in kinds.iter().zip(&paths).enumerate() {
+                let item = items.objectAtIndex(index);
+                let url = item
+                    .stringForType(&ty("public.file-url"))
+                    .expect("file URL on every item");
+                assert_eq!(
+                    path(&url.to_string()).canonicalize().unwrap(),
+                    file.canonicalize().unwrap()
+                );
+                let bitmap = item.dataForType(&ty("public.png")).map(|data| data.to_vec());
+                if *image {
+                    assert_eq!(bitmap.as_ref(), Some(&pngs[&RepresentationId(index as u32)]));
+                    assert!(item.types().containsObject(&ty("public.tiff")));
+                } else {
+                    assert_eq!(bitmap, None, "a document has no picture");
+                    assert!(!item.types().containsObject(&ty("public.tiff")));
+                }
+            }
+            board.clearContents();
+        }
+    });
+}
+
+/// A phone's file announced by its proxy PC is a received file from the phone
+/// (received-files.md §3), so it skips this ordinary cache even when small.
+#[test]
+fn phone_files_relayed_by_a_proxy_skip_the_small_file_cache() {
+    use content::Provider;
+    struct FromDevice(Arc<Files>, oink_foundation::DeviceId);
+    impl Namespace for FromDevice {
+        fn origin(&self) -> Option<oink_foundation::DeviceId> {
+            Some(self.1)
+        }
+        fn roots(&self) -> Vec<FileNode> {
+            self.0.roots()
+        }
+        fn list(&self, node: NodeId, cursor: Option<DirectoryCursor>) -> io::Result<DirectoryPage> {
+            self.0.list(node, cursor)
+        }
+        fn select(&self, node: NodeId) -> io::Result<FileNode> {
+            self.0.select(node)
+        }
+        fn open(&self, node: NodeId, version: u64, offset: u64) -> io::Result<crate::FileReader> {
+            self.0.open(node, version, offset)
+        }
+    }
+    let spec = |origin| {
+        let roots = vec![file(1, "photo.jpg", 4)];
+        let namespace = Arc::new(FromDevice(files(roots.clone(), b"jpeg"), origin));
+        let contents = content::namespace::Files::new(namespace, crate::sync::files::TargetOs::current()).unwrap();
+        let inventory = inventory(roots);
+        NativeSpec {
+            contents: Arc::new(content::tests::fixture()),
+            files: contents.roots().to_vec(),
+            file_contents: Some(contents),
+            sensitivity: crate::Sensitivity::Normal,
+            inventory,
+        }
+    };
+    let announcer = inventory(vec![]).id.clip.origin;
+    let phone = oink_foundation::DeviceId([0x5a; 32]);
+    assert_ne!(phone, announcer);
+    assert!(
+        matches!(SmallFiles::for_spec(&spec(phone), Arc::new(|| Ok(()))), Ok(None)),
+        "a phone's small file went to the ordinary cache"
+    );
+    assert!(
+        !matches!(SmallFiles::for_spec(&spec(announcer), Arc::new(|| Ok(()))), Ok(None)),
+        "a device's own small file must still use the cache"
+    );
+}

@@ -25,6 +25,13 @@ struct Running {
     _main: crate::threads::MainReceiver,
 }
 impl Running {
+    /// A pause the test sets without the configuration owner (so no pause
+    /// Facts reach the peers): the native owner applies it first, as the
+    /// device-control owner does, then the stream machines follow.
+    fn set_paused(&mut self, paused: bool) {
+        self.owner.input.apply_owner_pause_for_test(paused);
+        self.owner.pause_changed(paused);
+    }
     async fn step(&mut self) {
         let input = self.owner.input.clone();
         let retry = self.owner.peers.values().filter_map(|p| p.machine.deadline()).min();
@@ -61,16 +68,73 @@ impl Running {
             .any(|p| p.peer == peer && p.attached)
     }
 }
+/// A paused device refuses a new I0 with `Paused` at once; the opener does not
+/// retry while it stays paused and reopens as soon as it is back.
+#[test]
+fn paused_device_refuses_i0_with_reason_and_opener_reopens_on_resume() {
+    crate::test_watchdog::run(
+        module_path!(),
+        "paused_device_refuses_i0_with_reason_and_opener_reopens_on_resume",
+        Some(4),
+        async {
+            let mut nodes = start_with(|_| crate::node::Node::offer_profile(), false).await;
+            let a = nodes[0].owner.links.id();
+            let b = nodes[1].owner.links.id();
+            while !nodes[0].attached(b) || !nodes[1].attached(a) {
+                step(&mut nodes).await;
+            }
+            nodes[0].set_paused(true);
+            // A config change unrelated to pause keeps the device paused. On
+            // a Windows test machine one (Members after a late Facts) sometimes landed in this
+            // window and resumed A, which then accepted B's I0: B never
+            // reached Closed. Deliver one here so that order runs every time.
+            nodes[0].owner.config_state_changed();
+            assert!(
+                nodes[0].owner.paused,
+                "an unrelated config change must not resume the device"
+            );
+            // The opener asks again (as after any close of its stream).
+            let reopen = nodes[1]
+                .owner
+                .peers
+                .get_mut(&a)
+                .unwrap()
+                .machine
+                .reopen(std::time::Instant::now());
+            nodes[1].owner.step(a, reopen);
+            while nodes[1].owner.peers[&a].machine.state() != crate::streams::machine::State::Closed {
+                step(&mut nodes).await;
+            }
+            assert_eq!(
+                nodes[1].owner.peers[&a].machine.deadline(),
+                None,
+                "no retry while paused"
+            );
+            nodes[0].set_paused(false);
+            while !nodes[0].attached(b) || !nodes[1].attached(a) {
+                step(&mut nodes).await;
+            }
+            for node in &nodes {
+                node.owner.input.stop();
+                node.owner.config.stop().await;
+                node.owner.links.stop().await;
+            }
+        },
+    );
+}
+
 async fn step(nodes: &mut [Running]) {
     let [a, b, c] = nodes else { unreachable!() };
     tokio::select! { _ = a.step() => {}, _ = b.step() => {}, _ = c.step() => {} }
 }
 async fn start() -> Vec<Running> {
-    start_with(false, true).await
+    start_with(|_| crate::node::Node::offer_profile(), true).await
 }
 /// Node 0 relays between nodes 1 and 2, whose direct path is blocked.
-/// `old_relay` makes node 0 a peer that does not offer sync unlock.
-async fn start_with(old_relay: bool, hold_headers: bool) -> Vec<Running> {
+async fn start_with(
+    profile: impl Fn(usize) -> oink_network::negotiation::OfferProfile,
+    hold_headers: bool,
+) -> Vec<Running> {
     let identities: Vec<_> = (1..=3).map(|seed| Arc::new(Identity::from_seed([seed; 32]))).collect();
     let states = crate::config_module::runtime_tests::same_group(3);
     let mut pending = Vec::new();
@@ -78,12 +142,8 @@ async fn start_with(old_relay: bool, hold_headers: bool) -> Vec<Running> {
         let directory = tempfile::tempdir().unwrap();
         group_store::save(&directory.path().join(group_store::STATE_FILE), &state).unwrap();
         let network = oink_test_support::network_config(directory.path().into(), "synthetic", 0);
-        let mut profile = crate::node::Node::offer_profile();
-        if old_relay && n == 0 {
-            profile.capabilities.retain(|c| c != "oink.auto-unlock.sync/1");
-        }
         let (links, port) = oink_network::link::LinkLayer::start(LinkConfig {
-            profile,
+            profile: profile(n),
             identity: identity.clone(),
             boot: Boot {
                 device_id: identity.id(),
@@ -126,6 +186,7 @@ async fn start_with(old_relay: bool, hold_headers: bool) -> Vec<Running> {
                 port,
                 identity,
                 application: Arc::new(Application),
+                pairing: true,
                 config,
                 owner_gate: Arc::new(std::sync::Mutex::new(())),
             },
@@ -196,10 +257,26 @@ fn lost_cutover_opening_recovers_via_a_fresh_link_at_the_opening_deadline() {
             testing::hold_input_header(&c, None);
             testing::flush_commands(&b);
             testing::flush_commands(&c);
+            // The native owner applies the stream task's commands on its own
+            // thread and publishes the result after that turn. The relay pairs
+            // can attach long before it has even applied the relayed peer's
+            // admission (a Windows test machine, full lib run: no entry for that peer yet), so
+            // also wait until it has published the writer this task holds.
+            let published = |node: &Running, peer: DeviceId| {
+                let writer = node.owner.peers[&peer].outbound;
+                node.owner
+                    .input
+                    .status()
+                    .peers
+                    .iter()
+                    .any(|p| p.peer == peer && p.outbound == writer)
+            };
             while !nodes[0].attached(b.id())
                 || !nodes[0].attached(c.id())
                 || !nodes[1].attached(nodes[0].owner.links.id())
                 || !nodes[2].attached(nodes[0].owner.links.id())
+                || !published(&nodes[1], c.id())
+                || !published(&nodes[2], b.id())
             {
                 step(&mut nodes).await;
             }
@@ -259,6 +336,63 @@ fn lost_cutover_opening_recovers_via_a_fresh_link_at_the_opening_deadline() {
     );
 }
 
+#[test]
+fn a_peer_without_the_input_capability_is_never_waited_for() {
+    crate::test_watchdog::run(
+        module_path!(),
+        "a_peer_without_the_input_capability_is_never_waited_for",
+        Some(4),
+        async {
+            // Node 2 negotiates like the iOS share extension: only core, group,
+            // low, clipboard and device (protocol §1.1), so no I0.
+            let mut nodes = start_with(
+                |n| {
+                    let mut profile = crate::node::Node::offer_profile();
+                    if n == 2 {
+                        profile.capabilities.retain(|c| {
+                            [
+                                "oink.core/2",
+                                "oink.group/2",
+                                "oink.low/1",
+                                "oink.clipboard/2",
+                                "oink.device/2",
+                            ]
+                            .contains(&c.as_str())
+                        });
+                    }
+                    profile
+                },
+                true,
+            )
+            .await;
+            let a = nodes[0].owner.links.clone();
+            let phone = nodes[2].owner.links.id();
+            let ready = |a: &oink_network::link::LinkLayer| {
+                a.links()
+                    .by_peer(phone)
+                    .filter(|l| l.state == oink_network::link::LinkState::Ready)
+                    .map(|l| l.link)
+            };
+            while ready(&a).is_none() || !nodes[0].attached(nodes[1].owner.links.id()) {
+                step(&mut nodes).await;
+            }
+            let link = ready(&a).unwrap();
+            assert!(!a.links().by_peer(phone).unwrap().agreement.contains("oink.input/2"));
+            // Deliver LinkReady explicitly; a repeated delivery is idempotent.
+            nodes[0].owner.link_ready(link, phone);
+            assert!(!nodes[0].owner.peers.contains_key(&phone));
+            nodes[0].owner.report_waits(Instant::now() + Duration::from_secs(60));
+            testing::flush_commands(&a);
+            assert_eq!(ready(&a), Some(link), "the link to a peer without input must stay up");
+            for node in &nodes {
+                node.owner.input.stop();
+                node.owner.config.stop().await;
+                node.owner.links.stop().await;
+            }
+        },
+    );
+}
+
 /// The device-control owner's order (`apply_pause_request`): the native owner
 /// applies the decision first, then the owner publishes it in its local facts.
 fn pause(owner: &InputStreams, paused: bool) {
@@ -266,7 +400,7 @@ fn pause(owner: &InputStreams, paused: bool) {
     publish_pause(&owner.config, paused);
 }
 fn publish_pause(config: &ConfigModule, paused: bool) {
-    use oink_protocol::v1::{
+    use oink_protocol::v2::{
         dto,
         schema::{WireDto, WireValue},
     };
@@ -332,7 +466,19 @@ fn sync_unlock_challenge_survives_relay_to_direct_migration() {
 async fn sync_round_trip(migrate: bool, relay_paused: bool) {
     use crate::auto_unlock::sync::SourceAnswer;
     use crate::threads::{MainCommand, input::InputCommand};
-    let mut nodes = start_with(true, false).await;
+    // The relay (node 0) does not negotiate the device domain that carries
+    // sync unlock and its challenge pair.
+    let mut nodes = start_with(
+        |n| {
+            let mut profile = crate::node::Node::offer_profile();
+            if n == 0 {
+                profile.capabilities.retain(|c| c != "oink.device/2");
+            }
+            profile
+        },
+        false,
+    )
+    .await;
     let relay = nodes[0].owner.links.id();
     let b = nodes[1].owner.links.clone();
     let c = nodes[2].owner.links.clone();
@@ -640,6 +786,120 @@ fn an_unrelated_config_change_keeps_an_unpublished_emergency_pause() {
                 step(&mut nodes).await;
             }
             crate::test_watchdog::phase("input and network shutdown");
+            for node in &nodes {
+                node.owner.input.stop();
+                node.owner.config.stop().await;
+                node.owner.links.stop().await;
+            }
+        },
+    );
+}
+
+/// B reopens its I0 while A is paused; A refuses it as `Paused`. Streams are
+/// independent, so that refusal can reach B after A's resumed Facts and A's
+/// new I0. It must not leave B waiting for a resume it has already seen (it
+/// stayed closed until the 3 s opening timeout retired the link).
+#[test]
+fn a_paused_refusal_arriving_after_the_resume_does_not_park_the_opener() {
+    crate::test_watchdog::run(
+        module_path!(),
+        "a_paused_refusal_arriving_after_the_resume_does_not_park_the_opener",
+        Some(4),
+        async {
+            // B's events are held and then delivered in the late order.
+            async fn step_without_b(nodes: &mut [Running]) {
+                let [a, _, c] = nodes else { unreachable!() };
+                tokio::select! { _ = a.step() => {}, _ = c.step() => {} }
+            }
+            fn a_paused_at_b(nodes: &[Running], a: DeviceId) -> bool {
+                nodes[1]
+                    .owner
+                    .config
+                    .members()
+                    .members
+                    .iter()
+                    .find(|m| m.device == a)
+                    .and_then(|m| m.facts.as_ref())
+                    .and_then(|f| f.pause().ok().flatten())
+                    .is_some_and(|p| p.paused() == Ok(true))
+            }
+            let mut nodes = start_with(|_| crate::node::Node::offer_profile(), false).await;
+            let a = nodes[0].owner.links.id();
+            let b = nodes[1].owner.links.id();
+            while !nodes[0].attached(b) || !nodes[1].attached(a) {
+                step(&mut nodes).await;
+            }
+            crate::test_watchdog::phase("A pauses and B sees its Facts");
+            pause(&nodes[0].owner, true);
+            while !nodes[0].owner.paused || !a_paused_at_b(&nodes, a) {
+                step(&mut nodes).await;
+            }
+            // B's task handles that Facts change (its queued event may still
+            // be pending when the loop sees B's configuration).
+            nodes[1].owner.facts_changed(a, false);
+            crate::test_watchdog::phase("B reopens its I0 during the pause; A refuses it");
+            // The opener asks again (as after any close of its stream).
+            let reopen = nodes[1].owner.peers.get_mut(&a).unwrap().machine.reopen(Instant::now());
+            nodes[1].owner.step(a, reopen);
+            let refused = nodes[1].owner.peers[&a].outbound.unwrap();
+            let mut admitted = InboundOrdinal::default();
+            admitted.admit(refused.tag.ordinal);
+            // A has read B's new I0 (and refused it: it is still paused).
+            while nodes[0].owner.peers[&b].ordinal != admitted {
+                step_without_b(&mut nodes).await;
+            }
+            assert!(nodes[0].owner.paused);
+            crate::test_watchdog::phase("A resumes: Facts and a new I0");
+            pause(&nodes[0].owner, false);
+            while nodes[0].owner.paused || nodes[0].owner.peers[&b].outbound.is_none() || a_paused_at_b(&nodes, a) {
+                step_without_b(&mut nodes).await;
+            }
+            crate::test_watchdog::phase("B collects A's new I0 and the refusal");
+            // The link layer reports the refusal with A's code. B's input
+            // thread can notice the closed stream first, on its next post,
+            // without that code (`None`); that notice is held back too and
+            // delivered after the refusal, so the refusal is what B's task
+            // reads for that stream.
+            let mut inbound = None;
+            let mut closed = None;
+            let mut faults = Vec::new();
+            while inbound.is_none() || closed.is_none() {
+                let node = &mut nodes[1];
+                tokio::select! {
+                    biased;
+                    event = node.port.next() => match event.unwrap() {
+                        ModuleEvent::Inbound(stream) if stream.peer == a && inbound.is_none() => inbound = Some(stream),
+                        ModuleEvent::StreamClosed { stream, reason } if stream == refused => closed = Some(reason),
+                        ModuleEvent::LinkReady { link, peer } => node.owner.link_ready(link, peer),
+                        ModuleEvent::LinkLost { link, peer, reason } => node.owner.link_lost(link, peer, reason),
+                        ModuleEvent::Inbound(stream) => node.owner.inbound(stream),
+                        ModuleEvent::StreamClosed { stream, reason } => node.owner.stream_closed(stream, reason),
+                        _ => {},
+                    },
+                    notice = node.notices.next() => match notice.unwrap() {
+                        notice @ InputNotice::Fault { which: Which::Outbound, stream, .. } if stream == refused => faults.push(notice),
+                        notice => node.owner.notice(notice),
+                    },
+                }
+            }
+            assert_eq!(closed, Some(StreamClosed::Peer(StreamCode::Paused)));
+            crate::test_watchdog::phase("late order: resumed Facts, new I0, then the refusal");
+            nodes[1].owner.facts_changed(a, false);
+            nodes[1].owner.inbound(inbound.unwrap());
+            nodes[1].owner.stream_closed(refused, closed.unwrap());
+            for fault in faults {
+                nodes[1].owner.notice(fault);
+            }
+            let machine = &nodes[1].owner.peers[&a].machine;
+            assert!(
+                !machine.peer_paused(),
+                "a Paused refusal that arrived after A resumed parked B's I0"
+            );
+            assert!(machine.current().is_some_and(|tag| tag.ordinal > refused.tag.ordinal));
+            crate::test_watchdog::phase("both directions attach without the opening timeout");
+            while !nodes[0].attached(b) || !nodes[1].attached(a) {
+                step(&mut nodes).await;
+            }
             for node in &nodes {
                 node.owner.input.stop();
                 node.owner.config.stop().await;

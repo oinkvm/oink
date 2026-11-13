@@ -33,6 +33,7 @@ mod source_foreground;
 #[cfg(all(test, debug_assertions))]
 mod source_release_desktop_tests;
 mod task_view;
+pub(crate) mod text_focus;
 mod touchpad;
 pub(crate) mod trace;
 mod warp;
@@ -165,6 +166,48 @@ fn deliver(inputs: &[INPUT]) -> Result<(), InputError> {
     }
 }
 
+/// See `crate::inject_text_direct`: this process's own `SendInput`, no service.
+pub(crate) fn send_text_local(text: &str) -> Result<(), InputError> {
+    send_text(text, |inputs| {
+        let n = warp::send(inputs);
+        if n as usize == inputs.len() {
+            Ok(())
+        } else {
+            Err(InputError::Platform(format!(
+                "SendInput 只注入了 {n}/{}：{}",
+                inputs.len(),
+                windows::core::Error::from_thread()
+            )))
+        }
+    })
+}
+
+/// OS behaviour (Win10 22H2 VM probe, 2026-11-09): input the target thread
+/// has not consumed yet is capped at about 10,000 queued messages; a
+/// 6,790-unit text sent at once (13,580 key events) reached a WinForms
+/// RichTextBox truncated at exactly 5,000 units, and `WaitForInputIdle` cannot
+/// pace it (it waits only once per process, later calls return immediately).
+/// Why this shape: batches of `TEXT_BATCH_UNITS` units, each followed by
+/// `TEXT_BATCH_PAUSE`, keep the burst far below the cap while the target
+/// drains (at most ~17,000 units/s; one 4,096-byte `InputText` takes ~0.25 s).
+/// Remote text reaches the backend already paced by the router
+/// (`WinInput::text_pacing`): one batch per `InjectEvent::Text`, so the
+/// injection thread does not sleep and other input goes between batches.
+/// The loop below paces only the direct probe path.
+fn send_text(text: &str, mut send: impl FnMut(&[INPUT]) -> Result<(), InputError>) -> Result<(), InputError> {
+    let batches = inject::text_batches(text);
+    let last = batches.len().saturating_sub(1);
+    for (index, batch) in batches.iter().enumerate() {
+        send(batch)?;
+        if index < last {
+            std::thread::sleep(TEXT_BATCH_PAUSE);
+        }
+    }
+    Ok(())
+}
+
+const TEXT_BATCH_PAUSE: std::time::Duration = std::time::Duration::from_millis(30);
+
 fn cursor_dpi() -> u32 {
     // SAFETY: 查询光标所在显示器的有效 DPI。
     unsafe {
@@ -197,6 +240,13 @@ impl InputBackend for WinInput {
 
     fn start_injection_session(&self) -> Result<(), InputError> {
         service::initialize()
+    }
+    /// See `send_text` for why Windows text is paced.
+    fn text_pacing(&self) -> Option<oink_foundation::input::TextPacing> {
+        Some(oink_foundation::input::TextPacing {
+            units: inject::TEXT_BATCH_UNITS,
+            pause: TEXT_BATCH_PAUSE,
+        })
     }
     fn stop_injection_session(&self) {
         self.source_foreground.set(false);
@@ -709,6 +759,8 @@ impl InputBackend for WinInput {
                 }
                 send(&inputs)
             }
+            // The protected service carries each unit as its own command.
+            InjectEvent::Text(text) => send_text(&text.0, send),
             InjectEvent::Gesture(g) => {
                 let actions = self.gestures.lock().map_err(|_| InputError::Platform("锁已损坏".into()))?
                     // Only native injection uses this mapper. No ordinary observer

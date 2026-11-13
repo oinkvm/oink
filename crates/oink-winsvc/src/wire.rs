@@ -37,6 +37,10 @@ pub enum Command {
         scan: bool,
         extended: bool,
         down: bool,
+        /// With a virtual-key `code`: the scan code injected alongside it
+        /// (`wScan`, at most 0xFF), so hooks and games still see the physical
+        /// key (numpad digits go by VK and scan code). 0 when `scan`.
+        vk_scan: u16,
     },
     /// One absolute-positioned left Down, never two independently dispatched events.
     DragPress {
@@ -51,6 +55,11 @@ pub enum Command {
         x: i32,
         y: i32,
         untagged: bool,
+    },
+    /// One UTF-16 code unit of committed text (`KEYEVENTF_UNICODE`).
+    Unicode {
+        unit: u16,
+        down: bool,
     },
 }
 impl Command {
@@ -67,15 +76,17 @@ impl Command {
             Self::Move { x, y } => (3, x, y, 0),
             Self::Button { button, down, untagged } => (4, i32::from(button), i32::from(down), i32::from(untagged)),
             Self::Wheel { amount, horizontal } => (5, amount, i32::from(horizontal), 0),
+            Self::Unicode { unit, down } => (12, i32::from(unit), i32::from(down), 0),
             Self::Key {
                 code,
                 scan,
                 extended,
                 down,
+                vk_scan,
             } => (
                 6,
                 i32::from(code),
-                i32::from(scan) | (i32::from(extended) << 1),
+                i32::from(scan) | (i32::from(extended) << 1) | (i32::from(vk_scan) << 8),
                 i32::from(down),
             ),
         };
@@ -126,11 +137,16 @@ impl Command {
                 amount: a as i32,
                 horizontal: b == 1,
             },
-            6 if (1..=255).contains(&a) && b <= 3 && c <= 1 => Self::Key {
+            6 if (1..=255).contains(&a) && b & !0xFF03 == 0 && (b & 1 == 0 || b >> 8 == 0) && c <= 1 => Self::Key {
                 code: a as u16,
                 scan: b & 1 != 0,
                 extended: b & 2 != 0,
                 down: c == 1,
+                vk_scan: (b >> 8) as u16,
+            },
+            12 if (1..=0xFFFF).contains(&a) && b <= 1 && c == 0 => Self::Unicode {
+                unit: a as u16,
+                down: b == 1,
             },
             7 if (a as i32).unsigned_abs() <= 1_000_000 && (b as i32).unsigned_abs() <= 1_000_000 && c == 0 => {
                 Self::MoveRelative {
@@ -347,6 +363,30 @@ mod tests {
     }
 
     #[test]
+    fn unicode_units_round_trip_and_reject_out_of_range_values() {
+        for command in [
+            Command::Unicode {
+                unit: 0x4E2D,
+                down: true,
+            },
+            Command::Unicode {
+                unit: 0xD83D,
+                down: false,
+            },
+            Command::Unicode {
+                unit: 0xFFFF,
+                down: true,
+            },
+        ] {
+            assert_eq!(Command::decode(&command.encode()), Some(command));
+        }
+        assert!(Command::decode(&Command::Unicode { unit: 0, down: true }.encode()).is_none());
+        let mut bad = Command::Unicode { unit: 1, down: true }.encode();
+        bad[12..16].copy_from_slice(&2u32.to_le_bytes());
+        assert!(Command::decode(&bad).is_none());
+    }
+
+    #[test]
     fn rejects_malformed_and_unbounded_input() {
         let valid = Command::Move { x: 65535, y: 0 }.encode();
         assert_eq!(Command::decode(&valid), Some(Command::Move { x: 65535, y: 0 }));
@@ -367,9 +407,36 @@ mod tests {
                 scan: true,
                 extended: false,
                 down: true,
+                vk_scan: 0,
+            },
+            // A scan-code key has no second scan code.
+            Command::Key {
+                code: 0x4F,
+                scan: true,
+                extended: false,
+                down: true,
+                vk_scan: 0x4F,
+            },
+            Command::Key {
+                code: 0x61,
+                scan: false,
+                extended: false,
+                down: true,
+                vk_scan: 0x100,
             },
         ] {
             assert!(Command::decode(&cmd.encode()).is_none());
+        }
+        // Numpad 1 by virtual key keeps its physical scan code across the pipe.
+        for down in [true, false] {
+            let numpad = Command::Key {
+                code: 0x61,
+                scan: false,
+                extended: false,
+                down,
+                vk_scan: 0x4F,
+            };
+            assert_eq!(Command::decode(&numpad.encode()), Some(numpad));
         }
         for index in [0, 4, 20] {
             let mut bad = valid;

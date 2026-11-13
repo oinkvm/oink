@@ -3,13 +3,14 @@
 //! one edit, so a concurrent move or join allocation never interleaves with it.
 use crate::{group_state::State, wire_identity as wire};
 use oink_foundation::DeviceId;
-use oink_protocol::v1::{
+use oink_protocol::v2::{
     self, RawValue, dto,
     schema::{WireDto, WireValue},
 };
 use std::collections::{BTreeMap, BTreeSet};
 
-/// Optional retained register. 0.3.x peers merge and relay it opaquely in ConfigState.
+/// Optional retained register kind 0x1302. Public 0.3.6 shipped it with the
+/// same id and value shape, so upgraded data and groups keep their order.
 pub const REGISTER_KIND: u32 = 0x1302;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -28,24 +29,24 @@ pub fn sort_key(order: &BTreeMap<DeviceId, i64>, device: DeviceId) -> (bool, i64
 }
 
 /// Apply one move. Returns false when the order is already as requested.
-pub fn place(order: &mut BTreeMap<DeviceId, i64>, device: DeviceId, placement: Placement) -> v1::Result<bool> {
+pub fn place(order: &mut BTreeMap<DeviceId, i64>, device: DeviceId, placement: Placement) -> v2::Result<bool> {
     let (Placement::Above(anchor) | Placement::After(anchor)) = placement;
     if anchor == device || !order.contains_key(&device) {
-        return Err(v1::ErrorCode::StateConflict.into());
+        return Err(v2::ErrorCode::StateConflict.into());
     }
-    let base = *order.get(&anchor).ok_or(v1::ErrorCode::StateConflict)?;
+    let base = *order.get(&anchor).ok_or(v2::ErrorCode::StateConflict)?;
     let target = match placement {
         Placement::Above(_) => base.checked_sub(1),
         Placement::After(_) => base.checked_add(1),
     }
-    .ok_or(v1::ErrorCode::LimitExceeded)?;
+    .ok_or(v2::ErrorCode::LimitExceeded)?;
     let taken = matches!(placement, Placement::Above(_)) && order.iter().any(|(d, o)| *d != device && *o == target);
     if !taken && order[&device] == target {
         return Ok(false);
     }
     if taken {
         for (_, value) in order.iter_mut().filter(|(d, o)| **d != device && **o <= target) {
-            *value = value.checked_sub(1).ok_or(v1::ErrorCode::LimitExceeded)?;
+            *value = value.checked_sub(1).ok_or(v2::ErrorCode::LimitExceeded)?;
         }
     }
     order.insert(device, target);
@@ -54,12 +55,12 @@ pub fn place(order: &mut BTreeMap<DeviceId, i64>, device: DeviceId, placement: P
 
 impl State {
     /// Only current membership incarnations appear; offline members keep their entry.
-    pub fn device_order(&self) -> v1::Result<BTreeMap<DeviceId, i64>> {
+    pub fn device_order(&self) -> v2::Result<BTreeMap<DeviceId, i64>> {
         let Some(register) = self.register(REGISTER_KIND)? else {
             return Ok(BTreeMap::new());
         };
         if register.deleted()? {
-            return Err(v1::ErrorCode::StateConflict.into());
+            return Err(v2::ErrorCode::StateConflict.into());
         }
         let mut result = BTreeMap::new();
         let mut devices = BTreeSet::new();
@@ -67,7 +68,7 @@ impl State {
             let device = wire::read_device(&entry.device()?)?;
             let order = entry.order()?;
             if !devices.insert(device) {
-                return Err(v1::ErrorCode::StateConflict.into());
+                return Err(v2::ErrorCode::StateConflict.into());
             }
             if self
                 .roster()
@@ -81,7 +82,7 @@ impl State {
     }
     /// Keep existing entries and append each new incarnation at max + 1, in
     /// signed join order (issued_ms, then DeviceId). Departed devices drop out.
-    pub fn reconcile_device_order(&self, writer: DeviceId) -> v1::Result<Self> {
+    pub fn reconcile_device_order(&self, writer: DeviceId) -> v2::Result<Self> {
         let mut order = self.device_order()?;
         let mut joining = self
             .roster()
@@ -93,19 +94,19 @@ impl State {
             let next = order
                 .values()
                 .max()
-                .map_or(Ok(0), |max| max.checked_add(1).ok_or(v1::ErrorCode::LimitExceeded))?;
+                .map_or(Ok(0), |max| max.checked_add(1).ok_or(v2::ErrorCode::LimitExceeded))?;
             order.insert(member.device, next);
         }
         self.write_device_order(writer, &order)
     }
-    pub fn move_device(&self, writer: DeviceId, device: DeviceId, placement: Placement) -> v1::Result<Self> {
+    pub fn move_device(&self, writer: DeviceId, device: DeviceId, placement: Placement) -> v2::Result<Self> {
         let mut order = self.device_order()?;
         if !place(&mut order, device, placement)? {
             return Ok(self.clone());
         }
         self.write_device_order(writer, &order)
     }
-    fn write_device_order(&self, writer: DeviceId, order: &BTreeMap<DeviceId, i64>) -> v1::Result<Self> {
+    fn write_device_order(&self, writer: DeviceId, order: &BTreeMap<DeviceId, i64>) -> v2::Result<Self> {
         let retained = self
             .register(REGISTER_KIND)?
             .map(|r| dto::DeviceOrder::from_raw(r.value()?)?.entries())
@@ -115,7 +116,7 @@ impl State {
         let entries = order
             .iter()
             .map(|(device, value)| {
-                let epoch = self.roster().member(*device).ok_or(v1::ErrorCode::StateConflict)?.epoch;
+                let epoch = self.roster().member(*device).ok_or(v2::ErrorCode::StateConflict)?.epoch;
                 let mut raw = retained
                     .iter()
                     .find(|e| {
@@ -129,7 +130,7 @@ impl State {
                 raw.insert(3, value.write());
                 dto::DeviceOrderEntry::from_raw(raw).map(|e| e.write())
             })
-            .collect::<v1::Result<Vec<_>>>()?;
+            .collect::<v2::Result<Vec<_>>>()?;
         self.put_register(REGISTER_KIND, writer, [(1, RawValue::Array(entries))].into())
     }
 }
@@ -138,7 +139,7 @@ impl State {
 mod tests {
     use super::*;
     use crate::identity::Identity;
-    use oink_protocol::v1::retained;
+    use oink_protocol::v2::retained;
 
     fn id(seed: u8) -> DeviceId {
         Identity::from_seed([seed; 32]).id()
@@ -274,11 +275,11 @@ mod tests {
         // (it is not reserved), whole-register digest checks, and opaque merge.
         let register = moved.register(REGISTER_KIND).unwrap().unwrap();
         retained::verify_register(&register).unwrap();
-        assert!(!v1::registry::RESERVED_REGISTERS.contains(&REGISTER_KIND));
+        assert!(!v2::registry::RESERVED_REGISTERS.contains(&REGISTER_KIND));
         let relayed = dto::GroupState::from_raw(
-            v1::cbor::decode_map(
-                &moved.wire().encode(v1::limits::CONFIG_STATE).unwrap(),
-                v1::limits::CONFIG_STATE,
+            v2::cbor::decode_map(
+                &moved.wire().encode(v2::limits::CONFIG_STATE).unwrap(),
+                v2::limits::CONFIG_STATE,
             )
             .unwrap(),
         )

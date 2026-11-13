@@ -3,7 +3,7 @@ import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/re
 import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import { OinkProvider } from 'oink-ui';
 import { agent } from '../api/store';
-import type { PairView } from '../api/pairing';
+import { PairFailure, pairProblem, pairingApi, type PairView } from '../api/pairing';
 import { setLanguage } from '../i18n';
 import { usePairing, type Pairing } from './usePairing';
 import { ManualSearch, PairDialog } from './PairDialog';
@@ -42,4 +42,20 @@ it('opens the manual-IP result context menu and blocks that peer', async () => {
   fireEvent.contextMenu(result);
   fireEvent.click(await screen.findByRole('menuitem', { name: 'Block' }));
   expect(block).toHaveBeenCalledExactlyOnceWith(peer);
+});
+
+// M35: a refused cancel (another revision raced it) is a pairing answer shown on
+// the dialog, never the window-wide "backend unavailable" failure.
+it('a refused cancel is reported as a pairing problem, not a backend failure', async () => {
+  const address = { family: 0, address: [192, 0, 2, 1], port: 47470, interface_scope: 0 };
+  const view: PairView = { id: 'pair', revision: '1', direction: 'incoming', phase: 2, attempts_left: 3, feedback: 'waiting', terminal: null, peer: { address, expected_id: 'peer', verified: { device: 'peer', name: 'Peer', os: 'macos', remote: address, listen: null } } };
+  agent.adopt('pairings', { revision: '1', requests: [], sessions: [view] });
+  const cancel = vi.spyOn(pairingApi, 'cancel').mockRejectedValue(new PairFailure(pairProblem(37)));
+  const fail = vi.spyOn(agent, 'fail');
+  render(<OinkProvider defaultMotion="reduced"><Dialog /></OinkProvider>);
+  fireEvent.click(await screen.findByRole('button', { name: 'Cancel' }));
+  await waitFor(() => expect(cancel).toHaveBeenCalledOnce());
+  await new Promise(resolve => setTimeout(resolve, 0));
+  expect(fail).not.toHaveBeenCalled();
+  vi.restoreAllMocks();
 });

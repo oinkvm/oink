@@ -19,9 +19,9 @@ pub struct Report {
     previous_instance: bool,
 }
 impl Report {
-    pub(super) fn network(&self) -> oink_protocol::v1::Result<oink_protocol::v1::dto::DiagCrashSummary> {
+    pub(super) fn network(&self) -> oink_protocol::v2::Result<oink_protocol::v2::dto::DiagCrashSummary> {
         use super::wire_values::{Value, dto};
-        use oink_protocol::v1::{dto as w, schema::WireValue};
+        use oink_protocol::v2::{dto as w, schema::WireValue};
         use oink_telemetry::ExceptionClass as C;
         let class = match self.exception_class {
             C::Panic => w::DiagExceptionClass::Panic,

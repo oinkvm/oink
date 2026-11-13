@@ -18,7 +18,9 @@ pub mod group_merge;
 pub mod group_pake;
 pub mod group_state;
 pub mod identity;
+pub mod legacy_merge;
 pub mod link;
+pub mod member;
 pub mod negotiation;
 pub mod pair_journal;
 pub mod pair_merge;
@@ -152,6 +154,8 @@ pub struct TcpBulkStatus {
 }
 
 pub mod device_order;
+pub mod pointer_base;
 pub mod pointer_slots;
+pub mod stream_machine;
 
 mod listeners;

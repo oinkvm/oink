@@ -22,12 +22,15 @@ mod control_wire;
 mod core;
 pub(crate) mod diagnostics;
 pub mod events;
+mod gate;
 mod handle;
 pub mod low;
 mod pipe;
 mod probe_socket;
 mod queue;
 mod realtime_datagram;
+pub mod restart;
+mod route_policy;
 mod runtime;
 pub mod snapshot;
 pub mod stream;
@@ -132,18 +135,41 @@ impl LinkLayer {
     /// Close every link (reason `Stopped`) and stop the thread. Waits for it.
     pub async fn stop(&self) {
         self.0.send(handle::Command::Stop);
+        self.stopped().await;
+        if let Some(pool) = self.0.pool.get() {
+            pool.wait_stopped().await;
+        }
+    }
+    /// Resolves once the network thread has stopped (after `stop`), so an
+    /// owner's helper task can end with the layer it feeds.
+    pub async fn stopped(&self) {
         loop {
             let done = self.0.done.notified();
             tokio::pin!(done);
             done.as_mut().enable();
             if self.0.stopped.load(std::sync::atomic::Ordering::Acquire) {
-                break;
+                return;
             }
             done.await;
         }
-        if let Some(pool) = self.0.pool.get() {
-            pool.wait_stopped().await;
-        }
+    }
+    /// Resolves when the network thread has ended: `Ok` after `stop`, the
+    /// [`NetworkFatal`] when it ended on its own. Then every link is already
+    /// lost; the owner restarts through its normal startup path (with a new
+    /// Boot), never by reusing this layer.
+    pub async fn exited(&self) -> Result<(), NetworkFatal> {
+        self.stopped().await;
+        self.fatal().map_or(Ok(()), Err)
+    }
+    /// Why the network thread ended on its own, once it has.
+    pub fn fatal(&self) -> Option<NetworkFatal> {
+        self.0.fatal.get().cloned()
+    }
+    /// Test only: the endpoint socket fails for good, so Quinn's endpoint
+    /// driver ends on its next receive (as on 2026-11-12).
+    #[cfg(test)]
+    pub(crate) fn fail_endpoint_socket(&self) {
+        self.0.send(handle::Command::FailEndpointSocket);
     }
 
     pub fn id(&self) -> DeviceId {
@@ -151,6 +177,19 @@ impl LinkLayer {
     }
     pub fn profile(&self) -> &crate::negotiation::OfferProfile {
         &self.0.profile
+    }
+    /// Replaces the offer used by future C0 negotiations. Existing links keep
+    /// their negotiated agreement until the owner closes and reconnects them.
+    pub fn update_profile(&self, profile: crate::negotiation::OfferProfile) {
+        *self.0.dynamic_profile.lock().expect("link profile mutex poisoned") = profile.clone();
+        self.0.send(handle::Command::UpdateProfile(profile));
+    }
+    pub fn profile_snapshot(&self) -> crate::negotiation::OfferProfile {
+        self.0
+            .dynamic_profile
+            .lock()
+            .expect("link profile mutex poisoned")
+            .clone()
     }
     pub fn boot(&self) -> Boot {
         self.0.boot
@@ -168,6 +207,23 @@ impl LinkLayer {
     /// Opens this exact IPv4 QUIC service and keeps the authenticated connection
     /// for C0 greeting/negotiation. The config owner exposes a prepared result only
     /// after C0 completes; the TLS identity returned here is never a pairing request.
+    /// Replaces the endpoint socket with a new one on the same port; live
+    /// connections continue on it. Android tags a socket with the network the
+    /// process was bound to when it was created, so after the host moves the
+    /// process to another network the old socket cannot reach the LAN.
+    pub async fn rebind_socket(&self) -> std::io::Result<()> {
+        let (send, receive) = tokio::sync::oneshot::channel();
+        self.0.send(handle::Command::RebindSocket(send));
+        receive.await.map_err(|_| std::io::Error::other("link layer stopped"))?
+    }
+
+    /// This device is the speaker exit or sends its microphone (`true`), or no
+    /// longer (`false`). Send only on change. iOS marks the endpoint socket as
+    /// voice meanwhile (`qos::audio_service_type`); a no-op elsewhere.
+    pub fn set_audio_marking(&self, audio: bool) {
+        self.0.send(handle::Command::AudioMarking(audio));
+    }
+
     pub async fn probe_address(&self, address: SocketAddr) -> Result<DeviceId, AddressProbeError> {
         if !address.is_ipv4() || address.port() == 0 || address.ip().is_unspecified() || address.ip().is_multicast() {
             return Err(AddressProbeError::InvalidAddress);
@@ -205,7 +261,7 @@ impl LinkLayer {
     /// Responder, on entering "wait for done": send this command before posting the
     /// config reply, so that it takes effect before the initiator's upper streams can
     /// arrive. Lost link: nothing, no error.
-    pub fn set_peer_formats(&self, link: LinkId, formats: oink_protocol::v1::dto::FormatSupport) {
+    pub fn set_peer_formats(&self, link: LinkId, formats: oink_protocol::v2::dto::FormatSupport) {
         self.0.send(handle::Command::Formats(link, formats));
     }
     /// Withdraw application authority while retaining bounded C0 proof exchange.
@@ -220,14 +276,14 @@ impl LinkLayer {
     pub fn set_old_member_lane(&self, link: LinkId, enabled: bool) {
         self.0.send(handle::Command::OldMemberLane(link, enabled));
     }
-    pub fn set_peer_audio(&self, link: LinkId, audio: Vec<oink_protocol::v1::dto::AudioSupport>) {
+    pub fn set_peer_audio(&self, link: LinkId, audio: Vec<oink_protocol::v2::dto::AudioSupport>) {
         self.0.send(handle::Command::Audio(link, audio));
     }
     /// A module reports payload-validation failures without copying rejected data.
-    pub fn report_protocol_violation(&self, link: LinkId, violation: oink_protocol::v1::admission::Violation) {
+    pub fn report_protocol_violation(&self, link: LinkId, violation: oink_protocol::v2::admission::Violation) {
         self.0.send(handle::Command::Violation(link, violation));
     }
-    pub fn set_agreement(&self, link: LinkId, agreement: oink_protocol::v1::admission::Agreement) {
+    pub fn set_agreement(&self, link: LinkId, agreement: oink_protocol::v2::admission::Agreement) {
         self.0.send(handle::Command::Agreement(link, agreement));
     }
     pub fn set_half_open(&self, link: LinkId) {
@@ -261,6 +317,50 @@ impl LinkLayer {
         self.0.send(handle::Command::Addresses(peer, candidates));
     }
 
+    // ---- route selection between direct connections (protocol-v2 11) -------------
+
+    /// The IPv4 endpoints `peer` published in its facts, with their QUIC ports.
+    /// They are the route list; remembered or discovered addresses are not.
+    pub fn update_route_addresses(&self, peer: DeviceId, mut addresses: Vec<SocketAddr>) {
+        addresses.retain(SocketAddr::is_ipv4);
+        self.0.send(handle::Command::RouteAddresses(peer, addresses));
+    }
+    /// This device's IPv4 addresses, from the owner's system network-change
+    /// source (`discovery::address_watch` on desktops, the host's path
+    /// monitor on phones). Peer addresses equal to one of them are not
+    /// dialed, and a change resets every route back-off. The network thread
+    /// never enumerates interfaces itself.
+    pub fn set_local_addresses(&self, addresses: Vec<std::net::Ipv4Addr>) {
+        self.0.send(handle::Command::LocalAddresses(addresses));
+    }
+    /// The persisted pin of this link's peer. Send before `set_ready`, so the
+    /// arbiter's first route state and the follower's restore order hold.
+    pub fn set_route_record(&self, link: LinkId, record: Option<RouteRecord>) {
+        self.0.send(handle::Command::RouteRecord(link, record));
+    }
+    /// Apply the user's choice at once (no idle wait). `false`: not possible now
+    /// (no ready direct link, a cut-over in progress, or the choice is unavailable).
+    pub fn set_route(&self, peer: DeviceId, choice: RouteChoice) -> bool {
+        // The network thread answers within one loop turn; a stopped layer
+        // drops the sender and the choice is reported as not applied.
+        let (send, receive) = std::sync::mpsc::sync_channel(1);
+        self.0.send(handle::Command::SetRoute(peer, choice, send));
+        receive.recv().unwrap_or(false)
+    }
+    /// This device's sharing pause. While set, every send gate keeps back the
+    /// messages whose registry pause policy is `Suspend` (`PostError::Paused`,
+    /// `DatagramError::Paused`, `LowError::Paused`); `Allow` messages leave.
+    pub fn set_sharing_paused(&self, paused: bool) {
+        self.0
+            .hub
+            .sharing_paused
+            .store(paused, std::sync::atomic::Ordering::Release);
+    }
+    /// Whole-group pause: stop standby dials and probes; `true` resumes them.
+    pub fn set_route_probing(&self, enabled: bool) {
+        self.0.send(handle::Command::RouteProbing(enabled));
+    }
+
     // ---- business modules ---------------------------------------------------------
 
     /// Register a module for stream kinds, once per kind, at start-up before any link
@@ -275,7 +375,9 @@ impl LinkLayer {
     /// calling thread and produces no traffic: the QUIC stream appears at the first post,
     /// waiting for Quinn to provide stream credit. The caller checks "link ready" and "not paused" itself; on a
     /// link that is not ready the peer rejects with `NotReady`.
-    /// `tag.kind` must be a business kind (panics otherwise).
+    /// `tag.kind` must be a business kind (panics otherwise). The send gate
+    /// refuses a kind whose registry stream gate this link did not negotiate
+    /// (`OpenError::Unnegotiated`), and later every frame the link cannot carry.
     pub fn open_stream(
         &self,
         link: LinkId,
@@ -283,7 +385,7 @@ impl LinkLayer {
         tag: StreamTag,
         queue: QueueSpec,
         datagram: Option<QueueSpec>,
-    ) -> Result<(SendStream, Option<DatagramSend>), LinkGone> {
+    ) -> Result<(SendStream, Option<DatagramSend>), OpenError> {
         self.allocate_stream(link, priority, tag, queue, datagram)
     }
 
@@ -292,6 +394,11 @@ impl LinkLayer {
     /// (the writer's reset, or the reader's stop request, to which the writer's network
     /// layer answers by resetting its half). The local handle reports `Local`.
     /// Unknown or already closed stream: nothing.
+    ///
+    /// A caller that holds the stream's handle and drops it closes with
+    /// `SendStream::close_with` / `RecvStream::close_with` instead: this
+    /// command can arrive after the network owner saw the dropped handle and
+    /// already closed with `None`.
     pub fn close_stream(&self, stream: StreamId, code: StreamCode) {
         self.0.send(handle::Command::Close(stream, code));
     }

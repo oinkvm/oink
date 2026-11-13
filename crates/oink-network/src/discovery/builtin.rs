@@ -1,7 +1,7 @@
 //! 内置的纯 Rust mDNS（`mdns-sd`）：Windows 等非 macOS 平台使用；macOS 上可用 `OINK_MDNS=builtin`
 //! 切换过来做对比。
 
-use super::{Advert, SERVICE_TYPE, Sighting, Source, advert_from_txt, instance_name, txt_pairs};
+use super::{Advert, MdnsPeers, SERVICE_TYPE, Sighting, Source, advert_from_txt, instance_name, txt_pairs};
 use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -61,6 +61,7 @@ impl Builtin {
                 // 浏览到、还没被移除的服务 → 最近一次解析结果；定期重新交给上层（附近条目 10 秒过期，
                 // 而解析结果只在服务出现或变化时报告一次）。
                 let mut live: HashMap<String, Sighting> = HashMap::new();
+                let mut peers = MdnsPeers::default();
                 let mut last_reemit = Instant::now();
                 loop {
                     if last_reemit.elapsed() >= REEMIT_EVERY {
@@ -80,6 +81,7 @@ impl Builtin {
                         ServiceEvent::ServiceResolved(info) => info,
                         ServiceEvent::ServiceRemoved(_, fullname) => {
                             live.remove(&fullname);
+                            peers.update(live.values());
                             continue;
                         }
                         _ => continue,
@@ -105,6 +107,7 @@ impl Builtin {
                         source: Source::Mdns,
                     };
                     live.insert(info.get_fullname().to_string(), s.clone());
+                    peers.update(live.values());
                     if out.try_send(s).is_err() {
                         break;
                     }

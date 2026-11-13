@@ -8,7 +8,7 @@ use oink_network::{
     identity::Identity,
     link::{LinkConfig, LinkLayer, ModulePort},
 };
-use oink_protocol::v1::{
+use oink_protocol::v2::{
     dto,
     schema::{WireDto, WireValue},
 };
@@ -77,6 +77,7 @@ async fn start() -> Vec<Running> {
                 port,
                 identity: identity.clone(),
                 application: Arc::new(Application),
+                pairing: true,
                 config: local_config,
                 owner_gate: Arc::new(std::sync::Mutex::new(())),
             },

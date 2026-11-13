@@ -1,10 +1,37 @@
 import { tr } from '../i18n';
 import type { ReactNode } from 'react';
 import { Tooltip } from 'oink-ui';
-import type { DeviceOS } from './types';
-export function OsLogo({ os }: {
+import type { Device, DeviceOS } from './types';
+import { ANDROID_CROWN, ANDROID_CROWN_STROKE, ANDROID_CROWN_VIEWBOX, ANDROID_EYES, ANDROID_HEAD, ANDROID_HEAD_VIEWBOX } from './androidHead';
+import { latencyTone, signalLevel } from './latency';
+const APPLE = <>
+      <path d="M15.6 1.5c.1 1.3-.4 2.6-1.2 3.5-.8.9-2 1.6-3.1 1.5-.1-1.3.5-2.6 1.2-3.4.8-.9 2.1-1.5 3.1-1.6z"/>
+      <path d="M19.6 17c-.5 1.2-.8 1.7-1.5 2.8-1 1.5-2.3 3.3-4 3.3-1.5 0-1.9-1-3.9-1s-2.5 1-4 1c-1.7 0-2.9-1.7-3.9-3.1C-.4 15.9-.6 11.1 1 8.6c1.2-1.8 3-2.8 4.8-2.8s2.9 1 4.4 1c1.4 0 2.3-1 4.4-1 1.6 0 3.2.9 4.4 2.3-3.9 2.1-3.3 7.6.6 8.9z"/>
+    </>;
+export function OsLogo({ os, formFactor, privileged = false }: {
     os: DeviceOS;
+    formFactor?: Device['formFactor'];
+    /** Android privileged mode is on and running: the crowned head. */
+    privileged?: boolean;
 }) {
+    // Same badges as the phone app: the official Android robot head, and the
+    // Apple logo with an iPhone or iPad corner (docs/native-rewrite.md sizes,
+    // scaled from its 28 px apple to the 20 px apple of this row).
+    // The crown is two layers: the path with a round stroke in the edge colour
+    // (the whole footprint), then the bare path in the crown colour on top.
+    if (os === 'android' && privileged) return <svg className="os-logo" data-os="android" data-privileged="" viewBox={ANDROID_CROWN_VIEWBOX} role="img" aria-label={tr('Android，特权模式已开启')}>
+        <path d={ANDROID_HEAD}/><path className="os-logo__knock" d={ANDROID_EYES}/>
+        <path className="os-logo__crown-edge" strokeWidth={ANDROID_CROWN_STROKE} strokeLinejoin="round" d={ANDROID_CROWN}/>
+        <path className="os-logo__crown" d={ANDROID_CROWN}/>
+    </svg>;
+    if (os === 'android') return <svg className="os-logo" data-os="android" viewBox={ANDROID_HEAD_VIEWBOX} aria-hidden><path d={ANDROID_HEAD}/><path className="os-logo__knock" d={ANDROID_EYES}/></svg>;
+    if (os === 'ios') {
+        const ipad = formFactor === 'tablet';
+        return <span className="os-apple" data-device={ipad ? 'ipad' : 'iphone'} aria-hidden>
+            <svg className="os-logo" data-os="mac" viewBox="0 0 24 24">{APPLE}</svg>
+            <svg className="os-apple__corner" viewBox="0 0 16 20"><rect x={ipad ? 1 : 3} y="1" width={ipad ? 14 : 10} height="18" rx="2.4"/><path d={ipad ? 'M6 17h4' : 'M6 3h4M6 17h4'}/></svg>
+        </span>;
+    }
     if (os === 'other' || os === 'linux') return <svg className="os-logo" viewBox="0 0 24 24" aria-hidden><rect x="2" y="3" width="20" height="14" rx="2" fill="none" stroke="currentColor" strokeWidth="2"/><path d="M8 22h8M12 17v5" stroke="currentColor" strokeWidth="2"/></svg>;
     if (os === 'win') {
         return (<svg className="os-logo" data-os="win" viewBox="0 0 88 88" aria-hidden>
@@ -12,9 +39,11 @@ export function OsLogo({ os }: {
       </svg>);
     }
     return (<svg className="os-logo" data-os="mac" viewBox="0 0 24 24" aria-hidden>
-      <path d="M15.6 1.5c.1 1.3-.4 2.6-1.2 3.5-.8.9-2 1.6-3.1 1.5-.1-1.3.5-2.6 1.2-3.4.8-.9 2.1-1.5 3.1-1.6z"/>
-      <path d="M19.6 17c-.5 1.2-.8 1.7-1.5 2.8-1 1.5-2.3 3.3-4 3.3-1.5 0-1.9-1-3.9-1s-2.5 1-4 1c-1.7 0-2.9-1.7-3.9-3.1C-.4 15.9-.6 11.1 1 8.6c1.2-1.8 3-2.8 4.8-2.8s2.9 1 4.4 1c1.4 0 2.3-1 4.4-1 1.6 0 3.2.9 4.4 2.3-3.9 2.1-3.3 7.6.6 8.9z"/>
+      {APPLE}
     </svg>);
+}
+export function UpgradeMark() {
+    return <span className="os-upgrade" role="img" aria-label={tr('需要升级')}><svg viewBox="0 0 16 16" aria-hidden><circle cx="8" cy="8" r="6.2"/><path d="M8 4.3v5.2M5.8 7.3 8 9.5l2.2-2.2M5.4 12h5.2"/></svg></span>;
 }
 export function CursorMark({ locked, tooltip = true }: {
     locked: boolean;
@@ -71,15 +100,13 @@ export function PauseGlyph({ knockout = false }: { knockout?: boolean }) {
         <path className="os-pause__bars" d="M4.6 3.7v4.6M7.4 3.7v4.6"/>
       </svg>);
 }
-export function signalLevel(latency: number): 1 | 2 | 3 {
-    return latency < 20 ? 3 : latency <= 50 ? 2 : 1;
-}
+export { signalLevel };
 export function Signal({ latency, offline }: {
     latency?: number | null;
     offline?: boolean;
 }) {
     const level = offline || latency == null ? 0 : signalLevel(latency);
-    const tone = level === 3 ? 'good' : level === 2 ? 'fair' : level === 1 ? 'poor' : 'off';
+    const tone = offline ? 'off' : latencyTone(latency ?? null) ?? 'off';
     const bars = [
         { x: 1, y: 8, h: 4 },
         { x: 5.5, y: 5, h: 7 },

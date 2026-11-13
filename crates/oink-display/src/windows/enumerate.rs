@@ -36,6 +36,8 @@ use crate::DisplayError;
 struct Monitor {
     rect: RECT,
     primary: bool,
+    /// Effective DPI / 96 (the user's scale setting for this screen).
+    system_scale: Option<f64>,
     /// `\\.\DISPLAY1`
     gdi_name: String,
 }
@@ -96,6 +98,9 @@ fn build(index: usize, m: &Monitor, target: Option<&Target>) -> DisplayInfo {
         .map(|t| t.device_path.clone())
         .filter(|p| !p.is_empty())
         .unwrap_or_else(|| m.gdi_name.clone());
+    if let Some(scale) = m.system_scale {
+        crate::record_system_scale(&key, scale);
+    }
     let info = DisplayInfo {
         key,
         name,
@@ -193,9 +198,18 @@ fn monitors() -> Result<Vec<Monitor>, DisplayError> {
         if !ok.as_bool() {
             continue;
         }
+        let (mut x, mut y) = (0u32, 0u32);
+        // SAFETY: valid monitor handle from EnumDisplayMonitors; outputs are locals.
+        let system_scale = unsafe {
+            windows::Win32::UI::HiDpi::GetDpiForMonitor(h, windows::Win32::UI::HiDpi::MDT_EFFECTIVE_DPI, &mut x, &mut y)
+        }
+        .ok()
+        .filter(|_| x > 0)
+        .map(|_| f64::from(x) / 96.0);
         out.push(Monitor {
             rect: mi.monitorInfo.rcMonitor,
             primary: mi.monitorInfo.dwFlags & MONITORINFOF_PRIMARY != 0,
+            system_scale,
             gdi_name: from_wide(&mi.szDevice),
         });
     }

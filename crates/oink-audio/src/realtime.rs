@@ -48,19 +48,21 @@ impl Signal {
     }
     /// Real-time safe, coalesced to one outstanding work notification. Does not
     /// wait for the worker or release any shared ownership.
+    /// Without an OS wake object (mobile) the waiter polls, so there is
+    /// nothing to signal.
     pub fn notify(&self) {
-        if self.0.pending.swap(true, Ordering::Release) {
-            return;
-        }
-        #[cfg(target_os = "macos")]
-        // SAFETY: Arc keeps the OS semaphore live for this call.
-        unsafe {
-            oink_audio_wake_signal(self.0.handle);
-        }
-        #[cfg(windows)]
-        // SAFETY: Arc keeps this event live; SetEvent does not wait for a peer.
-        unsafe {
-            let _ = wake_set_event(self.0.handle.0);
+        #[cfg(any(target_os = "macos", windows))]
+        if !self.0.pending.swap(true, Ordering::Release) {
+            #[cfg(target_os = "macos")]
+            // SAFETY: Arc keeps the OS semaphore live for this call.
+            unsafe {
+                oink_audio_wake_signal(self.0.handle);
+            }
+            #[cfg(windows)]
+            // SAFETY: Arc keeps this event live; SetEvent does not wait for a peer.
+            unsafe {
+                let _ = wake_set_event(self.0.handle.0);
+            }
         }
     }
     /// Scheduling boundary only; never called in a work unit. There is one
@@ -120,7 +122,7 @@ impl Schedule {
             Ok(Self { raw })
         }
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(windows)]
     pub(crate) fn device(_: u32, _: u64) -> Result<Self, String> {
         Ok(Self {})
     }

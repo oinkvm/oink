@@ -4,7 +4,9 @@
 //! across their producers and consumers.
 
 pub mod clipboard;
+pub mod clipboard_burst;
 pub mod clipboard_dedupe;
+pub mod clipboard_history;
 pub mod clipboard_marker;
 pub mod contacts;
 pub mod content;
@@ -24,6 +26,7 @@ pub mod realtime;
 pub mod session;
 pub mod snapshot;
 pub mod storage;
+pub mod text;
 
 pub use geom::{Point, Rect, Size};
 pub use id::{DeviceId, GroupId};

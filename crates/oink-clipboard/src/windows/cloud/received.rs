@@ -2,6 +2,9 @@
 use super::*;
 use crate::received::{self, Basis, Item, Reader, Usage};
 use serde::{Deserialize, Serialize};
+// Probe timestamps are test-only; product decisions never use elapsed time.
+#[cfg(all(test, debug_assertions))]
+pub(super) static RENAME_PROBE: Mutex<Vec<(bool, u32, i64, Instant)>> = Mutex::new(Vec::new());
 use std::{
     collections::BTreeMap,
     os::windows::{fs::OpenOptionsExt, io::AsRawHandle},
@@ -103,6 +106,12 @@ pub(super) struct Journal {
     pub cancelled: HashSet<u64>,
     #[serde(skip)]
     pub opens: HashMap<(u64, usize), i64>,
+    /// NOTIFY_RENAME owns TargetPath only until callback return. Completion's
+    /// path is not a replacement for that intended destination.
+    #[serde(skip)]
+    pub renames: HashMap<(u32, i64), (PathBuf, PathBuf)>,
+    #[serde(skip)]
+    pub move_watches: HashMap<(u32, i64), super::moved::notification::Watch>,
     /// Admission barrier held across the native unlink, without holding a mutex
     /// through an OS call which can synchronously dispatch provider callbacks.
     #[serde(skip)]
@@ -966,8 +975,8 @@ fn rename_allowed(root: &Path, old: &Path, new: &Path, flags: CF_CALLBACK_RENAME
         }
         // This is the destination application's move of its received copy.
         // CfAPI still owns hydration/move execution. A successful completion
-        // outside the root never makes the destination an Oink-managed path:
-        // the journal retains only the old identity for absent-item retirement.
+        // outside the root is never an Oink-managed path. Phone proxy files
+        // may keep a read-only identity reference after successful completion.
         None => {
             new.is_absolute()
                 && flags & CF_CALLBACK_RENAME_FLAG_SOURCE_IN_SCOPE != 0
@@ -989,6 +998,19 @@ pub(super) unsafe extern "system" fn renaming(info: *const CF_CALLBACK_INFO, par
             .as_ref()
             .zip(new.as_ref())
             .is_some_and(|(old, new)| rename_allowed(&service.root, old, new, flags));
+        if allowed && flags & CF_CALLBACK_RENAME_FLAG_TARGET_IN_SCOPE == 0 {
+            service.received.lock().unwrap().renames.insert(
+                (i.VolumeSerialNumber, i.FileId),
+                (old.clone().unwrap(), new.clone().unwrap()),
+            );
+        }
+        let native_id = (i.VolumeSerialNumber, i.FileId);
+        if allowed
+            && flags & CF_CALLBACK_RENAME_FLAG_TARGET_IN_SCOPE == 0
+            && let Err(error) = service.watch_proxy_move(old.as_ref().unwrap(), new.as_ref().unwrap(), native_id)
+        {
+            tracing::warn!(kind=?error.kind(), "phone move directory notification could not be armed; cache retained without positive completion");
+        }
         let connection = i.ConnectionKey;
         let transfer = i.TransferKey;
         let request = i.RequestKey;
@@ -1039,7 +1061,8 @@ pub(super) unsafe extern "system" fn renaming(info: *const CF_CALLBACK_INFO, par
                         let result = crate::content::namespace::NativeFiles::download(&*delivery, &check, &|_, _| {});
                         drop(population);
                         acknowledge_rename(
-                            &provider.api,
+                            &provider,
+                            native_id,
                             connection,
                             transfer,
                             request,
@@ -1055,7 +1078,8 @@ pub(super) unsafe extern "system" fn renaming(info: *const CF_CALLBACK_INFO, par
                     return;
                 }
                 acknowledge_rename(
-                    &service.api,
+                    &service,
+                    native_id,
                     connection,
                     transfer,
                     request,
@@ -1065,7 +1089,8 @@ pub(super) unsafe extern "system" fn renaming(info: *const CF_CALLBACK_INFO, par
             }
         }
         acknowledge_rename(
-            &service.api,
+            &service,
+            native_id,
             connection,
             transfer,
             request,
@@ -1077,7 +1102,14 @@ pub(super) unsafe extern "system" fn renaming(info: *const CF_CALLBACK_INFO, par
         );
     }
 }
-fn acknowledge_rename(api: &Api, connection: CF_CONNECTION_KEY, transfer: i64, request: i64, status: NTSTATUS) {
+fn acknowledge_rename(
+    service: &Service,
+    native_id: (u32, i64),
+    connection: CF_CONNECTION_KEY,
+    transfer: i64,
+    request: i64,
+    status: NTSTATUS,
+) {
     let mut op = operation(connection, transfer, request);
     op.Type = CF_OPERATION_TYPE_ACK_RENAME;
     let mut p = CF_OPERATION_PARAMETERS {
@@ -1089,10 +1121,22 @@ fn acknowledge_rename(api: &Api, connection: CF_CONNECTION_KEY, transfer: i64, r
             },
         },
     };
+    #[cfg(all(test, debug_assertions))]
+    if status == STATUS_SUCCESS {
+        RENAME_PROBE
+            .lock()
+            .unwrap()
+            .push((false, native_id.0, native_id.1, Instant::now()));
+    }
     // SAFETY: all scalar keys and acknowledgement buffers live through execute.
-    let result = unsafe { (api.execute)(&op, &mut p) };
+    let result = unsafe { (service.api.execute)(&op, &mut p) };
+    if status != STATUS_SUCCESS || result < 0 {
+        let mut journal = service.received.lock().unwrap();
+        journal.renames.remove(&native_id);
+        journal.move_watches.remove(&native_id);
+    }
     tracing::info!(target: "oink_file_diagnostics", file_stage = 61_u8,
-        file_request = request, file_status = status as u32, file_code = result as u32,
+        file_request = request, file_id = native_id.1, file_status = status as u32, file_code = result as u32,
         "cloud file rename acknowledged");
 }
 pub(super) unsafe extern "system" fn renamed(info: *const CF_CALLBACK_INFO, params: *const CF_CALLBACK_PARAMETERS) {
@@ -1102,6 +1146,37 @@ pub(super) unsafe extern "system" fn renamed(info: *const CF_CALLBACK_INFO, para
         let Some(service) = (&*i.CallbackContext.cast::<Weak<Service>>()).upgrade() else {
             return;
         };
+        #[cfg(all(test, debug_assertions))]
+        RENAME_PROBE
+            .lock()
+            .unwrap()
+            .push((true, i.VolumeSerialNumber, i.FileId, Instant::now()));
+        let pending = service
+            .received
+            .lock()
+            .unwrap()
+            .renames
+            .get(&(i.VolumeSerialNumber, i.FileId))
+            .cloned();
+        tracing::info!(target: "oink_file_diagnostics", file_stage = 62_u8,
+            file_request = i.RequestKey, file_id = i.FileId, has_target = pending.is_some(),
+            "cloud file rename completed");
+        if let Some((old, _target)) = pending {
+            // Either a CF completion or the armed directory event must positively
+            // prove the old FRN moved out; DELETE alone never commits a handoff.
+            match service.track_proxy_move(&old, i.VolumeSerialNumber, i.FileId) {
+                Ok(true) => {
+                    let mut journal = service.received.lock().unwrap();
+                    journal.renames.remove(&(i.VolumeSerialNumber, i.FileId));
+                    journal.move_watches.remove(&(i.VolumeSerialNumber, i.FileId));
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    tracing::warn!(kind=?error.kind(), "phone file move reference not committed; proxy cache retained")
+                }
+            }
+            return;
+        }
         let Some((old, new)) =
             callback_path(i, (*params).Anonymous.RenameCompletion.SourcePath).zip(callback_path(i, i.NormalizedPath))
         else {

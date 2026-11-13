@@ -1,0 +1,6 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <application>
+        <!-- Design scenes for comparing the UI against the mobile mockup; debug builds only. -->
+        <provider android:name=".DesignFixtureInstaller" android:authorities="${applicationId}.design-fixtures" android:exported="false" />
+    </application>
+</manifest>

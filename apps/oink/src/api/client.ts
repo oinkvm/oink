@@ -36,6 +36,10 @@ export const api = {
   audioQuality: () => call<T.AudioQuality>("audio_quality"),
   connectionQuality: () => call<T.ConnectionQuality>("connection_quality"),
   memberAddresses: (device: string) => call<string[]>('member_addresses', {device}),
+  /** The latest background measurement (once a minute); reading never probes. */
+  memberRoutes: (device: string) => call<T.MemberRoutes>('member_routes', {device}),
+  /** Applied at once; `false` when the choice is not possible now. */
+  setMemberRoute: (device: string, selection: T.RouteSelection) => call<boolean>('set_member_route', {device, selection}),
   setMemberAddress: (device: string,address: string) => call<null>('set_member_address', {device,address}),
   moveDeviceOrder: (device: string, placement: import('../devices/reorder').Placement) => call<null>('move_device_order', { device, placement }),
   updateStatus: () => call<import('./update').UpdateStatus>('query_update_status'),
@@ -43,6 +47,9 @@ export const api = {
   lockFocusTo: (device: string) => call<null>('lock_focus_to', { device }),
   setForwardingControls: (requestId: string, versionToken: string, volumePercent: number, muted: boolean, deferPersistence = false) => call<import('./cards').DeviceControlReply>('set_forwarding_controls', { requestId, versionToken, volumePercent, muted, ...(deferPersistence ? { deferPersistence } : {}) }),
   deviceCards: () => call<import('./cards').DeviceCardsView>('device_cards'),
+  // Phones: start only where start_allowed (Android privileged); "切回本地" is a card audio mode.
+  mobileAudioState: (device: string) => call<T.MobileAudioState | null>('mobile_audio_state', { device }),
+  startMobileAudioEndpoint: (target: T.MobileAudioTarget) => call<null>('start_mobile_audio_endpoint', { target }),
   blockedDevices: () => call<import('./store').BlockedDevicesSnapshot>('blocked_devices'),
   block: (device: string) => call<import('./cards').BlockedDeviceReply>('block', { operation_id: crypto.randomUUID(), device }),
   unblock: (device: string) => call<import('./cards').BlockedDeviceReply>('unblock', { operation_id: crypto.randomUUID(), device }),

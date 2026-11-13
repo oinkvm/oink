@@ -22,17 +22,29 @@ def package_build(sequence, inhouse):
     return encode_build(inhouse_version() if inhouse else IDENTITY['version'].split('-')[0], sequence)
 
 
+def encoded_sequence(version, build):
+    """The sequence n of `build`; rejects a build that does not encode `version`."""
+    encoded, sequence = decode_build(build)
+    if encoded != version:
+        raise ValueError(f'build {build} encodes {encoded}, but this package is {version}')
+    return sequence
+
+
+def inhouse_label(build):
+    """`<inhouse_version>-inhouse.<n>`: the display label of an in-house build (PC and phone)."""
+    version = inhouse_version()
+    return f'{version}-inhouse.{encoded_sequence(version, build)}'
+
+
 def release_version(base, source_commit, build):
     """Display label of a package; rejects a build that does not encode the labelled version."""
     if not re.fullmatch(r'[0-9]+\.[0-9]+\.[0-9]+(?:-beta\.[0-9]+)?', base):
         raise ValueError('packages require a stable or beta.N base version')
     if source_commit is not None:
         validate_source_commit(source_commit)
-    version = base.split('-')[0] if source_commit is None else inhouse_version()
-    encoded, sequence = decode_build(build)
-    if encoded != version:
-        raise ValueError(f'build {build} encodes {encoded}, but this package is {version}')
-    return base if source_commit is None else f'{version}-inhouse.{sequence}'
+        return inhouse_label(build)
+    encoded_sequence(base.split('-')[0], build)
+    return base
 
 
 def local_source_commit(explicit=None, root=ROOT):

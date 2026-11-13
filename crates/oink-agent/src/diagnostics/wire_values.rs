@@ -5,84 +5,84 @@ use oink_foundation::{
     Point, Rect, Size,
     input::{Gesture, GesturePhase, MouseButton, ScrollPhase, ScrollUnit, SwipeAxis},
 };
-use oink_protocol::v1::{
+use oink_protocol::v2::{
     self, RawMap, RawValue, dto as w,
     schema::{EnumSchema, OpenEnvelope, WireDto, WireValue},
 };
 
 pub(super) trait Value {
-    fn wire(&self) -> v1::Result<RawValue>;
+    fn wire(&self) -> v2::Result<RawValue>;
 }
 macro_rules! scalar {
-    ($($t:ty),*) => { $(impl Value for $t { fn wire(&self)->v1::Result<RawValue> { Ok(self.write()) } })* };
+    ($($t:ty),*) => { $(impl Value for $t { fn wire(&self)->v2::Result<RawValue> { Ok(self.write()) } })* };
 }
 scalar!(bool, u8, u16, u32, u64, i32, i64, f32, f64);
 impl Value for usize {
-    fn wire(&self) -> v1::Result<RawValue> {
+    fn wire(&self) -> v2::Result<RawValue> {
         Ok(RawValue::Uint(*self as u64))
     }
 }
 impl Value for String {
-    fn wire(&self) -> v1::Result<RawValue> {
+    fn wire(&self) -> v2::Result<RawValue> {
         Ok(RawValue::Text(self.clone()))
     }
 }
 impl<T: Value> Value for Option<T> {
-    fn wire(&self) -> v1::Result<RawValue> {
+    fn wire(&self) -> v2::Result<RawValue> {
         self.as_ref().map_or(Ok(RawValue::Null), Value::wire)
     }
 }
 impl<T: Value> Value for Vec<T> {
-    fn wire(&self) -> v1::Result<RawValue> {
+    fn wire(&self) -> v2::Result<RawValue> {
         Ok(RawValue::Array(
-            self.iter().map(Value::wire).collect::<v1::Result<_>>()?,
+            self.iter().map(Value::wire).collect::<v2::Result<_>>()?,
         ))
     }
 }
 impl<const N: usize> Value for [u64; N] {
-    fn wire(&self) -> v1::Result<RawValue> {
+    fn wire(&self) -> v2::Result<RawValue> {
         Ok(RawValue::Array(
-            self.iter().map(Value::wire).collect::<v1::Result<_>>()?,
+            self.iter().map(Value::wire).collect::<v2::Result<_>>()?,
         ))
     }
 }
 impl<T: Value> Value for Box<T> {
-    fn wire(&self) -> v1::Result<RawValue> {
+    fn wire(&self) -> v2::Result<RawValue> {
         (**self).wire()
     }
 }
 impl Value for (f64, f64) {
-    fn wire(&self) -> v1::Result<RawValue> {
+    fn wire(&self) -> v2::Result<RawValue> {
         Ok(dto::<w::Point>([("x", self.0.wire()?), ("y", self.1.wire()?)])?.write())
     }
 }
-pub(super) fn dto<T: WireDto>(values: impl IntoIterator<Item = (&'static str, RawValue)>) -> v1::Result<T> {
+pub(super) fn dto<T: WireDto>(values: impl IntoIterator<Item = (&'static str, RawValue)>) -> v2::Result<T> {
     T::from_raw(raw_fields::<T>(values)?)
 }
 // Assemble newly projected children without copying them into intermediate
 // DTOs. The owning top-level DTO recursively validates the entire tree once.
-fn raw_fields<T: WireDto>(values: impl IntoIterator<Item = (&'static str, RawValue)>) -> v1::Result<RawMap> {
+fn raw_fields<T: WireDto>(values: impl IntoIterator<Item = (&'static str, RawValue)>) -> v2::Result<RawMap> {
     let mut raw = RawMap::new();
     for (name, value) in values {
         let field = T::SCHEMA
             .fields
             .iter()
             .find(|f| f.name == name)
-            .ok_or(v1::ErrorCode::UnsupportedValue)?;
+            .ok_or(v2::ErrorCode::UnsupportedValue)?;
         if raw.insert(field.key, value).is_some() {
-            return Err(v1::ErrorCode::MalformedFrame.into());
+            return Err(v2::ErrorCode::MalformedFrame.into());
         }
     }
     Ok(raw)
 }
-fn envelope<K: EnumSchema>(kind: K, body: RawMap) -> v1::Result<RawValue> {
+fn envelope<K: EnumSchema>(kind: K, body: RawMap) -> v2::Result<RawValue> {
     Ok(RawValue::Map(
         OpenEnvelope::<K>::from_raw([(1, kind.write()), (2, RawValue::Map(body))].into())?.into_raw(),
     ))
 }
 macro_rules! structure {
     ($domain:ty=>$wire:ty {$($field:ident),*$(,)?}) => {
-        impl Value for $domain { fn wire(&self)->v1::Result<RawValue> {
+        impl Value for $domain { fn wire(&self)->v2::Result<RawValue> {
             $(let _ = <$wire>::$field;)*
             Ok(RawValue::Map(dto::<$wire>([$((stringify!($field),self.$field.wire()?),)*])?.into_raw()))
         } }
@@ -90,7 +90,7 @@ macro_rules! structure {
 }
 macro_rules! unit {
     ($domain:path=>$wire:path {$($from:ident=>$to:ident),*$(,)?})=>{
-        impl Value for $domain { fn wire(&self)->v1::Result<RawValue> {
+        impl Value for $domain { fn wire(&self)->v2::Result<RawValue> {
             use $domain as D; use $wire as W;
             Ok(match self { $(D::$from=>W::$to,)* }.write())
         } }
@@ -111,7 +111,7 @@ unit!(SwipeAxis=>w::DiagSwipeAxis{Horizontal=>Horizontal,Vertical=>Vertical,Pinc
 unit!(StateKind=>w::DiagStateKind{CaptureMode=>CaptureMode,Injection=>Injection,Layout=>Layout,Permission=>Permission,DisplayPower=>DisplayPower,Clipboard=>Clipboard,Files=>Files,DragDrop=>DragDrop,GameMode=>GameMode,Emergency=>Emergency,QueueLoss=>QueueLoss,HeldSync=>HeldSync,SessionLock=>SessionLock,RecorderTick=>RecorderTick,CapsLock=>CapsLock,SecureInput=>SecureInput});
 unit!(oink_routing::GameMode=>w::GameMode{Auto=>Auto,On=>On,Off=>Off});
 impl Value for MouseButton {
-    fn wire(&self) -> v1::Result<RawValue> {
+    fn wire(&self) -> v2::Result<RawValue> {
         use w::DiagMouseButtonKind as K;
         let (kind, body) = match self {
             Self::Left => (K::Left, RawMap::new()),
@@ -128,7 +128,7 @@ impl Value for MouseButton {
     }
 }
 impl Value for Gesture {
-    fn wire(&self) -> v1::Result<RawValue> {
+    fn wire(&self) -> v2::Result<RawValue> {
         use w::DiagGestureKind as K;
         let (kind, body) = match self {
             Self::DockSwipe {
@@ -160,10 +160,10 @@ impl Value for Gesture {
     }
 }
 impl Value for SafeInput {
-    fn wire(&self) -> v1::Result<RawValue> {
+    fn wire(&self) -> v2::Result<RawValue> {
         use w::DiagSafeInputKind as K;
         let (kind, body) = match self {
-            Self::ContactsOmitted => return Err(v1::ErrorCode::UnsupportedValue.into()),
+            Self::ContactsOmitted => return Err(v2::ErrorCode::UnsupportedValue.into()),
             Self::Motion { dx, dy, raw } => (
                 K::Motion,
                 dto::<w::DiagMotion>([("dx", dx.wire()?), ("dy", dy.wire()?), ("raw", raw.wire()?)])?.into_raw(),
@@ -238,7 +238,7 @@ impl Value for SafeInput {
 
 unit!(oink_foundation::input::SourceKind=>w::DiagSourceKind{Mouse=>Mouse,Touchpad=>Touchpad,Keyboard=>Keyboard,Unknown=>Indeterminate});
 impl Value for oink_foundation::input::InputMode {
-    fn wire(&self) -> v1::Result<RawValue> {
+    fn wire(&self) -> v2::Result<RawValue> {
         use oink_foundation::input::InputMode;
         Ok(match self {
             InputMode::Shared => w::DiagInputMode::Shared,
@@ -270,7 +270,7 @@ unit!(oink_clipboard::provider_preparation::PlaceholderFallback=>w::DiagPlacehol
 unit!(super::ProviderDragPath=>w::DiagProviderDragPath{Provider=>Provider,DegradedPromise=>DegradedPromise,Failed=>Failed});
 unit!(oink_foundation::dnd::NativeHoldEnd=>w::DiagNativeHoldEnd{Resume=>Resume,DraggingExited=>DraggingExited,DraggingEnded=>DraggingEnded,DropAccepted=>DropAccepted,DropRejected=>DropRejected,CancelRepositioned=>CancelRepositioned,HoldRejected=>HoldRejected,HoldUnconfirmed=>HoldUnconfirmed});
 unit!(oink_foundation::dnd::ImageNudgeReason=>w::DiagImageNudgeReason{InitialHide=>InitialHide,ImageUpdate=>ImageUpdate});
-unit!(oink_routing::Os=>w::DiagOs{MacOS=>MacOS,Windows=>Windows,Other=>Other});
+unit!(oink_routing::Os=>w::DiagOs{MacOS=>MacOS,Windows=>Windows,Other=>Other,Android=>Android});
 unit!(oink_routing::router::SourceInput=>w::DiagSourceInput{Motion=>Motion,RawMotion=>RawMotion,Button=>Button,Keyboard=>Keyboard,Scroll=>Scroll,Gesture=>Gesture,Contacts=>Contacts});
 unit!(oink_routing::router::SourceDestination=>w::DiagSourceDestination{Local=>Local,Forwarded=>Forwarded,Consumed=>Consumed});
 structure!(oink_input::warp_delta::DeltaSnapshot=>w::DiagDeltaSnapshot{hid_location,fold,warp,drop_next});
@@ -286,7 +286,7 @@ structure!(super::buttons::Refusal=>w::DiagHeldButtonsRefusal{at_us,epoch,holder
 structure!(super::handoff::HandoffEvent=>w::DiagHandoff{action,peer,holder,epoch,router_instance,screen,at,clip,mode,sequence,success,decision,reason,count,topology_sequence,sender,recipient,origin,next_target,flush_reason,first_sequence,message_identity,scope});
 structure!(oink_routing::control::TrailPoint=>w::DiagTrailPoint{age_secs,pos});
 impl Value for super::handoff::TrailEvent {
-    fn wire(&self) -> v1::Result<RawValue> {
+    fn wire(&self) -> v2::Result<RawValue> {
         Ok(dto::<w::DiagTrail>([
             ("stage", self.stage.wire()?),
             ("topology_sequence", self.topology_sequence.wire()?),
@@ -330,22 +330,22 @@ structure!(oink_foundation::dnd::NativeHoldSummary=>w::DiagNativeHoldSummary{ope
 structure!(oink_routing::router::SourceDecision=>w::DiagSourceRouting{mouse_mode,keyboard_mode,input,destination,swallowed});
 
 impl Value for (String, String) {
-    fn wire(&self) -> v1::Result<RawValue> {
+    fn wire(&self) -> v2::Result<RawValue> {
         Ok(dto::<w::DiagScopeMember>([("device", self.0.wire()?), ("instance", self.1.wire()?)])?.write())
     }
 }
 impl Value for ((f64, f64), Point) {
-    fn wire(&self) -> v1::Result<RawValue> {
+    fn wire(&self) -> v2::Result<RawValue> {
         Ok(dto::<w::DiagFold>([("delta", self.0.wire()?), ("target", self.1.wire()?)])?.write())
     }
 }
 impl Value for (Point, u64) {
-    fn wire(&self) -> v1::Result<RawValue> {
+    fn wire(&self) -> v2::Result<RawValue> {
         Ok(dto::<w::DiagWarp>([("target", self.0.wire()?), ("timestamp_ns", self.1.wire()?)])?.write())
     }
 }
 impl Value for oink_foundation::input::CaptureMode {
-    fn wire(&self) -> v1::Result<RawValue> {
+    fn wire(&self) -> v2::Result<RawValue> {
         use w::DiagCaptureModeKind as K;
         let (kind, body) = match self {
             Self::Local => (K::Local, RawMap::new()),
@@ -372,11 +372,11 @@ unit!(oink_input::native_lifecycle::Kind=>w::LifecycleKind{
     ContactCapture=>ContactCapture,ContactInjection=>ContactInjection,
     MarkerSubmission=>MarkerSubmission,MarkerHookDecision=>MarkerHookDecision,MarkerChainResult=>MarkerChainResult,MarkerReadback=>MarkerReadback,RestoreSafetyReset=>RestoreSafetyReset,MouseKeysCompensation=>MouseKeysCompensation,KeyboardCapture=>KeyboardCapture
 });
-fn named_scalars<T: Value>(values: impl IntoIterator<Item = (String, T)>) -> v1::Result<RawValue> {
+fn named_scalars<T: Value>(values: impl IntoIterator<Item = (String, T)>) -> v2::Result<RawValue> {
     let mut values = values.into_iter().collect::<Vec<_>>();
     values.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
     if values.windows(2).any(|pair| pair[0].0 == pair[1].0) {
-        return Err(v1::ErrorCode::MalformedFrame.into());
+        return Err(v2::ErrorCode::MalformedFrame.into());
     }
     Ok(RawValue::Array(
         values
@@ -384,15 +384,15 @@ fn named_scalars<T: Value>(values: impl IntoIterator<Item = (String, T)>) -> v1:
             .map(|(name, value)| {
                 dto::<w::NamedScalar>([("name", name.wire()?), ("value", value.wire()?)]).map(|v| v.write())
             })
-            .collect::<v1::Result<_>>()?,
+            .collect::<v2::Result<_>>()?,
     ))
 }
-fn body<T: WireDto>(values: impl IntoIterator<Item = (&'static str, RawValue)>) -> v1::Result<RawMap> {
+fn body<T: WireDto>(values: impl IntoIterator<Item = (&'static str, RawValue)>) -> v2::Result<RawMap> {
     Ok(dto::<T>(values)?.into_raw())
 }
 
 impl Value for [u8; 32] {
-    fn wire(&self) -> v1::Result<RawValue> {
+    fn wire(&self) -> v2::Result<RawValue> {
         Ok(RawValue::Bytes(self.to_vec()))
     }
 }
@@ -420,7 +420,7 @@ unit!(super::layout::CompilationStage=>w::CompilationStage{Prepared=>Prepared,Ro
 unit!(super::layout::ChangeKind=>w::ChangeKind{Initialized=>Initialized,GroupChanged=>GroupChanged,Arrangement=>Arrangement,Settings=>Settings,DisplayFacts=>DisplayFacts,Membership=>Membership,Availability=>Availability,CompiledTopology=>CompiledTopology,Applied=>Applied});
 structure!(oink_display::layout::EffectiveSettings=>w::EffectiveSettings{gap_travel,overlap_tolerance,minimum_portal,portal_snap,walls,endpoint_reach});
 impl Value for super::layout::Scalar {
-    fn wire(&self) -> v1::Result<RawValue> {
+    fn wire(&self) -> v2::Result<RawValue> {
         match self {
             Self::Flag(v) => v.wire(),
             Self::Integer(v) => v.wire(),
@@ -429,7 +429,7 @@ impl Value for super::layout::Scalar {
     }
 }
 impl Value for super::layout::OwnerValue {
-    fn wire(&self) -> v1::Result<RawValue> {
+    fn wire(&self) -> v2::Result<RawValue> {
         Ok(dto::<w::DiagOwnerValue>([
             (
                 "scalars",
@@ -442,7 +442,7 @@ impl Value for super::layout::OwnerValue {
     }
 }
 impl Value for super::layout::TopologyScreen {
-    fn wire(&self) -> v1::Result<RawValue> {
+    fn wire(&self) -> v2::Result<RawValue> {
         Ok(dto::<w::DiagTopologyScreen>([
             ("device", self.device.wire()?),
             ("screen", self.screen.wire()?),
@@ -464,7 +464,7 @@ impl Value for super::layout::TopologyScreen {
     }
 }
 impl Value for super::layout::SourceScreen {
-    fn wire(&self) -> v1::Result<RawValue> {
+    fn wire(&self) -> v2::Result<RawValue> {
         Ok(dto::<w::DiagSourceScreen>([
             ("device", self.device.wire()?),
             ("screen", self.screen.wire()?),
@@ -477,7 +477,7 @@ impl Value for super::layout::SourceScreen {
     }
 }
 impl Value for super::layout::SegmentKind {
-    fn wire(&self) -> v1::Result<RawValue> {
+    fn wire(&self) -> v2::Result<RawValue> {
         let (kind, body) = match self {
             Self::Wall => (w::DiagSegmentKind::Wall, RawMap::new()),
             Self::Portal {
@@ -504,7 +504,7 @@ unit!(oink_routing::router::IntegrityOutcome=>w::DiagIntegrityOutcome{Completed=
 unit!(oink_routing::dnd::SourceButtonDisposition=>w::DiagSourceDisposition{OriginalSourceOwns=>OriginalSourceOwns,ReleaseSubmitted=>ReleaseSubmitted,Released=>Released,ReturnedToOriginalRoute=>ReturnedToOriginalRoute,Unconfirmed=>Unconfirmed});
 structure!(oink_routing::DndIntegrity=>w::DiagIntegrity{roles,source_os,input_os,target_os,holder_epoch,native,physical,disposition,route,outcome});
 impl Value for oink_routing::router::NativeObservation {
-    fn wire(&self) -> v1::Result<RawValue> {
+    fn wire(&self) -> v2::Result<RawValue> {
         use w::DiagDndNativeKind as K;
         let (kind, body) = match self {
             Self::Observed => (K::Observed, RawMap::new()),
@@ -526,7 +526,7 @@ impl Value for oink_routing::router::NativeObservation {
         envelope(kind, body)
     }
 }
-fn screen_summaries(layout: &super::layout::CompleteLayout) -> v1::Result<RawValue> {
+fn screen_summaries(layout: &super::layout::CompleteLayout) -> v2::Result<RawValue> {
     Ok(RawValue::Array(
         layout
             .saved
@@ -540,10 +540,10 @@ fn screen_summaries(layout: &super::layout::CompleteLayout) -> v1::Result<RawVal
                 ])
                 .map(|s| s.write())
             })
-            .collect::<v1::Result<_>>()?,
+            .collect::<v2::Result<_>>()?,
     ))
 }
-fn topology_summary(layout: &super::layout::CompleteLayout) -> v1::Result<RawMap> {
+fn topology_summary(layout: &super::layout::CompleteLayout) -> v2::Result<RawMap> {
     body::<w::DiagTopologySummary>([
         ("sequence", layout.sequence.wire()?),
         ("version", layout.version.wire()?),
@@ -553,10 +553,10 @@ fn topology_summary(layout: &super::layout::CompleteLayout) -> v1::Result<RawMap
 }
 impl Event {
     #[cfg(test)]
-    pub(super) fn network(&self, rich: bool) -> v1::Result<w::DiagnosticEvent> {
+    pub(super) fn network(&self, rich: bool) -> v2::Result<w::DiagnosticEvent> {
         w::DiagnosticEvent::from_raw(self.network_raw(rich)?)
     }
-    fn network_raw(&self, rich: bool) -> v1::Result<RawMap> {
+    fn network_raw(&self, rich: bool) -> v2::Result<RawMap> {
         macro_rules! fields {($t:ty,$($name:ident),*$(,)?)=>{body::<$t>([$((stringify!($name),$name.wire()?),)*])?};}
         macro_rules! projected {
             ($kind:literal,$value:expr) => {
@@ -564,7 +564,7 @@ impl Event {
                     $kind,
                     match $value.wire()? {
                         RawValue::Map(fields) => fields,
-                        _ => return Err(v1::ErrorCode::MalformedFrame.into()),
+                        _ => return Err(v2::ErrorCode::MalformedFrame.into()),
                     },
                 )
             };
@@ -803,12 +803,12 @@ impl Event {
     }
 }
 
-pub(super) fn snapshot(value: &Snapshot, rich: bool) -> v1::Result<w::Snapshot> {
+pub(super) fn snapshot(value: &Snapshot, rich: bool) -> v2::Result<w::Snapshot> {
     let layout = value.layout.as_ref();
     let omitted = if rich {
         Vec::new()
     } else {
-        vec![RawValue::from("oink.diagnostics.layout/1")]
+        vec![RawValue::from("oink.diagnostics/2")]
     };
     let excerpt = dto::<w::DiagSnapshotExcerpt>([
         ("configuration_available", value.group_state.is_some().wire()?),
@@ -866,7 +866,7 @@ pub(super) fn snapshot(value: &Snapshot, rich: bool) -> v1::Result<w::Snapshot> 
     }
     dto::<w::Snapshot>(fields)
 }
-pub(super) fn segment(value: &store::Segment, rich: bool) -> v1::Result<w::DiagnosticSegment> {
+pub(super) fn segment(value: &store::Segment, rich: bool) -> v2::Result<w::DiagnosticSegment> {
     let rows = value
         .rows
         .iter()
@@ -879,7 +879,7 @@ pub(super) fn segment(value: &store::Segment, rich: bool) -> v1::Result<w::Diagn
             ])
             .map(RawValue::Map)
         })
-        .collect::<v1::Result<_>>()?;
+        .collect::<v2::Result<_>>()?;
     dto::<w::DiagnosticSegment>([
         ("schema", value.schema.wire()?),
         ("device", value.device.wire()?),

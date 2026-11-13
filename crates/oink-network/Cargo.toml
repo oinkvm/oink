@@ -34,6 +34,7 @@ ed25519-dalek = { version = "2", features = ["rand_core", "pkcs8", "serde"] }
 spake2 = "0.4"
 rand = "0.8"
 sha2 = "0.10"
+blake3 = "1"
 hkdf = "0.12"
 hmac = "0.12"
 zeroize = { version = "1", features = ["derive"] }
@@ -47,7 +48,8 @@ crossbeam-queue = "0.3"
 # 也可用 OINK_MDNS=builtin 切换到它做对比测试。
 mdns-sd = "0.21"
 
-[target.'cfg(target_os = "macos")'.dependencies]
+# iOS: SO_NET_SERVICE_TYPE on the QUIC socket while audio flows (qos::set_service_type).
+[target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
 libc = "0.2"
 
 [dev-dependencies]
@@ -56,7 +58,6 @@ oink-foundation = { workspace = true, features = ["test-storage-retries"] }
 tokio = { workspace = true, features = ["test-util"] }
 oink-audio.workspace = true
 oink-clipboard.workspace = true
-blake3 = "1"
 tracing-subscriber.workspace = true
 tempfile = "3"
 # Socket reservations retain file leases after their owners shut down.

@@ -3,6 +3,8 @@
 // Install: cargo install cargo-about --version 0.9.2 --locked --features cli
 //          cargo install cargo-deny --version 0.20.2 --locked
 //          npm ci
+// Android Gradle graph (after changing app dependencies; the Android build fails while it is stale):
+//          apps/mobile/android/gradlew -p apps/mobile/android :app:oinkLicenseInventory
 // Regenerate: node build-support/generate-licenses.mjs
 // Drift gate: node build-support/generate-licenses.mjs --check
 import { createHash } from 'node:crypto';
@@ -78,26 +80,36 @@ for (const review of reviews) {
     if (hash(readFileSync(join(dirname(p.manifest_path),path))) !== sha) throw Error(`Reviewed source changed: ${p.name}/${path}`);
   }
 }
-const platforms = [['macos-arm64','aarch64-apple-darwin'],['macos-x64','x86_64-apple-darwin'],['windows-x64','x86_64-pc-windows-msvc']];
+// Desktop targets walk every workspace member. The mobile apps ship only the UniFFI library, so
+// their graphs start at oink-mobile-ffi (Android ships the phone and the emulator slice).
+const platforms = [['macos-arm64','aarch64-apple-darwin'],['macos-x64','x86_64-apple-darwin'],['windows-x64','x86_64-pc-windows-msvc'],
+  ['android-arm64','aarch64-linux-android',['oink-mobile-ffi']],['android-x64','x86_64-linux-android',['oink-mobile-ffi']],['ios-arm64','aarch64-apple-ios',['oink-mobile-ffi']]];
+const desktopPlatforms = platforms.filter(([,,roots])=>!roots).map(([platform])=>platform);
+const androidPlatforms = platforms.map(([platform])=>platform).filter(platform=>platform.startsWith('android-'));
+const mobileApps = [['licenses/mobile-android.json',androidPlatforms],['licenses/mobile-ios.json',['ios-arm64']]];
 const reachability = new Map();
-for (const [platform,target] of platforms) {
+for (const [platform,target,roots] of platforms) {
   const m = jsonFromRun(['metadata','--locked','--all-features','--format-version','1','--filter-platform',target]);
   const nodes = new Map(m.resolve.nodes.map(n=>[n.id,n]));
-  const queue = m.workspace_members.map(id=>[id,'runtime']);
+  const names = new Map(m.packages.map(p=>[p.id,p.name]));
+  const starts = roots ? m.workspace_members.filter(id=>roots.includes(names.get(id))) : m.workspace_members;
+  if (roots && starts.length!==roots.length) throw Error(`Mobile Rust root missing from the workspace: ${roots}`);
+  const queue = starts.map(id=>[id,'runtime']);
   const seen = new Set();
   for (let i=0; i<queue.length; ++i) {
     const [id,scope] = queue[i], key = `${id}|${scope}`;
     if (seen.has(key)) continue;
     seen.add(key);
-    const info = reachability.get(id) ?? {scope:new Set(), platforms:new Set()};
+    const info = reachability.get(id) ?? {scope:new Set(), platforms:new Set(), runtime:new Set()};
     info.scope.add(scope); info.platforms.add(platform); reachability.set(id,info);
+    if (scope==='runtime') info.runtime.add(platform);
     for (const dep of nodes.get(id)?.deps ?? []) for (const kind of dep.dep_kinds) {
       const next = kind.kind === 'dev' ? 'test' : kind.kind === 'build' && scope !== 'test' ? 'build' : scope;
       queue.push([dep.pkg,next]);
     }
   }
 }
-console.log('Collecting full Rust license texts (both targets; runtime/build/test)…');
+console.log('Collecting full Rust license texts (desktop and mobile targets; runtime/build/test)…');
 // cargo-about refuses captured stdout under PowerShell to prevent UTF-16
 // corruption. Its explicit output file preserves the same UTF-8 bytes on both
 // build platforms and leaves generated metadata outside the source tree.
@@ -111,6 +123,8 @@ try {
   rmSync(aboutTemp,{recursive:true,force:true});
 }
 const components=[];
+// Platforms on which each component ships in a product (runtime scope), for the mobile 开源许可 data.
+const shippedOn=new Map();
 for (const entry of rust.crates) {
   const p = entry.package;
   if (!p.source) continue;
@@ -129,6 +143,7 @@ for (const entry of rust.crates) {
     repository: httpUrl(p.repository), source:{url:`https://crates.io/api/v1/crates/${p.name}/${p.version}/download`,integrity:`sha256:${rustLock.get(`${p.name}@${p.version}`)}`},
     licenseExpression:entry.license, selectedLicense:selections.join(' AND '), modified:false,
     scope: sorted(reachable?.scope ?? []), platforms:sorted(reachable?.platforms ?? [])},texts));
+  shippedOn.set(`cargo:${p.name}@${p.version}`,sorted(reachable.runtime));
 }
 function httpUrl(value) {
   if (!value) return null;
@@ -202,9 +217,17 @@ for (const [path,locked] of Object.entries(npmLock.packages)) {
     scope:roles,platforms:npmPlatforms(locked)},texts));
 }
 components.push(...npmComponents.values());
+console.log('Checking Android Gradle runtime graph (licenses/android-runtime.json)…');
+// Written by `:app:oinkLicenseInventory` from releaseRuntimeClasspath; the Android build fails
+// when it is stale, so a new Gradle dependency always arrives here before it can ship.
+const { mavenComponents } = await import('./maven-licenses.mjs');
+for (const m of mavenComponents(json('licenses/android-runtime.json'),json('licenses/maven-licenses.json'),allowed,p=>readFileSync(p))) {
+  components.push(base({id:m.id,name:m.name,version:m.version,ecosystem:'maven',repository:m.repositoryUrls.map(httpUrl).find(Boolean) ?? null,
+    source:m.source,licenseExpression:m.licenseExpression,selectedLicense:m.selectedLicense,modified:false,scope:['runtime'],platforms:androidPlatforms},sorted(m.texts)));
+}
 function npmPlatforms(p) {
   const matches=(list,value)=>!list || (!list.includes(`!${value}`) && (!list.some(x=>!x.startsWith('!')) || list.includes(value)));
-  return platforms.map(([platform])=>platform).filter(platform=>matches(p.os,platform.startsWith('macos-')?'darwin':'win32') && matches(p.cpu,platform==='macos-arm64'?'arm64':'x64'));
+  return desktopPlatforms.filter(platform=>matches(p.os,platform.startsWith('macos-')?'darwin':'win32') && matches(p.cpu,platform==='macos-arm64'?'arm64':'x64'));
 }
 const native=json('licenses/native-inventory.json');
 for (const c of native.components) {
@@ -243,10 +266,18 @@ for (const c of native.components) {
 }
 for (const asset of native.assets) {
   if (hash(readFileSync(asset.path))!==asset.sha256) throw Error(`Asset inventory hash changed: ${asset.path}`);
-  select(asset.licenseExpression);
+  // Exact reviewed artwork; CC-BY-3.0 stays outside the general allow list.
+  if (asset.id==='asset:android-robot-head@2026-11-08' && asset.licenseExpression==='CC-BY-3.0' && asset.compatibilityReview) {
+    if (asset.sha256!=='b36cb6f703556a27526fc336ae4d8705844c87c1e5e8aaf360b49aa08d19f065') throw Error('Android robot head review pin changed');
+  } else select(asset.licenseExpression);
   for (const f of asset.licenseFiles) if (hash(readFileSync(f.path))!==f.sha256) throw Error(`Asset license text changed: ${f.path}`);
+  // The same artwork compiled into the mobile apps (their own icon data / asset catalogue).
+  for (const copy of asset.copies ?? []) {
+    if (hash(readFileSync(copy.path))!==copy.sha256) throw Error(`Asset copy hash changed: ${copy.path}`);
+    if (!copy.platforms.every(p=>asset.platforms.includes(p))) throw Error(`Asset copy platform not listed: ${asset.id}`);
+  }
   if (asset.ownership === 'first-party') continue;
-  const {path,sha256,ownership,...component}=asset;
+  const {path,sha256,ownership,compatibilityReview,copies,...component}=asset;
   components.push(base({...component,ecosystem:'asset'},asset.licenseFiles.map(f=>read(f.path))));
 }
 function scanSourceAssets(dir) {
@@ -259,12 +290,12 @@ function scanSourceAssets(dir) {
 }
 for (const dir of ['apps/oink/src','apps/oink/public','apps/oink/src-tauri/icons','crates/oink-agent/src/tray','packaging/macos','packaging/windows']) scanSourceAssets(dir);
 components.sort((a,b)=>cmp(a.id,b.id));
-const inventory={schemaVersion:1,product:'Oink',tools:{cargoAbout:'0.9.2',npmScanner:'lockfile-v1',spdxExpressionParse:'5.0.0'},components};
+const inventory={schemaVersion:1,product:'Oink',tools:{cargoAbout:'0.9.2',npmScanner:'lockfile-v1',gradleScanner:'releaseRuntimeClasspath-v1',spdxExpressionParse:'5.0.0'},components};
 outputs.set('third-party-licenses.json',Buffer.from(JSON.stringify(inventory,null,2)+'\n'));
 const lines=['# Third-party licenses','','Generated by `node build-support/generate-licenses.mjs`; do not edit generated files.','',
-  'This inventory audits runtime, build and test dependencies for both product targets. Graph reachability does not assert every package is present in an installer.',
+  'This inventory audits runtime, build and test dependencies for the desktop products and the Android/iOS apps. Graph reachability does not assert every package is present in an installer.',
   'The original SPDX expression and selected branch are recorded separately. Upstream copyrights, notices and patent declarations are preserved in the linked texts.',
-  'Reviewed Rust MPL-covered source remains available under MPL-2.0 and, when combined with Oink, additionally under GPL-3.0-only pursuant to MPL §3.3. Standalone build tools retain their own licenses. Exact covered sources are linked below; distribute them with release source materials.',
+  'Rust MPL-covered source remains available under MPL-2.0 and, when combined with Oink, additionally under GPL-3.0-only pursuant to MPL §3.3. Standalone build tools retain their own licenses. Exact covered sources are linked below; distribute them with release source materials.',
   'WiX firewall custom actions and installer UI are separate MS-RL installer files; their pinned upstream source must accompany release source materials. The WiX CLI itself is a build tool.',
   '','| Component | Selected license | Roles | Platforms | Full texts |','| --- | --- | --- | --- | --- |'];
 const escape=s=>s.replaceAll('|','\\|').replaceAll('\n',' ');
@@ -274,13 +305,24 @@ const notice=['Oink — Oink Is Not only a KVM','Project: https://github.com/oin
   'Oink original material is licensed GPL-3.0-only. See LICENSE and LICENSE-ADDITIONAL-TERMS.md.',
   'This license does not replace the licenses of third-party components.',
   'Matching Oink source and lockfiles accompany each GitHub Release. Exact dependency sources are linked in third-party-licenses.json.',
-  'Reviewed Rust MPL-covered sources are available under MPL-2.0 and additionally GPL-3.0-only in this combined work under MPL section 3.3; their notices remain intact. Standalone build tools retain their own licenses.',
+  'Rust MPL-covered sources are available under MPL-2.0 and additionally GPL-3.0-only in this combined work under MPL section 3.3; their notices remain intact. Standalone build tools retain their own licenses.',
   'WiX firewall custom actions and installer UI remain separate MS-RL installer files. Their corresponding source is at the pinned upstream commit linked in the inventory; provide it with release source materials.',
   'See THIRD_PARTY_LICENSES.md and licenses/ for the complete upstream terms, notices and patent declarations.',''];
 for (const c of components) {
   notice.push(`${c.name} ${c.version} (${c.selectedLicense})`,...c.copyright,...c.licenseFiles.map(f=>`Full terms: ${f.path}`),'');
 }
 outputs.set('NOTICE',Buffer.from(notice.join('\n')+'\n'));
+// The mobile apps' 开源许可 pages: everything the app ships (runtime scope on its platforms), with
+// the full texts by hash. The Android build packages the referenced licenses/texts as assets; iOS
+// bundles licenses/texts.
+for (const [path,appPlatforms] of mobileApps) {
+  const shipped=components.filter(c=>(shippedOn.get(c.id) ?? (c.scope.includes('runtime') ? c.platforms : [])).some(p=>appPlatforms.includes(p)));
+  const entries=shipped.map(c=>({id:c.id,name:c.name,version:c.version,license:c.selectedLicense,
+    notices:[...(c.ecosystem==='asset' ? c.copyright : []),...(c.modificationNotice ? [c.modificationNotice] : [])],
+    texts:c.licenseFiles.map(f=>f.sha256)}));
+  entries.sort((a,b)=>cmp(a.name.toLowerCase(),b.name.toLowerCase()) || cmp(a.id,b.id));
+  outputs.set(path,Buffer.from(JSON.stringify({schemaVersion:1,platforms:appPlatforms,components:entries},null,2)+'\n'));
+}
 const previous = existsSync('licenses/generated-files.json') ? json('licenses/generated-files.json') : [];
 outputs.set('licenses/generated-files.json',Buffer.from(JSON.stringify([...outputs.keys()].sort(cmp),null,2)+'\n'));
 let changed=false;

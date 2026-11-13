@@ -6,8 +6,6 @@ use oink_foundation::Point;
 use oink_foundation::input::FeelProfile;
 use serde::{Deserialize, Serialize};
 
-pub const WINDOWS_LOCK_CAPABILITY: &str = "oink.input.lock-remote-windows/1";
-
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WindowsLockRequest {
     pub source: oink_foundation::session::Boot,
@@ -48,6 +46,31 @@ pub struct EntryProtection {
 /// Input effects carried by the current Input stream.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum ControlMsg {
+    /// Focus holder -> text source: the text with `seq` was not injected.
+    TextRefused {
+        seq: u64,
+        reason: TextRefusal,
+    },
+    /// Focus holder -> phone sources (protocol §14.7): the holder's text-input
+    /// focus. `seq` increases once per keyboard focus into an editable element,
+    /// `editable` / `secure` describe the focused element now (secure: a
+    /// password field), `revision` increases on every change of these, `epoch`
+    /// is the sender's focus epoch. Never the element's text.
+    TextFocus {
+        epoch: u64,
+        seq: u64,
+        editable: bool,
+        secure: bool,
+        revision: u64,
+    },
+    /// Focus holder -> the source of its pointer-unit motion: the pointer is
+    /// blocked by an edge, or about to cross to `target` (protocol §14.4).
+    EdgeReport {
+        epoch: u64,
+        state: EdgeState,
+        edge: EdgeSide,
+        target: Option<DeviceId>,
+    },
     LocalClick {
         epoch: u64,
         holder: DeviceId,
@@ -76,6 +99,8 @@ pub enum ControlMsg {
     UnlockReply {
         epoch: u64,
         unlocked: bool,
+        /// The source is paused: a definitive refusal, sent at once.
+        paused: bool,
     },
     /// The sender's user just unlocked it. Only a hint: the receiver challenges
     /// the sender with UnlockQuery on the same session before acting.
@@ -233,4 +258,41 @@ pub enum GameMode {
     Auto,
     On,
     Off,
+}
+
+/// Edge state reported to a screenless source (protocol §14.4).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum EdgeState {
+    Clear,
+    Blocked,
+    Approaching,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum EdgeSide {
+    Left,
+    Right,
+    Top,
+    Bottom,
+}
+
+/// A focus holder's text-input focus as a phone acts on it (protocol §14.7).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct TextFocusState {
+    /// Input-focus episode: increases once per keyboard focus into an editable element.
+    pub seq: u64,
+    /// An editable text element has keyboard focus.
+    pub editable: bool,
+    /// That element is a password field.
+    pub secure: bool,
+}
+
+/// Why a focus holder did not inject committed text (protocol §12.1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum TextRefusal {
+    Paused,
+    NotJoined,
+    Duplicate,
+    /// This target has no text injection (the Android helper).
+    Unsupported,
 }

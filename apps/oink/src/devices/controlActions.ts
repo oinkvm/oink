@@ -16,7 +16,7 @@ export interface ControlObservation {
   volumeReadiness?:'ready'|'wait'|'drop';
   /** This command must finish a prerequisite before applying the final target. */
   intermediate?:boolean;
-  /** Microphone claim revisions can arrive before the resolved mode projection. */
+  /** Microphone route versions can arrive before the resolved mode projection. */
   microphoneMode?:'source'|'receiver'|'muted';
 }
 export interface ControlActionDeps {
@@ -100,9 +100,9 @@ export class ControlActions {
         const result=flight.result;
         const refused=result.outcome==='failed'||result.outcome==='refused';
         const fresh=now.token!==flight.before.token;
-        // A published claim revision is not a completed microphone transition:
-        // the audio owner's resolved mode can still lag behind that revision.
-        // Advancing here can release an already-released source again (NotExit).
+        // A new route token is not a completed microphone transition: the audio
+        // owner's resolved mode can still lag behind that route version.
+        // Advancing here could release an already-released source again.
         const transitioned=fresh&&(flight.before.microphoneMode===undefined||now.microphoneMode!==flight.before.microphoneMode);
         if(refused) {
           // Concurrent resources/external changes can spend a token. Rebase the

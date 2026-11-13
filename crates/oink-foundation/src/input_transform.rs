@@ -52,13 +52,13 @@ impl KeyboardMapping {
     pub fn preset(preset: KeyPreset, source_os: &str, target_os: &str) -> Self {
         use KeyCode as K;
         let pairs: &[(KeyCode, KeyCode)] = match (preset, source_os, target_os) {
-            (KeyPreset::MacFeel, "macos", "windows") | (KeyPreset::MacFeel, "windows", "macos") => &[
+            (KeyPreset::MacFeel, "macos", "windows" | "android") | (KeyPreset::MacFeel, "windows", "macos") => &[
                 (K::LEFT_CTRL, K::LEFT_GUI),
                 (K::LEFT_GUI, K::LEFT_CTRL),
                 (K::RIGHT_CTRL, K::RIGHT_GUI),
                 (K::RIGHT_GUI, K::RIGHT_CTRL),
             ],
-            (KeyPreset::WinFeel, "macos", "windows") | (KeyPreset::WinFeel, "windows", "macos") => &[
+            (KeyPreset::WinFeel, "macos", "windows" | "android") | (KeyPreset::WinFeel, "windows", "macos") => &[
                 (K::LEFT_ALT, K::LEFT_GUI),
                 (K::LEFT_GUI, K::LEFT_ALT),
                 (K::RIGHT_ALT, K::RIGHT_GUI),
@@ -153,6 +153,9 @@ pub struct TargetOverride {
 pub struct InputTransform {
     pub macos: TargetTransform,
     pub windows: TargetTransform,
+    /// Absent means the source OS default; Some preserves an explicit choice.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub android: Option<TargetTransform>,
     pub overrides: Vec<TargetOverride>,
 }
 impl InputTransform {
@@ -160,9 +163,31 @@ impl InputTransform {
         let mut value = Self::default();
         if source_os == "macos" {
             value.windows.keyboard = KeyboardMapping::preset(KeyPreset::MacFeel, source_os, "windows");
+            value.android = Some(TargetTransform {
+                keyboard: KeyboardMapping::preset(KeyPreset::MacFeel, source_os, "android"),
+                ..Default::default()
+            });
         }
         if source_os == "windows" {
             value.macos.keyboard = KeyboardMapping::preset(KeyPreset::MacFeel, source_os, "macos");
+        }
+        value
+    }
+    /// Resolve omitted source preferences without rewriting an explicit None / Custom row.
+    pub fn resolve_for_source(&self, target: DeviceId, source_os: &str, target_os: &str) -> TargetTransform {
+        let mut value = self.resolve(target, target_os);
+        if source_os == "macos"
+            && target_os == "android"
+            && self.android.is_none()
+            && !self
+                .overrides
+                .iter()
+                .any(|o| o.target == target && o.keyboard.is_some())
+        {
+            // Android reserves Meta+Enter for HOME (PhoneWindowManager, API 34/35).
+            // Mac application shortcuts use Command, Android applications use Ctrl.
+            // Resolve at the target too: an existing source item may omit this row.
+            value.keyboard = KeyboardMapping::preset(KeyPreset::MacFeel, source_os, target_os);
         }
         value
     }
@@ -170,6 +195,7 @@ impl InputTransform {
         let mut value = match target_os {
             "macos" => self.macos.clone(),
             "windows" => self.windows.clone(),
+            "android" => self.android.clone().unwrap_or_default(),
             _ => TargetTransform::default(),
         };
         if let Some(o) = self.overrides.iter().find(|o| o.target == target) {
@@ -185,6 +211,9 @@ impl InputTransform {
     pub fn validate(&self) -> Result<(), String> {
         self.macos.keyboard.validate()?;
         self.windows.keyboard.validate()?;
+        if let Some(android) = &self.android {
+            android.keyboard.validate()?;
+        }
         if self.overrides.len() > 16 {
             return Err("目标设备覆盖最多 16 项".into());
         }

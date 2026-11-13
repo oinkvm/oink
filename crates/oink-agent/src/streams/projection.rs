@@ -14,7 +14,7 @@ use oink_network::link::{
 };
 use oink_protocol::{
     frame::{StreamCode, StreamKind},
-    v1::{
+    v2::{
         self, Message,
         schema::{WireDto, WireValue},
     },
@@ -86,9 +86,7 @@ impl ProjectionStreams {
     }
 
     fn supported(&self, peer: DeviceId) -> bool {
-        self.config
-            .peer_agreement(peer)
-            .is_some_and(|agreement| agreement.contains("oink.layout.projection/1"))
+        self.config.peer_opens(peer, StreamKind::Projection)
     }
 
     fn advance(&mut self, peer: DeviceId, now: Instant) {
@@ -144,16 +142,11 @@ impl ProjectionStreams {
     }
 
     fn post(&mut self, peer: DeviceId, message: &Message, now: Instant) -> Result<(), PostError> {
-        if !Self::valid(message)
-            || matches!(message, Message::ArrangementPreview(_))
-                && !self
-                    .config
-                    .peer_agreement(peer)
-                    .is_some_and(|a| a.contains("oink.layout.preview/1"))
-        {
+        // The send gate refuses a preview this link did not negotiate.
+        if !Self::valid(message) {
             return Err(PostError::TooLarge);
         }
-        let bytes = v1::frame::encode(message, v1::limits::RELIABLE_FRAME).map_err(|_| PostError::TooLarge)?;
+        let bytes = v2::frame::encode(message, v2::limits::RELIABLE_FRAME).map_err(|_| PostError::TooLarge)?;
         let state = self.peers.get_mut(&peer).ok_or(PostError::Closed)?;
         let result = state.tx.as_ref().ok_or(PostError::Closed)?.post(bytes);
         let failure = match result {
@@ -207,7 +200,11 @@ impl ProjectionStreams {
                 // Cleanup must be final: a preceding buffered message cannot restore
                 // the receive state after this same stream was rejected.
                 delivered.retain(|(source, _)| *source != peer);
-                self.links.close_stream(stream, code);
+                // Through the handle, which `stream_closed` then drops: a
+                // `close_stream` command can lose its code to that drop.
+                if let Some(rx) = state.rx.as_ref().filter(|rx| rx.id() == stream) {
+                    rx.close_with(code);
+                }
                 self.stream_closed(stream, StreamClosed::Local);
             }
         }
@@ -373,7 +370,7 @@ fn remaining_opening(message: &Message, elapsed: Duration) -> Option<Message> {
     let mut raw = preview.raw().clone();
     raw.insert(3, remaining.write());
     Some(Message::ArrangementPreview(
-        v1::dto::ArrangementPreview::from_raw(raw).ok()?,
+        v2::dto::ArrangementPreview::from_raw(raw).ok()?,
     ))
 }
 
@@ -385,7 +382,7 @@ mod lease_tests {
     fn cached_reopen_seed_ages_monotonically_but_clear_keeps_its_fence() {
         let snapshot =
             crate::layout_profiles::render::capture(&oink_display::layout::Layout::default(), &Default::default());
-        let mut raw: v1::RawMap = [
+        let mut raw: v2::RawMap = [
             (1, true.write()),
             (2, 7u64.write()),
             (3, 2000u32.write()),
@@ -393,7 +390,7 @@ mod lease_tests {
             (5, crate::layout_profiles::wire::snapshot(&snapshot).unwrap()),
         ]
         .into();
-        let frame = Message::ArrangementPreview(v1::dto::ArrangementPreview::from_raw(raw.clone()).unwrap());
+        let frame = Message::ArrangementPreview(v2::dto::ArrangementPreview::from_raw(raw.clone()).unwrap());
         let Some(Message::ArrangementPreview(remaining)) = remaining_opening(&frame, Duration::from_millis(1900))
         else {
             panic!("live seed missing");
@@ -407,7 +404,7 @@ mod lease_tests {
         );
         assert!(remaining_opening(&frame, Duration::from_millis(2000)).is_none());
         raw.remove(&5);
-        let clear = Message::ArrangementPreview(v1::dto::ArrangementPreview::from_raw(raw).unwrap());
+        let clear = Message::ArrangementPreview(v2::dto::ArrangementPreview::from_raw(raw).unwrap());
         assert!(remaining_opening(&clear, Duration::from_secs(60)).is_some());
     }
 }

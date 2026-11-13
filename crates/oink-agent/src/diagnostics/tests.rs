@@ -44,6 +44,7 @@ fn heartbeat_samples_export_measurement_age_and_share_the_link_capture_stamp() {
             udp_bytes_received: 100,
             low_available: true,
             low_failure: None,
+            route: None,
         }],
     };
     recorder.sample_links(&table);
@@ -205,7 +206,7 @@ async fn layout_changes_and_export_scenario() {
     config
         .edit_layout(
             Box::new(|layout| layout.screens[0].translate(23., 7.)),
-            oink_protocol::v1::dto::LayoutSource::Manual,
+            oink_protocol::v2::dto::LayoutSource::Manual,
         )
         .unwrap();
     let saving = recorder.clone();
@@ -306,8 +307,8 @@ fn build_identity_does_not_relabel_recovered_segments_or_missing_members() {
     r.shutdown();
 }
 
-pub(super) fn wire_version(counter: u64) -> oink_protocol::v1::dto::ConfigVersion {
-    use oink_protocol::v1::{
+pub(super) fn wire_version(counter: u64) -> oink_protocol::v2::dto::ConfigVersion {
+    use oink_protocol::v2::{
         RawValue as V, dto,
         schema::{WireDto, WireValue},
     };
@@ -610,6 +611,17 @@ fn rolling_size_and_duplicate_replay_are_bounded() {
     assert_eq!(s.segments.len(), 1);
 }
 #[test]
+fn broken_mobile_proxy_directory_does_not_stop_the_recorder() {
+    let temp = tempfile::tempdir().unwrap();
+    // A file where the proxy directory belongs: every proxy I/O fails. Only
+    // the proxy may be off; the recorder (and with it sharing) must start.
+    std::fs::write(temp.path().join("mobile-proxy"), b"not a directory").unwrap();
+    let recorder = isolated(temp.path().into(), DeviceId([3; 32]), Some(GroupId([4; 16])), true)
+        .expect("recorder starts while the mobile proxy directory is broken");
+    recorder.wait_recovery();
+    recorder.shutdown();
+}
+#[test]
 fn expansion_limit_rejects_compression_bombs() {
     use std::io::Write;
     let mut encoder = flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::fast());
@@ -884,6 +896,76 @@ fn audio_permission_query_duration_is_retained_without_permission_detail_text() 
         ])
     );
     assert!(!serde_json::to_string(&rows).unwrap().contains("private-error"));
+}
+
+/// The AEC summary (`oink_echo`) is in the bundle with its typed names and
+/// numbers; the platform's text of a reference failure stays local.
+#[test]
+fn echo_cancellation_summary_reaches_the_bundle_without_platform_text() {
+    use tracing_subscriber::layer::SubscriberExt;
+    let temp = tempfile::tempdir().unwrap();
+    let recorder = isolated(temp.path().into(), DeviceId([86; 32]), None, true).unwrap();
+    recorder.wait_recovery();
+    let subscriber = tracing_subscriber::registry().with(trace::scoped(&recorder));
+    tracing::subscriber::with_default(subscriber, || {
+        let summary = oink_audio::echo::Summary {
+            state: oink_audio::echo::State::Active,
+            window_ms: 2000,
+            blocks: 200,
+            processed_blocks: 198,
+            bypass_blocks: 2,
+            render_active_blocks: 150,
+            active_capture_energy: 100.0,
+            active_output_energy: 1.0,
+            internal_delay_ms: Some(12),
+            aec3_erle_db: Some(18.5),
+            engines_built: 1,
+            ..Default::default()
+        };
+        oink_audio::echo::SummaryLog::new()
+            .record(summary, std::time::Instant::now())
+            .emit();
+        tracing::info!(target: oink_audio::echo::LOG_TARGET, event = "aec_reference",
+            reference_source = "oink", system_status = "permission-denied",
+            detail = ?Some("private-platform-text"), "echo cancellation reference");
+    });
+    let bundle = recorder.save(Reason::Manual).unwrap();
+    let rows = timeline(&bundle.path, "merged.ndjson");
+    recorder.shutdown();
+    let logs: Vec<_> = rows.iter().filter_map(|row| row["event"].get("Log")).collect();
+    assert_eq!(logs.len(), 3, "aec, aec_timing and aec_reference");
+    let labelled = |event: &str| {
+        logs.iter()
+            .find(|log| {
+                log["labels"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&serde_json::json!(["event", event]))
+            })
+            .unwrap_or_else(|| panic!("{event}"))
+    };
+    let summary = labelled("aec");
+    let labels = summary["labels"].as_array().unwrap();
+    assert!(labels.contains(&serde_json::json!(["state", "active"])));
+    assert!(labels.contains(&serde_json::json!(["reason", "none"])));
+    let fields = summary["fields"].as_array().unwrap();
+    for (name, value) in [
+        ("engaged", 1.0),
+        ("bypass_blocks", 2.0),
+        ("attenuation_db", 20.0),
+        ("aec3_erle_db", 18.5),
+        ("aec3_delay_ms", 12.0),
+        ("engines_built", 1.0),
+    ] {
+        assert!(
+            fields.iter().any(|f| f[0] == name && f[1].as_f64() == Some(value)),
+            "{name}"
+        );
+    }
+    assert!(labelled("aec_timing")["fields"].as_array().unwrap().len() > 10);
+    let reference = labelled("aec_reference")["labels"].as_array().unwrap();
+    assert!(reference.contains(&serde_json::json!(["system_status", "permission-denied"])));
+    assert!(!serde_json::to_string(&rows).unwrap().contains("private-platform-text"));
 }
 
 #[test]
@@ -3126,7 +3208,7 @@ async fn diagnostic_preference_commit_precedes_apply_and_failed_marker_can_be_re
 
 #[test]
 fn baseline_collection_omits_rich_layout_and_keeps_typed_availability() {
-    use oink_protocol::v1::{dto as w, schema::WireDto};
+    use oink_protocol::v2::{dto as w, schema::WireDto};
     let layout = empty_layout_for_export(1);
     let snapshot = Snapshot {
         group_state: Some("{}".into()),
@@ -3139,7 +3221,7 @@ fn baseline_collection_omits_rich_layout_and_keeps_typed_availability() {
     assert!(baseline.group_state().unwrap().layout_available().unwrap());
     assert_eq!(
         baseline.group_state().unwrap().omitted_details().unwrap().0[0].0,
-        "oink.diagnostics.layout/1"
+        "oink.diagnostics/2"
     );
     assert!(
         super::wire_values::snapshot(&snapshot, true)
@@ -3187,7 +3269,7 @@ fn baseline_collection_omits_rich_layout_and_keeps_typed_availability() {
             segment.rows[0].event.network(rich).unwrap()
         );
         assert_eq!(projected.snapshot().unwrap().layout().unwrap().is_some(), rich);
-        let bytes = projected.encode(oink_protocol::v1::limits::DIAGNOSTIC_SEGMENT).unwrap();
+        let bytes = projected.encode(oink_protocol::v2::limits::DIAGNOSTIC_SEGMENT).unwrap();
         assert_eq!(w::DiagnosticSegment::decode(&bytes, bytes.len()).unwrap(), projected);
     }
     segment.rows[0].event = Event::State {
@@ -3327,7 +3409,7 @@ fn ordinary_segment_publication_batches_two_seconds_without_changing_retention_o
 
 #[test]
 fn modifier_hook_evidence_preserves_counters_and_unknown_held_state_on_wire() {
-    use oink_protocol::v1::{dto as w, schema::WireDto};
+    use oink_protocol::v2::{dto as w, schema::WireDto};
     for held in [None, Some(8)] {
         let event = Event::NativeInputLifecycle {
             at_us: 123,
@@ -3363,7 +3445,7 @@ fn modifier_hook_evidence_preserves_counters_and_unknown_held_state_on_wire() {
 
 #[test]
 fn modifier_duration_and_boundary_sample_survive_wire_projection() {
-    use oink_protocol::v1::{dto as w, schema::WireDto};
+    use oink_protocol::v2::{dto as w, schema::WireDto};
     for (reason, steps, flags, success) in [
         (11, Some(1_500_000), 0, None),
         (12, None, 8, Some(false)),

@@ -6,6 +6,7 @@
 //! A queue hands messages between two threads, reports "full" at once, and holds
 //! messages during a cut-over. It guarantees no delivery: closing a stream discards what
 //! is queued and in flight.
+use super::gate::Gate;
 use super::queue::{DatagramQueue, Queue};
 use super::types::{Closed, LinkId, PostError, QueueSpec, StreamId};
 use oink_foundation::DeviceId;
@@ -23,6 +24,7 @@ pub type Wake = Arc<dyn Fn() + Send + Sync>;
 pub struct SendStream {
     pub(super) id: StreamId,
     pub(super) queue: Arc<Queue>,
+    pub(super) gate: Arc<Gate>,
 }
 
 impl SendStream {
@@ -32,10 +34,21 @@ impl SendStream {
     pub fn cancel(&self) {
         self.queue.cancel();
     }
+    /// Close with `code`, which the peer receives. Use this instead of
+    /// `close_stream` followed by dropping the handle: the network owner can see
+    /// the dropped queue before that command and would close with `None`.
+    pub fn close_with(&self, code: StreamCode) {
+        self.queue.close_with(code);
+    }
     /// Whether closure intentionally retired the session. A realtime producer
     /// can observe `PostError::Closed` before the module receives StreamClosed.
     pub fn is_cancelled(&self) -> bool {
         self.queue.close_code() == StreamCode::Cancelled
+    }
+    /// The code published on this handle's queue when it was closed with one
+    /// (`close_with`, `cancel`, or the peer's `Cancelled`); `None` otherwise.
+    pub fn close_code(&self) -> StreamCode {
+        self.queue.close_code()
     }
     /// Includes a reliable writer's pending frame until QUIC accepts it.
     pub fn oldest_pending(&self) -> Option<std::time::Instant> {
@@ -62,12 +75,34 @@ impl SendStream {
         messages: Vec<Vec<u8>>,
         observer: Option<Wake>,
     ) -> Result<(), PostError> {
+        for message in &messages {
+            self.admits(message)?;
+        }
         self.queue
             .set_heartbeat(messages, self.id.tag.kind.max_message(), observer)
     }
+    /// Whether the send gate lets this encoded frame leave on this stream now
+    /// (protocol-v2 1.1): `Unnegotiated` or, while this device is paused and
+    /// the message is `Suspend`, `Paused`. An owner that queues frames before
+    /// posting asks here so the refusal reaches the caller of that send.
+    pub fn admits(&self, encoded: &[u8]) -> Result<(), PostError> {
+        self.gate.check(encoded).map_err(|refusal| match refusal {
+            super::gate::Refusal::Unnegotiated => PostError::Unnegotiated,
+            super::gate::Refusal::Paused => PostError::Paused,
+        })
+    }
     /// Queue one encoded `Message` and wake the network thread. Returns at once.
     /// During a cut-over messages stay queued; `Full` is reported as usual.
+    /// The send gate refuses a frame this link cannot carry (`Unnegotiated`).
     pub fn post(&self, encoded: impl Into<Vec<u8>>) -> Result<(), PostError> {
+        let encoded = encoded.into();
+        self.admits(&encoded)?;
+        self.queue.post(encoded, self.id.tag.kind.max_message())
+    }
+    /// Test only: post past the send gate, as a peer that ignores its own
+    /// gate would, so the receiving end's checks can be exercised.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn post_ungated(&self, encoded: impl Into<Vec<u8>>) -> Result<(), PostError> {
         self.queue.post(encoded.into(), self.id.tag.kind.max_message())
     }
 }
@@ -86,6 +121,10 @@ impl RecvStream {
     /// Publishes the cause before closing the queue; safe on the input thread.
     pub fn cancel(&self) {
         self.queue.cancel();
+    }
+    /// Close with `code`, which the peer receives (see `SendStream::close_with`).
+    pub fn close_with(&self, code: StreamCode) {
+        self.queue.close_with(code);
     }
     /// Includes a reliable writer's pending frame until QUIC accepts it.
     pub fn oldest_pending(&self) -> Option<std::time::Instant> {
@@ -145,6 +184,12 @@ pub enum DatagramError {
     TooLarge,
     #[error("stream closed")]
     Closed,
+    /// The send gate refused the frame (see `PostError::Unnegotiated`).
+    #[error("datagram not negotiated on this flow")]
+    Unnegotiated,
+    /// This device's sharing is paused and the message is `Suspend`.
+    #[error("sharing is paused")]
+    Paused,
 }
 
 /// Writer end of the datagram flow that follows a reliable stream; closed with it.
@@ -167,6 +212,7 @@ pub struct DatagramSend {
     pub(super) _owner: Arc<DatagramOwner>,
     pub(super) queue: Arc<DatagramQueue>,
     pub(super) parent: Option<Arc<Queue>>,
+    pub(super) gate: Arc<Gate>,
 }
 
 impl DatagramSend {
@@ -187,6 +233,11 @@ impl DatagramSend {
         let encoded = encoded.as_ref();
         if self.queue.is_closed() || self.parent.as_ref().is_some_and(|q| q.is_closed()) {
             return Err(DatagramError::Closed);
+        }
+        match self.gate.check(encoded) {
+            Ok(()) => {}
+            Err(super::gate::Refusal::Unnegotiated) => return Err(DatagramError::Unnegotiated),
+            Err(super::gate::Refusal::Paused) => return Err(DatagramError::Paused),
         }
         if encoded.len() + self.queue.datagram_prefix.load(Ordering::Acquire) > oink_protocol::frame::MAX_DATAGRAM {
             self.queue.dropped.fetch_add(1, Ordering::Relaxed);
@@ -245,7 +296,7 @@ impl DatagramRecv {
             return Err(Closed);
         }
         if self.partition.is_some() {
-            let mut bytes = [0; oink_protocol::v1::limits::DATAGRAM];
+            let mut bytes = [0; oink_protocol::v2::limits::DATAGRAM];
             return self
                 .take_timed_into(&mut bytes)
                 .map_err(|_| Closed)

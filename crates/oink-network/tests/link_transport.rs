@@ -4,13 +4,13 @@ use oink_network::negotiation as oink_network_profile;
 use oink_network::{identity::Identity, link::*};
 use oink_protocol::{
     frame::{Priority, StreamCode, StreamKind, StreamTag},
-    v1::{
+    v2::{
         self, Message, RawValue, dto,
         schema::{WireDto, WireValue},
     },
 };
 use std::{sync::Arc, time::Duration};
-use tokio::time::timeout;
+use tokio::time::{sleep, timeout};
 #[path = "support/frames.rs"]
 mod frames;
 
@@ -96,7 +96,7 @@ impl Node {
     async fn ready(&mut self, link: LinkId) {
         self.network.set_agreement(
             link,
-            v1::admission::Agreement::new(frames::profile().capabilities).unwrap(),
+            v2::admission::Agreement::new(frames::profile().capabilities).unwrap(),
         );
         self.network.set_ready(link);
         loop {
@@ -317,8 +317,8 @@ async fn negotiated_config_and_reliable_frames_preserve_unknown_fields() {
     let (ac, mut bc) = connect(&mut a, &mut b).await;
     let selected = ac.negotiation.as_ref().unwrap();
     assert_eq!(selected.peer_boot.device_id, b.network.id());
-    assert!(selected.agreement.contains("oink.input/1"));
-    assert!(!selected.agreement.contains("oink.calibration/1"));
+    assert!(selected.agreement.contains("oink.input/2"));
+    assert!(!selected.agreement.contains("oink.calibration/2"));
     assert_eq!(selected.negotiated, bc.negotiation.as_ref().unwrap().negotiated);
     let config = frames::control(100 * 1024);
     ac.control_tx.post(config.as_slice()).unwrap();
@@ -416,6 +416,57 @@ async fn handle_cancellation_preserves_its_cause_before_any_module_close_command
     tokio::join!(a.network.stop(), b.network.stop());
 }
 
+/// A module that closes a stream with a reason and drops the handle at once
+/// (B0 closing with `Paused`) gets that reason to the peer: the handle
+/// carries it, so the network owner seeing the dropped queue first cannot
+/// turn it into `None`.
+#[tokio::test]
+async fn handle_close_with_a_code_reaches_the_peer() {
+    let mut a = Node::start().await;
+    let mut b = Node::start().await;
+    let (ac, bc) = connect(&mut a, &mut b).await;
+    a.ready(ac.link).await;
+    b.ready(bc.link).await;
+    for (ordinal, close_writer) in [(1, true), (2, false)] {
+        let (tx, _) = a
+            .network
+            .open_stream(ac.link, Priority::Normal, tag(ordinal), queues().0, None)
+            .unwrap();
+        tx.post(reliable(1)).unwrap();
+        let (mut rx, _) = b
+            .inbound()
+            .await
+            .accept(queues().1, QueueSpec::datagram(StreamKind::Diagnostics));
+        assert_eq!(rx.next().await.unwrap(), reliable(1));
+        let (port, expected) = if close_writer {
+            let expected = rx.id();
+            tx.close_with(StreamCode::Paused);
+            drop(tx);
+            (&mut b.module, expected)
+        } else {
+            let expected = tx.id();
+            rx.close_with(StreamCode::Paused);
+            drop(rx);
+            (&mut a.module, expected)
+        };
+        timeout(Duration::from_secs(2), async {
+            loop {
+                match port.next().await.unwrap() {
+                    ModuleEvent::StreamClosed { stream, reason } if stream == expected => {
+                        assert_eq!(reason, StreamClosed::Peer(StreamCode::Paused));
+                        break;
+                    }
+                    ModuleEvent::LinkLost { reason, .. } => panic!("closing lost the link: {reason:?}"),
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .unwrap();
+    }
+    tokio::join!(a.network.stop(), b.network.stop());
+}
+
 #[tokio::test]
 async fn invalid_business_channel_isolated_without_losing_control() {
     let mut a = Node::start().await;
@@ -427,8 +478,11 @@ async fn invalid_business_channel_isolated_without_losing_control() {
         .network
         .open_stream(ac.link, Priority::Normal, tag(1), queues().0, None)
         .unwrap();
-    // A valid C0 frame is forbidden on D0 before its large payload is allocated.
-    tx.post(frames::control(300)).unwrap();
+    // A valid C0 frame is forbidden on D0: this end's send gate refuses it,
+    // and a peer that ignores its own gate is isolated by the receiver before
+    // the large payload is allocated.
+    assert_eq!(tx.post(frames::control(300)), Err(PostError::Unnegotiated));
+    tx.post_ungated(frames::control(300)).unwrap();
     let (mut rx, _) = b
         .inbound()
         .await
@@ -572,7 +626,11 @@ async fn datagram_flows_are_bounded_and_timestamped() {
     let mut flows = Vec::new();
     for ordinal in 1..=3 {
         let flow = datagram_stream(&mut a, &mut b, ac.link, ordinal).await;
-        assert_eq!(flow.1.post([0; 1100]), Err(DatagramError::TooLarge));
+        // A negotiated message over the datagram size limit.
+        assert_eq!(
+            flow.1.post(datagram(ordinal as u64, 1100)),
+            Err(DatagramError::TooLarge)
+        );
         let frame = datagram(ordinal as u64, 900);
         flow.1.post(&frame).unwrap();
         assert_eq!(next_datagram(&flow.3).await, frame);
@@ -630,6 +688,40 @@ async fn relay_preserves_frames_datagrams_and_stream_handles_across_cutover() {
     );
     dg.post(datagram(2, 900)).unwrap();
     assert_eq!(next_datagram(&rd).await, datagram(2, 900));
+    r.stop().await;
+}
+
+#[tokio::test]
+async fn relay_to_direct_keeps_low_on_the_connection_to_the_relay() {
+    let mut r = Relayed::start().await;
+    r.a.ready(r.ac.link).await;
+    r.b.ready(r.bc.link).await;
+    r.direct();
+    timeout(Duration::from_secs(3), async {
+        while r.a.network.links().by_peer(r.b.network.id()).unwrap().path != LinkPath::Direct
+            || r.b.network.links().by_peer(r.a.network.id()).unwrap().path != LinkPath::Direct
+        {
+            sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    // The relayed link's first hop was the connection to the relay; after the
+    // cutover that connection still carries the a-relay link and its Low.
+    let mut stream = timeout(
+        Duration::from_secs(4),
+        r.a.network
+            .open_low(r._neighbors[0].link, StreamKind::Diagnostics, low_options()),
+    )
+    .await
+    .expect("Low open deadline")
+    .expect("Low to the relay after relay-to-direct cutover");
+    let data = frames::low(0, 64);
+    stream.send(&data).await.unwrap();
+    let mut inbound = next_low(&mut r.relay).await;
+    assert_eq!(inbound.first, data);
+    stream.finish();
+    assert!(inbound.stream.recv().await.unwrap().is_none());
     r.stop().await;
 }
 

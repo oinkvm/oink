@@ -11,19 +11,67 @@ use oink_foundation::session::Boot;
 use oink_network::link::{LinkId, ModuleEvent, ModulePort};
 use oink_protocol::{
     frame::{StreamCode, StreamKind},
-    v1::{
+    v2::{
         self, Message, RawValue as V, dto,
         schema::{WireDto, WireValue},
     },
 };
 use std::{
     collections::HashMap,
+    fs,
+    path::Path,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 use wire::{boot, clear_projection, project, wire_clear, wire_usage};
 
 type CachedReplies = std::collections::VecDeque<(Boot, [u8; 16], bool, dto::CacheResult)>;
+
+fn proxy_cache_usage(root: &Path, clear: bool) -> (CacheSize, u64, bool) {
+    let mut size = CacheSize {
+        category: CacheCategory::TransferProxy,
+        bytes: 0,
+        kept_bytes: 0,
+    };
+    let mut removed = 0;
+    let mut incomplete = false;
+    let entries = match fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return (size, 0, false),
+        Err(_) => return (size, 0, true),
+    };
+    for entry in entries {
+        let Ok(entry) = entry else {
+            incomplete = true;
+            continue;
+        };
+        let path = entry.path();
+        let before = match oink_clipboard::cache::tree_bytes(&path) {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                incomplete = true;
+                continue;
+            }
+        };
+        // An upload being staged, a read serving another device, or a file
+        // on the current system clipboard keeps its directory (kept_bytes).
+        if clear && oink_clipboard::cache::remove_unless_active(&path).is_err() {
+            incomplete = true;
+        }
+        let after = match oink_clipboard::cache::tree_bytes(&path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(_) => {
+                incomplete = true;
+                before
+            }
+        };
+        removed += before.saturating_sub(after);
+        size.bytes = size.bytes.saturating_add(after);
+        size.kept_bytes = size.kept_bytes.saturating_add(after);
+    }
+    (size, removed, incomplete)
+}
 
 pub(crate) struct State {
     native: bool,
@@ -149,6 +197,25 @@ async fn local(
             usage.categories.push(fulfilled);
         }
         usage.incomplete |= incomplete;
+        // Copied bitmaps and rich text kept 24 h for phones are snapshots of this device's
+        // own sources; "清理缓存" removes them (and their thumbnails) too.
+        let (retained, freed, incomplete) = oink_clipboard::retained::RetainedClips::new(&data).usage(can_clear);
+        if let Some(snapshots) = usage
+            .categories
+            .iter_mut()
+            .find(|size| size.category == retained.category)
+        {
+            snapshots.bytes = snapshots.bytes.saturating_add(retained.bytes);
+            snapshots.kept_bytes = snapshots.kept_bytes.saturating_add(retained.kept_bytes);
+        } else {
+            usage.categories.push(retained);
+        }
+        removed += freed;
+        usage.incomplete |= incomplete;
+        let (proxy, freed, incomplete) = proxy_cache_usage(&data.join(crate::mobile_v2::PROXY_CACHE_DIR), can_clear);
+        usage.categories.push(proxy);
+        removed += freed;
+        usage.incomplete |= incomplete;
         // Mac clipboard files have a direct cache above; the other categories
         // still have no independent storage producer in this build.
         for category in [
@@ -224,7 +291,7 @@ async fn request(node: &Node, peer: DeviceId, clear: bool) -> api::ApiResult<(Ca
     let entry = links
         .links()
         .by_peer(peer)
-        .filter(|e| e.state == oink_network::link::LinkState::Ready && e.agreement.contains("oink.cache/1"))
+        .filter(|e| e.state == oink_network::link::LinkState::Ready && e.opens(oink_protocol::frame::StreamKind::Cache))
         .cloned()
         .ok_or_else(unavailable)?;
     let mut id = [0u8; 16];
@@ -408,7 +475,7 @@ pub(crate) fn start(node: Node, mut port: ModulePort) -> tokio::task::JoinHandle
                                         let Ok((usage,result))=local(&n,clear,Some(valid.clone())).await else{operation.stream.cancel();return;};
                                         let Ok(usage)=wire_usage(&usage)else{return;};
                                         let Ok(clear)=result.as_ref().map(wire_clear).transpose()else{return;};
-                                        let mut raw=v1::RawMap::from([(1,usage.write()),(3,id.write())]);if let Some(clear)=clear{raw.insert(2,clear.write());}
+                                        let mut raw=v2::RawMap::from([(1,usage.write()),(3,id.write())]);if let Some(clear)=clear{raw.insert(2,clear.write());}
                                         let Ok(result)=dto::CacheResult::from_raw(raw)else{return;};
                                         if replies.len()>=128{replies.pop_front();}replies.push_back((entry.peer_boot,id.0,request.clear().unwrap(),result.clone()));result
                                     };
@@ -424,4 +491,34 @@ pub(crate) fn start(node: Node, mut port: ModulePort) -> tokio::task::JoinHandle
             }
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clearing_proxy_cache_keeps_uploads_and_live_reads() {
+        let root = tempfile::tempdir().unwrap();
+        let idle = root.path().join("share-idle");
+        let uploading = root.path().join("share-uploading");
+        let reading = root.path().join("share-reading");
+        for dir in [&idle, &uploading, &reading] {
+            fs::create_dir_all(dir).unwrap();
+            fs::write(dir.join("r-0"), b"bytes").unwrap();
+        }
+        let upload = oink_clipboard::cache::SourceLease::busy(uploading.clone());
+        let read = oink_clipboard::cache::SourceLease::busy(reading.join("r-0"));
+        let (size, removed, incomplete) = proxy_cache_usage(root.path(), true);
+        assert!(!incomplete);
+        assert!(removed > 0);
+        assert!(!idle.exists(), "an idle proxy entry is cleared");
+        assert!(uploading.exists() && reading.exists(), "active entries are kept");
+        assert_eq!(size.bytes, size.kept_bytes);
+        assert!(size.kept_bytes > 0);
+        drop((upload, read));
+        let (size, _, _) = proxy_cache_usage(root.path(), true);
+        assert_eq!(size.bytes, 0);
+        assert!(!uploading.exists() && !reading.exists());
+    }
 }

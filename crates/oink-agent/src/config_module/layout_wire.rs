@@ -1,34 +1,18 @@
 //! Shared rigid computer placements. Native screen geometry is owned by its OS;
 //! canvas rectangles are expanded views and are never independently persisted.
-use oink_display::layout::{Layout, LayoutSettings, ScreenId, ScreenPlacement, SizeSource};
+use oink_display::layout::{Layout, ScreenPlacement, SizeSource};
 use oink_foundation::{DeviceId, Point, Rect};
-use oink_protocol::v1::{
+use oink_protocol::v2::{
     self, ErrorCode, RawMap, RawValue, dto,
     schema::{WireDto, WireValue},
 };
-pub fn validate(layout: &dto::LayoutValue) -> v1::Result<()> {
-    // Screen key 11 is an in-process projection of register key 7. Strip it
-    // before applying the frozen executable-geometry validator; it is never
-    // retained in the baseline value sent to an old peer.
-    let mut raw = layout.raw().clone();
-    if let Some(RawValue::Array(groups)) = raw.get_mut(&1) {
-        for group in groups {
-            if let RawValue::Map(group) = group {
-                group.remove(&5);
-                if let Some(RawValue::Array(screens)) = group.get_mut(&4) {
-                    for screen in screens {
-                        if let RawValue::Map(screen) = screen {
-                            screen.remove(&11);
-                        }
-                    }
-                }
-            }
-        }
-    }
-    let clean = dto::LayoutValue::from_raw(raw)?;
-    v1::layout::require_supported_geometry(&clean)
+pub fn validate(layout: &dto::LayoutValue) -> v2::Result<()> {
+    // v2 carries device and screen visibility as formal executable geometry
+    // fields. There is no register key-7 projection or compatibility envelope
+    // to strip before validation.
+    v2::layout::require_supported_geometry(layout)
 }
-fn native_device(device: &dto::DeviceId) -> v1::Result<DeviceId> {
+fn native_device(device: &dto::DeviceId) -> v2::Result<DeviceId> {
     Ok(DeviceId(
         device
             .public_key()?
@@ -37,67 +21,17 @@ fn native_device(device: &dto::DeviceId) -> v1::Result<DeviceId> {
             .map_err(|_| ErrorCode::UnsupportedValue)?,
     ))
 }
-pub fn from_wire(value: &dto::LayoutValue) -> v1::Result<Layout> {
-    validate(value)?;
-    let mut screens = Vec::new();
-    for group in value.devices()?.0 {
-        let k = group.scale()?;
-        let origin = group.origin()?;
-        for screen in group.screens()?.0 {
-            let id = screen.id()?;
-            let r = screen.local()?;
-            let local = Rect::new(r.x()?, r.y()?, r.w()?, r.h()?);
-            screens.push(ScreenPlacement {
-                id: ScreenId::new(native_device(&id.device()?)?, id.display()?.0),
-                name: screen.name()?.0,
-                local,
-                rect: Rect::new(
-                    origin.x()? + local.x * k,
-                    origin.y()? + local.y * k,
-                    local.w * k,
-                    local.h * k,
-                ),
-                size_source: match screen.size_source()? {
-                    dto::SizeSource::Reported => SizeSource::Reported,
-                    dto::SizeSource::Estimated => SizeSource::Estimated,
-                    dto::SizeSource::Manual => SizeSource::Manual,
-                    _ => return Err(ErrorCode::UnsupportedValue.into()),
-                },
-                primary: screen.primary()?,
-                builtin: screen.builtin()?,
-                device_hidden: group.hidden()?,
-                screen_hidden: screen.hidden()?,
-                device_visibility_known: group.raw().contains_key(&5),
-                screen_visibility_known: screen.raw().contains_key(&11),
-            });
-        }
-    }
-    let st = value.topology()?;
-    Ok(Layout {
-        screens,
-        settings: LayoutSettings {
-            gap_travel: st.gap_travel()?,
-            overlap_tolerance: st.overlap_tolerance()?,
-            minimum_portal: st.minimum_portal()?,
-            portal_snap: st.portal_snap()?,
-            walls: st.walls()?,
-            endpoint_reach: st.endpoint_reach()?,
-        },
-    })
+pub use oink_routing::wire::layout::{from_wire, owner_preferences};
+pub fn from_register(register: &dto::Register) -> v2::Result<Layout> {
+    from_wire(&v2::layout::register_value(register)?)
 }
-pub fn from_register(register: &dto::Register) -> v1::Result<Layout> {
-    from_wire(&v1::layout::register_value(register)?)
-}
-pub fn has_device_visibility_record(register: &dto::Register, device: DeviceId) -> v1::Result<bool> {
-    let Some(metadata) = register.layout_visibility()? else {
-        return Ok(false);
-    };
-    for key in [1, 3] {
-        let Some(value) = metadata.get(&key) else {
+pub fn has_device_visibility_record(register: &dto::Register, device: DeviceId) -> v2::Result<bool> {
+    let layout = v2::layout::register_value(register)?;
+    for group in layout.devices()?.0 {
+        if native_device(&group.device()?)? != device {
             continue;
-        };
-        let list = oink_protocol::v1::schema::List::<dto::DeviceId, 256>::read(value)?;
-        if list.0.iter().any(|candidate| native_device(candidate) == Ok(device)) {
+        }
+        if group.raw().contains_key(&5) || group.screens()?.0.iter().any(|screen| screen.raw().contains_key(&11)) {
             return Ok(true);
         }
     }
@@ -109,7 +43,7 @@ fn rect(r: Rect) -> RawValue {
 fn point(p: Point) -> RawValue {
     RawValue::Map([(1, p.x.write()), (2, p.y.write())].into())
 }
-fn to_screen(s: &ScreenPlacement) -> v1::Result<dto::ScreenPlacement> {
+fn to_screen(s: &ScreenPlacement) -> v2::Result<dto::ScreenPlacement> {
     let mut fields = [
         (
             1,
@@ -142,7 +76,7 @@ fn to_screen(s: &ScreenPlacement) -> v1::Result<dto::ScreenPlacement> {
     }
     dto::ScreenPlacement::from_raw(fields)
 }
-pub fn to_wire(layout: &Layout, source: dto::LayoutSource) -> v1::Result<dto::LayoutValue> {
+pub fn to_wire(layout: &Layout, source: dto::LayoutSource) -> v2::Result<dto::LayoutValue> {
     let mut groups = Vec::new();
     for device in layout
         .screens
@@ -220,52 +154,6 @@ pub fn to_wire(layout: &Layout, source: dto::LayoutSource) -> v1::Result<dto::La
     validate(&value)?;
     Ok(value)
 }
-/// Read the owner-only layout inputs from a complete accepted preference
-/// baseline. Missing or unsupported inputs cannot silently enable a device.
-pub fn owner_preferences(
-    preferences: &[dto::DevicePreference],
-) -> v1::Result<oink_display::layout::OwnerLayoutPreferences> {
-    use oink_display::layout::{OwnerLayoutPreferences, ScreenPreference, SpeedMode};
-    fn value(preferences: &[dto::DevicePreference], option: dto::LocalOption) -> v1::Result<RawValue> {
-        let mut items = preferences.iter().filter(|item| item.option() == Ok(option));
-        let value = items.next().ok_or(ErrorCode::StateConflict)?.value()?;
-        if items.next().is_some() {
-            return Err(ErrorCode::StateConflict.into());
-        }
-        Ok(value)
-    }
-    let screen_shared = bool::read(&value(preferences, dto::LocalOption::ScreenShared)?)?;
-    let screen_preferences =
-        dto::ScreenPreferencesValue::read(&value(preferences, dto::LocalOption::ScreenPreferences)?)?;
-    let speed_mode = match dto::SpeedMode::read(&value(preferences, dto::LocalOption::SpeedMode)?)? {
-        dto::SpeedMode::Physical => SpeedMode::Physical,
-        dto::SpeedMode::ScreenProportional => SpeedMode::ScreenProportional,
-        _ => return Err(ErrorCode::UnsupportedValue.into()),
-    };
-    let mut screens = std::collections::BTreeMap::new();
-    for screen in screen_preferences.screens()?.0 {
-        if screens
-            .insert(
-                screen.display()?.0,
-                ScreenPreference {
-                    remote_gain: screen.remote_gain()?,
-                    gain: screen.gain()?,
-                    enabled: screen.enabled()?,
-                },
-            )
-            .is_some()
-        {
-            return Err(ErrorCode::StateConflict.into());
-        }
-    }
-    Ok(OwnerLayoutPreferences {
-        screen_shared,
-        device_gain: screen_preferences.device_gain()?,
-        speed_mode,
-        screens,
-    })
-}
-
 /// Seed one device's legacy owner visibility into the shared layout. The
 /// caller invokes this only when that device has no key7 record; later starts
 /// and later peers never rewrite an existing global value.
@@ -273,7 +161,7 @@ pub fn seed_owner_visibility(
     raw: &mut RawMap,
     device: DeviceId,
     owner: &oink_display::layout::OwnerLayoutPreferences,
-) -> v1::Result<()> {
+) -> v2::Result<()> {
     let value = dto::LayoutValue::from_raw(raw.clone())?;
     let mut groups = value.devices()?.0;
     for group in &mut groups {
@@ -295,7 +183,7 @@ pub fn seed_owner_visibility(
                 fields.entry(11).or_insert_with(|| (!enabled).write());
                 Ok(RawValue::Map(fields))
             })
-            .collect::<v1::Result<Vec<_>>>()?;
+            .collect::<v2::Result<Vec<_>>>()?;
         fields.insert(4, RawValue::Array(screens));
         *group = dto::DevicePlacement::from_raw(fields)?;
     }
@@ -304,7 +192,7 @@ pub fn seed_owner_visibility(
     *raw = root;
     Ok(())
 }
-pub(crate) fn same_screen(a: &dto::ScreenId, b: &dto::ScreenId) -> v1::Result<bool> {
+pub(crate) fn same_screen(a: &dto::ScreenId, b: &dto::ScreenId) -> v2::Result<bool> {
     Ok(a.device()?.ordering_key()? == b.device()?.ordering_key()? && a.display()? == b.display()?)
 }
 
@@ -324,7 +212,7 @@ pub fn sync_local_displays(
     displays: &[oink_display::DisplayInfo],
     detached: &super::detached::DetachedScreens,
     now_ms: u64,
-) -> v1::Result<DisplaySync> {
+) -> v2::Result<DisplaySync> {
     validate(current)?;
     let mut groups = current.devices()?.0;
     let index = groups
@@ -497,7 +385,7 @@ fn fields(current: &mut RawMap, before: &RawMap, after: &RawMap, known: &[u32]) 
 }
 /// Patch known geometry and preserve stable identity extensions. Empty groups
 /// survive edits so unplugging the last display never forgets device placement.
-pub fn patch(current: &mut RawMap, before: &dto::LayoutValue, after: &dto::LayoutValue) -> v1::Result<()> {
+pub fn patch(current: &mut RawMap, before: &dto::LayoutValue, after: &dto::LayoutValue) -> v2::Result<()> {
     validate(before)?;
     validate(after)?;
     let latest = dto::LayoutValue::from_raw(current.clone())?;
@@ -537,7 +425,7 @@ pub fn patch(current: &mut RawMap, before: &dto::LayoutValue, after: &dto::Layou
                     }
                     Ok(RawValue::Map(raw))
                 })
-                .collect::<v1::Result<Vec<_>>>()?;
+                .collect::<v2::Result<Vec<_>>>()?;
             raw.insert(4, RawValue::Array(screens));
             groups.push(RawValue::Map(raw));
         } else if prior.is_none() {
@@ -565,6 +453,7 @@ pub fn patch(current: &mut RawMap, before: &dto::LayoutValue, after: &dto::Layou
 #[cfg(test)]
 mod tests {
     use super::*;
+    use oink_display::layout::ScreenId;
 
     #[test]
     fn hotplug_preserves_owner_and_noncolliders_in_recorded_three_computer_layout() {
@@ -692,6 +581,88 @@ mod tests {
         )
         .unwrap();
         assert_eq!(from_wire(&repeat.layout).unwrap().screens, repaired.screens);
+    }
+
+    #[test]
+    fn phone_placement_rotation_keeps_scale_and_does_not_drift() {
+        let pc = DeviceId([1; 32]);
+        let phone = DeviceId([9; 32]);
+        let mut portrait = display(oink_foundation::display::ANDROID_INPUT_DISPLAY, 0., 0.);
+        portrait.bounds = Rect::new(0., 0., 400., 800.);
+        portrait.pixel_width = 400;
+        portrait.pixel_height = 800;
+        portrait.reference_extent = None;
+        portrait.is_primary = true;
+        portrait.is_builtin = true;
+        let mut landscape = portrait.clone();
+        landscape.bounds = Rect::new(0., 0., 800., 400.);
+        landscape.pixel_width = 800;
+        landscape.pixel_height = 400;
+        landscape.rotation_deg = 90;
+        let base = Layout::auto(&[(pc, vec![display("a", 0., 0.)])]);
+        let wire = to_wire(&base, dto::LayoutSource::Manual).unwrap();
+        let initial = sync_local_displays(
+            &wire,
+            phone,
+            &[pc, phone],
+            std::slice::from_ref(&portrait),
+            &Default::default(),
+            1,
+        )
+        .unwrap();
+        let layout = from_wire(&initial.layout).unwrap();
+        assert!(layout.overlaps().is_empty());
+        let pc_rect = layout.screens.iter().find(|s| s.id.device == pc).unwrap().rect;
+        let phone_rect = layout.screens.iter().find(|s| s.id.device == phone).unwrap().rect;
+        assert!((pc_rect.right() - phone_rect.x).abs() < 1e-12);
+        let group = initial
+            .layout
+            .devices()
+            .unwrap()
+            .0
+            .into_iter()
+            .find(|g| native_device(&g.device().unwrap()) == Ok(phone))
+            .unwrap();
+        let mut current = initial.layout;
+        for _ in 0..100 {
+            for info in [&landscape, &portrait] {
+                let next = sync_local_displays(
+                    &current,
+                    phone,
+                    &[pc, phone],
+                    std::slice::from_ref(info),
+                    &Default::default(),
+                    2,
+                )
+                .unwrap();
+                let layout = from_wire(&next.layout).unwrap();
+                let screen = layout.screens.iter().find(|s| s.id.device == phone).unwrap();
+                assert_eq!(screen.rect.w, info.bounds.w * group.scale().unwrap());
+                assert_eq!(screen.rect.h, info.bounds.h * group.scale().unwrap());
+                let next_group = next
+                    .layout
+                    .devices()
+                    .unwrap()
+                    .0
+                    .into_iter()
+                    .find(|g| native_device(&g.device().unwrap()) == Ok(phone))
+                    .unwrap();
+                assert_eq!(next_group.scale().unwrap(), group.scale().unwrap());
+                assert_eq!(next_group.origin().unwrap(), group.origin().unwrap());
+                assert!(layout.overlaps().is_empty());
+                current = next.layout;
+            }
+        }
+        // Existing collision repair moves only the changed phone, exactly once.
+        let mut collided = from_wire(&current).unwrap();
+        collided.place_device(phone, Point::new(-phone_rect.w, 0.), group.scale().unwrap(), true);
+        let wire = to_wire(&collided, dto::LayoutSource::Manual).unwrap();
+        let rotated = sync_local_displays(&wire, phone, &[pc, phone], &[landscape], &Default::default(), 3).unwrap();
+        assert!(from_wire(&rotated.layout).unwrap().overlaps().is_empty());
+        assert_eq!(
+            from_wire(&rotated.layout).unwrap().device_transform(pc),
+            base.device_transform(pc)
+        );
     }
 
     fn display(key: &str, x: f64, y: f64) -> oink_display::DisplayInfo {

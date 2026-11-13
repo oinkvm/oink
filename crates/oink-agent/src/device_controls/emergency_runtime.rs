@@ -11,7 +11,7 @@ use crate::{
     node::{Node, lock},
     threads::input::InputCommand,
 };
-use oink_protocol::v1::{
+use oink_protocol::v2::{
     Message, dto,
     schema::{WireDto, WireValue},
 };

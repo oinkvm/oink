@@ -523,7 +523,7 @@ fn session_idle_refresh_rechecks_pause_sleep_wake_setting_and_input_safety() {
     let (writer, _) = h.inbound(1);
     opening(&writer, &remote(), true);
     h.attach();
-    h.driver.command(InputCommand::MovePointerTo(peer()));
+    h.driver.command(InputCommand::MovePointerTo(peer(), None));
     assert!(h.driver.idle_refresh_allowed());
     let mut settings = (*h.driver.snapshots.settings.load()).clone();
     settings.wake_displays_on_input = false;
@@ -565,7 +565,7 @@ fn focus_boundaries_gate_group_idle_dispatch_and_queued_carrier_conversion() {
     h.attach();
     let local = h.driver.local;
     for holder in [local, peer(), local, peer()] {
-        h.driver.command(InputCommand::MovePointerTo(holder));
+        h.driver.command(InputCommand::MovePointerTo(holder, None));
         assert_eq!(h.driver.adapter.router().focus().holder, holder);
         h._main.try_iter().for_each(drop);
         h.driver.message(peer(), Message::Control(ControlMsg::UserActivity));

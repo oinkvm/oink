@@ -3,14 +3,14 @@
 use super::control::*;
 use crate::{LowOptions, LowTcpPurpose, wire_identity as id};
 use oink_foundation::session::RouteRevision;
-use oink_protocol::v1::{
+use oink_protocol::v2::{
     self, Message, RawMap, RawValue, dto,
     schema::{WireDto, WireValue},
 };
 
-type Result<T> = v1::Result<T>;
+type Result<T> = v2::Result<T>;
 fn get<T: WireValue>(map: &RawMap, key: u32) -> Result<T> {
-    T::read(map.get(&key).ok_or(v1::ErrorCode::MalformedFrame)?)
+    T::read(map.get(&key).ok_or(v2::ErrorCode::MalformedFrame)?)
 }
 fn optional<T>(map: &RawMap, key: u32, read: impl FnOnce(&RawMap) -> Result<T>) -> Result<Option<T>> {
     map.get(&key).map(|value| read(&RawMap::read(value)?)).transpose()
@@ -108,7 +108,7 @@ fn read_reference(value: &RawMap) -> Result<PathReference> {
     match get::<u32>(value, 1)? {
         0 => Ok(PathReference::Request(read_req(&get(&body, 1)?)?)),
         1 => Ok(PathReference::Installed(id::read_path(&get(&body, 1)?)?)),
-        _ => Err(v1::ErrorCode::UnsupportedValue.into()),
+        _ => Err(v2::ErrorCode::UnsupportedValue.into()),
     }
 }
 fn options(value: LowOptions) -> RawValue {
@@ -125,7 +125,7 @@ fn read_options(value: &RawMap) -> Result<LowOptions> {
         operation_max: get(value, 3)?,
     };
     if !options.valid() {
-        return Err(v1::ErrorCode::LimitExceeded.into());
+        return Err(v2::ErrorCode::LimitExceeded.into());
     }
     Ok(options)
 }
@@ -156,7 +156,7 @@ fn read_request(raw: &RawMap) -> Result<LowRequest> {
         0 => LowTcpPurpose::Transfer,
         1 => LowTcpPurpose::Warm,
         2 => LowTcpPurpose::Race,
-        _ => return Err(v1::ErrorCode::UnsupportedValue.into()),
+        _ => return Err(v2::ErrorCode::UnsupportedValue.into()),
     };
     let kind = get(raw, 10)?;
     Ok(LowRequest {
@@ -236,10 +236,10 @@ fn read_refusal(raw: &RawMap, key: u32) -> Result<Refusal> {
         7 => Refusal::Superseded,
         8 => Refusal::Expired,
         9 => Refusal::Cancelled,
-        _ => return Err(v1::ErrorCode::UnsupportedValue.into()),
+        _ => return Err(v2::ErrorCode::UnsupportedValue.into()),
     })
 }
-fn protocol_error(code: v1::ErrorCode) -> RawValue {
+fn protocol_error(code: v2::ErrorCode) -> RawValue {
     RawValue::Map(map([
         (1, (code.number() as u16).write()),
         (2, dto::ErrorScope::LowOperation.write()),
@@ -278,7 +278,7 @@ fn read_failure(raw: &RawMap) -> Result<crate::LowUnavailable> {
             stage: format!("{:?}", value.stage()?),
             detail: format!("{code:?}"),
         },
-        _ => return Err(v1::ErrorCode::UnsupportedValue.into()),
+        _ => return Err(v2::ErrorCode::UnsupportedValue.into()),
     };
     Ok(crate::LowUnavailable {
         from: id::read_device(&value.from()?)?,
@@ -287,11 +287,139 @@ fn read_failure(raw: &RawMap) -> Result<crate::LowUnavailable> {
     })
 }
 
+fn route_address(ip: std::net::Ipv4Addr) -> RawValue {
+    RawValue::Map(map([(1, dto::AddressFamily::Ipv4.write()), (2, bytes(&ip.octets()))]))
+}
+fn read_route_address(raw: &RawMap) -> Result<std::net::Ipv4Addr> {
+    let value = dto::RouteAddress::from_raw(raw.clone())?;
+    match value.family()? {
+        dto::AddressFamily::Ipv4 => {
+            let octets: [u8; 4] = value
+                .address()?
+                .0
+                .as_slice()
+                .try_into()
+                .map_err(|_| v2::ErrorCode::MalformedFrame)?;
+            Ok(octets.into())
+        }
+        // The first phase routes IPv4 only; an IPv6 route is well formed but unusable.
+        _ => Err(v2::ErrorCode::UnsupportedValue.into()),
+    }
+}
+fn route_action(value: RouteAction) -> RawValue {
+    let (kind, body) = match value {
+        RouteAction::Use { connection, pinned } => {
+            let mut body = map([(1, id::connection(connection).write())]);
+            if let Some(ip) = pinned {
+                body.insert(2, route_address(ip));
+            }
+            (dto::RouteActionKind::Use, body)
+        }
+        RouteAction::Remember { pin } => {
+            let mut body = RawMap::new();
+            if let Some(pin) = pin {
+                body.insert(
+                    1,
+                    RawValue::Map(map([
+                        (1, id::device(pin.dialer).write()),
+                        (2, route_address(pin.target)),
+                    ])),
+                );
+            }
+            (dto::RouteActionKind::Remember, body)
+        }
+        RouteAction::Propose { connection, median_us } => (
+            dto::RouteActionKind::Propose,
+            map([(1, id::connection(connection).write()), (2, median_us.write())]),
+        ),
+    };
+    RawValue::Map(map([(1, kind.write()), (2, RawValue::Map(body))]))
+}
+fn read_route_action(raw: &RawMap) -> Result<RouteAction> {
+    let action = dto::RouteAction::from_raw(raw.clone())?;
+    let body = action.body()?;
+    Ok(match action.variant()? {
+        v2::schema::Open::Known(dto::RouteActionKind::Use) => {
+            let value = dto::RouteUse::from_raw(body)?;
+            RouteAction::Use {
+                connection: id::read_connection(&value.connection_id()?)?,
+                pinned: optional(value.raw(), 2, read_route_address)?,
+            }
+        }
+        v2::schema::Open::Known(dto::RouteActionKind::Remember) => RouteAction::Remember {
+            pin: optional(&body, 1, |raw| {
+                Ok(RoutePin {
+                    dialer: id::read_device(&get(raw, 1)?)?,
+                    target: read_route_address(&get(raw, 2)?)?,
+                })
+            })?,
+        },
+        v2::schema::Open::Known(dto::RouteActionKind::Propose) => {
+            let value = dto::RoutePropose::from_raw(body)?;
+            RouteAction::Propose {
+                connection: id::read_connection(&value.connection_id()?)?,
+                median_us: value.median_us()?,
+            }
+        }
+        _ => return Err(v2::ErrorCode::UnsupportedValue.into()),
+    })
+}
+fn route_state(value: RouteState) -> RawMap {
+    let mut raw = map([
+        (1, id::path(value.path_id).write()),
+        (2, value.route_revision.0.write()),
+        (3, id::connection(value.active).write()),
+    ]);
+    if let Some(pin) = value.pin {
+        raw.insert(
+            4,
+            RawValue::Map(map([
+                (1, id::device(pin.dialer).write()),
+                (2, route_address(pin.target)),
+            ])),
+        );
+    }
+    if let Some(connection) = value.pin_connection {
+        raw.insert(8, id::connection(connection).write());
+    }
+    if let Some(device) = value.set_by {
+        raw.insert(5, id::device(device).write());
+    }
+    if let Some(request) = value.answers {
+        raw.insert(6, request.write());
+    }
+    if let Some(reason) = value.refused {
+        raw.insert(7, reason.write());
+    }
+    raw
+}
+fn read_route_state(raw: &RawMap) -> Result<RouteState> {
+    let value = dto::LinkRouteState::from_raw(raw.clone())?;
+    Ok(RouteState {
+        path_id: id::read_path(&value.path_id()?)?,
+        route_revision: RouteRevision(value.route_revision()?),
+        active: id::read_connection(&value.active()?)?,
+        pin: optional(raw, 4, |pin| {
+            Ok(RoutePin {
+                dialer: id::read_device(&get(pin, 1)?)?,
+                target: read_route_address(&get(pin, 2)?)?,
+            })
+        })?,
+        pin_connection: value.pin_connection()?.as_ref().map(id::read_connection).transpose()?,
+        set_by: raw
+            .get(&5)
+            .map(|value| id::read_device(&dto::DeviceId::read(value)?))
+            .transpose()?,
+        answers: value.answers()?,
+        refused: value.refused()?,
+    })
+}
+
 pub(super) fn encode(message: &LinkMsg) -> Result<Vec<u8>> {
-    v1::frame::encode(&to_wire(message)?, v1::limits::LOW_OUTER_FRAME)
+    v2::frame::encode(&to_wire(message)?, v2::limits::LOW_OUTER_FRAME)
 }
 pub(super) fn decode(bytes: &[u8]) -> Result<LinkMsg> {
-    from_wire(v1::frame::OpaqueFrame::parse_exact(bytes, v1::limits::LOW_OUTER_FRAME)?.decode()?)
+    from_wire(v2::frame::OpaqueFrame::parse_exact(bytes, v2::limits::LOW_OUTER_FRAME)?.decode()?)
 }
 fn to_wire(message: &LinkMsg) -> Result<Message> {
     macro_rules! dto {
@@ -390,6 +518,19 @@ fn to_wire(message: &LinkMsg) -> Result<Message> {
         LinkMsg::MigrateDrained(value) => dto!(LinkMigrateDrained, moving(*value)),
         LinkMsg::MigrateCommit(value) => dto!(LinkMigrateCommit, moving(*value)),
         LinkMsg::MigrateCommitted(value) => dto!(LinkMigrateCommitted, moving(*value)),
+        LinkMsg::RouteRequest {
+            path_id,
+            request_id,
+            action,
+        } => dto!(
+            LinkRouteRequest,
+            map([
+                (1, id::path(*path_id).write()),
+                (2, request_id.write()),
+                (3, route_action(*action))
+            ])
+        ),
+        LinkMsg::RouteState(value) => dto!(LinkRouteState, route_state(*value)),
         LinkMsg::Low {
             binding: lease,
             message,
@@ -401,7 +542,7 @@ fn to_wire(message: &LinkMsg) -> Result<Message> {
                         raw.insert(2, port.write());
                     }
                     if failure.is_some() {
-                        raw.insert(3, protocol_error(v1::ErrorCode::NotReady));
+                        raw.insert(3, protocol_error(v2::ErrorCode::NotReady));
                     }
                     (0xc20, raw)
                 }
@@ -415,7 +556,7 @@ fn to_wire(message: &LinkMsg) -> Result<Message> {
                             RawValue::Map(if result.is_ok() {
                                 map([(1, 0u32.write())])
                             } else {
-                                map([(1, 1u32.write()), (2, protocol_error(v1::ErrorCode::NotReady))])
+                                map([(1, 1u32.write()), (2, protocol_error(v2::ErrorCode::NotReady))])
                             }),
                         ),
                     ]),
@@ -496,6 +637,12 @@ fn from_wire(message: Message) -> Result<LinkMsg> {
         Message::LinkMigrateDrained(_) => LinkMsg::MigrateDrained(read_moving(raw)?),
         Message::LinkMigrateCommit(_) => LinkMsg::MigrateCommit(read_moving(raw)?),
         Message::LinkMigrateCommitted(_) => LinkMsg::MigrateCommitted(read_moving(raw)?),
+        Message::LinkRouteRequest(_) => LinkMsg::RouteRequest {
+            path_id: id::read_path(&get(raw, 1)?)?,
+            request_id: get(raw, 2)?,
+            action: read_route_action(&get(raw, 3)?)?,
+        },
+        Message::LinkRouteState(_) => LinkMsg::RouteState(read_route_state(raw)?),
         Message::LowInfo(_)
         | Message::LowOpen(_)
         | Message::LowReady(_)
@@ -518,7 +665,7 @@ fn from_wire(message: Message) -> Result<LinkMsg> {
                         .map(|error| {
                             error
                                 .code()
-                                .map(|code| format!("{:?}", v1::ErrorCode::from_number(code.into())))
+                                .map(|code| format!("{:?}", v2::ErrorCode::from_number(code.into())))
                         })
                         .transpose()?,
                 },
@@ -526,12 +673,12 @@ fn from_wire(message: Message) -> Result<LinkMsg> {
                 Message::LowReady(value) => {
                     let result = value.result()?;
                     let result = match result.variant()? {
-                        v1::schema::Open::Known(dto::ResultKind::Success) => Ok(()),
-                        v1::schema::Open::Known(dto::ResultKind::Failure) => Err(format!(
+                        v2::schema::Open::Known(dto::ResultKind::Success) => Ok(()),
+                        v2::schema::Open::Known(dto::ResultKind::Failure) => Err(format!(
                             "{:?}",
-                            v1::ErrorCode::from_number(get::<u16>(&result.body()?, 1)?.into())
+                            v2::ErrorCode::from_number(get::<u16>(&result.body()?, 1)?.into())
                         )),
-                        _ => return Err(v1::ErrorCode::UnsupportedValue.into()),
+                        _ => return Err(v2::ErrorCode::UnsupportedValue.into()),
                     };
                     LowMsg::Ready {
                         request: value.request()?.0,
@@ -573,6 +720,6 @@ fn from_wire(message: Message) -> Result<LinkMsg> {
                 message: Box::new(value),
             }
         }
-        _ => return Err(v1::ErrorCode::InvalidChannel.into()),
+        _ => return Err(v2::ErrorCode::InvalidChannel.into()),
     })
 }

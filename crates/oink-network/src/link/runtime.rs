@@ -1,7 +1,7 @@
 //! The single network thread. Quinn drivers run on this same current-thread runtime;
 //! stream work is polled here, in the three measured time-budget classes.
 mod low;
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", target_os = "android", test))]
 mod udp;
 use super::control::LinkMsg;
 use super::{
@@ -13,7 +13,7 @@ use super::{
 };
 use oink_foundation::{realtime, session::ConnectionId};
 use oink_protocol::frame::{self, StreamHeader};
-use oink_protocol::v1::{
+use oink_protocol::v2::{
     self,
     admission::{Agreement, Context as Admission, Phase},
     registry::Transport,
@@ -42,11 +42,13 @@ struct Physical {
     _probe_endpoint: Option<quinn::Endpoint>,
     peer: DeviceId,
     id: Option<ConnectionId>,
+    low_peer_info: Arc<arc_swap::ArcSwapOption<super::control::LowMsg>>,
     deadline: Instant,
     outbound: bool,
     datagram_source_cursor: usize,
     next_flow: u32,
     bootstrap: crate::negotiation::Bootstrap,
+    rejecting_bootstrap: bool,
     incoming: wire::Waiter<Result<quinn::RecvStream, quinn::ConnectionError>>,
     datagrams: wire::Waiter<Result<bytes::Bytes, quinn::ConnectionError>>,
 }
@@ -73,19 +75,65 @@ struct Dialing {
     peer: DeviceId,
     origin: DialOrigin,
     identity_mismatch: bool,
+    /// A candidate refused our ALPN (TLS no_application_protocol): the member
+    /// still runs protocol v1 there. Reported only when no candidate succeeded.
+    alpn_rejected: bool,
     addresses: VecDeque<SocketAddr>,
     attempts: Vec<Handshake>,
 }
 struct ControlQueues {
     tx: Arc<queue::Queue>,
     rx: Arc<queue::Queue>,
+    /// C0's send gate: the v2 baseline until the C0 negotiation arrives.
+    gate: Arc<super::gate::Gate>,
     announced: bool,
+}
+/// One standby dial requested by the core: one address, one budget.
+struct StandbyDial {
+    peer: DeviceId,
+    address: SocketAddr,
+    id: ConnectionId,
+    handshake: Option<Handshake>,
+}
+/// Concurrent standby handshakes; they never use the `MAX_DIALS` slots.
+const STANDBY_DIALS: usize = 2;
+/// Held keys and buttons in one direction of one link.
+#[derive(Default)]
+struct Held {
+    keys: std::collections::BTreeSet<u32>,
+    buttons: std::collections::BTreeSet<Vec<u8>>,
+}
+#[derive(Default)]
+struct LinkActivity {
+    last: Option<Instant>,
+    held: [Held; 2],
+}
+struct RouteContext<'a> {
+    activity: &'a HashMap<LinkId, LinkActivity>,
+    hub: &'a super::tcp::Hub,
+    physical: &'a HashMap<usize, Physical>,
+    connections: &'a HashMap<ConnectionId, usize>,
+}
+impl super::core::RouteEnv for RouteContext<'_> {
+    fn activity(&self, link: LinkId) -> super::route_policy::Activity {
+        let observed = self.activity.get(&link);
+        let (low_open, low_ended) = self.hub.low_activity(link);
+        super::route_policy::Activity {
+            last: observed.and_then(|a| a.last).max(low_ended),
+            held: observed.is_some_and(|a| a.held.iter().any(|h| !h.keys.is_empty() || !h.buttons.is_empty())),
+            low_open,
+        }
+    }
+    fn quinn_rtt(&self, connection: ConnectionId) -> Option<Duration> {
+        let uid = self.connections.get(&connection)?;
+        self.physical.get(uid).map(|p| p.connection.rtt())
+    }
 }
 struct Network {
     profile: crate::negotiation::OfferProfile,
     logical: HashMap<LinkId, Agreement>,
-    formats: HashMap<LinkId, v1::dto::FormatSupport>,
-    audio: HashMap<LinkId, Vec<v1::dto::AudioSupport>>,
+    formats: HashMap<LinkId, v2::dto::FormatSupport>,
+    audio: HashMap<LinkId, Vec<v2::dto::AudioSupport>>,
     old_lanes: std::collections::HashSet<LinkId>,
     retired_members: std::collections::HashSet<LinkId>,
     #[cfg(any(test, feature = "test-support"))]
@@ -95,8 +143,12 @@ struct Network {
     core: Core,
     send_errors: crate::qos::SendErrors,
     endpoint: quinn::Endpoint,
-    #[cfg(any(target_os = "macos", test))]
+    #[cfg(any(target_os = "macos", target_os = "android", test))]
     socket: Arc<udp::Socket>,
+    /// Duplicate descriptor of the endpoint socket for its service type
+    /// (`qos::audio_service_type`); iOS has no socket rebind, so it stays valid.
+    #[cfg(target_os = "ios")]
+    service_marker: Option<std::net::UdpSocket>,
     probe_client: quinn::ClientConfig,
     accepting: wire::Waiter<Option<quinn::Incoming>>,
     shared: Arc<Shared>,
@@ -118,6 +170,8 @@ struct Network {
     next_snapshot: Instant,
     next_readback: Instant,
     stop: bool,
+    /// Why this loop ends on its own (`fail`); published on `Shared::fatal`.
+    fatal: Option<NetworkFatal>,
     cursors: [usize; 3],
     idle_visits: [usize; 3],
     datagram_cursor: usize,
@@ -127,6 +181,12 @@ struct Network {
     n1_retry: HashMap<ConnectionId, Instant>,
     low_port: Arc<super::tcp::port::Port>,
     probes: HashMap<ConnectionId, low::Probe>,
+    standby_dials: VecDeque<StandbyDial>,
+    activity: HashMap<LinkId, LinkActivity>,
+    /// Test only: open new streams on this device's own standby connection to
+    /// this address instead of the link's current one.
+    #[cfg(test)]
+    streams_on: Option<SocketAddr>,
 }
 fn transport(
     credentials: &crate::tls::Credentials,
@@ -171,11 +231,18 @@ pub(super) async fn run(
         }
     };
     let send_errors = crate::qos::SendErrors::default();
+    // iOS marks the socket while audio flows (`Command::AudioMarking`); Quinn
+    // owns the socket itself, so keep a duplicate descriptor for setsockopt.
+    #[cfg(target_os = "ios")]
+    let service_marker = udp_socket
+        .try_clone()
+        .inspect_err(|error| tracing::warn!(%error, "QUIC socket duplicate for audio service type failed"))
+        .ok();
     let setup = || -> Result<_, crate::NetError> {
         let (server, client) = transport(&credentials)?;
-        #[cfg(any(target_os = "macos", test))]
+        #[cfg(any(target_os = "macos", target_os = "android", test))]
         let socket = udp::Socket::from_std_observed(udp_socket, shared.wake.clone(), send_errors.clone())?;
-        #[cfg(not(any(target_os = "macos", test)))]
+        #[cfg(not(any(target_os = "macos", target_os = "android", test)))]
         let socket = {
             let socket = udp_socket;
             crate::qos::set_service_type(&socket, crate::qos::ServiceType::Voice);
@@ -197,7 +264,7 @@ pub(super) async fn run(
             return;
         }
     };
-    #[cfg(not(any(target_os = "macos", test)))]
+    #[cfg(not(any(target_os = "macos", target_os = "android", test)))]
     drop(socket);
     match endpoint.local_addr() {
         Ok(address) => {
@@ -209,6 +276,8 @@ pub(super) async fn run(
         }
     }
     let now = Instant::now();
+    let mut core = Core::new(config.boot);
+    core.set_forwards(config.profile.capabilities.iter().any(|c| c == RELAY_TRANSIT));
     let mut network = Network {
         profile: config.profile,
         logical: HashMap::new(),
@@ -220,11 +289,13 @@ pub(super) async fn run(
         blocked_direct: std::collections::HashSet::new(),
         violations: HashMap::new(),
         started: now,
-        core: Core::new(config.boot),
+        core,
         endpoint,
         send_errors,
-        #[cfg(any(target_os = "macos", test))]
+        #[cfg(any(target_os = "macos", target_os = "android", test))]
         socket,
+        #[cfg(target_os = "ios")]
+        service_marker,
         probe_client,
         accepting: Default::default(),
         shared: shared.clone(),
@@ -248,6 +319,7 @@ pub(super) async fn run(
         next_snapshot: now,
         next_readback: now + realtime::READBACK_INTERVAL,
         stop: false,
+        fatal: None,
         cursors: [0; 3],
         idle_visits: [0; 3],
         datagram_cursor: 0,
@@ -261,6 +333,10 @@ pub(super) async fn run(
             commands: shared.commands.clone(),
         }),
         probes: HashMap::new(),
+        standby_dials: VecDeque::new(),
+        activity: HashMap::new(),
+        #[cfg(test)]
+        streams_on: None,
     };
     network.publish();
     let _ = start.send(Ok(()));
@@ -271,7 +347,7 @@ pub(super) async fn run(
         tokio::task::yield_now().await;
         // Rebind outside Quinn's socket callbacks, which hold its endpoint lock.
         // Failure is logged by the socket and resumes Quinn's native I/O errors.
-        #[cfg(any(target_os = "macos", test))]
+        #[cfg(any(target_os = "macos", target_os = "android", test))]
         if let Ok(Some(socket)) = network.socket.rebind(&network.endpoint) {
             network.socket = socket;
         }
@@ -286,6 +362,7 @@ pub(super) async fn run(
         let mut cx = Context::from_waker(&waker);
         network.log_send_errors(began);
         network.core.tick(began);
+        network.route_tick(began);
         network.probe_tick(began);
         network.retry_n1(began);
         network.effects();
@@ -339,6 +416,10 @@ pub(super) async fn run(
         network.core.lose(id, LinkLost::Stopped);
     }
     network.effects();
+    // Before `stopped`: an owner that sees the layer stopped reads why.
+    if let Some(fatal) = network.fatal.take() {
+        let _ = network.shared.fatal.set(fatal);
+    }
     network.shared.hub.stopped.store(true, Ordering::Release);
     network.shared.hub.changed.notify_waiters();
     network.endpoint.close(0u32.into(), b"stopped");
@@ -357,8 +438,13 @@ impl Network {
             include(at);
         }
         for p in self.physical.values() {
-            if p.id.is_none_or(|id| !self.core.selected_connection_id(id)) {
+            if p.id.is_none_or(|id| !self.core.retained_connection_id(id)) {
                 include(p.deadline);
+            }
+        }
+        for dial in &self.standby_dials {
+            if let Some(h) = &dial.handshake {
+                include(h.deadline);
             }
         }
         for h in &self.inbound {
@@ -457,7 +543,7 @@ impl Network {
         &mut self,
         peer: Boot,
         path: Option<oink_foundation::session::PathId>,
-        v: v1::admission::Violation,
+        v: v2::admission::Violation,
     ) {
         let now = Instant::now();
         let rate = self.violations.entry((peer, path)).or_insert((now, 0, 0));
@@ -465,30 +551,30 @@ impl Network {
             rate.0 = now;
             rate.1 = 0;
         }
-        if rate.1 >= v1::limits::ERROR_RATE_PER_SECOND {
+        if rate.1 >= v2::limits::ERROR_RATE_PER_SECOND {
             rate.2 = rate.2.saturating_add(1);
             return;
         }
         rate.1 += 1;
         let suppressed = std::mem::take(&mut rate.2);
         let scope = match v.isolation {
-            v1::dto::Isolation::PhysicalConnection => v1::dto::ErrorScope::Connection,
-            v1::dto::Isolation::LogicalLink => v1::dto::ErrorScope::LogicalLink,
-            v1::dto::Isolation::LowOperation => v1::dto::ErrorScope::LowOperation,
-            _ => v1::dto::ErrorScope::Stream,
+            v2::dto::Isolation::PhysicalConnection => v2::dto::ErrorScope::Connection,
+            v2::dto::Isolation::LogicalLink => v2::dto::ErrorScope::LogicalLink,
+            v2::dto::Isolation::LowOperation => v2::dto::ErrorScope::LowOperation,
+            _ => v2::dto::ErrorScope::Stream,
         };
         if v.reply {
-            use v1::schema::{WireDto, WireValue};
-            let mut raw: v1::RawMap = [(1, v.code.number().write()), (2, scope.write())].into();
+            use v2::schema::{WireDto, WireValue};
+            let mut raw: v2::RawMap = [(1, v.code.number().write()), (2, scope.write())].into();
             if let Some(type_id) = v.type_id {
                 raw.insert(3, type_id.write());
             }
             raw.insert(4, v.kind.write());
             if let Some(capability) = v.capability {
-                raw.insert(7, v1::RawValue::from(capability));
+                raw.insert(7, v2::RawValue::from(capability));
             }
-            if let Ok(error) = v1::dto::ProtocolError::from_raw(raw)
-                && let Ok(bytes) = v1::frame::encode(&v1::Message::ProtocolError(error), v1::limits::CONFIG_FRAME)
+            if let Ok(error) = v2::dto::ProtocolError::from_raw(raw)
+                && let Ok(bytes) = v2::frame::encode(&v2::Message::ProtocolError(error), v2::limits::CONFIG_FRAME)
             {
                 if let Some(path) = path {
                     if let Some((id, _)) = self
@@ -498,7 +584,7 @@ impl Network {
                         .find(|(_, link)| link.peer == peer && link.wire.path_id == path)
                         && let Some(control) = self.controls.get(id)
                     {
-                        let _ = control.tx.post(bytes, v1::limits::CONFIG_FRAME);
+                        let _ = control.tx.post(bytes, v2::limits::CONFIG_FRAME);
                     }
                 } else if let Some(uid) = self.physical.iter().find_map(|(uid, physical)| {
                     physical
@@ -511,7 +597,7 @@ impl Network {
                 }
             }
         }
-        let violation = v1::admission::ProtocolViolation {
+        let violation = v2::admission::ProtocolViolation {
             code: v.code,
             scope,
             peer: crate::wire_identity::device(peer.device_id),
@@ -578,11 +664,18 @@ impl Network {
             Source::User(tx.clone()),
             None,
         )));
+        // A C0 negotiation that already reached this link (a relay re-greeting
+        // keeps the logical link) applies to its fresh queue at once.
+        let gate = super::gate::Gate::baseline(StreamKind::Config as u16, self.shared.hub.sharing_paused.clone());
+        if let Some(agreement) = self.logical.get(&id) {
+            gate.update(agreement);
+        }
         self.controls.insert(
             id,
             ControlQueues {
                 tx,
                 rx,
+                gate,
                 announced: false,
             },
         );
@@ -664,6 +757,7 @@ impl Network {
                                 tag,
                             },
                             queue: q.tx.clone(),
+                            gate: q.gate.clone(),
                         },
                         control_rx: RecvStream {
                             id: StreamId {
@@ -723,6 +817,7 @@ impl Network {
                     } else {
                         self.dials.push(Dialing {
                             identity_mismatch: false,
+                            alpn_rejected: false,
                             peer,
                             origin,
                             addresses: unique,
@@ -752,6 +847,19 @@ impl Network {
                 }
                 Effect::PathChanged { link, old } => {
                     self.ensure_n1(self.core.links[&link].hop.connection_id);
+                    // Direct to direct: the old connection stays as a standby with
+                    // N0 only; its Low hop closes (Low follows the new connection).
+                    // It keeps the hop while any other path still rides it: after
+                    // relay to direct it is the connection to the relay, whose own
+                    // link carries Low; after direct to direct it can still be the
+                    // first hop of a relayed link or one end of a forwarded transit.
+                    if self.core.retained_connection_id(old.connection_id)
+                        && !self.core.connection_in_use(old.connection_id)
+                        && let Some(&uid) = self.connections.get(&old.connection_id)
+                    {
+                        self.close_n1(uid);
+                        self.n1_retry.remove(&old.connection_id);
+                    }
                     if let Some(uid) = self.physical_for(link) {
                         let route = self.core.links[&link].hop.route_tag;
                         let count = self.writers.len();
@@ -789,7 +897,7 @@ impl Network {
                         });
                     }
                     self.publish();
-                    let path = LinkPath::Direct;
+                    let path = self.core.links[&link].path();
                     let _ = self.events.send(ConfigEvent::PathChanged { link, path });
                     self.module_all(|| ModuleEvent::PathChanged { link, path });
                     #[cfg(any(test, feature = "test-support"))]
@@ -798,6 +906,17 @@ impl Network {
                 Effect::CloseTransit(path) => {
                     self.pipes.retain(|p| p.path != path);
                     self.publish_low();
+                }
+                Effect::DialStandby { peer, address, id } => {
+                    self.standby_dials.push_back(StandbyDial {
+                        peer,
+                        address,
+                        id,
+                        handshake: None,
+                    });
+                }
+                Effect::RouteRecord { link, peer, record } => {
+                    let _ = self.events.send(ConfigEvent::RouteRecord { link, peer, record });
                 }
             }
         }
@@ -831,6 +950,7 @@ impl Network {
                     .any(|(id, l)| *id != link && l.peer == *peer && Some(l.wire.path_id) == *path)
         });
         self.logical.remove(&link);
+        self.activity.remove(&link);
         self.formats.remove(&link);
         self.audio.remove(&link);
         self.old_lanes.remove(&link);
@@ -893,6 +1013,19 @@ impl Network {
                     })
                     .map(|(_, failure)| failure.clone())
                     .or_else(|| pool.filter(|p| !p.available).and_then(|p| p.failure.clone()));
+                let low_available = failure.is_none() && pool.is_some_and(|p| p.available);
+                // Diagnostics only: without the hop's N1 the link has no Low
+                // admission, and every open fails with this same reason.
+                let failure = failure.or_else(|| {
+                    (!self.n1.contains_key(&l.hop.connection_id)).then(|| crate::LowUnavailable {
+                        from: self.core.boot.device_id,
+                        to: l.peer.device_id,
+                        reason: crate::LowFailureReason::Tcp {
+                            stage: "admission".into(),
+                            detail: "low-priority admission is unavailable: no Low control hop (N1) on the link's connection".into(),
+                        },
+                    })
+                });
                 LinkEntry {
                     link: l.id,
                     peer: l.peer.device_id,
@@ -954,8 +1087,9 @@ impl Network {
                     udp_bytes_sent: stats.as_ref().map_or(0, |s| s.udp_tx.bytes),
                     udp_datagrams_sent: stats.as_ref().map_or(0, |s| s.udp_tx.datagrams),
                     udp_bytes_received: stats.as_ref().map_or(0, |s| s.udp_rx.bytes),
-                    low_available: failure.is_none() && pool.is_some_and(|p| p.available),
+                    low_available,
                     low_failure: failure,
+                    route: self.core.route_view(l.id),
                 }
             })
             .collect();
@@ -979,8 +1113,43 @@ impl Network {
             return false;
         };
         match command {
+            Command::UpdateProfile(profile) => {
+                self.core
+                    .set_forwards(profile.capabilities.iter().any(|c| c == RELAY_TRANSIT));
+                self.profile = profile;
+            }
             Command::ConfigFence(applied) => {
                 let _ = applied.send(());
+            }
+            Command::RebindSocket(reply) => {
+                // Here, not inside Quinn's socket callbacks, which hold its endpoint lock.
+                #[cfg(any(target_os = "macos", target_os = "android", test))]
+                let result = {
+                    self.socket.request_rebind();
+                    match self.socket.rebind(&self.endpoint) {
+                        Ok(Some(socket)) => {
+                            self.socket = socket;
+                            Ok(())
+                        }
+                        Ok(None) => Ok(()),
+                        Err(error) => Err(error),
+                    }
+                };
+                #[cfg(not(any(target_os = "macos", target_os = "android", test)))]
+                let result = Err(std::io::ErrorKind::Unsupported.into());
+                let _ = reply.send(result);
+            }
+            Command::AudioMarking(audio) => {
+                // iOS only: the Mac's socket is always voice; Android and
+                // Windows have no marking that reaches the wire (qos.rs).
+                #[cfg(target_os = "ios")]
+                if let Some(marker) = &self.service_marker {
+                    let service = crate::qos::audio_service_type(audio);
+                    crate::qos::set_service_type(marker, service);
+                    tracing::info!(?service, "QUIC socket service type for audio");
+                }
+                #[cfg(not(target_os = "ios"))]
+                let _ = audio;
             }
             #[cfg(test)]
             Command::InspectConnections(reply) => {
@@ -1003,6 +1172,12 @@ impl Network {
             }
             Command::Disconnect(id, reason) => self.core.lose(id, LinkLost::Local(reason)),
             Command::HalfOpen(id) => {
+                // Fresh membership has been accepted. The peer can read our C0
+                // reply and send TCP Race on N1 before its Done reaches us.
+                // Keeping the old-root Low fence until Ready drops that Open
+                // even though its exact path is current. HalfOpen still holds
+                // upper streams and application Low Opens until Ready.
+                self.old_lanes.remove(&id);
                 self.core.set_half_open(id);
                 self.publish();
             }
@@ -1061,6 +1236,22 @@ impl Network {
                 }
             }
             Command::Addresses(peer, addresses) => self.core.update_addresses(peer, addresses, Instant::now()),
+            Command::RouteAddresses(peer, addresses) => {
+                self.core.update_route_addresses(peer, addresses, Instant::now());
+                self.publish();
+            }
+            Command::RouteRecord(link, record) => self.core.set_route_record(link, record),
+            Command::SetRoute(peer, choice, reply) => {
+                let accepted = self.core.set_route(peer, choice, Instant::now());
+                let _ = reply.send(accepted);
+                self.publish();
+            }
+            Command::RouteProbing(enabled) => self.core.set_route_probing(enabled, Instant::now()),
+            Command::LocalAddresses(mut ips) => {
+                ips.sort();
+                ips.dedup();
+                self.core.update_local_addresses(ips, Instant::now());
+            }
             Command::Register(kinds, sender) => {
                 for kind in kinds {
                     self.modules.insert(kind, sender.clone());
@@ -1072,7 +1263,14 @@ impl Network {
                 queue,
                 datagram,
             } => {
-                if let Some(uid) = self.physical_for(id.link) {
+                #[cfg(test)]
+                let forced = self
+                    .streams_on
+                    .and_then(|address| self.core.test_own_standby(address))
+                    .and_then(|connection| self.connections.get(&connection).copied());
+                #[cfg(not(test))]
+                let forced = None;
+                if let Some(uid) = forced.or_else(|| self.physical_for(id.link)) {
                     let flow = if datagram.is_some() {
                         let Some(flow) = self.flow(uid) else {
                             queue.close();
@@ -1191,6 +1389,9 @@ impl Network {
             }
             Command::Agreement(link, agreement) => {
                 if self.core.links.contains_key(&link) {
+                    if let Some(control) = self.controls.get(&link) {
+                        control.gate.update(&agreement);
+                    }
                     self.logical.insert(link, agreement);
                 }
             }
@@ -1221,12 +1422,23 @@ impl Network {
                 }
             }
             Command::Stop => self.stop = true,
+            #[cfg(any(test, feature = "test-support"))]
+            Command::InjectFatal(fatal) => self.fail(fatal),
+            #[cfg(test)]
+            Command::FailEndpointSocket => self.socket.fail_for_test(),
             #[cfg(test)]
             Command::ResetN1(link) => {
                 if let Some(uid) = self.physical_for(link) {
                     self.close_n1(uid);
                 }
             }
+            #[cfg(test)]
+            Command::SwitchRoute(peer, address, reply) => {
+                let _ = reply.send(self.core.test_switch_route(peer, address, Instant::now()));
+                self.publish();
+            }
+            #[cfg(test)]
+            Command::StreamsOn(address) => self.streams_on = address,
             Command::Probe(connection, active) => {
                 if active {
                     self.probes.entry(connection).or_insert(low::Probe {
@@ -1316,6 +1528,14 @@ impl Network {
             .physical
             .get(&writer.uid)
             .map_or(Err(StreamClosed::LinkLost), |p| writer.step(&p.connection, frozen, cx));
+        if !writer.observed.is_empty() {
+            let observed = std::mem::take(&mut writer.observed);
+            if let Some(id) = writer.id {
+                for (type_id, bytes) in observed {
+                    self.observe_frame(id.link, StreamDir::Out, type_id, bytes.as_deref());
+                }
+            }
+        }
         match result {
             Ok(progress) => {
                 self.writers.push_back(writer);
@@ -1454,6 +1674,11 @@ impl Network {
                     self.core.peer_data_received(id.link, Instant::now());
                 }
                 let header = reader.header.expect("header");
+                if header.tag.kind == StreamKind::Input
+                    && let Some(id) = reader.id
+                {
+                    self.observe_input(id.link, StreamDir::In, &bytes);
+                }
                 if header.tag.kind == StreamKind::LowControl {
                     reader.pending_low = self.low_message(reader.uid, bytes);
                 } else {
@@ -1532,7 +1757,7 @@ impl Network {
                 .and_then(|id| self.core.links.get(&id))
                 .is_some_and(|link| self.shared.hold_input_peer.load().as_deref() == Some(&link.peer.device_id))
     }
-    fn header(&mut self, mut reader: Box<Reader>, raw_header: v1::frame::StreamHeader) {
+    fn header(&mut self, mut reader: Box<Reader>, raw_header: v2::frame::StreamHeader) {
         let Some(physical) = self.physical.get(&reader.uid) else {
             return;
         };
@@ -1572,6 +1797,21 @@ impl Network {
         if self.hold_input_header(reader.uid, header) {
             self.shared.input_header_held.notify_one();
             self.readers.push_back(reader);
+            return;
+        }
+        // A standby connection carries N0 only (protocol-v2 11.2). N1 while no
+        // path rides it, and any stream of a link that is not on it, are
+        // refused as InvalidChannel here; admission would answer Invalid for
+        // want of a link.
+        if let Some(id) = physical.id
+            && self.core.retained_connection_id(id)
+            && match header.tag.kind {
+                StreamKind::Internal => false,
+                StreamKind::LowControl => !self.core.connection_in_use(id),
+                _ => self.core.route(id, raw_header.route_tag).is_none(),
+            }
+        {
+            reader.stop(StreamCode::InvalidChannel);
             return;
         }
         if self
@@ -1651,6 +1891,99 @@ impl Network {
         self.module_event(header.tag.kind, ModuleEvent::Inbound(inbound));
         self.readers.push_back(reader);
     }
+    fn reject_bootstrap(&mut self, uid: usize, bytes: &[u8], error: v2::Error) {
+        use v2::{
+            ErrorCode, Message,
+            schema::{WireDto, WireValue},
+        };
+
+        let input = v2::frame::OpaqueFrame::parse_exact(bytes, v2::limits::RELIABLE_FRAME).ok();
+        let type_id = input.as_ref().map(|frame| frame.header.type_id);
+        let code = match error.code {
+            ErrorCode::MissingCapability => ErrorCode::RegistryMismatch,
+            ErrorCode::NegotiationMismatch => ErrorCode::IncompatibleProtocol,
+            ErrorCode::MalformedFrame | ErrorCode::UnsupportedValue | ErrorCode::LimitExceeded
+                if type_id == Some(0xc00) =>
+            {
+                ErrorCode::MalformedOffer
+            }
+            code => code,
+        };
+        let physical = self.physical.get_mut(&uid).expect("bootstrap candidate");
+        if code.requires_upgrade() {
+            let _ = self
+                .events
+                .send(ConfigEvent::ProtocolIncompatible { peer: physical.peer });
+        }
+        if type_id == Some(1) || !(code.requires_upgrade() || code == ErrorCode::MalformedOffer) {
+            self.remove_physical(uid);
+            return;
+        }
+
+        let version = input.and_then(|frame| match frame.decode().ok()? {
+            Message::ConnectionOffer(offer) => offer.protocols().ok()?.0.into_iter().next(),
+            _ => None,
+        });
+        let peer_major = version.as_ref().and_then(|version| version.major().ok());
+        let peer_minor = version.and_then(|version| version.highest_minor().ok());
+        let mut raw: v2::RawMap = [
+            (1, code.number().write()),
+            (2, v2::dto::ErrorScope::Connection.write()),
+            (
+                5,
+                v2::RawValue::Array(error.field_path.into_iter().map(|field| field.write()).collect()),
+            ),
+            (10, v2::MAJOR.write()),
+            (12, code.requires_upgrade().write()),
+        ]
+        .into();
+        if let Some(type_id) = type_id {
+            raw.insert(3, type_id.write());
+        }
+        if let Some(major) = peer_major {
+            raw.insert(8, major.write());
+        }
+        if let Some(minor) = peer_minor {
+            raw.insert(9, minor.write());
+        }
+        if code.requires_upgrade() {
+            raw.insert(11, v2::RawValue::from("protocol.upgrade_required"));
+        }
+        let reason = if code == ErrorCode::UnsupportedMajor {
+            format!(
+                "protocol_major_mismatch:{}:{}",
+                peer_major.unwrap_or_default(),
+                v2::MAJOR
+            )
+        } else {
+            "protocol_bootstrap_rejected".to_owned()
+        };
+        let connection = physical.connection.clone();
+        physical.rejecting_bootstrap = true;
+        // A connection close discards outstanding STREAM data. Give the peer
+        // a bounded opportunity to receive the final error before retiring.
+        tokio::spawn(async move {
+            let _ = tokio::time::timeout(Duration::from_millis(500), async {
+                let error = v2::dto::ProtocolError::from_raw(raw).ok()?;
+                let frame = v2::frame::encode(&Message::ProtocolError(error), v2::limits::RELIABLE_FRAME).ok()?;
+                let mut stream = connection.open_uni().await.ok()?;
+                stream
+                    .write_all(&v2::frame::StreamHeader::bootstrap().encode().ok()?)
+                    .await
+                    .ok()?;
+                stream.write_all(&frame).await.ok()?;
+                stream.finish().ok()?;
+                stream.stopped().await.ok()?;
+                Some(())
+            })
+            .await;
+            connection.close(
+                quinn::VarInt::from_u64(code.number()).expect("bootstrap error code"),
+                reason.as_bytes(),
+            );
+        });
+    }
+
     fn message(&mut self, uid: usize, header: StreamHeader, bytes: Vec<u8>) {
         let Some(physical) = self.physical.get_mut(&uid) else {
             return;
@@ -1660,9 +1993,15 @@ impl Network {
                 self.remove_physical(uid);
                 return;
             }
-            let Ok(replies) = physical.bootstrap.receive(&bytes, Instant::now()) else {
-                self.remove_physical(uid);
+            if physical.rejecting_bootstrap {
                 return;
+            }
+            let replies = match physical.bootstrap.receive(&bytes, Instant::now()) {
+                Ok(replies) => replies,
+                Err(error) => {
+                    self.reject_bootstrap(uid, &bytes, error);
+                    return;
+                }
             };
             let selected = physical
                 .bootstrap
@@ -1681,10 +2020,22 @@ impl Network {
                     self.remove_physical(uid);
                     return;
                 }
-                self.physical.get_mut(&uid).expect("candidate").id = Some(selected.connection);
+                let physical = self.physical.get_mut(&uid).expect("candidate");
+                physical.id = Some(selected.connection);
+                // Own dial: the peer address dialed. Peer's dial: this device's
+                // address it reached (Quinn reports it from the packet info).
+                let target = if physical.outbound {
+                    Some(physical.connection.remote_address())
+                } else {
+                    physical
+                        .connection
+                        .local_ip()
+                        .map(|ip| SocketAddr::new(ip, self.endpoint.local_addr().map_or(0, |a| a.port())))
+                };
                 self.connections.insert(selected.connection, uid);
+                let relay = RelayRole::of(&selected.agreement, &selected.peer_capabilities());
                 self.core
-                    .authenticated(selected.peer_boot, selected.connection, Instant::now());
+                    .authenticated_at(selected.peer_boot, selected.connection, target, relay, Instant::now());
             }
             return;
         }
@@ -1693,7 +2044,9 @@ impl Network {
             return;
         };
         if let Some(connection) = physical.id {
-            if let LinkMsg::HopPong { nonce } = message {
+            if let LinkMsg::HopPong { nonce } = message
+                && nonce & super::core::ROUTE_NONCE == 0
+            {
                 self.probe_pong(connection, nonce);
             } else {
                 let route_change = matches!(
@@ -1826,6 +2179,13 @@ impl Network {
                 {
                     if let Some(id) = reader.id {
                         self.core.peer_data_received(id.link, Instant::now());
+                        if reader
+                            .header
+                            .is_some_and(|h| matches!(h.tag.kind, StreamKind::Input | StreamKind::Audio))
+                            && let Some(activity) = self.activity.get_mut(&id.link)
+                        {
+                            activity.last = Some(Instant::now());
+                        }
                     }
                     if reader
                         .id
@@ -1836,7 +2196,7 @@ impl Network {
                     } else if let Some(mut admission) = reader.header.and_then(|header| self.admission(uid, header)) {
                         admission.transport = Transport::Datagram;
                         if let Ok(frame) =
-                            v1::frame::OpaqueFrame::parse_exact(&bytes[prefix..], v1::limits::DATAGRAM - 4)
+                            v2::frame::OpaqueFrame::parse_exact(&bytes[prefix..], v2::limits::DATAGRAM - 4)
                             && admission.admit(frame.header).is_ok()
                         {
                             let _ = queue.post_lossy(frame.bytes());
@@ -1863,14 +2223,19 @@ impl Network {
                 .writers
                 .iter_mut()
                 .filter(|w| w.uid == uid && w.stream.is_some() && !w.finished)
-                .filter_map(|w| w.datagram.as_ref().map(|q| (w.header.datagram_flow, q)))
+                .filter_map(|w| {
+                    let watched =
+                        w.id.filter(|_| matches!(w.header.tag.kind, StreamKind::Input | StreamKind::Audio))
+                            .map(|id| id.link);
+                    w.datagram.as_ref().map(|q| (w.header.datagram_flow, watched, q))
+                })
                 .chain(
                     self.pipes
                         .iter_mut()
                         .filter(|p| p.target == uid)
-                        .map(|p| (p.header.datagram_flow, &p.datagrams)),
+                        .map(|p| (p.header.datagram_flow, None, &p.datagrams)),
                 );
-            for (index, (flow, queue)) in sources.enumerate().skip(skip).take(take) {
+            for (index, (flow, watched, queue)) in sources.enumerate().skip(skip).take(take) {
                 *cursor = index;
                 self.datagram_buffer.clear();
                 self.datagram_buffer.extend_from_slice(&flow.to_le_bytes());
@@ -1879,6 +2244,11 @@ impl Network {
                 if let Ok(Some(len)) = queue.take_into(&mut self.datagram_buffer[prefix..]) {
                     self.datagram_buffer.truncate(prefix + len);
                     let _ = connection.send_datagram(bytes::Bytes::copy_from_slice(&self.datagram_buffer));
+                    if let Some(link) = watched
+                        && let Some(activity) = self.activity.get_mut(&link)
+                    {
+                        activity.last = Some(Instant::now());
+                    }
                     return true;
                 }
             }
@@ -1964,7 +2334,7 @@ impl Network {
             .iter()
             .filter(|(_, p)| {
                 p.connection.close_reason().is_some()
-                    || now >= p.deadline && p.id.is_none_or(|id| !self.core.selected_connection_id(id))
+                    || now >= p.deadline && p.id.is_none_or(|id| !self.core.retained_connection_id(id))
             })
             .map(|(uid, _)| *uid)
             .collect();
@@ -1997,15 +2367,26 @@ impl Network {
                 progress = true;
             }
         }
-        if let Poll::Ready(Some(incoming)) = self.accepting.poll(cx, || {
+        let accepted = self.accepting.poll(cx, || {
             let endpoint = self.endpoint.clone();
             Box::pin(async move { endpoint.accept().await })
-        }) {
+        });
+        // Accept ends only when the endpoint closes (after this loop) or its
+        // driver has exited: the latter is the same failure `connect_shared`
+        // detects, found here without waiting for a dial.
+        if let Poll::Ready(None) = accepted {
+            self.fail(NetworkFatal::EndpointDriverStopped {
+                detected_by: "accept",
+                local_address: self.endpoint.local_addr().ok(),
+            });
+            progress = true;
+        }
+        if let Poll::Ready(Some(incoming)) = accepted {
             let pending = self.inbound.len()
                 + self
                     .physical
                     .values()
-                    .filter(|p| !p.outbound && p.id.is_none_or(|id| !self.core.selected_connection_id(id)))
+                    .filter(|p| !p.outbound && p.id.is_none_or(|id| !self.core.retained_connection_id(id)))
                     .count();
             if pending >= MAX_INBOUND_PENDING {
                 incoming.refuse();
@@ -2131,6 +2512,7 @@ impl Network {
                             }
                         }
                         Err(error) => {
+                            dial.alpn_rejected |= alpn_rejected(&error);
                             if let Some(trace) = &mut attempt.trace {
                                 trace.end("failed", diagnostics::quic_reason(&error), &error.to_string());
                             }
@@ -2149,6 +2531,13 @@ impl Network {
             }
             if dial.attempts.is_empty() {
                 if dial.addresses.is_empty() {
+                    if dial.alpn_rejected && !dial.identity_mismatch {
+                        // A 0.3.x member known only by address (manual IP,
+                        // another subnet) never shows up in v2 discovery.
+                        // TLS ends before identities, so this rests on the
+                        // address book: it is a display hint, never trust.
+                        let _ = self.events.send(ConfigEvent::ProtocolIncompatible { peer: dial.peer });
+                    }
                     if dial.identity_mismatch {
                         self.core.dial_identity_mismatch(dial.peer, now);
                     } else {
@@ -2174,7 +2563,7 @@ impl Network {
                         diagnostics::hex(&id.random),
                         dial.origin,
                     );
-                    match self.endpoint.connect(address, crate::tls::SERVER_NAME) {
+                    match self.connect_shared(address) {
                         Ok(connecting) => {
                             dial.attempts.push(Handshake {
                                 trace: Some(trace),
@@ -2193,7 +2582,196 @@ impl Network {
             self.dials.insert(index, dial);
             index += 1;
         }
+        progress |= self.standby_dials_one(now, cx);
         progress
+    }
+    /// Standby handshakes: two at a time, and none started while a real
+    /// reconnect dial is running (it has the right of way, design 4.1).
+    fn standby_dials_one(&mut self, now: Instant, cx: &mut Context<'_>) -> bool {
+        let mut progress = false;
+        let reconnecting = self
+            .dials
+            .iter()
+            .any(|d| !d.attempts.is_empty() || !d.addresses.is_empty());
+        let mut running = self.standby_dials.iter().filter(|d| d.handshake.is_some()).count();
+        let mut index = 0;
+        while index < self.standby_dials.len() {
+            let dial = &self.standby_dials[index];
+            if !self.core.standby_dial_wanted(dial.peer, dial.id) {
+                // The link went down and the route state forgot this dial;
+                // dropping a running handshake abandons the attempt.
+                let dial = self.standby_dials.remove(index).expect("standby dial");
+                if dial.handshake.is_some() {
+                    running -= 1;
+                }
+                progress = true;
+                continue;
+            }
+            let dial = &mut self.standby_dials[index];
+            if dial.handshake.is_none() {
+                if reconnecting || running >= STANDBY_DIALS {
+                    index += 1;
+                    continue;
+                }
+                let (address, peer, id) = (dial.address, dial.peer, dial.id);
+                match self.connect_shared(address) {
+                    Ok(connecting) => {
+                        self.standby_dials[index].handshake = Some(Handshake {
+                            trace: None,
+                            future: Box::pin(connecting),
+                            peer: Some(peer),
+                            id: Some(id),
+                            deadline: now + DIAL_BUDGET,
+                        });
+                        running += 1;
+                        progress = true;
+                    }
+                    Err(_) => {
+                        let dial = self.standby_dials.remove(index).expect("standby dial");
+                        self.core.standby_dial_failed(dial.peer, dial.id, now);
+                        progress = true;
+                        continue;
+                    }
+                }
+            }
+            let dial = &mut self.standby_dials[index];
+            let handshake = dial.handshake.as_mut().expect("started");
+            let result = if now >= handshake.deadline {
+                Some(Err(()))
+            } else {
+                match handshake.future.as_mut().poll(cx) {
+                    Poll::Ready(Ok(connection)) => Some(Ok(connection)),
+                    Poll::Ready(Err(_)) => Some(Err(())),
+                    Poll::Pending => None,
+                }
+            };
+            let Some(result) = result else {
+                index += 1;
+                continue;
+            };
+            let dial = self.standby_dials.remove(index).expect("standby dial");
+            running -= 1;
+            progress = true;
+            let accepted = match result {
+                Ok(connection) => {
+                    // Wrong identity, or the address routes back to this device
+                    // (for example a bridge address shared by both ends): unreachable.
+                    if tls_peer(&connection) == Some(dial.peer) {
+                        self.established(connection, Some(dial.peer), Some(dial.id), None)
+                    } else {
+                        connection.close(11u32.into(), b"route identity rejected");
+                        false
+                    }
+                }
+                Err(()) => false,
+            };
+            if !accepted {
+                self.core.standby_dial_failed(dial.peer, dial.id, now);
+            }
+        }
+        progress
+    }
+    fn route_tick(&mut self, now: Instant) {
+        for (id, link) in &self.core.links {
+            if link.state == LinkState::Ready && self.core.boot.device_id < link.peer.device_id {
+                self.activity.entry(*id).or_default();
+            }
+        }
+        let context = RouteContext {
+            activity: &self.activity,
+            hub: &self.shared.hub,
+            physical: &self.physical,
+            connections: &self.connections,
+        };
+        self.core.route_tick(now, &context);
+    }
+    fn observe_input(&mut self, link: LinkId, dir: StreamDir, bytes: &[u8]) {
+        if bytes.len() < v2::frame::FRAME_HEADER || !self.activity.contains_key(&link) {
+            return;
+        }
+        let type_id = u16::from_le_bytes([bytes[0], bytes[1]]);
+        self.observe_frame(link, dir, type_id, wire::held_frame(type_id).then_some(bytes));
+    }
+    /// Idle test inputs (decision D2): input events in either direction, and the
+    /// held key and button sets, which keep the link busy without new events.
+    fn observe_frame(&mut self, link: LinkId, dir: StreamDir, type_id: u16, bytes: Option<&[u8]>) {
+        let Some(activity) = self.activity.get_mut(&link) else {
+            return;
+        };
+        // Motion, key, button, scroll, key repeat, gesture, relative motion,
+        // volume key, touchpad contacts. Periodic held/focus/game records are not events.
+        if matches!(type_id, 0x0201..=0x0204 | 0x0207..=0x020b) {
+            activity.last = Some(Instant::now());
+        }
+        let Some(bytes) = bytes else { return };
+        let Ok(message) =
+            v2::frame::OpaqueFrame::parse_exact(bytes, v2::limits::RELIABLE_FRAME).and_then(|f| f.decode())
+        else {
+            return;
+        };
+        let held = &mut activity.held[usize::from(dir == StreamDir::In)];
+        let button = |value: &v2::dto::MouseButton| v2::cbor::encode_map(v2::schema::WireDto::raw(value), 256).ok();
+        match message {
+            v2::Message::InputKey(key) => {
+                let (Ok(code), Ok(pressed)) = (key.code(), key.pressed()) else {
+                    return;
+                };
+                let code = key.physical_code().ok().flatten().unwrap_or(code);
+                if pressed {
+                    held.keys.insert(code);
+                } else {
+                    held.keys.remove(&code);
+                }
+            }
+            v2::Message::InputButton(value) => {
+                let (Ok(b), Ok(pressed)) = (value.button(), value.pressed()) else {
+                    return;
+                };
+                let Some(key) = button(&b) else { return };
+                if pressed {
+                    held.buttons.insert(key);
+                } else {
+                    held.buttons.remove(&key);
+                }
+            }
+            v2::Message::InputHeldSync(sync) => {
+                if let (Ok(keys), Ok(buttons)) = (sync.keys(), sync.buttons()) {
+                    held.keys = keys.0.into_iter().collect();
+                    held.buttons = buttons.0.iter().filter_map(button).collect();
+                }
+            }
+            _ => {}
+        }
+    }
+    /// A dial on the shared endpoint. Quinn reports EndpointStopping once the
+    /// endpoint is closing (only after this loop ends, at `stop`) or its driver
+    /// has exited. Before `stop` that is the driver: the endpoint no longer
+    /// sends or receives, so every dial would fail at once (2026-11-12: a
+    /// receive error ended it and dials kept retrying for minutes). The layer
+    /// fails instead of rebuilding the endpoint in place: its owner restarts it.
+    fn connect_shared(&mut self, address: SocketAddr) -> Result<quinn::Connecting, quinn::ConnectError> {
+        let result = self.endpoint.connect(address, crate::tls::SERVER_NAME);
+        if matches!(result, Err(quinn::ConnectError::EndpointStopping)) {
+            self.fail(NetworkFatal::EndpointDriverStopped {
+                detected_by: "dial",
+                local_address: self.endpoint.local_addr().ok(),
+            });
+        }
+        result
+    }
+    /// End this loop with `fatal` (once; a requested stop wins). Every link
+    /// still up is then lost with `Stopped` (one whose connection the dead
+    /// driver already ended was lost as `ConnectionLost`), and the owner reads
+    /// the reason from `LinkLayer::exited` (user 2026-11-12: fail fast,
+    /// supervised restart).
+    fn fail(&mut self, fatal: NetworkFatal) {
+        if self.stop {
+            return;
+        }
+        tracing::error!(reason = fatal.code(), error = %fatal,
+            links = self.core.links.len(), "network layer exiting with a fatal error; its owner restarts it");
+        self.stop = true;
+        self.fatal = Some(fatal);
     }
     fn established(
         &mut self,
@@ -2229,11 +2807,13 @@ impl Network {
                 _probe_endpoint: probe_endpoint,
                 peer,
                 id,
+                low_peer_info: Arc::new(arc_swap::ArcSwapOption::empty()),
                 deadline: bootstrap.deadline,
                 outbound: id.is_some(),
                 datagram_source_cursor: 0,
                 next_flow: 0,
                 bootstrap,
+                rejecting_bootstrap: false,
                 incoming: Default::default(),
                 datagrams: Default::default(),
             },
@@ -2242,6 +2822,15 @@ impl Network {
             self.send_private(uid, 0, offer);
         }
         true
+    }
+}
+/// The server refused every offered ALPN (TLS alert 120): it speaks only v1.
+fn alpn_rejected(error: &quinn::ConnectionError) -> bool {
+    let code = quinn::TransportErrorCode::crypto(120);
+    match error {
+        quinn::ConnectionError::ConnectionClosed(close) => close.error_code == code,
+        quinn::ConnectionError::TransportError(error) => error.code == code,
+        _ => false,
     }
 }
 fn tls_peer(connection: &quinn::Connection) -> Option<DeviceId> {

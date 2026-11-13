@@ -213,6 +213,7 @@ export function SettingsPage({ open, platform, api, capsIme, query, jump, onActi
         finally {setReceivedSaving(false);}
     };
     const [cacheBytes, setCacheBytes] = useState<number | null>(null);
+    const [proxyCacheBytes, setProxyCacheBytes] = useState(0);
     const [cacheNote, setCacheNote] = useState('');
     const [clearing, setClearing] = useState(false);
     useEffect(() => {
@@ -222,6 +223,7 @@ export function SettingsPage({ open, platform, api, capsIme, query, jump, onActi
                 const usage = rows.find(row => row.device === self)?.usage;
                 if (usage) {
                     setCacheBytes(usage.total_bytes);
+                    setProxyCacheBytes(usage.categories.find(category => category.category === 'transfer_proxy')?.bytes ?? 0);
                     setCacheNote('');
                 }
             }).catch(() => { });
@@ -358,7 +360,7 @@ export function SettingsPage({ open, platform, api, capsIme, query, jump, onActi
             ]}/>};
             case 'cache':
                 return {
-                    desc: cacheNote ? <>{text(item.desc, platform)} · {cacheNote}</> : undefined,
+                    desc: <>{text(item.desc, platform)}{proxyCacheBytes > 0 && <> · {tr('移动代理文件')}: {formatSize(proxyCacheBytes)}</>}{cacheNote && <> · {cacheNote}</>}</>,
                     node: (<span className="setp__btns">
               <span className="setp__size">{cacheBytes === null ? '—' : cacheBytes === 0 ? tr('没有缓存') : formatSize(cacheBytes)}</span>
               <Button size="sm" loading={clearing} disabled={cacheBytes === 0} onClick={clearCache}>{tr('清空缓存')}</Button>
@@ -430,6 +432,7 @@ export function SettingsPage({ open, platform, api, capsIme, query, jump, onActi
             case 'microphoneInput': return {node:<MicrophoneInput/>};
             case 'microphonePermission': return {node:<MicrophonePermission/>};
             case 'audioEncodingQuality': return {node:<Select size="sm" aria-label={label} value={prefs.audioEncodingQuality} onChange={(v) => set('audioEncodingQuality', v as Prefs['audioEncodingQuality'])} options={[{value:'smooth',label:tr('流畅')},{value:'quality',label:tr('质量')},{value:'lossless',label:tr('无损')}]}/>};
+            case 'echoCancellation': return { node: <Switch aria-label={label} checked={prefs.echoCancellation} onChange={v => set('echoCancellation', v)} /> };
             case 'audioDevice': {
                 const list = agentState.audio?.devices.find(d => d.device.map(v => v.toString(16).padStart(2, '0')).join('') === agentState.overview?.this_device.id)?.outputs ?? [];
                 return {

@@ -2,7 +2,7 @@
 use oink_network::link::{LinkId, LinkLayer, LinkPath, LinkState};
 use oink_protocol::{
     frame::{StreamCode, StreamKind},
-    v1::{
+    v2::{
         self, Message,
         admission::{Context, Phase},
         registry::Transport,
@@ -14,7 +14,7 @@ pub(super) fn decode<T>(
     link: LinkId,
     kind: StreamKind,
     bytes: &[u8],
-    convert: impl FnOnce(Message) -> v1::Result<T>,
+    convert: impl FnOnce(Message) -> v2::Result<T>,
 ) -> Result<T, StreamCode> {
     let table = links.links();
     let entry = table
@@ -30,7 +30,7 @@ pub(super) fn decode<T>(
         direct: entry.path == LinkPath::Direct,
         old_member_lane: false,
     };
-    let frame = v1::frame::OpaqueFrame::parse_exact(bytes, v1::limits::RELIABLE_FRAME)
+    let frame = v2::frame::OpaqueFrame::parse_exact(bytes, v2::limits::RELIABLE_FRAME)
         .map_err(|error| StreamCode::from_wire(error.code.number()))?;
     let type_id = frame.header.type_id;
     context
@@ -42,7 +42,7 @@ pub(super) fn decode<T>(
             code
         })
 }
-pub(crate) fn report_low_payload(links: &LinkLayer, link: LinkId, kind: StreamKind, type_id: u16, code: v1::ErrorCode) {
+pub(crate) fn report_low_payload(links: &LinkLayer, link: LinkId, kind: StreamKind, type_id: u16, code: v2::ErrorCode) {
     let table = links.links();
     if let Some(entry) = table.links.iter().find(|entry| entry.link == link) {
         let context = Context {

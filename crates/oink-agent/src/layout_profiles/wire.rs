@@ -3,7 +3,7 @@ use super::{model::*, types::*};
 use crate::api::{DeviceKey, GroupKey, Placement, ScreenKey};
 use oink_display::layout::LayoutSettings;
 use oink_foundation::{Point, Size};
-use oink_protocol::v1::{
+use oink_protocol::v2::{
     self, RawValue as V, dto as d,
     schema::{WireDto, WireValue},
 };
@@ -17,26 +17,26 @@ fn list<T>(values: impl IntoIterator<Item = T>, f: impl Fn(T) -> V) -> V {
 fn dev(v: DeviceKey) -> V {
     crate::config::store::wire_device(v.0).write()
 }
-fn device(v: d::DeviceId) -> v1::Result<DeviceKey> {
+fn device(v: d::DeviceId) -> v2::Result<DeviceKey> {
     Ok(DeviceKey(oink_foundation::DeviceId(
         v.public_key()?
             .0
             .try_into()
-            .map_err(|_| v1::ErrorCode::UnsupportedValue)?,
+            .map_err(|_| v2::ErrorCode::UnsupportedValue)?,
     )))
 }
-fn bytes(s: &str, n: usize) -> v1::Result<V> {
+fn bytes(s: &str, n: usize) -> v2::Result<V> {
     if s.len() != n * 2 {
-        return Err(v1::ErrorCode::UnsupportedValue.into());
+        return Err(v2::ErrorCode::UnsupportedValue.into());
     }
     let b = (0..s.len())
         .step_by(2)
         .map(|i| {
             s.get(i..i + 2)
                 .and_then(|s| u8::from_str_radix(s, 16).ok())
-                .ok_or(v1::ErrorCode::UnsupportedValue.into())
+                .ok_or(v2::ErrorCode::UnsupportedValue.into())
         })
-        .collect::<v1::Result<Vec<_>>>()?;
+        .collect::<v2::Result<Vec<_>>>()?;
     Ok(V::Bytes(b))
 }
 fn hex(b: &[u8]) -> String {
@@ -45,7 +45,7 @@ fn hex(b: &[u8]) -> String {
 fn ver(v: &Version) -> V {
     map([(1, v.counter.write()), (3, dev(v.writer))])
 }
-fn version(v: d::ConfigVersion) -> v1::Result<Version> {
+fn version(v: d::ConfigVersion) -> v2::Result<Version> {
     Ok(Version {
         counter: v.counter()?,
         writer: device(v.writer()?)?,
@@ -54,19 +54,19 @@ fn version(v: d::ConfigVersion) -> v1::Result<Version> {
 pub fn point(v: Point) -> V {
     map([(1, v.x.write()), (2, v.y.write())])
 }
-fn read_point(v: d::Point) -> v1::Result<Point> {
+fn read_point(v: d::Point) -> v2::Result<Point> {
     Ok(Point::new(v.x()?, v.y()?))
 }
 fn screen(v: &ScreenKey) -> V {
     map([(1, dev(v.device)), (2, V::from(v.display.as_str()))])
 }
-fn read_screen(v: d::ScreenId) -> v1::Result<ScreenKey> {
+fn read_screen(v: d::ScreenId) -> v2::Result<ScreenKey> {
     Ok(ScreenKey {
         device: device(v.device()?)?,
         display: v.display()?.0,
     })
 }
-pub fn native(v: &NativeState) -> v1::Result<d::LayoutProfileNative> {
+pub fn native(v: &NativeState) -> v2::Result<d::LayoutProfileNative> {
     d::LayoutProfileNative::from_raw(
         [
             (1, dev(v.device)),
@@ -86,7 +86,7 @@ pub fn native(v: &NativeState) -> v1::Result<d::LayoutProfileNative> {
         .into(),
     )
 }
-pub fn read_native(v: d::LayoutProfileNative) -> v1::Result<NativeState> {
+pub fn read_native(v: d::LayoutProfileNative) -> v2::Result<NativeState> {
     Ok(NativeState {
         device: device(v.device()?)?,
         primary: read_screen(v.primary()?)?,
@@ -102,7 +102,7 @@ pub fn read_native(v: d::LayoutProfileNative) -> v1::Result<NativeState> {
                     size: Size::new(s.size()?.w()?, s.size()?.h()?),
                 })
             })
-            .collect::<v1::Result<_>>()?,
+            .collect::<v2::Result<_>>()?,
     })
 }
 fn topology(v: &LayoutSettings) -> V {
@@ -118,13 +118,13 @@ fn topology(v: &LayoutSettings) -> V {
 pub fn disabled(v: &Disabled) -> V {
     map([(1, screen(&v.screen)), (2, v.disabled.write())])
 }
-pub fn read_disabled(v: d::LayoutProfileDisabled) -> v1::Result<Disabled> {
+pub fn read_disabled(v: d::LayoutProfileDisabled) -> v2::Result<Disabled> {
     Ok(Disabled {
         screen: read_screen(v.screen()?)?,
         disabled: v.disabled()?,
     })
 }
-pub(crate) fn snapshot(v: &ArrangementSnapshot) -> v1::Result<V> {
+pub(crate) fn snapshot(v: &ArrangementSnapshot) -> v2::Result<V> {
     Ok(map([
         (
             1,
@@ -139,7 +139,7 @@ pub(crate) fn snapshot(v: &ArrangementSnapshot) -> v1::Result<V> {
                 v.native
                     .iter()
                     .map(|n| native(n).map(|n| n.write()))
-                    .collect::<v1::Result<_>>()?,
+                    .collect::<v2::Result<_>>()?,
             ),
         ),
         (4, topology(&v.topology)),
@@ -149,7 +149,7 @@ pub(crate) fn snapshot(v: &ArrangementSnapshot) -> v1::Result<V> {
         ),
     ]))
 }
-pub(crate) fn read_snapshot(v: d::LayoutProfileSnapshot, active: &str) -> v1::Result<ArrangementSnapshot> {
+pub(crate) fn read_snapshot(v: d::LayoutProfileSnapshot, active: &str) -> v2::Result<ArrangementSnapshot> {
     let t = v.topology()?;
     let mut s = ArrangementSnapshot {
         screen_shared: v
@@ -163,7 +163,7 @@ pub(crate) fn read_snapshot(v: d::LayoutProfileSnapshot, active: &str) -> v1::Re
                             shared: d.shared()?,
                         })
                     })
-                    .collect::<v1::Result<Vec<_>>>()
+                    .collect::<v2::Result<Vec<_>>>()
             })
             .transpose()?
             .unwrap_or_default(),
@@ -178,14 +178,14 @@ pub(crate) fn read_snapshot(v: d::LayoutProfileSnapshot, active: &str) -> v1::Re
                     scale: p.scale()?,
                 })
             })
-            .collect::<v1::Result<_>>()?,
+            .collect::<v2::Result<_>>()?,
         disabled: v
             .disabled()?
             .0
             .into_iter()
             .map(read_disabled)
-            .collect::<v1::Result<_>>()?,
-        native: v.native()?.0.into_iter().map(read_native).collect::<v1::Result<_>>()?,
+            .collect::<v2::Result<_>>()?,
+        native: v.native()?.0.into_iter().map(read_native).collect::<v2::Result<_>>()?,
         topology: LayoutSettings {
             gap_travel: t.gap_travel()?,
             overlap_tolerance: t.overlap_tolerance()?,
@@ -199,7 +199,20 @@ pub(crate) fn read_snapshot(v: d::LayoutProfileSnapshot, active: &str) -> v1::Re
     canonicalize(&mut s);
     Ok(s)
 }
-pub fn catalog(v: &Catalog) -> v1::Result<d::LayoutProfileCatalogV3> {
+/// Encode the catalog for the v2 wire. Retired local fields are deliberately
+/// omitted from this projection even when an older local file retained them.
+pub fn catalog(v: &Catalog) -> v2::Result<d::LayoutProfileCatalog> {
+    let mut raw = storage_catalog(v)?.into_raw();
+    for key in [6, 7, 8] {
+        raw.remove(&key);
+    }
+    d::LayoutProfileCatalog::from_raw(raw)
+}
+
+/// Encode the durable catalog without changing its historical raw shape.
+/// Local 0.3.x files may contain retired fields; they remain opaque here and
+/// are never sent on the v2 wire.
+pub fn storage_catalog(v: &Catalog) -> v2::Result<d::LayoutProfileCatalog> {
     let profiles = v
         .profiles
         .iter()
@@ -223,7 +236,7 @@ pub fn catalog(v: &Catalog) -> v1::Result<d::LayoutProfileCatalogV3> {
                         (
                             2,
                             list(&p.match_state.connected_screens, |(device, screens)| {
-                                let mut raw = [(1, dev(*device))].into_iter().collect::<v1::RawMap>();
+                                let mut raw = [(1, dev(*device))].into_iter().collect::<v2::RawMap>();
                                 if let Some(screens) = screens {
                                     raw.insert(2, list(screens, |s| V::from(s.as_str())));
                                 }
@@ -234,7 +247,7 @@ pub fn catalog(v: &Catalog) -> v1::Result<d::LayoutProfileCatalogV3> {
                 ),
             ]
             .into_iter()
-            .collect::<v1::RawMap>();
+            .collect::<v2::RawMap>();
             if let Some(topology) = &p.saved_topology {
                 raw.insert(9, ver(&p.content_revision));
                 raw.insert(
@@ -281,8 +294,8 @@ pub fn catalog(v: &Catalog) -> v1::Result<d::LayoutProfileCatalogV3> {
             }
             Ok(V::Map(raw))
         })
-        .collect::<v1::Result<Vec<_>>>()?;
-    d::LayoutProfileCatalogV3::from_raw(restore_extensions(
+        .collect::<v2::Result<Vec<_>>>()?;
+    d::LayoutProfileCatalog::from_raw(restore_extensions(
         [
             (1, v.schema.write()),
             (2, V::Bytes(v.group.0.0.to_vec())),
@@ -307,14 +320,14 @@ pub fn catalog(v: &Catalog) -> v1::Result<d::LayoutProfileCatalogV3> {
                                                 .map(|a| {
                                                     Ok(catalog(&template_catalog(a, v.group))?.profiles()?.0[0].write())
                                                 })
-                                                .collect::<v1::Result<_>>()?,
+                                                .collect::<v2::Result<_>>()?,
                                         ),
                                     ),
                                 ]
                                 .into(),
                             ))
                         })
-                        .collect::<v1::Result<_>>()?,
+                        .collect::<v2::Result<_>>()?,
                 ),
             ),
             (
@@ -323,7 +336,7 @@ pub fn catalog(v: &Catalog) -> v1::Result<d::LayoutProfileCatalogV3> {
                     v.completed_joins
                         .iter()
                         .map(|(id, j)| {
-                            let mut raw: v1::RawMap = [
+                            let mut raw: v2::RawMap = [
                                 (1, bytes(id, 32)?),
                                 (2, ver(&j.version)),
                                 (
@@ -332,7 +345,7 @@ pub fn catalog(v: &Catalog) -> v1::Result<d::LayoutProfileCatalogV3> {
                                         j.dropped_defaults
                                             .iter()
                                             .map(|id| bytes(id, 16))
-                                            .collect::<v1::Result<_>>()?,
+                                            .collect::<v2::Result<_>>()?,
                                     ),
                                 ),
                             ]
@@ -342,7 +355,7 @@ pub fn catalog(v: &Catalog) -> v1::Result<d::LayoutProfileCatalogV3> {
                             }
                             Ok(V::Map(raw))
                         })
-                        .collect::<v1::Result<_>>()?,
+                        .collect::<v2::Result<_>>()?,
                 ),
             ),
         ]
@@ -350,16 +363,13 @@ pub fn catalog(v: &Catalog) -> v1::Result<d::LayoutProfileCatalogV3> {
         &v.extensions,
     )?)
 }
-pub fn read_catalog(v: d::LayoutProfileCatalogV3) -> Result<Catalog> {
-    fn read(v: d::LayoutProfileCatalogV3) -> v1::Result<Catalog> {
+pub fn read_catalog(v: d::LayoutProfileCatalog) -> Result<Catalog> {
+    fn read(v: d::LayoutProfileCatalog) -> v2::Result<Catalog> {
         let active = hex(&v.active()?.0);
         let mut retained =
-            extensions(&V::Map(v.raw().clone()), "LayoutProfileCatalogV3").unwrap_or(V::Map(Default::default()));
+            extensions(&V::Map(v.raw().clone()), "LayoutProfileCatalog").unwrap_or(V::Map(Default::default()));
         if let V::Map(raw) = &mut retained {
             raw.remove(&5);
-            for key in [6, 7, 8] {
-                raw.remove(&key);
-            }
         }
         Ok(Catalog {
             extensions: extension_bytes(retained)?,
@@ -413,10 +423,10 @@ pub fn read_catalog(v: d::LayoutProfileCatalogV3) -> Result<Catalog> {
                                                         primary: s.primary()?,
                                                     })
                                                 })
-                                                .collect::<v1::Result<_>>()?,
+                                                .collect::<v2::Result<_>>()?,
                                         })
                                     })
-                                    .collect::<v1::Result<_>>()
+                                    .collect::<v2::Result<_>>()
                             })
                             .transpose()?,
                         extensions: extension_bytes(
@@ -442,7 +452,7 @@ pub fn read_catalog(v: d::LayoutProfileCatalogV3) -> Result<Catalog> {
                         },
                         content: read_snapshot(p.content()?, "")?,
                         match_state: DeviceState {
-                            online_devices: state.online()?.0.into_iter().map(device).collect::<v1::Result<_>>()?,
+                            online_devices: state.online()?.0.into_iter().map(device).collect::<v2::Result<_>>()?,
                             connected_screens: state
                                 .devices()?
                                 .0
@@ -453,11 +463,11 @@ pub fn read_catalog(v: d::LayoutProfileCatalogV3) -> Result<Catalog> {
                                         d.displays()?.map(|v| v.0.into_iter().map(|s| s.0).collect()),
                                     ))
                                 })
-                                .collect::<v1::Result<_>>()?,
+                                .collect::<v2::Result<_>>()?,
                         },
                     })
                 })
-                .collect::<v1::Result<_>>()?,
+                .collect::<v2::Result<_>>()?,
             completed_joins: v
                 .completed_joins()?
                 .0
@@ -481,7 +491,7 @@ pub fn read_catalog(v: d::LayoutProfileCatalogV3) -> Result<Catalog> {
                                 .unwrap_or_default()
                                 .into_iter()
                                 .map(|p| {
-                                    let wrapper = d::LayoutProfileCatalogV3::from_raw(
+                                    let wrapper = d::LayoutProfileCatalog::from_raw(
                                         [
                                             (1, 1u32.write()),
                                             (2, v.group()?.write()),
@@ -492,16 +502,16 @@ pub fn read_catalog(v: d::LayoutProfileCatalogV3) -> Result<Catalog> {
                                         .into(),
                                     )?;
                                     let template = read_catalog(wrapper)
-                                        .map_err(|_| v1::ErrorCode::UnsupportedValue)?
+                                        .map_err(|_| v2::ErrorCode::UnsupportedValue)?
                                         .profiles
                                         .remove(0);
                                     Ok(template)
                                 })
-                                .collect::<v1::Result<_>>()?,
+                                .collect::<v2::Result<_>>()?,
                         },
                     ))
                 })
-                .collect::<v1::Result<_>>()?,
+                .collect::<v2::Result<_>>()?,
         })
     }
     let c = read(v).map_err(invalid)?;
@@ -526,10 +536,10 @@ fn shape_name(shape: &str) -> String {
 }
 fn extensions(value: &V, shape: &str) -> Option<V> {
     let name = shape_name(shape);
-    let schema = v1::registry::SCHEMAS.iter().find(|s| s.name == name)?;
+    let schema = v2::registry::SCHEMAS.iter().find(|s| s.name == name)?;
     match value {
         V::Map(raw) => {
-            let mut unknown = v1::RawMap::new();
+            let mut unknown = v2::RawMap::new();
             for (key, value) in raw {
                 if let Some(field) = schema.fields.iter().find(|f| f.key == *key) {
                     if let Some(child) = extensions(value, field.shape) {
@@ -559,15 +569,15 @@ fn extensions(value: &V, shape: &str) -> Option<V> {
         _ => None,
     }
 }
-fn extension_bytes(value: V) -> v1::Result<Vec<u8>> {
+fn extension_bytes(value: V) -> v2::Result<Vec<u8>> {
     let raw = value.as_map()?;
     if raw.is_empty() {
         Ok(Vec::new())
     } else {
-        v1::cbor::encode_map(raw, MAX_BYTES)
+        v2::cbor::encode_map(raw, MAX_BYTES)
     }
 }
-fn restore_extensions(raw: v1::RawMap, bytes: &[u8]) -> v1::Result<v1::RawMap> {
+fn restore_extensions(raw: v2::RawMap, bytes: &[u8]) -> v2::Result<v2::RawMap> {
     if bytes.is_empty() {
         return Ok(raw);
     }
@@ -597,7 +607,7 @@ fn restore_extensions(raw: v1::RawMap, bytes: &[u8]) -> v1::Result<v1::RawMap> {
         }
     }
     let mut value = V::Map(raw);
-    overlay(&mut value, V::Map(v1::cbor::decode_map(bytes, MAX_BYTES)?));
+    overlay(&mut value, V::Map(v2::cbor::decode_map(bytes, MAX_BYTES)?));
     Ok(value.as_map()?.clone())
 }
 

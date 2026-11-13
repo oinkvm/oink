@@ -1,6 +1,7 @@
-//! Target-local MOVE completion never authorizes deleting a source or target path.
+//! Target-local MOVE never deletes a remote original or user-owned destination.
 use super::*;
 use serde::{Deserialize, Serialize};
+pub(super) mod notification;
 
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -46,6 +47,71 @@ impl Offer {
     }
 }
 impl Service {
+    fn proxy_root(
+        &self,
+        old: &Path,
+    ) -> io::Result<Option<(Arc<dyn crate::content::namespace::Namespace>, crate::model::NodeId)>> {
+        let deliveries: Vec<_> = self.deliveries.lock().unwrap().values().cloned().collect();
+        for delivery in deliveries {
+            let Some(namespace) = delivery.contents().namespace() else {
+                continue;
+            };
+            let Some(nodes) = delivery.contents().descriptor_nodes()? else {
+                continue;
+            };
+            let index =
+                delivery.native_paths.lock().unwrap().iter().position(|path| {
+                    received::relative_path(path, old).is_some_and(|tail| tail.as_os_str().is_empty())
+                });
+            if let Some(index) = index {
+                let Some(node) = nodes.get(index) else { continue };
+                if namespace.tracked_file(node.id)?.is_some() {
+                    return Ok(Some((namespace, node.id)));
+                }
+            }
+        }
+        Ok(None)
+    }
+    pub(super) fn watch_proxy_move(self: &Arc<Self>, old: &Path, target: &Path, key: (u32, i64)) -> io::Result<()> {
+        if self.proxy_root(old)?.is_none() {
+            // Ordinary PC received files keep their existing lifecycle; only
+            // phone roots need pending path/identity observations.
+            self.received.lock().unwrap().renames.remove(&key);
+            return Ok(());
+        }
+        let watch = notification::Watch::start(Arc::downgrade(self), old.to_owned(), target.to_owned(), key)?;
+        let mut journal = self.received.lock().unwrap();
+        if self.stopping.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        journal.move_watches.insert(key, watch);
+        journal.move_watches.get_mut(&key).unwrap().activate();
+        Ok(())
+    }
+    /// Called only by CF completion or a real filesystem change notification.
+    pub(super) fn track_proxy_move(&self, old: &Path, volume: u32, file: i64) -> io::Result<bool> {
+        match std::fs::symlink_metadata(old) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Ok(_) => return Ok(false),
+            Err(error) => return Err(error),
+        }
+        let Some((namespace, node)) = self.proxy_root(old)? else {
+            return Ok(true);
+        };
+        // Resolve the exact old placeholder FRN, not the pathname which another
+        // object could already have replaced. A second user move is also safe.
+        let reference = crate::tracked_file::TrackedFile::capture_native(&self.root, volume, file)?;
+        let current = reference
+            .resolve()
+            .map_err(crate::tracked_file::ResolveError::into_io)?;
+        if received::relative_path(&self.root.canonicalize()?, &current).is_some() {
+            return Ok(false);
+        }
+        namespace.proxy_file_moved(node, &reference)?;
+        tracing::info!(target: "oink_file_diagnostics", file_stage = 63_u8,
+            file_id = file, "phone proxy cache replaced by moved file reference");
+        Ok(true)
+    }
     fn target_consumed(&self, id: u64, index: usize) -> io::Result<()> {
         let mut journal = self.received.lock().unwrap();
         if journal.cancelled.contains(&id)

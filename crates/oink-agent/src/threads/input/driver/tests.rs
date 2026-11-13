@@ -18,24 +18,23 @@ fn fixture_admission(peer: DeviceId, link: LinkId) -> wire::PeerAdmission {
         boot: fixture_boot(peer),
         link,
         agreement: Arc::new(
-            oink_protocol::v1::admission::Agreement::new(
+            oink_protocol::v2::admission::Agreement::new(
                 [
-                    "oink.core/1",
-                    "oink.group/1",
-                    "oink.clipboard/1",
+                    "oink.core/2",
+                    "oink.group/2",
+                    "oink.clipboard/2",
                     "oink.low/1",
-                    "oink.input/1",
-                    "oink.pointer.move/1",
-                    "oink.pointer.move-hidden/1",
-                    "oink.focus.local-click/1",
-                    "oink.auto-unlock/1",
-                    "oink.auto-unlock.sync/1",
-                    "oink.input.relative/1",
-                    "oink.input.gestures/1",
-                    "oink.input.contacts/1",
-                    "oink.input.trail/1",
+                    "oink.input/2",
+                    "oink.input/2",
+                    "oink.input/2",
+                    "oink.input/2",
+                    "oink.device/2",
+                    "oink.input/2",
+                    "oink.input/2",
+                    "oink.input/2",
+                    "oink.input/2",
                     "oink.drag/1",
-                    "oink.audio.exit-volume/1",
+                    "oink.audio/2",
                 ]
                 .into_iter()
                 .map(str::to_owned),
@@ -44,18 +43,17 @@ fn fixture_admission(peer: DeviceId, link: LinkId) -> wire::PeerAdmission {
         ),
     }
 }
-fn encode(message: &Message) -> oink_protocol::v1::Result<Vec<u8>> {
-    let mut bytes = vec![0; oink_protocol::v1::limits::RELIABLE_FRAME];
+fn encode(message: &Message) -> oink_protocol::v2::Result<Vec<u8>> {
+    let mut bytes = vec![0; oink_protocol::v2::limits::RELIABLE_FRAME];
     let used = wire::encode(message, &mut bytes)?;
     bytes.truncate(used);
     Ok(bytes)
 }
-fn decode(bytes: &[u8]) -> oink_protocol::v1::Result<Message> {
+fn decode(bytes: &[u8]) -> oink_protocol::v2::Result<Message> {
     let admission = fixture_admission(peer(), LinkId(1));
-    let frame = oink_protocol::v1::frame::OpaqueFrame::parse_exact(bytes, oink_protocol::v1::limits::RELIABLE_FRAME)?;
+    let frame = oink_protocol::v2::frame::OpaqueFrame::parse_exact(bytes, oink_protocol::v2::limits::RELIABLE_FRAME)?;
     match wire::decode(bytes, &admission, frame.header.type_id == 0x0209)? {
         wire::Decoded::Packet(packet) => Ok(packet),
-        wire::Decoded::Retired => Err(oink_protocol::v1::ErrorCode::UnsupportedValue.into()),
         wire::Decoded::Deferred(message) => crate::dnd::wire::decode(message).map(Message::Dnd),
     }
 }
@@ -139,12 +137,12 @@ fn input_scope(driver: &Driver) -> oink_routing::control::FocusScope {
         members: vec![(driver.local, driver.adapter.routing_session()), (peer(), *session)],
     }
 }
-fn fixture_version() -> oink_protocol::v1::dto::ConfigVersion {
-    use oink_protocol::v1::{
+fn fixture_version() -> oink_protocol::v2::dto::ConfigVersion {
+    use oink_protocol::v2::{
         RawValue,
         schema::{WireDto, WireValue},
     };
-    oink_protocol::v1::dto::ConfigVersion::from_raw(
+    oink_protocol::v2::dto::ConfigVersion::from_raw(
         [
             (1, RawValue::from(0_u64)),
             (3, oink_network::wire_identity::device(DeviceId([1; 32])).write()),
@@ -335,7 +333,7 @@ fn pointer_shortcut_command_reaches_hidden_target_over_the_input_wire() {
         .adapter
         .router_mut()
         .set_layout(Arc::new(oink_routing::TopologyLayout::from_layout(&layout, &owners)));
-    h.driver.command(InputCommand::MovePointerTo(peer()));
+    h.driver.command(InputCommand::MovePointerTo(peer(), None));
     assert_eq!(h.driver.adapter.router().focus().holder, peer());
     assert!(drain(&mut read).iter().any(|m| matches!(m, Message::Control(ControlMsg::MovePointerEnter { display, pos, .. }) if display == "screen" && *pos == fixture_display().bounds.center())));
 }
@@ -609,7 +607,7 @@ fn outbound_reopen_retains_newest_inbound_state_and_waits_for_release() {
     assert!(!h.driver.shared.status.load().peers[0].online);
     let old = h.driver.adapter.receive_state(peer()).unwrap().clone();
     let mut feel = old.feel.clone().unwrap();
-    feel.key_repeat_delay_ms += 25;
+    feel.wheel_lines_per_notch = Some(2.5);
     write
         .post(encode(&Message::Control(ControlMsg::Feel { profile: feel.clone() })).unwrap())
         .unwrap();
@@ -690,6 +688,9 @@ fn invalid_opening_fault_identifies_only_the_exact_inbound_stream() {
     assert!(
         matches!(h.driver.notices.take(), Some(InputNotice::Fault { which: Which::Inbound, code: StreamCode::Invalid, stream, .. }) if stream.tag.ordinal == 7)
     );
+    // The handle carried the code when it was dropped: the network owner can
+    // see the closed queue before InputStreams handles the notice.
+    assert_eq!(write.close_code(), StreamCode::Invalid);
 }
 
 #[test]
@@ -1021,7 +1022,7 @@ fn blocked_fake_injector_leaves_i0_queued_while_the_input_owner_keeps_running() 
     }
     let previous = h.driver.adapter.receive_state(peer()).unwrap().feel.clone().unwrap();
     let mut changed = previous.clone();
-    changed.key_repeat_delay_ms += 99;
+    changed.wheel_lines_per_notch = Some(3.5);
     writer
         .post(
             encode(&Message::Control(ControlMsg::Feel {
@@ -1229,7 +1230,7 @@ fn delayed_ordinary_drag_work_cannot_cross_an_input_stream_replacement() {
     drain(&mut new_reader);
     let original = h.driver.adapter.receive_state(peer()).unwrap().feel.clone().unwrap();
     let mut changed = original.clone();
-    changed.key_repeat_delay_ms += 42;
+    changed.wheel_lines_per_notch = Some(4.5);
     let message = Message::Control(ControlMsg::Feel {
         profile: changed.clone(),
     });
@@ -1241,9 +1242,9 @@ fn delayed_ordinary_drag_work_cannot_cross_an_input_stream_replacement() {
     h.driver.command(InputCommand::SendMessage {
         peer: peer(),
         stream: old_outbound,
-        message: oink_protocol::v1::frame::OpaqueFrame::parse_exact(
+        message: oink_protocol::v2::frame::OpaqueFrame::parse_exact(
             &encode(&message).unwrap(),
-            oink_protocol::v1::limits::RELIABLE_FRAME,
+            oink_protocol::v2::limits::RELIABLE_FRAME,
         )
         .unwrap()
         .decode()
@@ -1260,9 +1261,9 @@ fn delayed_ordinary_drag_work_cannot_cross_an_input_stream_replacement() {
     h.driver.command(InputCommand::SendMessage {
         peer: peer(),
         stream: status.peers[0].outbound.unwrap(),
-        message: oink_protocol::v1::frame::OpaqueFrame::parse_exact(
+        message: oink_protocol::v2::frame::OpaqueFrame::parse_exact(
             &encode(&message).unwrap(),
-            oink_protocol::v1::limits::RELIABLE_FRAME,
+            oink_protocol::v2::limits::RELIABLE_FRAME,
         )
         .unwrap()
         .decode()
@@ -1765,7 +1766,7 @@ fn update_prepare_waits_for_injection_fence_and_abort_restores_admission() {
 
 #[test]
 fn intentional_capture_withdrawal_keeps_keyboard_health_known() {
-    use oink_protocol::v1::dto::ResourceFaultCode as Fault;
+    use oink_protocol::v2::dto::ResourceFaultCode as Fault;
     let mut h = Harness::new();
     h.driver.capture_available(true);
     h.driver.command(InputCommand::KeyboardDisabled(true));
@@ -1787,7 +1788,7 @@ fn intentional_capture_withdrawal_keeps_keyboard_health_known() {
 #[test]
 fn resource_faults_keep_unknown_and_separate_capture_secure_input_and_cleanup() {
     use oink_foundation::input::KeyCode;
-    use oink_protocol::v1::dto::ResourceFaultCode as Fault;
+    use oink_protocol::v2::dto::ResourceFaultCode as Fault;
     let mut h = Harness::new();
     h.driver.publish();
     assert_eq!(
@@ -1890,7 +1891,7 @@ fn resource_faults_keep_unknown_and_separate_capture_secure_input_and_cleanup() 
 
 #[test]
 fn owner_resume_cannot_cross_an_emergency_sequence() {
-    use oink_protocol::v1::dto::ControlFailure;
+    use oink_protocol::v2::dto::ControlFailure;
     let mut h = Harness::new();
     // A resume already queued to the native owner is invalidated by a later emergency.
     let (reply, result) = mpsc::sync_channel(1);
@@ -1956,7 +1957,7 @@ fn received_emergency_invalidates_resume_without_originating_another_group_event
     });
     assert_eq!(
         received.try_recv().unwrap(),
-        Err(oink_protocol::v1::dto::ControlFailure::StaleRevision)
+        Err(oink_protocol::v2::dto::ControlFailure::StaleRevision)
     );
 }
 
@@ -1978,7 +1979,7 @@ fn stale_keyboard_disable_cannot_cross_an_emergency() {
     });
     assert_eq!(
         result.try_recv().unwrap(),
-        Err(oink_protocol::v1::dto::ControlFailure::StaleRevision)
+        Err(oink_protocol::v2::dto::ControlFailure::StaleRevision)
     );
     assert!(!h.driver.adapter.router().keyboard_disabled());
 }
@@ -2004,10 +2005,10 @@ fn custom_emergency_hotkey_does_not_keep_paused_capture_active() {
 }
 
 #[test]
-fn baseline_input_attaches_without_optional_opening_records_or_datagrams() {
+fn merged_input_domain_attaches_and_delivers_input() {
     let mut h = Harness::new();
     let admission = wire::PeerAdmission {
-        agreement: Arc::new(oink_protocol::v1::admission::Agreement::new(["oink.input/1".into()]).unwrap()),
+        agreement: Arc::new(oink_protocol::v2::admission::Agreement::new(["oink.input/2".into()]).unwrap()),
         ..fixture_admission(peer(), LinkId(1))
     };
     h.driver.command(InputCommand::PeerAdmission(admission));
@@ -2017,7 +2018,7 @@ fn baseline_input_attaches_without_optional_opening_records_or_datagrams() {
         input,
         motion: None,
     });
-    assert_eq!(drain(&mut read).len(), 3);
+    assert_eq!(drain(&mut read).len(), 4);
     let (write, input) = reliable_pair(LinkId(1), tag(1), QueueSpec::reliable(StreamKind::Input).1);
     h.driver.command(InputCommand::Inbound {
         peer: peer(),
@@ -2025,11 +2026,11 @@ fn baseline_input_attaches_without_optional_opening_records_or_datagrams() {
         motion: None,
         peer_os: Os::Windows,
     });
-    for message in remote().opening_state(true).into_iter().take(3) {
+    for message in remote().opening_state(true).into_iter().take(4) {
         write.post(encode(&message).unwrap()).unwrap();
     }
     h.attach();
-    assert_eq!(h.driver.pairs[&peer()].opening, 3);
+    assert_eq!(h.driver.pairs[&peer()].opening, 4);
     drain(&mut read);
     h.driver.send(
         peer(),
@@ -2038,10 +2039,8 @@ fn baseline_input_attaches_without_optional_opening_records_or_datagrams() {
             gesture: oink_foundation::input::Gesture::SmartMagnify,
         }),
     );
-    assert!(read.take().unwrap().is_none());
-    write.post(encode(&remote().opening_state(true)[3]).unwrap()).unwrap();
-    h.driver.read();
-    assert!(!h.driver.adapter.attached(peer()));
+    assert!(read.take().unwrap().is_some());
+    assert!(h.driver.adapter.attached(peer()));
 }
 
 #[test]
@@ -2098,7 +2097,7 @@ fn queued_writer_uses_current_native_permission_and_not_its_old_snapshot() {
 
 #[test]
 fn unsupported_native_action_reports_numeric_violation_before_detaching() {
-    use oink_protocol::v1::{
+    use oink_protocol::v2::{
         self, RawValue as V, dto,
         schema::{WireDto, WireValue},
     };
@@ -2107,11 +2106,11 @@ fn unsupported_native_action_reports_numeric_violation_before_detaching() {
     let (write, _) = h.inbound(1);
     opening(&write, &remote(), true);
     h.attach();
-    let value = v1::Message::InputButton(
+    let value = v2::Message::InputButton(
         dto::InputButton::from_raw([(1, V::Map([(1, V::Uint(99))].into())), (2, true.write())].into()).unwrap(),
     );
     write
-        .post(v1::frame::encode(&value, v1::limits::RELIABLE_FRAME).unwrap())
+        .post(v2::frame::encode(&value, v2::limits::RELIABLE_FRAME).unwrap())
         .unwrap();
     h.poll();
     assert!(!h.driver.adapter.attached(peer()));
@@ -2119,7 +2118,7 @@ fn unsupported_native_action_reports_numeric_violation_before_detaching() {
         notice,
         InputNotice::ProtocolViolation {
             type_id: Some(0x0203),
-            code: v1::ErrorCode::UnsupportedValue,
+            code: v2::ErrorCode::UnsupportedValue,
             datagram: false,
             ..
         }
@@ -2145,6 +2144,7 @@ fn migration_peer_facts_before_opening_preserve_caps_tap_mapping() {
         h.driver.command(InputCommand::PeerFacts {
             boot: fixture_boot(peer()),
             os: Os::Windows,
+            mobile: false,
             displays: Vec::new(),
             transform: Some(oink_foundation::input_transform::InputTransform::initial("windows")),
         });
@@ -2998,7 +2998,7 @@ fn stale_mouse_disable_cannot_cross_safety_release() {
     });
     assert_eq!(
         result.try_recv().unwrap(),
-        Err(oink_protocol::v1::dto::ControlFailure::StaleRevision)
+        Err(oink_protocol::v2::dto::ControlFailure::StaleRevision)
     );
     assert!(!h.driver.adapter.router().mouse_disabled());
 }
@@ -3099,7 +3099,7 @@ fn passive_game_fresh_native_edge_crosses_but_timeout_and_recenter_do_not() {
 
 #[test]
 fn display_enumeration_notice_waits_for_persistence_and_resets_on_recovery() {
-    use oink_protocol::v1::dto::ResourceFaultCode as Fault;
+    use oink_protocol::v2::dto::ResourceFaultCode as Fault;
     let mut h = Harness::new();
     let start = h.driver.now;
     for command in [InputCommand::LocalDisplayFailure, InputCommand::LocalDisplays(vec![])] {
@@ -3219,7 +3219,7 @@ fn source_foreground_driver_restores_on_normal_return() {
 
 #[test]
 fn unavailable_injection_target_withdraws_capability_and_faults_both_resources() {
-    use oink_protocol::v1::dto::ResourceFaultCode as Fault;
+    use oink_protocol::v2::dto::ResourceFaultCode as Fault;
     let mut h = Harness::new();
     h.driver.command(InputCommand::InjectionAvailable(Some(false)));
     assert_eq!(h.driver.notices.take(), Some(InputNotice::Controllable(false)));
@@ -3285,7 +3285,7 @@ fn auto_unlock_requires_accepted_entry_and_consumes_one_source_reply() {
     opening(&writer, &remote(), true);
     h.attach();
     drain(&mut read);
-    h.driver.command(InputCommand::MovePointerTo(peer()));
+    h.driver.command(InputCommand::MovePointerTo(peer(), None));
     h.driver.command(InputCommand::SessionLocked(Some(true)));
     let epoch = h.driver.adapter.router().focus().epoch + 1;
     let enter = Message::Control(ControlMsg::FocusEnter {
@@ -3307,7 +3307,11 @@ fn auto_unlock_requires_accepted_entry_and_consumes_one_source_reply() {
     for _ in 0..2 {
         h.driver.message(
             peer(),
-            Message::Control(ControlMsg::UnlockReply { epoch, unlocked: true }),
+            Message::Control(ControlMsg::UnlockReply {
+                epoch,
+                unlocked: true,
+                paused: false,
+            }),
         );
     }
     assert_eq!(
@@ -3361,7 +3365,7 @@ fn auto_unlock_uses_authoritative_lock_state_when_observer_cache_lags() {
     opening(&writer, &remote(), true);
     h.attach();
     drain(&mut read);
-    h.driver.command(InputCommand::MovePointerTo(peer()));
+    h.driver.command(InputCommand::MovePointerTo(peer(), None));
     // The observer has not delivered SessionLocked yet; only the platform
     // query in the FocusEnter path knows that the session is already locked.
     let epoch = h.driver.adapter.router().focus().epoch + 1;
@@ -3449,7 +3453,7 @@ fn local_unlock_admission_survives_focus_leaving_before_first_character() {
         admission: LocalUnlockAdmission::Focus(h.driver.adapter.router().focus().epoch),
         job,
     });
-    h.driver.command(InputCommand::MovePointerTo(peer()));
+    h.driver.command(InputCommand::MovePointerTo(peer(), None));
     release.send(()).unwrap();
     assert!(result.recv_timeout(Duration::from_secs(1)).unwrap().is_ok());
 }

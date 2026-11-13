@@ -143,6 +143,14 @@ pub trait Namespace: Send + Sync + 'static {
     /// Release redundant native capture storage, while preserving metadata and
     /// leases held by readers that were already opened. Never render again.
     fn release_fulfilled(&self, _roots: &[NodeId]) {}
+    /// Local-only phone root reference, following its atomic proxy handoffs.
+    fn tracked_file(&self, _node: NodeId) -> io::Result<Option<crate::tracked_file::TrackedFile>> {
+        Ok(None)
+    }
+    /// Successful same-volume CF move; persist the target before dropping cache bytes.
+    fn proxy_file_moved(&self, _node: NodeId, _target: &crate::tracked_file::TrackedFile) -> io::Result<()> {
+        Ok(())
+    }
     fn origin(&self) -> Option<oink_foundation::DeviceId> {
         None
     }
@@ -152,6 +160,13 @@ pub trait Namespace: Send + Sync + 'static {
         false
     }
     fn retain_files(&self, _retention: super::transfer::FileRetention) {}
+    /// Real clipboard file roots by path and disk identity, recorded when the
+    /// offer is registered so the files stay readable by their paths after
+    /// the registration is gone (`content::announced`). Links, promises and
+    /// virtual files are not recorded.
+    fn announced_roots(&self) -> Vec<(NodeId, std::path::PathBuf, [u64; 2])> {
+        Vec::new()
+    }
     fn roots(&self) -> Vec<FileNode>;
     fn list(&self, node: NodeId, cursor: Option<DirectoryCursor>) -> io::Result<DirectoryPage>;
     /// Select the current file version. Real clipboard files may publish a new
@@ -349,6 +364,12 @@ impl Namespace for Restricted {
                 .collect()
         })
     }
+    fn tracked_file(&self, node: NodeId) -> io::Result<Option<crate::tracked_file::TrackedFile>> {
+        self.inner.tracked_file(node)
+    }
+    fn proxy_file_moved(&self, node: NodeId, target: &crate::tracked_file::TrackedFile) -> io::Result<()> {
+        self.inner.proxy_file_moved(node, target)
+    }
     fn origin(&self) -> Option<oink_foundation::DeviceId> {
         self.inner.origin()
     }
@@ -357,6 +378,14 @@ impl Namespace for Restricted {
     }
     fn retain_files(&self, retention: super::transfer::FileRetention) {
         self.inner.retain_files(retention);
+    }
+    fn announced_roots(&self) -> Vec<(NodeId, std::path::PathBuf, [u64; 2])> {
+        let roots = self.roots();
+        self.inner
+            .announced_roots()
+            .into_iter()
+            .filter(|(id, _, _)| roots.iter().any(|root| root.id == *id))
+            .collect()
     }
     fn roots(&self) -> Vec<FileNode> {
         self.resolved_roots().unwrap_or_else(|_| self.roots.clone())
@@ -403,7 +432,7 @@ pub(crate) fn page(
     let mut selected = Vec::new();
     for entry in entries.iter().skip(start).take(DIRECTORY_PAGE_ENTRIES) {
         let length = crate::wire::node(entry)
-            .and_then(|value| oink_protocol::v1::schema::WireDto::encode(&value, DIRECTORY_PAGE_BYTES))
+            .and_then(|value| oink_protocol::v2::schema::WireDto::encode(&value, DIRECTORY_PAGE_BYTES))
             .map_err(|_| unavailable(Unavailable::InvalidData))?
             .len();
         if bytes + length > DIRECTORY_PAGE_BYTES {

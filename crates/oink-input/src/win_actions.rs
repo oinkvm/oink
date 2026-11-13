@@ -20,7 +20,8 @@ pub const SWIPE_PROGRESS_FLOOR: f64 = 0.05;
 /// 捏合放大量每累计这么多发一格 Ctrl+滚轮（Windows 应用一格通常缩放 10%）。
 pub const MAGNIFY_PER_NOTCH: f64 = 0.1;
 
-/// Dock 轻扫的线上方向约定（Pinch 在 macOS 截获端按字段 136 归一化，不是原始进度）：竖直进度为负 = 向上（调度中心），为正 = 向下
+/// Dock 轻扫的线上方向约定（不是原始进度：macOS 截获端按字段 136 换成 136=1 形式，左右与捏合再取反，
+/// 见 `macos::sysevent`；手机触摸板按同一约定生成）：竖直进度为负 = 向上（调度中心），为正 = 向下
 /// （App Exposé，收起调度中心）；捏合进度为负 = 捏合（打开 Apps / 启动台），为正 = 张开（显示桌面）。
 /// 左右：进度为正 = 手指向左、切到右边的桌面（**待真实触摸板记录核对**）。
 pub const HORIZONTAL_POSITIVE_GOES_RIGHT: bool = true;

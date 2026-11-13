@@ -130,14 +130,12 @@ it.each([false,true])('microphone source (muted=%s) toggles mute on click and st
   expect(backend.writes).toHaveLength(2);
   expect(backend.writes[1].params.token).toBe('receive:2');
   expect(icon().getAttribute('aria-label')).toContain('Microphone: Local');
-  // Release first enables receiving in v1; Local must execute the second setter.
-  await finish(1,cards('forwarding','idle',!muted,3));
-  expect(backend.writes).toHaveLength(3);
-  expect(backend.writes[2].params.token).toBe('receive:3');
-  await finish(2,cards('forwarding','muted',!muted,4));
+  // Global audio configuration: leaving Send for Local is one write (Clear
+  // and the receive switch off together); there is no second setter.
+  await finish(1,cards('forwarding','muted',!muted,3));
   expect(agent.get().cards?.cards[0].status?.microphone?.mode).toBe('muted');
   expect(icon().getAttribute('aria-label')).toContain('Microphone: Local');
-  expect(backend.writes).toHaveLength(3);
+  expect(backend.writes).toHaveLength(2);
   expect(notices()).toEqual([]);
 });
 it.each(['idle','receiver','muted'] as const)('microphone %s sends mode immediately and double-click mode last',async mode=>{
@@ -253,16 +251,14 @@ it('times out accepted audio writes and restores the latest device report',async
   } finally {vi.useRealTimers();}
 });
 
-it('keeps Local visible through both v1 release and receiving-disable steps',async()=>{
+it('Local from Send is one write (global audio configuration) and stays visible',async()=>{
   const {container}=mount('forwarding','source');
   const icon=()=>container.querySelectorAll('.dev-ico')[3];
   fireEvent.keyDown(icon(),{key:'Enter',shiftKey:true});
   expect(icon().getAttribute('aria-label')).toContain('Microphone: Local');
-  await finish(0,cards('forwarding','idle',false,2));
-  expect(backend.writes).toHaveLength(2);
-  expect(backend.writes[1].params.token).toBe('receive:2');
-  expect(icon().getAttribute('aria-label')).toContain('Microphone: Local');
-  await finish(1,cards('forwarding','muted',false,3));
+  expect(backend.writes.map(w=>w.params.token)).toEqual(['receive:1']);
+  await finish(0,cards('forwarding','muted',false,2));
+  expect(backend.writes).toHaveLength(1);
   expect(icon().getAttribute('aria-label')).toContain('Microphone: Local');
 });
 
@@ -332,18 +328,18 @@ it('mute and volume stay enabled and the newer volume unmutes over an earlier mu
   expect(mute.querySelector('.vol__glyph')).toBe(glyph);expect(mute.disabled).toBe(false);
 });
 
-it('Local still disables receiving after releasing Send without a virtual microphone',async()=>{
+it('Local from Send without a virtual microphone is one write too',async()=>{
   backend.snapshot=cards('forwarding','source');
   backend.snapshot.cards[0].status!.microphone!.virtualReady=false;
   agent.adopt('cards',backend.snapshot);
   const {container}=render(<App/>);
   fireEvent.keyDown(container.querySelectorAll('.dev-ico')[3],{key:'Enter',shiftKey:true});
+  expect(backend.writes.map(w=>w.params.token)).toEqual(['receive:1']);
   const released=cards('forwarding','idle',false,2);
   released.cards[0].status!.microphone!.mode='unavailable';
   released.cards[0].status!.microphone!.virtualReady=false;
   await finish(0,released);
-  expect(backend.writes).toHaveLength(2);
-  expect(backend.writes[1].params.token).toBe('receive:2');
+  expect(backend.writes).toHaveLength(1);
   expect(container.querySelectorAll('.dev-ico')[3].getAttribute('aria-label')).toContain('Microphone: Local');
 });
 it('shows game-mode changes immediately and restores the confirmed mode on refusal',async()=>{
@@ -500,11 +496,9 @@ it.each(micModes.flatMap(from=>micModes.filter(to=>to!==from).flatMap(to=>[false
   await reportMicrophone(from,2); // changed option token, old resolved mode
   if(!receiptFirst)await microphoneReceipt(0);
   expect(backend.writes).toHaveLength(1);
-  if(from==='source'&&to==='muted'){
-    await reportMicrophone('idle',3);
-    expect(backend.writes.map(w=>w.params.token)).toEqual(['receive:1','receive:3']);
-    await finish(1,cards('forwarding','muted',false,4));
-  }else await reportMicrophone(to,3);
+  // One write per choice: leaving Send for Local or Receive needs no second step.
+  await reportMicrophone(to,3);
+  expect(backend.writes).toHaveLength(1);
   expect(container.querySelector('[data-glyph="microphone"]')?.getAttribute('aria-label')).toContain('Microphone: '+{muted:'Local',receiver:'Receive',source:'Send'}[to]);
   expect(document.querySelector('.ok-toast:not([data-leaving])')).toBeNull();
   expect(notices()).toEqual([]);
@@ -516,23 +510,18 @@ it.each(micModes.flatMap(from=>micModes.filter(first=>first!==from).flatMap(firs
   await reportMicrophone(from,2);
   await microphoneReceipt(0,outcome);
   expect(backend.writes).toHaveLength(1); // never plan from the stale source/mode
-  // Source release enables Receive before the optional Local disable step.
-  const actual=from==='source'?'receiver':first;
-  await reportMicrophone(actual,3);
+  // Every choice is one write, so the first one resolved to exactly `first`.
+  await reportMicrophone(first,3);
   expect(backend.writes).toHaveLength(2);
-  const last=from==='source'?'share:3':actual==='source'?'receive:3':from==='muted'?'receive:3':'receive-mute:3';
+  const last=from==='source'?'share:3':from==='muted'?'receive:3':'receive-mute:3';
   expect(backend.writes[1].params.token).toBe(last);
-  if(actual==='source'&&from==='muted'){
-    await finish(1,cards('forwarding','idle',false,4));
-    expect(backend.writes[2].params.token).toBe('receive:4');
-    await finish(2,cards('forwarding','muted',false,5));
-  }else await finish(1,cards('forwarding',from,false,4));
+  await finish(1,cards('forwarding',from,false,4));
   expect(document.querySelector('.ok-toast:not([data-leaving])')).toBeNull();
   expect(notices()).toEqual([]);
 // Two menu round trips of jsdom role queries: CPU-bound, 2-5 s on a hosted Intel Mac runner.
 },15000);
 it('still reports an actual microphone release refusal rather than suppressing not_exit',async()=>{
-  const {container}=mount('forwarding','source');backend.refuseToken='receive:1';
+  const {container}=mount('forwarding','source');backend.refuseToken='receive-mute:1';
   await chooseMicrophone(container,'receiver');
   await act(async()=>{});
   expect(document.querySelector('.ok-toast:not([data-leaving])')?.textContent).toContain('Could not change microphone settings');

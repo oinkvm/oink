@@ -1,16 +1,18 @@
-//! System-output capture, playback and claim-bound exit volume controls.
+//! System-output capture, playback and route-bound exit volume controls.
 //! Capture never changes endpoint volume or default devices; source mute uses a
 //! durable restoration journal. Explicit exit controls target one exact output.
 mod capture_permission;
-pub mod claims;
 #[cfg(any(target_os = "macos", test))]
 mod endpoint_mute;
 pub mod media;
 #[cfg(any(target_os = "macos", windows, test))]
 mod media_pause;
 pub mod microphone;
+pub mod mobile;
+pub mod mobile_native;
 pub mod model;
 pub mod negotiation;
+pub mod route;
 pub mod session;
 pub mod volume;
 pub use capture_permission::CapturePreflight;
@@ -21,6 +23,9 @@ mod allocation_audit;
 pub mod device_notifications;
 pub mod diagnostics;
 pub mod dsp;
+/// Device-local Case A acoustic echo cancellation. Reference samples stay
+/// inside this crate and are never put on the network.
+pub mod echo;
 pub mod forward_volume;
 mod handoff;
 mod levels;
@@ -52,9 +57,9 @@ mod windows_playback;
 #[cfg(windows)]
 pub(crate) mod windows_timer;
 #[cfg(target_os = "macos")]
-pub use macos::{Capture, MacCaptureOptions};
+pub use macos::{Capture, HeldSourceMute, MacCaptureOptions};
 #[cfg(windows)]
-pub use windows::{Capture, endpoint_state, recover};
+pub use windows::{Capture, HeldSourceMute, endpoint_state, recover};
 
 pub use model::{
     AudioPhase, CapturePermission, DeviceAudioState, ForwardingOffReason, OutputDevice, OutputLatency, Problem,
@@ -96,12 +101,13 @@ pub struct Settings {
     pub forwarding_off_reason: Option<ForwardingOffReason>,
     /// Keep the source audible locally while forwarding. Local only.
     pub keep_local_playback: bool,
+    /// Device-local Case A AEC policy. It is deliberately not projected into
+    /// group facts or any v2 wire message; the audio owner evaluates it with
+    /// the local endpoint and demand state.
+    pub echo_cancellation: bool,
     pub capture_scope: CaptureScope,
     /// Sender-owned encoding quality, edited through the owner preference API.
     pub quality: negotiation::Quality,
-    /// Local source opt-in, off on a fresh install. Selecting an exit does not
-    /// enable sources; this preference does not affect exit playback.
-    pub forwarding_enabled: bool,
     /// Local forwarding control position: 0..=200, 100 is unity.
     /// A continuous fit of the measured Mac dB curve, with a smooth boost
     /// extension. This persisted value is not an amplitude percentage.
@@ -116,9 +122,9 @@ impl Default for Settings {
             receive_output: None,
             forwarding_off_reason: None,
             keep_local_playback: false,
+            echo_cancellation: true,
             capture_scope: CaptureScope::DefaultOutput,
             quality: negotiation::Quality::default(),
-            forwarding_enabled: false,
             forwarding_volume_percent: 100,
             forwarding_muted: false,
         }
@@ -177,9 +183,13 @@ pub struct Status {
     pub audio_activity: bool,
     pub settings: Settings,
     #[serde(default)]
-    pub resolution: claims::Resolution,
+    pub resolution: route::Resolution,
     #[serde(default)]
-    pub microphone_resolution: claims::Resolution,
+    pub microphone_resolution: route::Resolution,
+    /// The global audio overview this device executes: registers and every
+    /// online device's speaker / microphone modes.
+    #[serde(default)]
+    pub overview: route::Overview,
     /// Local input selector metadata, from notification-invalidated discovery.
     #[serde(default)]
     pub microphone_inputs: Vec<microphone::InputDevice>,
@@ -226,6 +236,7 @@ impl Default for Status {
             settings: Default::default(),
             resolution: Default::default(),
             microphone_resolution: Default::default(),
+            overview: Default::default(),
             microphone_inputs: Default::default(),
             microphone_input: None,
             devices: Default::default(),
@@ -362,22 +373,22 @@ mod settings_tests {
         assert!(serde_json::from_str::<Settings>(r#"{"quality":"typo"}"#).is_err());
     }
     #[test]
-    fn forwarding_is_opt_in_and_explicit_choices_round_trip() {
-        assert!(!Settings::default().forwarding_enabled);
-        for enabled in [false, true] {
-            let settings: Settings =
-                serde_json::from_value(serde_json::json!({"forwarding_enabled": enabled})).unwrap();
-            assert_eq!(settings.forwarding_enabled, enabled);
-            let restored: Settings = serde_json::from_value(serde_json::to_value(settings).unwrap()).unwrap();
-            assert_eq!(restored.forwarding_enabled, enabled);
-        }
+    fn the_forward_switch_is_not_a_local_setting() {
+        // It is part of the global audio configuration (route.rs); an earlier
+        // build's saved field is ignored.
+        let settings: Settings = serde_json::from_value(serde_json::json!({"forwarding_enabled": true})).unwrap();
+        assert!(
+            serde_json::to_value(settings)
+                .unwrap()
+                .get("forwarding_enabled")
+                .is_none()
+        );
     }
 
     #[test]
     fn forwarding_volume_defaults_round_trips_and_rejects_invalid_percentages() {
         let settings: Settings = serde_json::from_str("{}").unwrap();
         assert_eq!(settings.forwarding_volume_percent, 100);
-        assert!(!settings.forwarding_enabled);
         for percent in [0, 50, 100, 150, 200] {
             let settings: Settings =
                 serde_json::from_value(serde_json::json!({"forwarding_volume_percent": percent})).unwrap();

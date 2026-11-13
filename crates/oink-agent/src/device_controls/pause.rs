@@ -1,7 +1,7 @@
 //! Session-local pause state. An emergency high-water survives local resume and
 //! same-Boot reconnect; retiring membership or the origin Boot clears it.
 use super::transactions::Requester;
-use oink_protocol::v1::{
+use oink_protocol::v2::{
     RawMap, dto,
     schema::{WireDto, WireValue},
 };
@@ -124,7 +124,7 @@ impl PauseOwner {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use oink_protocol::v1::{
+    use oink_protocol::v2::{
         RawValue,
         schema::{Ascii, Bytes},
     };

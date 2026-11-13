@@ -10,9 +10,9 @@ pub struct LinkEntry {
     pub peer_boot: Boot,
     pub path_id: oink_foundation::session::PathId,
     pub route_revision: u64,
-    pub agreement: oink_protocol::v1::admission::Agreement,
-    pub peer_formats: Option<oink_protocol::v1::dto::FormatSupport>,
-    pub peer_audio: Option<Vec<oink_protocol::v1::dto::AudioSupport>>,
+    pub agreement: oink_protocol::v2::admission::Agreement,
+    pub peer_formats: Option<oink_protocol::v2::dto::FormatSupport>,
+    pub peer_audio: Option<Vec<oink_protocol::v2::dto::AudioSupport>>,
     pub state: LinkState,
     pub path: LinkPath,
     /// Actual direct QUIC peer address; relayed links have no end-to-end socket address.
@@ -31,6 +31,21 @@ pub struct LinkEntry {
     pub low_available: bool,
     /// When the low-priority channel is unavailable: which directed hop failed and why.
     pub low_failure: Option<crate::LowUnavailable>,
+    /// Route selection between direct connections; `None` while relayed or not ready.
+    pub route: Option<super::types::RouteView>,
+}
+
+impl LinkEntry {
+    /// Whether this link can carry message `type_id` (a `registry::type_id`
+    /// constant): the same registry rule as the send gate. Modules ask this to
+    /// choose targets or offer an operation; they never name capabilities.
+    pub fn permits(&self, type_id: u16) -> bool {
+        self.agreement.permits(type_id)
+    }
+    /// Whether this link negotiated the stream gate of `kind`.
+    pub fn opens(&self, kind: oink_protocol::frame::StreamKind) -> bool {
+        super::gate::opens(&self.agreement, kind as u16)
+    }
 }
 
 /// Established links only; dial attempts are not links. Path and connection are one

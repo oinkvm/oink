@@ -310,9 +310,9 @@ impl Linked {
     }
 }
 fn options(request: &ContentMsg, receive_max: u64) -> io::Result<oink_foundation::transfer::LowOptions> {
-    let send_max = oink_protocol::v1::frame::encode(
+    let send_max = oink_protocol::v2::frame::encode(
         &crate::wire::content(request).map_err(|_| unavailable(Unavailable::InvalidData))?,
-        oink_protocol::v1::limits::LOW_FRAME,
+        oink_protocol::v2::limits::LOW_FRAME,
     )
     .map_err(|_| unavailable(Unavailable::InvalidData))?
     .len() as u64;

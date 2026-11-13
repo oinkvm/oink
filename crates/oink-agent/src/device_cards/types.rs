@@ -16,12 +16,21 @@ macro_rules! codes {
 codes!(CardOs {
     Macos,
     Windows,
+    Android,
+    Ios,
     Linux,
     Other
 });
 codes!(CardLogo {
     Macos,
     Windows10,
+    Android,
+    // An Android device whose privileged mode is on and running (crowned head).
+    AndroidPrivileged,
+    // Ios: an iOS device whose form factor is not (yet) known.
+    Ios,
+    Iphone,
+    Ipad,
     Linux,
     Generic
 });
@@ -110,6 +119,7 @@ codes!(CardCommand {
     SetLocalOption,
     ClearAudioExit,
     MakeAudioExit,
+    SetAudioMode,
     SetGameMode,
     SetDevicePaused
 });

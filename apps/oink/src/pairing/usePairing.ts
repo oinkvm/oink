@@ -8,6 +8,7 @@ import type { IncomingRequest, Peer } from './data';
 import { problemText, tr } from '../i18n';
 import { speed, toast } from 'oink-ui';
 import { fingerprint } from '../api/identity';
+import { deviceOs } from '../devices/types';
 import { PairFailure, AddressQueryOwner, addressText, presentPeer, pairProblemText } from './model';
 export type PairStatus = 'connecting' | 'input' | 'verifying' | 'wrong' | 'success' | 'failed';
 export interface PairSession {
@@ -23,7 +24,9 @@ async function editBlock(device:string,blocked:boolean) {
   if(!('snapshot' in result))throw new Error(({0:tr('设备身份无效'),1:tr('无法保存屏蔽名单'),2:tr('屏蔽名单已达上限'),3:problemText('unavailable')})[result.code]??tr('无法更新屏蔽名单'));
   agent.receive({type:'blocked_devices',data:{snapshot:result.snapshot}});
 }
-export function usePairing(activeWindow = true) {
+// onPaired runs once a dialog that reached success has finished closing
+// (initiated or accepted alike); failed or cancelled pairings never call it.
+export function usePairing(activeWindow = true, onPaired?: () => void) {
   const state=useAgent();
   const localDevice=state.overview?.this_device.id;
   const [dialog,setDialog]=useState<PairDialogState>({open:false,mode:'manual',session:null,key:0});
@@ -35,6 +38,10 @@ export function usePairing(activeWindow = true) {
   const terminal=dialog.session?terminals[dialog.session.pairId]:undefined;
   const manual=useRef(new AddressQueryOwner());
   const active=useRef(dialog);active.current=dialog;
+  const paired=useRef(onPaired);paired.current=onPaired;
+  // Latched when the dialog shows success: the session view may be pruned
+  // before the close animation ends, so exit time cannot recompute it.
+  const succeeded=useRef<string|null>(null);
   const codeRequests=useRef(new Set<string>());
   const dismissed=useRef(new Set<string>());
   const refreshPending=useRef(new Map<string,{resolve:()=>void;reject:(error:Error)=>void}>());
@@ -87,9 +94,9 @@ export function usePairing(activeWindow = true) {
       void pairingApi.ack(id).then(()=>agent.consumePairingEvent(id)).catch(()=>agent.fail('unavailable'));
     }
   },[state.pairingEvents,activeWindow,localDevice]);
-  const blocked:Peer[]=state.blocked?.entries.map(b=>({compatible:null,id:b.device,device:b.device,deviceId:fingerprint(b.device),name:b.name??fingerprint(b.device),os:b.os==='macos'?'mac':b.os==='windows'?'win':b.os==='linux'?'linux':'other',ip:'',port:DEFAULT_PORT}))??[];
+  const blocked:Peer[]=state.blocked?.entries.map(b=>({compatible:null,id:b.device,device:b.device,deviceId:fingerprint(b.device),name:b.name??fingerprint(b.device),os:deviceOs(b.os),ip:'',port:DEFAULT_PORT}))??[];
   const members=new Set(state.cards?.cards.map(card=>card.device));
-  const nearby:Peer[]=state.nearby?.rows.filter(peer=>!members.has(peer.device)).map(p=>({compatible:p.compatible,problem:p.problem?pairProblemText(p.problem):p.compatible?undefined:tr('协议版本不兼容'),id:p.device,device:p.device,name:p.name,os:p.os==='macos'?'mac':p.os==='windows'?'win':p.os==='linux'?'linux':'other',deviceId:fingerprint(p.device),ip:addressText(p.selected),port:p.selected.port}))??[];
+  const nearby:Peer[]=state.nearby?.rows.filter(peer=>!members.has(peer.device)).map(p=>({compatible:p.compatible,problem:p.problem?pairProblemText(p.problem):p.compatible?undefined:tr('协议版本不兼容'),id:p.device,device:p.device,name:p.name,os:deviceOs(p.os),deviceId:fingerprint(p.device),ip:addressText(p.selected),port:p.selected.port}))??[];
   const requests:IncomingRequest[]=state.pairings?.requests.map(p=>({...presentPeer(p.peer),id:p.id,sourceCount:p.source_count??null,targetCount:p.target_count,revision:p.revision}))??[];
   // Returning from onboarding hides the code entry without rejecting the request.
   // The live accepted session remains resumable from the regular sidebar.
@@ -136,11 +143,15 @@ export function usePairing(activeWindow = true) {
       if(dialog.mode==='manual'){await manual.current.close();setDialog(d=>({...d,open:false}));return;}
       let session=agent.get().pairings?.sessions.find(p=>p.id===dialog.session?.pairId);
       if(!session&&!terminal){await run(()=>agent.query('pairings',pairingApi.pairings));session=agent.get().pairings?.sessions.find(p=>p.id===dialog.session?.pairId);if(!session)throw new Error(problemText('unavailable'));}
-      if(session&&session.phase<7&&!terminal){const result=await run(()=>pairingApi.cancel(session.id,session.revision));if(result.type==='already_committed')toast({title:tr('配对已经提交'),action:{label:tr('撤销'),onClick:()=>{void run(()=>pairingApi.undo(crypto.randomUUID(),result.undo)).catch(error=>toast({title:tr('无法撤销配对'),description:errorText(error)}));}}});}
+      if(session&&session.phase<7&&!terminal){let result;try{result=await run(()=>pairingApi.cancel(session.id,session.revision));}catch(error){if(!(error instanceof PairFailure))throw error;toast({title:tr('无法取消配对'),description:errorText(error)});return;}if(result.type==='already_committed')toast({title:tr('配对已经提交'),action:{label:tr('撤销'),onClick:()=>{void run(()=>pairingApi.undo(crypto.randomUUID(),result.undo)).catch(error=>toast({title:tr('无法撤销配对'),description:errorText(error)}));}}});}
       setDialog(d=>({...d,open:false}));setInput('');setCodes({});
     },
     dismiss:()=>{if(dialog.session)dismissed.current.add(dialog.session.pairId);setDialog(d=>({...d,open:false,session:null}));setInput('');},
-    exited:()=>setDialog(d=>d.open?d:{...d,session:null}),
+    exited:()=>{
+      const closed=active.current;
+      if(!closed.open&&closed.session&&succeeded.current===closed.session.pairId){succeeded.current=null;paired.current?.();}
+      setDialog(d=>d.open?d:{...d,session:null});
+    },
   };
   useEffect(()=>{if(current && current.phase!==3)setSubmitting(false);},[current?.revision,current?.phase]);
   // Completed is authoritative even when its replay notification was acknowledged.
@@ -153,6 +164,7 @@ export function usePairing(activeWindow = true) {
     // must win immediately, without waiting for the durable receipt effect.
     const status:PairStatus=terminal?.id===session.pairId?terminal.status:view?.phase===7?'success':view&&view.phase>=8?'failed':!view||view.phase===0||!verified?'connecting':view.phase>=3||view.feedback==='correct'?'verifying':view.feedback==='wrong'?'wrong':view.phase===1&&!codes[view.id]?'connecting':'input';
     session={...session,peer:verified?presentPeer(verified):session.peer,dir:view?.direction==='incoming'?'in':session.dir,code:codes[session.pairId]??'',input,status:submitting&&status!=='success'&&status!=='failed'?'verifying':status,wrongs:view?3-view.attempts_left:0,reason:terminal?.id===session.pairId?terminal.reason:view?.terminal?pairProblemText(view.terminal):undefined};
+    if(session.status==='success')succeeded.current=session.pairId;
   }
   return {requests,nearby,blocked,dialog:{...dialog,session},actions,defaultPort:DEFAULT_PORT};
 }

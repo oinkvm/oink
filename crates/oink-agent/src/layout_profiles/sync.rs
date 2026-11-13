@@ -10,13 +10,13 @@ use crate::node::{Node, lock};
 use oink_network::link::{InboundLow, LinkId, ModuleEvent, ModulePort};
 use oink_protocol::{
     frame::StreamKind,
-    v1::{
+    v2::{
         Message, RawValue as V, dto,
         schema::{WireDto, WireValue},
     },
 };
 use std::{collections::BTreeMap, time::Duration};
-const CAP: &str = "oink.layout.profiles/3";
+const CAP: &str = "oink.layout/2";
 const BUDGET: u64 = (MAX_BYTES + 1024 * 1024) as u64;
 impl Node {
     fn receive_profile_message(
@@ -41,7 +41,7 @@ impl Node {
             .group_id()
             .ok_or_else(|| super::state::unavailable("Group unavailable"))?;
         match message {
-            Message::LayoutProfilesStateV3(message) => {
+            Message::LayoutProfilesState(message) => {
                 #[cfg(test)]
                 if self
                     .inner
@@ -75,6 +75,13 @@ impl Node {
                 }
                 if accepts_dependency {
                     lock(&self.inner.profiles.data).pending_layout = dependency;
+                }
+                // A target desktop's catalog arrived; merge the joining list in
+                // the phone acceptor's place (H8).
+                if let Ok(observation) = self.observe_profiles()
+                    && let Some(merged) = self.substitute_merge(group.into(), &observation)?
+                {
+                    self.persist_catalog(merged)?;
                 }
             }
             Message::LayoutProfilesJoin(message) => {
@@ -166,11 +173,11 @@ async fn deliver(node: &Node, link: LinkId, catalog: Catalog) -> bool {
     };
     let Ok(group) = catalog.group() else { return false };
     let Ok(message) =
-        dto::LayoutProfilesStateV3::from_raw([(1, group.write()), (2, catalog.write()), (4, version.write())].into())
+        dto::LayoutProfilesState::from_raw([(1, group.write()), (2, catalog.write()), (4, version.write())].into())
     else {
         return false;
     };
-    send(node, link, Message::LayoutProfilesStateV3(message), group).await
+    send(node, link, Message::LayoutProfilesState(message), group).await
 }
 
 async fn send(node: &Node, link: LinkId, message: Message, group: dto::Id16) -> bool {
@@ -182,14 +189,14 @@ async fn send(node: &Node, link: LinkId, message: Message, group: dto::Id16) -> 
         receive_max: 1024,
         operation_max: BUDGET + 1024,
     };
-    let Ok(mut stream) = links.open_low(link, StreamKind::LayoutProfilesV3, options).await else {
+    let Ok(mut stream) = links.open_low(link, StreamKind::LayoutProfiles, options).await else {
         return false;
     };
     if stream.send(&message).await.is_err() {
         return false;
     }
     stream.finish();
-    let Ok(Some(Message::LayoutProfilesReceiptV3(receipt))) = stream.recv().await else {
+    let Ok(Some(Message::LayoutProfilesReceipt(receipt))) = stream.recv().await else {
         return false;
     };
     if receipt.accepted() != Ok(true) || receipt.group() != Ok(group) {
@@ -199,7 +206,7 @@ async fn send(node: &Node, link: LinkId, message: Message, group: dto::Id16) -> 
 }
 async fn receive(node: Node, mut incoming: InboundLow) {
     let group = match &incoming.first {
-        Message::LayoutProfilesStateV3(m) => m.group(),
+        Message::LayoutProfilesState(m) => m.group(),
         Message::LayoutProfilesJoin(m) => m.group(),
         _ => return,
     };
@@ -233,7 +240,7 @@ async fn receive(node: Node, mut incoming: InboundLow) {
     };
     if incoming
         .stream
-        .send(&Message::LayoutProfilesReceiptV3(receipt))
+        .send(&Message::LayoutProfilesReceipt(receipt))
         .await
         .is_ok()
     {
@@ -261,7 +268,7 @@ pub(crate) fn start(node: Node, mut port: ModulePort) -> tokio::task::JoinHandle
                                     for join in joins {
                                         let Some(source) = join.catalog else {continue;};
                                         let Ok(catalog) = wire::catalog(&source) else {continue;};
-                                        let group = oink_protocol::v1::schema::FixedBytes(join.target.0.0);
+                                        let group = oink_protocol::v2::schema::FixedBytes(join.target.0.0);
                                         let Ok(id) = (0..join.id.len()).step_by(2).map(|i|u8::from_str_radix(&join.id[i..i+2],16)).collect::<std::result::Result<Vec<_>,_>>() else {continue;};
                                         let Ok(message) = dto::LayoutProfilesJoin::from_raw([(1,group.write()),(2,V::Bytes(id)),(3,catalog.write())].into()) else {continue;};
                                         let _ = tokio::time::timeout(Duration::from_secs(30),send(&node,link,Message::LayoutProfilesJoin(message),group)).await;

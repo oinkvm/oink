@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 接收音频 tile: the speaker of the device cards (pcSpeaker3), one colour. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp" android:height="24dp" android:viewportWidth="16" android:viewportHeight="16">
+    <path android:pathData="M1.5,5.8h2.3L7.2,3v10L3.8,10.2H1.5z" android:fillColor="#FFFFFFFF" />
+    <path android:pathData="M8.44,6.16A2.6,2.6 0,0 1,8.44 9.84M9.71,4.89A4.4,4.4 0,0 1,9.71 11.11M10.98,3.62A6.2,6.2 0,0 1,10.98 12.38"
+        android:strokeColor="#FFFFFFFF" android:strokeWidth="1.4" android:strokeLineCap="round" android:strokeLineJoin="round" android:fillColor="#00000000" />
+</vector>

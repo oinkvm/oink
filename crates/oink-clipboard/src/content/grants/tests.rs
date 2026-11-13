@@ -1031,3 +1031,45 @@ fn sender_restart_discards_even_the_current_clipboard_cache() {
     assert!(!path.exists());
     assert!(store.open(PEER, token).is_err());
 }
+
+#[test]
+#[cfg(any(target_os = "macos", windows))]
+fn phone_holder_handoff_updates_existing_grant_and_restart_authority() {
+    use crate::tracked_file::TrackedFile;
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("proxy");
+    let target = dir.path().join("moved");
+    fs::write(&source, b"phone payload").unwrap();
+    let files = Local::received_from(vec![(NodeId(1), source.clone())], oink_foundation::DeviceId([3; 32])).unwrap();
+    let journal = dir.path().join("journal");
+    let store = SourceGrants::load(&journal, [(PEER, [1; 32])]).unwrap();
+    let token = store.issue(PEER, files.as_ref(), &[NodeId(1)]).unwrap();
+    fs::copy(&source, &target).unwrap();
+    fs::File::options()
+        .write(true)
+        .open(&target)
+        .unwrap()
+        .set_times(fs::FileTimes::new().set_modified(fs::metadata(&source).unwrap().modified().unwrap()))
+        .unwrap();
+    files
+        .proxy_file_moved(NodeId(1), &TrackedFile::capture(&target).unwrap())
+        .unwrap();
+    assert!(!source.exists());
+    // Replacing the original cache path never changes the saved grant's object.
+    fs::write(&source, b"unrelated bytes").unwrap();
+    let namespace = store.open(PEER, token).unwrap();
+    let selected = namespace.select(NodeId(1)).unwrap();
+    assert_eq!(
+        crate::content::read_all(&mut namespace.open(selected.id, selected.version, 0).unwrap()).unwrap(),
+        b"phone payload"
+    );
+    drop(namespace);
+    drop(store);
+    let store = SourceGrants::load(&journal, [(PEER, [1; 32])]).unwrap();
+    let namespace = store.open(PEER, token).unwrap();
+    let selected = namespace.select(NodeId(1)).unwrap();
+    assert_eq!(
+        crate::content::read_all(&mut namespace.open(selected.id, selected.version, 0).unwrap()).unwrap(),
+        b"phone payload"
+    );
+}

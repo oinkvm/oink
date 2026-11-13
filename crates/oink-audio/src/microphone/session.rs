@@ -1,7 +1,7 @@
 //! Pure demand/lease state, independent of native devices and network owners.
 use crate::negotiation::Profile;
 use oink_foundation::DeviceId;
-use oink_protocol::v1::{
+use oink_protocol::v2::{
     dto,
     schema::{WireDto, WireValue},
 };
@@ -20,12 +20,13 @@ pub struct Lease {
     pub ready: bool,
     pub expires: Instant,
 }
-/// Current owner identities and claim used to fence a microphone offer.
+/// Current owner identities and the microphone route version (whose target the
+/// caller checked is `source`) that fence a microphone offer.
 #[derive(Clone, Copy, Debug)]
 pub struct SessionContext<'a> {
     pub source: &'a dto::Boot,
     pub receiver: &'a dto::Boot,
-    pub claim: &'a dto::ExitClaimStamp,
+    pub route: &'a dto::AudioRouteVersion,
 }
 #[derive(Debug, Default)]
 pub struct Source {
@@ -40,7 +41,7 @@ impl Source {
         profile: Profile,
         now: Instant,
     ) -> Result<dto::MicrophonePrepared, dto::ControlFailure> {
-        validate(&session, context.source, context.receiver, context.claim)?;
+        validate(&session, context.source, context.receiver, context.route)?;
         if let Some(old) = self.leases.get(&peer) {
             if old.expires > now && old.prepared.session().as_ref() == Ok(&session) {
                 return Ok(old.prepared.clone());
@@ -130,7 +131,7 @@ pub fn validate(
     session: &dto::MicrophoneSession,
     source: &dto::Boot,
     receiver: &dto::Boot,
-    claim: &dto::ExitClaimStamp,
+    route: &dto::AudioRouteVersion,
 ) -> Result<(), dto::ControlFailure> {
     use dto::ControlFailure as Failure;
     if session.source().as_ref() != Ok(source)
@@ -138,10 +139,7 @@ pub fn validate(
     {
         return Err(Failure::StaleBoot);
     }
-    if session.share_claim().as_ref() != Ok(claim)
-        || claim.owner() != source.device_id()
-        || source.device_id() == receiver.device_id()
-    {
+    if session.route_version().as_ref() != Ok(route) || source.device_id() == receiver.device_id() {
         return Err(Failure::RouteChanged);
     }
     if session
@@ -159,7 +157,7 @@ pub fn validate(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use oink_protocol::v1::{
+    use oink_protocol::v2::{
         RawValue,
         schema::{FixedBytes, Text},
     };
@@ -174,11 +172,12 @@ mod tests {
         .unwrap();
         dto::Boot::from_raw([(1, device.write()), (2, FixedBytes([run; 16]).write())].into()).unwrap()
     }
-    fn context(request: u8) -> (dto::MicrophoneSession, dto::Boot, dto::Boot, dto::ExitClaimStamp) {
+    fn context(request: u8) -> (dto::MicrophoneSession, dto::Boot, dto::Boot, dto::AudioRouteVersion) {
         let source = boot(1, 1);
         let receiver = boot(2, 1);
-        let claim = dto::ExitClaimStamp::from_raw([(1, 1u64.write()), (2, source.device_id().unwrap().write())].into())
-            .unwrap();
+        let claim =
+            dto::AudioRouteVersion::from_raw([(1, 1u64.write()), (2, source.device_id().unwrap().write())].into())
+                .unwrap();
         let output = dto::ReceiverOutputBinding::from_raw(
             [
                 (1, receiver.write()),
@@ -214,7 +213,7 @@ mod tests {
                 SessionContext {
                     source: &own,
                     receiver: &remote,
-                    claim: &claim,
+                    route: &claim,
                 },
                 Profile::Opus5ms,
                 now,
@@ -243,7 +242,7 @@ mod tests {
                 SessionContext {
                     source: &own,
                     receiver: &remote,
-                    claim: &claim,
+                    route: &claim,
                 },
                 Profile::Opus5ms,
                 now,
@@ -256,7 +255,7 @@ mod tests {
                 SessionContext {
                     source: &own,
                     receiver: &remote,
-                    claim: &claim,
+                    route: &claim,
                 },
                 Profile::Opus5ms,
                 now,
@@ -270,14 +269,14 @@ mod tests {
         assert!(!source.active());
     }
     #[test]
-    fn stale_boot_and_replaced_source_claim_are_rejected() {
+    fn stale_boot_and_replaced_source_route_are_rejected() {
         let (session, own, remote, claim) = context(1);
         assert_eq!(
             validate(&session, &boot(1, 2), &remote, &claim),
             Err(dto::ControlFailure::StaleBoot)
         );
-        let other =
-            dto::ExitClaimStamp::from_raw([(1, 2u64.write()), (2, own.device_id().unwrap().write())].into()).unwrap();
+        let other = dto::AudioRouteVersion::from_raw([(1, 2u64.write()), (2, own.device_id().unwrap().write())].into())
+            .unwrap();
         assert_eq!(
             validate(&session, &own, &remote, &other),
             Err(dto::ControlFailure::RouteChanged)

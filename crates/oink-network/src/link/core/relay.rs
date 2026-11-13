@@ -1,4 +1,6 @@
 //! One-hop reservation and forwarding. Only ready direct links can relay.
+//! A peer negotiating `oink.relay/1` can terminate a relayed path; only a
+//! device announcing `oink.relay.transit/1` (a PC) forwards for others.
 use super::*;
 
 #[derive(Clone, Copy, Debug)]
@@ -44,14 +46,22 @@ impl Transit {
     }
 }
 impl Core {
+    /// Whether this connection carries a relayed path of another device.
+    pub(super) fn carries_transit(&self, connection: ConnectionId) -> bool {
+        self.transit.iter().any(|t| t.other(connection).is_some())
+    }
     pub(super) fn relay_neighbor_ready(&mut self, connection: ConnectionId, now: Instant) {
         // A live search also applies to newly admitted neighbors. Continue the
         // same request within its original budget; do not wait for a failed
         // attempt and the caller's reconnect backoff to discover this route.
         let neighbor = self.connection_boot(connection).expect("ready connection");
+        // Only a relay station (a PC) is asked to relay; a phone terminates
+        // relayed paths but is never asked to carry one.
+        let station = self.station(connection);
         let requests = self
             .dials
             .iter()
+            .filter(|_| station)
             .filter_map(|(peer, dial)| {
                 dial.request
                     .filter(|r| *peer != neighbor.device_id && now < r.deadline)
@@ -124,6 +134,7 @@ impl Core {
                 l.peer.device_id != peer && l.installed && l.state == LinkState::Ready && l.path() == LinkPath::Direct
             })
             .map(|l| l.hop.connection_id)
+            .filter(|connection| self.station(*connection))
             .collect();
         for connection in neighbors {
             self.send(
@@ -143,11 +154,13 @@ impl Core {
         let Some(request) = self.dials.get_mut(&peer).and_then(|d| d.request.take()) else {
             return;
         };
+        // The request went only to neighbors that forward.
         let neighbors: Vec<_> = self
             .links
             .values()
             .filter(|l| l.path() == LinkPath::Direct && l.state == LinkState::Ready)
             .map(|l| l.hop.connection_id)
+            .filter(|connection| self.station(*connection))
             .collect();
         for connection in neighbors {
             self.send(
@@ -509,10 +522,25 @@ impl Core {
             {
                 return;
             }
+            // Only a relay station forwards. A phone never announces
+            // oink.relay.transit/1 and is never asked; a request reaching it
+            // anyway is a peer bug and expires at the source.
+            if !self.forwards {
+                tracing::debug!(target: "oink_link_diagnostics", kind = "relay_request_ignored",
+                    peer_id = neighbor.device_id.to_hex().as_str(), reason = "not_a_relay_station",
+                    "Relay request at a device that does not forward");
+                return;
+            }
             let Some(target_connection) = self.ready_direct(target) else {
                 self.defer_relay_request(pending);
                 return;
             };
+            // A target that cannot terminate a relayed path (no oink.relay/1)
+            // cannot take part; the source's request expires as for any
+            // unreachable target. A relay endpoint (a phone) can.
+            if !self.relays(target_connection) {
+                return;
+            }
             let target_boot = self.connection_boot(target_connection).expect("ready connection");
             let reservation = RelayReservation {
                 relay: self.boot,

@@ -4,14 +4,16 @@
 use crate::config::store::{self, StoreError};
 use base64::Engine;
 use oink_foundation::{DeviceId, GroupId};
-use oink_protocol::v1::{
+use oink_protocol::v2::{
     self, RawMap, RawValue, dto, retained,
     schema::{WireDto, WireValue},
 };
 use std::{io::Read, path::Path};
 
+mod legacy_layout;
+
 pub const STATE_FILE: &str = "group-state.json";
-const MAX_ENVELOPE_BYTES: usize = v1::limits::CONFIG_STATE * 2;
+const MAX_ENVELOPE_BYTES: usize = v2::limits::CONFIG_STATE * 2;
 
 /// JSON schema1: device is {algorithm:"ed25519",public_key:<64hex>};
 /// state_cbor is base64 retained GroupState. Other envelope fields are retained.
@@ -35,10 +37,52 @@ impl StoredGroupState {
     pub fn group(&self) -> GroupId {
         GroupId(self.state.group().expect("validated group").0)
     }
-    pub fn to_wire(&self) -> dto::GroupState {
-        self.state.clone()
+    pub fn to_wire(&self) -> Result<dto::GroupState, StoreError> {
+        let roster = self.state.roster()?;
+        let registers = self.state.registers()?.0;
+        if !roster.raw().contains_key(&2)
+            && !registers
+                .iter()
+                .any(|register| register.raw().contains_key(&6) || register.raw().contains_key(&7))
+        {
+            return Ok(self.state.clone());
+        }
+        let anchor = oink_network::roster::Anchor {
+            group: self.group(),
+            root: oink_network::roster::root_id(&roster)?,
+        };
+        let roster = oink_network::roster::Roster::verify(roster, anchor)?;
+        let registers = registers
+            .into_iter()
+            .map(legacy_layout::project)
+            .map(|result| result.map(|register| register.write()))
+            .collect::<v2::Result<Vec<_>>>()?;
+        let mut raw = self.state.raw().clone();
+        raw.insert(2, RawValue::Array(registers));
+        raw.insert(3, roster.wire().write());
+        Ok(dto::GroupState::from_raw(raw)?)
+    }
+    pub fn has_legacy_layout(&self) -> Result<bool, StoreError> {
+        let raw = self.raw_layout_register()?;
+        Ok(raw.raw().contains_key(&6) || raw.raw().contains_key(&7))
+    }
+    /// Replace the v2 runtime projection while retaining fields owned by the
+    /// pre-v2 local format.  These fields are intentionally absent from v2
+    /// network state, but dropping them during a normal state commit would
+    /// make the same directory unreadable by a 0.3.x process.
+    pub fn replace_runtime_state(&mut self, candidate: dto::GroupState) -> Result<(), StoreError> {
+        let mut raw = candidate.raw().clone();
+        if self.state.group()? == candidate.group()? {
+            preserve_legacy_roster(&self.state, &mut raw)?;
+            preserve_legacy_registers(&self.state, &mut raw)?;
+        }
+        self.state = dto::GroupState::from_raw(raw)?;
+        validate(&self.state)
     }
     pub fn layout_register(&self) -> Result<dto::Register, StoreError> {
+        Ok(legacy_layout::project(self.raw_layout_register()?)?)
+    }
+    fn raw_layout_register(&self) -> Result<dto::Register, StoreError> {
         self.state
             .registers()?
             .0
@@ -51,13 +95,11 @@ impl StoredGroupState {
     pub fn edit_layout(
         &mut self,
         expected: &dto::ConfigVersion,
-        patch: impl FnOnce(&mut RawMap) -> v1::Result<()>,
+        patch: impl FnOnce(&mut RawMap) -> v2::Result<()>,
     ) -> Result<bool, StoreError> {
         let current = self.layout_register()?;
-        let edited = v1::layout::edit_register(&current, expected, store::wire_device(self.device), patch)?;
-        if edited.value()? == current.value()?
-            && edited.raw().get(&v1::layout::VISIBILITY_KEY) == current.raw().get(&v1::layout::VISIBILITY_KEY)
-        {
+        let edited = v2::layout::edit_register(&current, expected, store::wire_device(self.device), patch)?;
+        if edited.value()? == current.value()? {
             return Ok(false);
         }
         self.replace_layout(edited)
@@ -88,8 +130,102 @@ impl StoredGroupState {
         Ok(true)
     }
 }
+
+fn preserve_legacy_roster(previous: &dto::GroupState, candidate: &mut RawMap) -> Result<(), StoreError> {
+    let Some(RawValue::Map(previous_roster)) = previous.raw().get(&3) else {
+        return Err(StoreError::Invalid);
+    };
+    let Some(RawValue::Map(candidate_roster)) = candidate.get_mut(&3) else {
+        return Err(StoreError::Invalid);
+    };
+    if let Some(root) = previous_roster.get(&2) {
+        let stored_roster = dto::Roster::from_raw(previous_roster.clone())?;
+        let anchor = oink_network::roster::Anchor {
+            group: GroupId(stored_roster.group()?.0),
+            root: oink_network::roster::root_id(&stored_roster)?,
+        };
+        let projected = oink_network::roster::Roster::verify(stored_roster, anchor)?;
+        if projected.wire().raw() == candidate_roster {
+            *candidate_roster = previous_roster.clone();
+            return Ok(());
+        }
+        candidate_roster.entry(2).or_insert_with(|| root.clone());
+    }
+    let Some(RawValue::Array(previous_records)) = previous_roster.get(&3) else {
+        return Err(StoreError::Invalid);
+    };
+    let Some(RawValue::Array(candidate_records)) = candidate_roster.get_mut(&3) else {
+        return Err(StoreError::Invalid);
+    };
+    for candidate_record in candidate_records {
+        let Some(previous_record) = previous_records
+            .iter()
+            .find(|previous_record| same_v2_record(previous_record, candidate_record))
+        else {
+            continue;
+        };
+        let (RawValue::Map(previous_record), RawValue::Map(candidate_record)) = (previous_record, candidate_record)
+        else {
+            return Err(StoreError::Invalid);
+        };
+        if let Some(value) = previous_record.get(&2) {
+            candidate_record.entry(2).or_insert_with(|| value.clone());
+        }
+        let (Some(RawValue::Map(previous_body)), Some(RawValue::Map(candidate_body))) =
+            (previous_record.get(&1), candidate_record.get_mut(&1))
+        else {
+            return Err(StoreError::Invalid);
+        };
+        if let Some(value) = previous_body.get(&6) {
+            candidate_body.entry(6).or_insert_with(|| value.clone());
+        }
+    }
+    Ok(())
+}
+
+fn same_v2_record(previous: &RawValue, candidate: &RawValue) -> bool {
+    let (RawValue::Map(previous), RawValue::Map(candidate)) = (previous, candidate) else {
+        return false;
+    };
+    let (Some(RawValue::Map(previous_body)), Some(RawValue::Map(candidate_body))) =
+        (previous.get(&1), candidate.get(&1))
+    else {
+        return false;
+    };
+    let mut previous_body = previous_body.clone();
+    let mut candidate_body = candidate_body.clone();
+    previous_body.remove(&6);
+    candidate_body.remove(&6);
+    previous_body == candidate_body
+}
+
+fn preserve_legacy_registers(previous: &dto::GroupState, candidate: &mut RawMap) -> Result<(), StoreError> {
+    let Some(RawValue::Array(previous_registers)) = previous.raw().get(&2) else {
+        return Err(StoreError::Invalid);
+    };
+    let Some(RawValue::Array(candidate_registers)) = candidate.get_mut(&2) else {
+        return Err(StoreError::Invalid);
+    };
+    for candidate_register in candidate_registers {
+        let RawValue::Map(candidate_register) = candidate_register else {
+            return Err(StoreError::Invalid);
+        };
+        let Some(kind) = candidate_register.get(&1) else {
+            return Err(StoreError::Invalid);
+        };
+        let Some(RawValue::Map(previous_register)) = previous_registers
+            .iter()
+            .find(|value| matches!(value, RawValue::Map(register) if register.get(&1) == Some(kind)))
+        else {
+            continue;
+        };
+        let previous = dto::Register::from_raw(previous_register.clone())?;
+        legacy_layout::retain(&previous, candidate_register)?;
+    }
+    Ok(())
+}
 fn validate(state: &dto::GroupState) -> Result<(), StoreError> {
-    state.encode(v1::limits::CONFIG_STATE)?;
+    state.encode(v2::limits::CONFIG_STATE)?;
     let mut layout = false;
     for register in state.registers()?.0 {
         retained::verify_register(&register)?;
@@ -131,7 +267,9 @@ pub fn load(path: &Path, device: DeviceId) -> Result<Option<StoredGroupState>, S
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(encoded)
         .map_err(|_| StoreError::Invalid)?;
-    let state = dto::GroupState::from_raw(v1::cbor::decode_map(&bytes, v1::limits::CONFIG_STATE)?)?;
+    // v2 changes the network projection only. Keep unknown retained fields
+    // from 0.3.x in the raw DTO so older readers can still read the file.
+    let state = dto::GroupState::from_raw(v2::cbor::decode_map(&bytes, v2::limits::CONFIG_STATE)?)?;
     validate(&state)?;
     envelope
         .as_object_mut()
@@ -143,11 +281,12 @@ pub fn load(path: &Path, device: DeviceId) -> Result<Option<StoredGroupState>, S
         envelope,
     }))
 }
+
 pub fn save(path: &Path, state: &StoredGroupState) -> Result<(), StoreError> {
     validate(&state.state)?;
     let mut envelope = state.envelope.clone();
     envelope["state_cbor"] = base64::engine::general_purpose::STANDARD
-        .encode(state.state.encode(v1::limits::CONFIG_STATE)?)
+        .encode(state.state.encode(v2::limits::CONFIG_STATE)?)
         .into();
     let bytes = serde_json::to_vec_pretty(&envelope).map_err(|_| StoreError::Invalid)?;
     if bytes.len() > MAX_ENVELOPE_BYTES {
@@ -165,7 +304,7 @@ mod tests {
     use super::*;
     fn initial() -> StoredGroupState {
         let device = DeviceId([7; 32]);
-        let mut register: RawMap = [
+        let register: RawMap = [
             (1, 2u32.write()),
             (
                 3,
@@ -178,30 +317,19 @@ mod tests {
                         (1, RawValue::Array(vec![])),
                         (2, dto::LayoutSource::Default.write()),
                         (4, RawValue::Map(RawMap::new())),
-                        (90, RawValue::Map([(91, RawValue::Text("future".into()))].into())),
                     ]
                     .into(),
                 ),
             ),
+            (90, RawValue::Map([(91, RawValue::Text("future".into()))].into())),
         ]
         .into();
-        register.insert(6, retained::register_digest(&register).unwrap().write());
         let group = RawValue::Bytes(vec![9; 16]);
         let state = dto::GroupState::from_raw(
             [
                 (1, group.clone()),
                 (2, RawValue::Array(vec![RawValue::Map(register)])),
-                (
-                    3,
-                    RawValue::Map(
-                        [
-                            (1, group),
-                            (2, RawValue::Bytes(vec![3; 32])),
-                            (3, RawValue::Array(vec![])),
-                        ]
-                        .into(),
-                    ),
-                ),
+                (3, RawValue::Map([(1, group), (3, RawValue::Array(vec![]))].into())),
                 (99, RawValue::Bytes(vec![1, 2, 3])),
             ]
             .into(),
@@ -209,11 +337,106 @@ mod tests {
         .unwrap();
         StoredGroupState::new(device, state).unwrap()
     }
+
+    #[test]
+    fn legacy_030_033_104_105_state_roundtrips_without_rewrite() {
+        let state = initial();
+        let device = state.device;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(STATE_FILE);
+        let releases = ["0.3.0", "0.3.3", "104", "105"];
+
+        for release in releases {
+            let mut raw = state.state.raw().clone();
+            let RawValue::Map(roster) = raw.get_mut(&3).unwrap() else {
+                panic!("roster")
+            };
+            roster.insert(2, RawValue::Bytes(vec![4; 32]));
+            let RawValue::Array(records) = roster.get_mut(&3).unwrap() else {
+                panic!("records")
+            };
+            records.push(RawValue::Map(
+                [
+                    (
+                        1,
+                        RawValue::Map(
+                            [
+                                (1, dto::RecordKind::Create.write()),
+                                (2, RawValue::Bytes(vec![9; 16])),
+                                (3, store::wire_device(device).write()),
+                                (4, 0u64.write()),
+                                (5, store::wire_device(device).write()),
+                                (6, RawValue::Bytes(vec![6; 32])),
+                                (9, 1u64.write()),
+                            ]
+                            .into(),
+                        ),
+                    ),
+                    (
+                        2,
+                        RawValue::Map(
+                            [(1, RawValue::Text("ed25519".into())), (2, RawValue::Bytes(vec![7; 64]))].into(),
+                        ),
+                    ),
+                ]
+                .into(),
+            ));
+            let RawValue::Array(registers) = raw.get_mut(&2).unwrap() else {
+                panic!("registers")
+            };
+            let RawValue::Map(register) = registers.first_mut().unwrap() else {
+                panic!("register")
+            };
+            register.insert(6, RawValue::Bytes(vec![8; 32]));
+            register.insert(
+                7,
+                RawValue::Map(
+                    [
+                        (1, RawValue::Array(Vec::new())),
+                        (2, RawValue::Array(Vec::new())),
+                        (3, RawValue::Array(Vec::new())),
+                        (4, RawValue::Array(Vec::new())),
+                    ]
+                    .into(),
+                ),
+            );
+            let original = dto::GroupState::from_raw(raw).unwrap();
+            validate(&original).unwrap();
+            let envelope = serde_json::json!({
+                "schema": 1,
+                "device": {"algorithm": "ed25519", "public_key": device.to_hex()},
+                "legacy_release": release,
+                "state_cbor": base64::engine::general_purpose::STANDARD.encode(original.encode(v2::limits::CONFIG_STATE).unwrap()),
+            });
+            std::fs::write(&path, serde_json::to_vec_pretty(&envelope).unwrap()).unwrap();
+            let before = std::fs::read(&path).unwrap();
+            let loaded = load(&path, device).unwrap().unwrap();
+            assert_eq!(loaded.state.raw(), original.raw(), "{release} state changed");
+            assert_eq!(std::fs::read(&path).unwrap(), before, "{release} was rewritten on load");
+            let projected = loaded.to_wire().unwrap();
+            let wire_register = &projected.registers().unwrap().0[0];
+            assert!(!wire_register.raw().contains_key(&6));
+            assert!(!wire_register.raw().contains_key(&7));
+            let wire_roster = projected.roster().unwrap();
+            assert!(!wire_roster.raw().contains_key(&2));
+            assert!(!wire_roster.records().unwrap().0[0].raw().contains_key(&2));
+            let mut merged = loaded.clone();
+            merged.replace_runtime_state(projected).unwrap();
+            assert_eq!(merged, loaded, "{release} state changed by its v2 projection");
+            save(&path, &loaded).unwrap();
+            let after_save = load(&path, device).unwrap().unwrap();
+            assert_eq!(
+                after_save.state.raw(),
+                original.raw(),
+                "{release} state changed after save"
+            );
+        }
+    }
     #[test]
     fn retired_register_survives_save_and_layout_edit() {
         let mut state = initial();
         let version = state.layout_register().unwrap().version().unwrap();
-        let mut raw: RawMap = [
+        let raw: RawMap = [
             (1, 8u32.write()),
             (3, version.write()),
             (
@@ -222,7 +445,6 @@ mod tests {
             ),
         ]
         .into();
-        raw.insert(6, retained::register_digest(&raw).unwrap().write());
         let register = dto::Register::from_raw(raw).unwrap();
         let mut raw = state.state.raw().clone();
         let RawValue::Array(registers) = raw.get_mut(&2).unwrap() else {
@@ -232,7 +454,10 @@ mod tests {
         state = StoredGroupState::new(state.device, dto::GroupState::from_raw(raw).unwrap()).unwrap();
         state
             .edit_layout(&version, |raw| {
-                raw.insert(12, true.write());
+                let RawValue::Map(topology) = raw.get_mut(&4).unwrap() else {
+                    panic!("layout topology")
+                };
+                topology.insert(12, (8.0 / 686.0).write());
                 Ok(())
             })
             .unwrap();
@@ -263,7 +488,10 @@ mod tests {
         assert!(
             state
                 .edit_layout(&version, |raw| {
-                    raw.insert(12, true.write());
+                    let RawValue::Map(topology) = raw.get_mut(&4).unwrap() else {
+                        panic!("layout topology")
+                    };
+                    topology.insert(12, (8.0 / 686.0).write());
                     Ok(())
                 })
                 .unwrap()
@@ -276,14 +504,14 @@ mod tests {
         assert_eq!(state, before);
         save(&path, &state).unwrap();
         assert_eq!(load(&path, state.device).unwrap(), Some(state.clone()));
-        assert!(state.layout_register().unwrap().value().unwrap().contains_key(&90));
+        assert!(state.layout_register().unwrap().raw().contains_key(&90));
         assert!(state.state.raw().contains_key(&99));
         let bytes = std::fs::read(&path).unwrap();
         assert!(load(&path, DeviceId([8; 32])).is_err());
         assert_eq!(std::fs::read(&path).unwrap(), bytes);
     }
     #[test]
-    fn unknown_schema_and_bad_digest_fail_without_writing() {
+    fn unknown_schema_and_malformed_register_fail_without_writing() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(STATE_FILE);
         let state = initial();
@@ -295,9 +523,11 @@ mod tests {
         assert!(matches!(load(&path, state.device), Err(StoreError::UnsupportedSchema)));
         assert_eq!(std::fs::read(&path).unwrap(), bytes);
         let mut raw = state.layout_register().unwrap().into_raw();
-        raw.insert(6, RawValue::Bytes(vec![0; 32]));
-        let mut candidate = state.clone();
-        assert!(candidate.adopt_layout(&dto::Register::from_raw(raw).unwrap()).is_err());
-        assert_eq!(candidate, state);
+        raw.remove(&3);
+        assert!(dto::Register::from_raw(raw).is_err());
+        let mut restored = envelope;
+        restored["schema"] = 1.into();
+        std::fs::write(&path, serde_json::to_vec(&restored).unwrap()).unwrap();
+        assert_eq!(load(&path, state.device).unwrap(), Some(state));
     }
 }

@@ -54,6 +54,10 @@ pub enum ConfigEvent {
         link: LinkId,
         path: LinkPath,
     },
+    /// A TLS-authenticated peer could not negotiate a common application protocol.
+    ProtocolIncompatible {
+        peer: DeviceId,
+    },
     DialFailed {
         peer: DeviceId,
         reason: DialFailure,
@@ -62,6 +66,13 @@ pub enum ConfigEvent {
     ControlClosed {
         stream: StreamId,
         reason: StreamClosed,
+    },
+    /// The pair's route pin as seen from this end changed (protocol-v2 11).
+    /// The owner persists it and hands it back with `set_route_record`.
+    RouteRecord {
+        link: LinkId,
+        peer: DeviceId,
+        record: Option<super::RouteRecord>,
     },
 }
 
@@ -83,7 +94,7 @@ pub enum ModuleEvent {
     /// Sent only to the diagnostics ModulePort to avoid duplicate recording.
     ProtocolViolation {
         peer: DeviceId,
-        violation: oink_protocol::v1::admission::ProtocolViolation,
+        violation: oink_protocol::v2::admission::ProtocolViolation,
     },
     LinkReady {
         link: LinkId,

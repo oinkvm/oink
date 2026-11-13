@@ -7,7 +7,7 @@ import { ControlActions } from './controlActions';
 import { controlObservation } from './controlPlan';
 import { screenValue } from './data';
 import { setLanguage, problemText } from '../i18n';
-import { indicators } from './DeviceList';
+import { audioTooltip, indicators } from './DeviceList';
 import { captureNotices } from '../api/notices.fixture';
 const notices = captureNotices();
 
@@ -39,6 +39,16 @@ function controlStore() {
   };
 }
 describe('owner card presentation',()=>{
+  it('crowns only the cards the agent projects as Android privileged',()=>{
+    const phone=card();phone.os='android';
+    for(const [logo,privileged] of [['android',false],['android_privileged',true]] as const){
+      phone.logo=logo;
+      const d=presentCards(view(phone),[])[0];
+      expect([d.os,d.privileged]).toEqual(['android',privileged]);
+    }
+    const pc=card();
+    expect(presentCards(view(pc),[])[0].privileged).toBe(false);
+  });
   it('uses only explicit remote AX reports, leaving legacy faults and Windows alone',()=>{
     const owner=card();owner.os='macos';
     owner.status!.mouse.fault={code:'permission_denied',unknownCode:null,problem:null};
@@ -139,6 +149,29 @@ describe('owner card presentation',()=>{
     expect(optimistic.filter(d=>d.speaker.mode==='exit').map(d=>d.id)).toEqual([next.device]);
     expect(presentCards(facts,[]).filter(d=>d.speaker.mode==='exit').map(d=>d.id)).toEqual([old.device]);
   });
+  it('the previous exit forwards when it is a computer and goes local when it is a phone (Q1)',()=>{
+    const pc=card(),phone=card(),next=card();
+    phone.device='4'.repeat(64);phone.os='android';phone.logo='android';next.device='3'.repeat(64);
+    for(const old of [pc,phone])Object.assign(old.status!.speaker,{icon:'exit',configuredMode:'receiver'});
+    for(const facts of [{...view(pc),cards:[pc,next]},{...view(phone),cards:[phone,next]}]){
+      const intents=[{requestId:'exit',device:next.device,resource:'speaker',desired:'exit'}];
+      const [old]=presentCards(facts,intents);
+      const expected=old.os==='android'?{mode:'unused',configuredMode:'unused'}:{mode:'forwarding',configuredMode:'source'};
+      expect(old.speaker).toMatchObject(expected);
+      const store=new Map([[next.device,[{kind:'speaker',mode:'exit'} as const]]]);
+      expect(presentControls(facts,store)[0].speaker).toMatchObject(expected);
+    }
+  });
+  it('the previous sender receives when it is a computer with its virtual microphone, else local (Q1)',()=>{
+    const mic=(device:DeviceCard,virtualReady:boolean)=>{device.status!.microphone={mode:'source',permissionGranted:true,virtualReady,captureActive:false,consumerActive:false,receivingActive:false,fault:null,sourceDevice:device.device,sourceName:null,shareAction:unavailable,localAction:unavailable,receiveAction:unavailable,controlsToken:null,forwarding:null};};
+    const next=card();next.device='3'.repeat(64);
+    for(const [os,virtualReady,expected] of [['windows',true,'receiver'],['windows',false,'unavailable'],['android',false,'unavailable']] as const){
+      const old=card();old.os=os;mic(old,virtualReady);mic(next,true);next.status!.microphone!.mode='muted';
+      const shown=presentControls({...view(old),cards:[old,next]},new Map([[next.device,[{kind:'microphone',mode:'source'} as const]]]));
+      expect(shown[0].microphone?.mode).toBe(expected);
+      expect(shown[1].microphone?.mode).toBe('source');
+    }
+  });
   it('shows a missing-exit warning only from the owner observation',()=>{
     const source=card();source.status!.speaker.icon='forwarding';source.status!.speaker.activity='unknown';
     expect(indicators(presentCards(view(source),[])[0],true).find(i=>i.glyph==='speaker')?.badge).not.toBe('warning');
@@ -178,6 +211,29 @@ describe('unavailable resource presentation',()=>{
       expect(indicator.label).not.toMatch(/state|状态/);
     }
     expect(problemText('unrecognized')).toBe(language==='en'?'Unavailable':'不可用');
+  });
+});
+
+describe('resource fault reasons',()=>{
+  // Field case: a remote exit whose speaker the backend reports as unknown with
+  // fault code `none` read "扬声器：不可用，不可用".
+  it('names the real cause once and never repeats the unavailable state',()=>{
+    setLanguage('zh-Hans');
+    const unknown=presentCards(view(card()),[])[0];
+    expect(unknown.faults?.speaker).toBeUndefined();
+    expect(audioTooltip(unknown,'speaker',null)[0]).toBe('扬声器：不可用，状态未知');
+    const faulty=card();
+    faulty.status!.speaker={...faulty.status!.speaker,icon:'fault',condition:'faulted',fault:{code:'device_unavailable',unknownCode:null,problem:null}};
+    expect(audioTooltip(presentCards(view(faulty),[])[0],'speaker',null)[0]).toBe('扬声器：不可用，设备不可用');
+    faulty.status!.speaker.fault={code:'unrecognized',unknownCode:99,problem:{code:'backend_failed',unknownCode:null,nativeCode:null,retryAfterMs:null}};
+    expect(audioTooltip(presentCards(view(faulty),[])[0],'speaker',null)[0]).toBe('扬声器：不可用，后台服务异常');
+    faulty.status!.speaker.fault={code:'unrecognized',unknownCode:99,problem:null};
+    expect(audioTooltip(presentCards(view(faulty),[])[0],'speaker',null)[0]).toBe('扬声器：不可用，状态未知');
+    const mouse=card();
+    mouse.status!.mouse={...mouse.status!.mouse,icon:'fault',fault:{code:'unrecognized',unknownCode:7,problem:null}};
+    const label=indicators(presentCards(view(mouse),[])[0])[0].label;
+    expect(label).toBe('鼠标不可用：状态未知');
+    for(const line of [label,audioTooltip(unknown,'speaker',null)[0]])expect(line).not.toMatch(/不可用.*不可用/);
   });
 });
 
@@ -264,7 +320,8 @@ it('updates configured roles in optimistic speaker controls, including a failed 
   old.status!.speaker={...old.status!.speaker,configuredMode:'receiver',icon:'fault'};
   const facts={...view(old),cards:[old,next]};
   const shown=presentControls(facts,new Map([[next.device,[{kind:'speaker',mode:'exit'}]]]));
-  expect(shown.map(d=>d.speaker.configuredMode)).toEqual(['unused','receiver']);
+  // The old exit is a computer: it falls back to forward (user 2026-11-11 Q1).
+  expect(shown.map(d=>d.speaker.configuredMode)).toEqual(['source','receiver']);
   const stopped=presentControls(view(old),new Map([[old.device,[{kind:'speaker',mode:'unused'}]]]));
   expect(stopped[0].speaker.configuredMode).toBe('unused');
 });

@@ -3,14 +3,14 @@ use super::*;
 use crate::api::{AgentApi, Notification, NotificationLevel, NotificationReceipt, ScreenKey};
 use oink_foundation::{Point, session::Boot};
 use oink_locator::notification::{self, Click, NotificationOverlay, Style, Toast};
-use oink_protocol::v1::{
+use oink_protocol::v2::{
     Message, RawValue as V, dto,
     schema::{WireDto, WireValue},
 };
 use std::collections::HashMap;
 
-const CAPABILITY: &str = "oink.notify/1";
-const MICROPHONE_CAPABILITY: &str = "oink.notify.microphone/1";
+const CAPABILITY: &str = "oink.device/2";
+const MICROPHONE_CAPABILITY: &str = "oink.audio.microphone/1";
 /// A rendering host keeps one slot per state family, independent of origin device.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum Family {
@@ -291,7 +291,7 @@ impl Node {
             state.next
         };
         if let Some(screen) = remote {
-            let mut raw: oink_protocol::v1::RawMap = [
+            let mut raw: oink_protocol::v2::RawMap = [
                 (1, id.write()),
                 (2, V::Text(screen.display.clone())),
                 (3, level_number(request.level).write()),
@@ -584,7 +584,7 @@ impl Node {
                 }
             }
             Message::NotifyShow(m) => {
-                let read = || -> oink_protocol::v1::Result<_> {
+                let read = || -> oink_protocol::v2::Result<_> {
                     Ok((
                         m.id()?,
                         m.display()?.0,
@@ -1867,6 +1867,13 @@ mod owner_tests {
             .unwrap();
     }
 
+    async fn call_result(node: &Node, request: api::Request) -> api::ApiResult<api::Reply> {
+        let node = node.clone();
+        tokio::task::spawn_blocking(move || api::dispatch(&node, request))
+            .await
+            .unwrap()
+    }
+
     fn send_legacy_keyboard_notice(source: &Node, host: &Node) -> u64 {
         // Exercise the existing incoming typed-notification protocol. Current
         // builtins render on their owner; older senders can target another host.
@@ -2028,7 +2035,9 @@ mod owner_tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn remote_keyboard_notice_stays_on_owner_and_owner_undo_releases() {
         // Generic CLI calls and the UI's owner-card token must converge on the
-        // affected owner, including without the optional notification capability.
+        // affected owner when the device domain is negotiated. Without that
+        // domain, remote device-control calls are rejected; the owner can
+        // still perform the same local action.
         for supported in [true, false] {
             let (_home_a, home_b, requester, owner) = owners(supported).await;
             assert_eq!(owner.owner_notification_screen().unwrap().display, "right");
@@ -2043,6 +2052,20 @@ mod owner_tests {
                     })
                 })
                 .await;
+                if !supported && operation != "local" {
+                    assert!(
+                        call_result(
+                            &requester,
+                            api::Request::SetKeyboardDisabled {
+                                device: owner.id().into(),
+                                disabled: true,
+                            },
+                        )
+                        .await
+                        .is_err()
+                    );
+                    continue;
+                }
                 let request = if operation == "remote_ui" {
                     let cards = requester.device_cards().unwrap();
                     let owner_card = cards.cards.iter().find(|card| card.device.0 == owner.id()).unwrap();

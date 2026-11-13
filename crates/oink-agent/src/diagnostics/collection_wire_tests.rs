@@ -1,7 +1,7 @@
 //! Adversarial transfers use the real admitted Low channel and retained codec.
 use super::*;
 use crate::streams::lifecycle_tests::Fixture;
-use oink_protocol::v1::schema::{WireDto, WireValue};
+use oink_protocol::v2::schema::{WireDto, WireValue};
 
 #[test]
 fn unsupported_format_and_compression_refuse_only_the_low_operation() {
@@ -62,7 +62,7 @@ fn unsupported_format_and_compression_refuse_only_the_low_operation() {
                 })
                 .await
                 .unwrap();
-                assert_eq!(error.code().unwrap(), v1::ErrorCode::UnsupportedValue.number() as u16);
+                assert_eq!(error.code().unwrap(), v2::ErrorCode::UnsupportedValue.number() as u16);
                 assert_eq!(error.scope().unwrap(), w::ErrorScope::LowOperation);
                 assert_eq!(error.offending_type().unwrap(), Some(0x0a02));
                 assert_eq!(error.operation().unwrap().unwrap().0, request_id.0);
@@ -87,7 +87,7 @@ async fn respond(
     let id = request.request_id()?;
     if mode.starts_with("c0-") {
         let error = dto::<w::ProtocolError>([
-            ("code", (v1::ErrorCode::UnsupportedValue.number() as u16).write()),
+            ("code", (v2::ErrorCode::UnsupportedValue.number() as u16).write()),
             (
                 "scope",
                 if mode == "c0-other-scope" {
@@ -349,6 +349,192 @@ fn admitted_low_rejects_mixed_ids_offsets_and_lengths_before_commit() {
                 let _ = tokio::time::timeout(Duration::from_secs(2), operation.stream.recv()).await;
             }
             fixture.stop().await;
+        },
+    );
+}
+
+#[test]
+fn mobile_owner_uploads_to_the_desktop_proxy() {
+    // This fixture combines both session startup futures and a complete
+    // diagnostic operation. Debug builds need more than libtest's default stack.
+    std::thread::Builder::new()
+        .stack_size(16 * 1024 * 1024)
+        .spawn(run_mobile_owner_upload)
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+fn run_mobile_owner_upload() {
+    use crate::config_module::{ConfigDeps, ConfigModule, group_store};
+    use oink_foundation::{realtime::Tier, session::Boot};
+    use oink_mobile_core::{
+        DiagnosticCode, DiagnosticEvent, DiagnosticKind, MobileDiagnostics, MobileNetwork, MobileNetworkConfig,
+        MobileProcess,
+    };
+    use oink_network::{group_state::State, identity::Identity, link::LinkConfig, negotiation::OfferProfile};
+
+    struct Application;
+    impl crate::config_module::ConfigApplication for Application {
+        fn apply_state(&self, _: &group_store::StoredGroupState) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    crate::test_watchdog::run(
+        module_path!(),
+        "mobile_owner_uploads_to_the_desktop_proxy",
+        Some(4),
+        async {
+            let desktop_dir = tempfile::tempdir().unwrap();
+            let desktop_identity = Arc::new(Identity::from_seed([41; 32]));
+            let phone_id = Identity::from_seed([42; 32]).id();
+            let state = State::create(&desktop_identity, "desktop", "macos", 100).unwrap();
+            let roster = state
+                .roster()
+                .add(&desktop_identity, phone_id, "phone", "android", 101)
+                .unwrap();
+            let state = state.with_roster(&roster).unwrap();
+            let stored = group_store::StoredGroupState::new(desktop_identity.id(), state.wire().clone()).unwrap();
+            group_store::save(&desktop_dir.path().join(group_store::STATE_FILE), &stored).unwrap();
+            let network = oink_test_support::network_config(desktop_dir.path().into(), "desktop", 0);
+            let (desktop, port) = LinkLayer::start(LinkConfig {
+                profile: OfferProfile {
+                    capabilities: v2::registry::CAPABILITIES.iter().map(|cap| (*cap).to_owned()).collect(),
+                    formats: oink_clipboard::negotiation::formats(),
+                    audio: oink_audio::negotiation::audio(),
+                    ..Default::default()
+                },
+                identity: desktop_identity.clone(),
+                boot: Boot {
+                    device_id: desktop_identity.id(),
+                    nonce: [41; 16],
+                },
+                bind: (network.bind_ip, network.port).into(),
+                tier: Tier::Elevated,
+            })
+            .await
+            .unwrap();
+            let mut diagnostics_port = desktop.register(&[StreamKind::Diagnostics]);
+            let config = ConfigModule::start_with_config(
+                ConfigDeps {
+                    config: Arc::new(Mutex::new(
+                        crate::config::AgentConfig::load_from_with_device_name(desktop_dir.path(), "desktop".into())
+                            .unwrap(),
+                    )),
+                    owner_gate: Arc::new(Mutex::new(())),
+                    data_dir: desktop_dir.path().into(),
+                    links: desktop.clone(),
+                    port,
+                    identity: desktop_identity,
+                    application: Arc::new(Application),
+                    pairing: true,
+                },
+                network,
+            )
+            .unwrap();
+            let phone_dir = tempfile::tempdir().unwrap();
+            let phone = MobileNetwork::start(MobileNetworkConfig {
+                identity_seed: [42; 32],
+                boot: Boot {
+                    device_id: phone_id,
+                    nonce: [42; 16],
+                },
+                bind: (std::net::Ipv4Addr::LOCALHOST, 0).into(),
+                group_state: Some(state.wire().encode(v2::limits::CONFIG_STATE).unwrap()),
+                group_state_path: phone_dir.path().join("group-state.v2"),
+                pairing_journal_path: phone_dir.path().join("pairing-recovery.cbor"),
+                device_name: "phone".into(),
+                os: "android".into(),
+                form_factor: None,
+                trusted_peers: Vec::new(),
+                trust_path: None,
+                process: MobileProcess::App,
+            })
+            .await
+            .unwrap();
+            phone.dial(desktop.id(), vec![desktop.local_addr()]).unwrap();
+            let ready = tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if let Some(link) = desktop.links().by_peer(phone_id).filter(|entry| {
+                        entry.state == LinkState::Ready
+                            && config
+                                .members()
+                                .members
+                                .iter()
+                                .any(|member| member.device == phone_id && member.online)
+                    }) {
+                        break link.link;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            let mut owner = DiagnosticsStreams::new(desktop.clone(), config.clone());
+            owner.link_ready(ready, phone_id);
+            owner.set_hello("desktop-test".into(), true, None);
+            tokio::time::timeout(Duration::from_secs(3), async {
+                while phone.diagnostics_hello(desktop.id()).is_none() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            let dir = tempfile::tempdir().unwrap();
+            let recorder = crate::diagnostics::tests::isolated(
+                dir.path().into(),
+                desktop.id(),
+                Some(config.applied().group),
+                true,
+            )
+            .unwrap();
+            recorder.wait_recovery();
+            let receiver = Collector {
+                recorder: recorder.clone(),
+                context: super::tests::context(desktop.clone(), config.clone()),
+            };
+            let collector = MobileDiagnostics::with_ids(
+                Arc::new(phone.diagnostic_sink().unwrap()),
+                phone.device_id(),
+                "bd28300e-df4b-4e6f-9ce4-d2ae8082fb90",
+                "9642ea15-bac5-4ce0-97e3-a4fdb01d0187",
+                16 * 1024,
+                16 * 1024,
+            );
+            collector
+                .emit(DiagnosticEvent {
+                    timestamp_ms: 100,
+                    kind: DiagnosticKind::Status,
+                    code: DiagnosticCode::Started,
+                    metric: None,
+                    count: 1,
+                })
+                .unwrap();
+            collector.flush().unwrap();
+            let incoming = tokio::time::timeout(Duration::from_secs(18), async {
+                loop {
+                    if let Some(ModuleEvent::InboundLow(incoming)) = diagnostics_port.next().await {
+                        return *incoming;
+                    }
+                }
+            })
+            .await
+            .expect("mobile uploads a Low operation");
+            owner.inbound_low(incoming);
+            let [operation]: [oink_network::link::InboundLow; 1] =
+                owner.take_low().try_into().expect("admitted mobile upload");
+            receiver.serve(operation.stream, operation.first).await.unwrap();
+            let source = phone.device_id();
+            assert!(
+                lock(&recorder.inner.store)
+                    .mobile_proxy
+                    .has_source_in_range(&source, 0, i64::MAX)
+            );
+            phone.stop().await;
+            recorder.shutdown();
+            config.stop().await;
+            desktop.stop().await;
         },
     );
 }

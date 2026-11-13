@@ -22,7 +22,13 @@ impl Network {
         let Some(boot) = self.core.connection_boot(connection) else {
             return;
         };
-        let (hop, receiver) = tcp::N1::new(connection, boot, self.physical[&uid].connection.remote_address());
+        let physical = &self.physical[&uid];
+        let (hop, receiver) = tcp::N1::new(
+            connection,
+            boot,
+            physical.connection.remote_address(),
+            physical.low_peer_info.clone(),
+        );
         let header = StreamHeader {
             route_tag: 0,
             priority: Priority::Normal,
@@ -74,7 +80,7 @@ impl Network {
             .filter_map(|(connection, deadline)| (*deadline <= now).then_some(*connection))
             .collect();
         for connection in retries {
-            if !self.connections.contains_key(&connection) {
+            if !self.connections.contains_key(&connection) || !self.core.connection_in_use(connection) {
                 self.n1_retry.remove(&connection);
                 continue;
             }
@@ -153,6 +159,18 @@ impl Network {
         };
         let connection = self.physical.get(&uid)?.id?;
         if binding.hop.connection_id != connection || !message.is_hop_control() {
+            return None;
+        }
+        if matches!(message.as_ref(), LowMsg::Info { .. }) {
+            // N0 commit and N1 are independently scheduled: peer Info can arrive
+            // before our commit registers N1. Listener/pacing facts belong to the
+            // authenticated physical connection, including that gap and N1
+            // restarts. Dropping them leaves Race without a policy indefinitely.
+            // Opens and lease controls still require the exact current grant.
+            self.physical.get(&uid)?.low_peer_info.store(Some(Arc::new(*message)));
+            if let Some(hop) = self.n1.get(&connection) {
+                hop.peer_info_changed.notify_one();
+            }
             return None;
         }
         let grant = self.low_port.grant(binding)?;

@@ -2,6 +2,7 @@
 //! Candidate selection, matched heartbeats and relay reservations are ported from the
 //! old owner core. No session, acknowledgement, replay or consumer state is retained.
 mod relay;
+mod route;
 #[cfg(test)]
 mod tests;
 use super::*;
@@ -11,6 +12,7 @@ use crate::link::control::{
 };
 use oink_foundation::session::{BootPair, ConnectionId, PathId, RouteRevision};
 use relay::{Nomination, PendingRequest, Request, Transit};
+pub(in crate::link) use route::{ROUTE_NONCE, RouteEnv};
 use std::{
     collections::{HashMap, VecDeque},
     time::Instant,
@@ -45,12 +47,27 @@ pub(super) enum Effect {
         old: NextHopBinding,
     },
     CloseTransit(PathId),
+    /// Open a standby connection to this address of the peer under this id.
+    DialStandby {
+        peer: DeviceId,
+        address: SocketAddr,
+        id: ConnectionId,
+    },
+    /// The pair's pin as seen from this end changed; the owner persists it.
+    RouteRecord {
+        link: LinkId,
+        peer: DeviceId,
+        record: Option<RouteRecord>,
+    },
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Choice {
     Candidate,
     Offered(u64),
     Selected(u64),
+    /// Authenticated while the pair already had a selected connection: kept with
+    /// N0 only, probed by its dialer, a possible cut-over target (protocol-v2 11).
+    Standby,
 }
 #[derive(Debug)]
 struct Candidate {
@@ -59,6 +76,12 @@ struct Candidate {
     started: Instant,
     choice: Choice,
     deadline: Instant,
+    /// Outbound: the peer address dialed. Inbound: this device's address reached.
+    target: Option<SocketAddr>,
+    /// The peer's relay role. Path requests and nominations require at least
+    /// `Endpoint` (a peer without oink.relay/1 rejects them as unnegotiated);
+    /// only a `Station` is asked to forward.
+    relay: RelayRole,
 }
 #[derive(Debug)]
 struct Heartbeat {
@@ -156,6 +179,12 @@ pub(super) struct Core {
     pub transit: Vec<Transit>,
     counter: u64,
     pub effects: VecDeque<Effect>,
+    routes: HashMap<DeviceId, route::PeerRoute>,
+    local_ips: Vec<std::net::Ipv4Addr>,
+    probing: bool,
+    route_nonce: u64,
+    /// This device is a relay station (offers oink.relay.transit/1).
+    forwards: bool,
 }
 impl Cutover {
     fn waiting(&self, coordinator: bool) -> &'static str {
@@ -223,6 +252,11 @@ impl Core {
             transit: Vec::new(),
             counter: 0,
             effects: VecDeque::new(),
+            routes: HashMap::new(),
+            local_ips: Vec::new(),
+            probing: true,
+            route_nonce: 0,
+            forwards: true,
         }
     }
     fn number(&mut self) -> u64 {
@@ -243,11 +277,48 @@ impl Core {
             .get(&id)
             .is_some_and(|c| matches!(c.choice, Choice::Selected(_)))
     }
+    /// Whether any path still rides this physical connection: some link's
+    /// current hop (a direct link, or the first hop of a relayed one), or
+    /// either end of a relayed path this device forwards. The one test of
+    /// whether a connection may lose its Low hop (N1) or be dropped as an idle
+    /// standby; a connection that stopped being one link's hop can still carry
+    /// another link or a transit.
+    pub fn connection_in_use(&self, id: ConnectionId) -> bool {
+        self.connection_used_by_other(id, None)
+    }
+    /// `connection_in_use`, ignoring the link `except` itself.
+    pub(super) fn connection_used_by_other(&self, id: ConnectionId, except: Option<LinkId>) -> bool {
+        self.links
+            .values()
+            .any(|l| Some(l.id) != except && l.hop.connection_id == id)
+            || self.carries_transit(id)
+    }
+    /// Selected or standby: the executor keeps it past its bootstrap deadline.
+    pub fn retained_connection_id(&self, id: ConnectionId) -> bool {
+        self.candidates
+            .get(&id)
+            .is_some_and(|c| matches!(c.choice, Choice::Selected(_) | Choice::Standby))
+    }
     fn selected_connection(&self, peer: DeviceId) -> Option<ConnectionId> {
         self.candidates
             .iter()
             .find(|(_, c)| c.boot.device_id == peer && matches!(c.choice, Choice::Selected(_)))
             .map(|(id, _)| *id)
+    }
+    /// Whether path requests may be exchanged on this connection: the peer
+    /// can terminate a relayed path.
+    fn relays(&self, id: ConnectionId) -> bool {
+        self.candidates.get(&id).is_some_and(|c| c.relay != RelayRole::None)
+    }
+    /// Whether the peer on this connection is a relay station (a PC). A phone
+    /// terminates relayed paths but never forwards them.
+    fn station(&self, id: ConnectionId) -> bool {
+        self.candidates.get(&id).is_some_and(|c| c.relay == RelayRole::Station)
+    }
+    /// Whether this device forwards other devices' paths: it offers
+    /// oink.relay.transit/1 (PCs). A phone only terminates relayed paths.
+    pub fn set_forwards(&mut self, forwards: bool) {
+        self.forwards = forwards;
     }
     fn ready_direct(&self, peer: DeviceId) -> Option<ConnectionId> {
         self.links
@@ -393,11 +464,49 @@ impl Core {
             }
         }
     }
+    #[cfg(test)]
     pub fn authenticated(&mut self, boot: Boot, connection: ConnectionId, now: Instant) {
+        self.authenticated_at(boot, connection, None, RelayRole::Station, now);
+    }
+    /// `target`: for an own dial the peer address dialed; for the peer's dial
+    /// this device's address it reached (the connection's local address).
+    pub fn authenticated_at(
+        &mut self,
+        boot: Boot,
+        connection: ConnectionId,
+        target: Option<SocketAddr>,
+        relay: RelayRole,
+        now: Instant,
+    ) {
         if boot.device_id == self.boot.device_id || self.candidates.contains_key(&connection) {
             return;
         }
         self.observe_peer_boot(boot, now);
+        // Standbys exist only beside a direct link: its current connection is
+        // the selected one. A selection still waiting for its relay-to-direct
+        // cut-over can expire, and a standby left over from that window would
+        // block every later candidate from being offered.
+        let direct_selected = self.selected_connection(boot.device_id).is_some_and(|selected| {
+            self.links
+                .values()
+                .any(|l| l.peer.device_id == boot.device_id && l.hop.connection_id == selected)
+        });
+        if direct_selected && self.route_room_for(boot.device_id, connection, target) {
+            self.candidates.insert(
+                connection,
+                Candidate {
+                    boot,
+                    arrival: self.counter,
+                    started: now,
+                    choice: Choice::Standby,
+                    deadline: now,
+                    target,
+                    relay,
+                },
+            );
+            self.standby_authenticated(boot.device_id, connection, now);
+            return;
+        }
         if self.selected_connection(boot.device_id).is_some() {
             tracing::info!(target: "oink_link_diagnostics", kind = "connection_step", peer_id = boot.device_id.to_hex().as_str(), operation = diagnostics::hex(&connection.random).as_str(), stage = "selection", result = "failed", reason = "superseded", "Connection rejected");
             self.send(
@@ -420,12 +529,15 @@ impl Core {
                 started: now,
                 choice: Choice::Candidate,
                 deadline: now + DIAL_BUDGET,
+                target,
+                relay,
             },
         );
         tracing::info!(target: "oink_link_diagnostics", kind = "connection_step", peer_id = boot.device_id.to_hex().as_str(),
             operation = diagnostics::hex(&connection.random).as_str(), stage = "instance", result = "completed",
             initiator = if connection.initiator_boot == self.boot { "local" } else { "peer" }, reason = "none", "Connection instance authenticated");
         self.selection_trace(connection, "entered", "authenticated", 0);
+        self.route_dial_candidate(boot.device_id, connection);
         self.offer_candidate(boot.device_id);
     }
     fn observe_peer_boot(&mut self, boot: Boot, now: Instant) {
@@ -458,7 +570,7 @@ impl Core {
     pub(super) fn selection_wait(&self, id: ConnectionId) -> (&'static str, &'static str) {
         match self.candidates.get(&id).map(|c| c.choice) {
             Some(Choice::Offered(_)) => ("connection_selected", "peer"),
-            Some(Choice::Selected(_)) => ("none", "none"),
+            Some(Choice::Selected(_) | Choice::Standby) => ("none", "none"),
             Some(Choice::Candidate) if self.arbiter(self.candidates[&id].boot.device_id) => {
                 let waiting =
                     if self.candidates.values().any(|other| {
@@ -542,7 +654,7 @@ impl Core {
         let losers: Vec<_> = self
             .candidates
             .iter()
-            .filter(|(cid, c)| **cid != id && c.boot.device_id == peer.device_id)
+            .filter(|(cid, c)| **cid != id && c.boot.device_id == peer.device_id && c.choice != Choice::Standby)
             .map(|(cid, _)| *cid)
             .collect();
         for loser in losers {
@@ -720,6 +832,11 @@ impl Core {
         }
         if let Some(connection) = direct {
             self.relay_neighbor_ready(connection, Instant::now());
+            self.route_link_ready(id, Instant::now());
+        }
+        if let Some(peer) = relay {
+            self.route_link_ready(id, Instant::now());
+            self.route_relay_ready(peer, Instant::now());
         }
         if let Some(peer) = relay
             && self.arbiter(peer)
@@ -737,9 +854,19 @@ impl Core {
     pub fn retire_authority(&mut self, id: LinkId) {
         let Some(link) = self.links.get_mut(&id) else { return };
         link.state = LinkState::Connected;
-        let connection = link.hop.connection_id;
+        let peer = link.peer.device_id;
         if link.path() == LinkPath::Direct {
-            self.retire_relay_authority(connection);
+            // Every connection to the neighbor that still carries a path,
+            // by the same test as everywhere else, not only the current one.
+            let connections: Vec<_> = self
+                .candidates
+                .iter()
+                .filter(|(id, c)| c.boot.device_id == peer && self.connection_in_use(**id))
+                .map(|(id, _)| *id)
+                .collect();
+            for connection in connections {
+                self.retire_relay_authority(connection);
+            }
         }
     }
     pub(super) fn peer_data_received(&mut self, id: LinkId, now: Instant) {
@@ -767,6 +894,7 @@ impl Core {
                 Disconnect::HandshakeTimeout => "handshake_timeout",
                 Disconnect::ControlStreamFailed => "control_stream_failed",
                 Disconnect::InputOpeningTimeout => "input_opening_timeout",
+                Disconnect::CapabilityChanged => "capability_changed",
             },
         };
         let observed = Instant::now();
@@ -789,9 +917,12 @@ impl Core {
             if link.report_setup_failure {
                 let result = match reason {
                     LinkLost::Stopped
-                    | LinkLost::Local(Disconnect::Stopping | Disconnect::LeavingGroup | Disconnect::Sleeping) => {
-                        super::timing::Result::Cancelled
-                    }
+                    | LinkLost::Local(
+                        Disconnect::Stopping
+                        | Disconnect::LeavingGroup
+                        | Disconnect::Sleeping
+                        | Disconnect::CapabilityChanged,
+                    ) => super::timing::Result::Cancelled,
                     LinkLost::Local(Disconnect::HandshakeTimeout) => super::timing::Result::Timeout,
                     _ => super::timing::Result::Failed,
                 };
@@ -830,6 +961,7 @@ impl Core {
                 .push_back(Effect::DialFailed(link.peer.device_id, DialFailure::Unreachable));
         }
         self.nominations.remove(&link.peer.device_id);
+        self.route_link_lost(&link, reason, observed);
         self.path_down(&link);
         if link.wire.reservation.is_none() {
             self.candidates.remove(&link.hop.connection_id);
@@ -874,7 +1006,7 @@ impl Core {
             );
         }
     }
-    pub fn connection_lost(&mut self, connection: ConnectionId, _now: Instant) {
+    pub fn connection_lost(&mut self, connection: ConnectionId, now: Instant) {
         self.relay_connection_lost(connection);
         let lost: Vec<_> = self
             .links
@@ -891,7 +1023,13 @@ impl Core {
             self.lose(id, LinkLost::ConnectionLost);
         }
         if let Some(candidate) = self.candidates.remove(&connection) {
+            if candidate.choice == Choice::Standby {
+                self.route_standby_gone(candidate.boot.device_id, connection, now);
+                return;
+            }
             self.offer_candidate(candidate.boot.device_id);
+        } else {
+            self.route_dial_lost(connection, now);
         }
     }
     pub fn path_internal_closed(&mut self, connection: ConnectionId, tag: u64) {
@@ -1141,7 +1279,10 @@ impl Core {
                         let (_, sent) = link.heartbeat.pending[index];
                         link.heartbeat.pending.drain(..=index);
                         link.heartbeat.progress = now;
-                        link.heartbeat.rtt = Some(now.saturating_duration_since(sent));
+                        let rtt = now.saturating_duration_since(sent);
+                        link.heartbeat.rtt = Some(rtt);
+                        let peer = link.peer.device_id;
+                        self.route_heartbeat(peer, rtt, now);
                     }
                 } else {
                     self.path_send(id, LinkMsg::Pong(pulse));
@@ -1177,6 +1318,7 @@ impl Core {
                     || from_revision.next() != Some(to_revision)
                     || link.cutover.is_some()
                     || self.selected_connection(link.peer.device_id) != Some(connection_id)
+                        && !self.standby(link.peer.device_id, connection_id)
                 {
                     let reason = if self.arbiter(link.peer.device_id) {
                         "wrong_role"
@@ -1298,6 +1440,10 @@ impl Core {
                 }
             }
             LinkMsg::HopProbe { nonce } => self.send(connection, 0, LinkMsg::HopPong { nonce }),
+            LinkMsg::HopPong { nonce } if nonce & ROUTE_NONCE != 0 => self.route_pong(connection, nonce, now),
+            message @ (LinkMsg::RouteRequest { .. } | LinkMsg::RouteState(_)) => {
+                self.route_message(connection, tag, message, now)
+            }
             _ => {}
         }
     }
@@ -1347,6 +1493,25 @@ impl Core {
         if link.state != LinkState::Ready {
             return;
         }
+        self.start_cutover(id, connection, now);
+    }
+    /// Direct-to-direct cut-over to a standby connection of the pair (arbiter).
+    fn begin_route_cutover(&mut self, id: LinkId, connection: ConnectionId, now: Instant) -> bool {
+        let link = &self.links[&id];
+        if !link.installed
+            || link.path() != LinkPath::Direct
+            || link.cutover.is_some()
+            || link.state != LinkState::Ready
+            || link.hop.connection_id == connection
+            || !self.standby(link.peer.device_id, connection)
+        {
+            return false;
+        }
+        self.start_cutover(id, connection, now);
+        true
+    }
+    fn start_cutover(&mut self, id: LinkId, connection: ConnectionId, now: Instant) {
+        let link = &self.links[&id];
         let to_revision = link.wire.route_revision.next().expect("route revision");
         let migration_id = MigrationId {
             path_id: link.wire.path_id,
@@ -1502,6 +1667,7 @@ impl Core {
             "cutover",
         );
         let old = link.hop;
+        let relayed = link.wire.reservation.is_some();
         link.hop = m.next_hop;
         link.wire.route_revision = m.wire.migration_id.to_revision;
         link.wire.next_hop_binding = m.next_hop;
@@ -1509,31 +1675,57 @@ impl Core {
         link.heartbeat = Heartbeat::new(now);
         let path_id = link.wire.path_id;
         let peer = link.peer.device_id;
-        self.dials.remove(&peer);
-        self.effects.push_back(Effect::DialFinished(peer));
-        self.send(
-            old.connection_id,
-            0,
-            LinkMsg::PathCancel {
-                reference: PathReference::Installed(path_id),
-                reason: Refusal::Superseded,
-            },
-        );
+        if relayed {
+            self.dials.remove(&peer);
+            self.effects.push_back(Effect::DialFinished(peer));
+            self.send(
+                old.connection_id,
+                0,
+                LinkMsg::PathCancel {
+                    reference: PathReference::Installed(path_id),
+                    reason: Refusal::Superseded,
+                },
+            );
+        } else {
+            // Direct to direct: the old connection stays open as a standby;
+            // no PathCancel, and no dial result unless one is pending.
+            let counter = match self.candidates.get(&old.connection_id).map(|c| c.choice) {
+                Some(Choice::Selected(counter)) => counter,
+                _ => self.choices.get(&peer).map_or(0, |(_, counter)| *counter),
+            };
+            if let Some(previous) = self.candidates.get_mut(&old.connection_id) {
+                previous.choice = Choice::Standby;
+            }
+            if let Some(next) = self.candidates.get_mut(&m.next_hop.connection_id) {
+                next.choice = Choice::Selected(counter);
+            }
+            if self.dials.remove(&peer).is_some() {
+                self.effects.push_back(Effect::DialFinished(peer));
+            }
+        }
         self.effects.push_back(Effect::PathChanged { link: id, old });
+        if relayed {
+            // A link that became Ready over a relay is a direct link only from
+            // here on; `set_ready` saw the relay and did not start route probing.
+            self.route_link_ready(id, now);
+        } else {
+            self.route_cutover_finished(id, old.connection_id, m.next_hop.connection_id, now);
+        }
     }
     fn candidate_waiting_for_path(&self, connection: ConnectionId, candidate: &Candidate) -> bool {
         // Selection can finish while a prior relay install is still pending.
         // If that install fails, the selected direct connection has no path or
         // cutover to time it out. Keep its original candidate budget until a
         // link owns it; an orphan selection would reject every later candidate.
-        !matches!(candidate.choice, Choice::Selected(_))
-            || !self.links.values().any(|link| {
-                link.hop.connection_id == connection
-                    || link
-                        .cutover
-                        .as_ref()
-                        .is_some_and(|cutover| cutover.next_hop.connection_id == connection)
-            })
+        candidate.choice != Choice::Standby && !matches!(candidate.choice, Choice::Selected(_))
+            || matches!(candidate.choice, Choice::Selected(_))
+                && !self.links.values().any(|link| {
+                    link.hop.connection_id == connection
+                        || link
+                            .cutover
+                            .as_ref()
+                            .is_some_and(|cutover| cutover.next_hop.connection_id == connection)
+                })
     }
     pub fn next_deadline(&self) -> Option<Instant> {
         let mut next = None;
@@ -1585,6 +1777,7 @@ impl Core {
                 include(at);
             }
         }
+        self.route_deadlines(&mut include);
         next
     }
     pub fn tick(&mut self, now: Instant) {

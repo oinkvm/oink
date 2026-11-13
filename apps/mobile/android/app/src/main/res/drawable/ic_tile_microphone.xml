@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 共享麦克风 tile: the microphone of the device cards (pcMicrophone), one colour. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp" android:height="24dp" android:viewportWidth="16" android:viewportHeight="16">
+    <path android:pathData="M8,1.7H8A2.3,2.3 0,0 1,10.3 4V7.4A2.3,2.3 0,0 1,8 9.7H8A2.3,2.3 0,0 1,5.7 7.4V4A2.3,2.3 0,0 1,8 1.7Z"
+        android:strokeColor="#FFFFFFFF" android:strokeWidth="1.4" android:strokeLineCap="round" android:strokeLineJoin="round" android:fillColor="#00000000" />
+    <path android:pathData="M4.2,7.4v0.7a3.8,3.8 0,0 0,7.6 0v-0.7M8,11.9v2.4M5.9,14.3h4.2"
+        android:strokeColor="#FFFFFFFF" android:strokeWidth="1.4" android:strokeLineCap="round" android:strokeLineJoin="round" android:fillColor="#00000000" />
+</vector>

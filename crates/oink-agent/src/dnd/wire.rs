@@ -5,13 +5,13 @@ use oink_foundation::{
     clipboard::{ClipData, ClipPlatform},
     content::{Holder, OfferId},
 };
-use oink_protocol::v1::{
+use oink_protocol::v2::{
     self, RawMap, RawValue as V, dto,
     schema::{Open, WireDto, WireValue},
 };
 use oink_routing::dnd::*;
-fn invalid() -> v1::Error {
-    v1::ErrorCode::UnsupportedValue.into()
+fn invalid() -> v2::Error {
+    v2::ErrorCode::UnsupportedValue.into()
 }
 fn envelope(kind: u64, body: RawMap) -> RawMap {
     [(1, V::Uint(kind)), (2, V::Map(body))].into()
@@ -26,7 +26,7 @@ pub(crate) fn key(value: DragKey) -> dto::DragKey {
     )
     .expect("native drag identity")
 }
-pub(crate) fn local_key(value: dto::DragKey) -> v1::Result<DragKey> {
+pub(crate) fn local_key(value: dto::DragKey) -> v2::Result<DragKey> {
     Ok(DragKey {
         offer: content::local_offer_id(value.offer()?)?,
         native_generation: value.native_generation()?,
@@ -36,17 +36,17 @@ fn holder(value: Holder) -> dto::Holder {
     dto::Holder::from_raw([(1, content::device(value.device).write()), (2, V::Uint(value.epoch))].into())
         .expect("native holder")
 }
-fn local_device(value: dto::DeviceId) -> v1::Result<DeviceId> {
+fn local_device(value: dto::DeviceId) -> v2::Result<DeviceId> {
     value.require_supported()?;
     Ok(DeviceId(value.public_key()?.0.try_into().map_err(|_| invalid())?))
 }
-fn local_holder(value: dto::Holder) -> v1::Result<Holder> {
+fn local_holder(value: dto::Holder) -> v2::Result<Holder> {
     Ok(Holder {
         device: local_device(value.device()?)?,
         epoch: value.epoch()?,
     })
 }
-fn state(value: DragState) -> v1::Result<dto::DragState> {
+fn state(value: DragState) -> v2::Result<dto::DragState> {
     let (kind, body) = match value {
         DragState::Announced => (0, RawMap::new()),
         DragState::Offered { holder: h, mode } | DragState::Released { holder: h, mode } => (
@@ -86,7 +86,7 @@ fn state(value: DragState) -> v1::Result<dto::DragState> {
     };
     dto::DragState::from_raw(envelope(kind, body))
 }
-fn local_state(value: dto::DragState) -> v1::Result<DragState> {
+fn local_state(value: dto::DragState) -> v2::Result<DragState> {
     Ok(match value.variant()? {
         Open::Known(dto::DragStateKind::Announced) => DragState::Announced,
         Open::Known(kind @ (dto::DragStateKind::Offered | dto::DragStateKind::Released)) => {
@@ -135,9 +135,9 @@ fn local_state(value: dto::DragState) -> v1::Result<DragState> {
         _ => return Err(invalid()),
     })
 }
-pub(super) fn native_inventory(id: OfferId, items: &[ClipData], retained: Option<&[u8]>) -> v1::Result<dto::Inventory> {
+pub(super) fn native_inventory(id: OfferId, items: &[ClipData], retained: Option<&[u8]>) -> v2::Result<dto::Inventory> {
     if let Some(bytes) = retained {
-        let inventory = dto::Inventory::from_raw(v1::cbor::decode_map(bytes, v1::limits::INVENTORY)?)?;
+        let inventory = dto::Inventory::from_raw(v2::cbor::decode_map(bytes, v2::limits::INVENTORY)?)?;
         if content::local_offer_id(inventory.id()?)? != id {
             return Err(invalid());
         }
@@ -164,7 +164,7 @@ pub(super) fn native_inventory(id: OfferId, items: &[ClipData], retained: Option
         });
     content::reliable_inventory(&content::inventory(&inventory)?)
 }
-pub(crate) fn notice(value: &DragNotice) -> v1::Result<dto::DndNotice> {
+pub(crate) fn notice(value: &DragNotice) -> v2::Result<dto::DndNotice> {
     let inventory = native_inventory(value.key.offer, &value.items, value.retained_inventory.as_deref())?;
     let (kind, body) = match value.preview {
         PreviewAvailability::Unknown => (0, RawMap::new()),
@@ -199,20 +199,20 @@ pub(crate) fn notice(value: &DragNotice) -> v1::Result<dto::DndNotice> {
         .into(),
     )
 }
-pub(crate) fn local_notice(value: &dto::DndNotice) -> v1::Result<DragNotice> {
+pub(crate) fn local_notice(value: &dto::DndNotice) -> v2::Result<DragNotice> {
     local_notice_view(value, true)
 }
-pub(crate) fn notice_header(value: &dto::DndNotice) -> v1::Result<DragNotice> {
+pub(crate) fn notice_header(value: &dto::DndNotice) -> v2::Result<DragNotice> {
     local_notice_view(value, false)
 }
-pub(crate) fn attachment_notice_header(value: &dto::AttachmentHead) -> v1::Result<DragNotice> {
+pub(crate) fn attachment_notice_header(value: &dto::AttachmentHead) -> v2::Result<DragNotice> {
     let header = value.header()?;
     if header.variant() != Ok(Open::Known(dto::AttachmentKind::Drag)) {
         return Err(invalid());
     }
     notice_header(&dto::DragAttachment::from_raw(header.body()?)?.notice()?)
 }
-fn local_notice_view(value: &dto::DndNotice, full: bool) -> v1::Result<DragNotice> {
+fn local_notice_view(value: &dto::DndNotice, full: bool) -> v2::Result<DragNotice> {
     let items = if full {
         let inventory = content::local_inventory(&value.inventory()?)?;
         let platform = inventory.platform;
@@ -254,7 +254,7 @@ fn local_notice_view(value: &dto::DndNotice, full: bool) -> v1::Result<DragNotic
         preview,
         items,
         retained_inventory: if full {
-            Some(value.inventory()?.encode(v1::limits::INVENTORY)?)
+            Some(value.inventory()?.encode(v2::limits::INVENTORY)?)
         } else {
             None
         },
@@ -265,7 +265,7 @@ pub(crate) fn preview(
     epoch: u64,
     binding: PreviewBinding,
     image: Option<&oink_foundation::dnd::DragImage>,
-) -> v1::Result<dto::DndPreview> {
+) -> v2::Result<dto::DndPreview> {
     if binding.key.offer.clip != id {
         return Err(invalid());
     }
@@ -298,7 +298,7 @@ pub(crate) fn preview(
     }
     dto::DndPreview::from_raw(raw)
 }
-pub(crate) fn local_preview(value: dto::DndPreview) -> v1::Result<DndMsg> {
+pub(crate) fn local_preview(value: dto::DndPreview) -> v2::Result<DndMsg> {
     let id = content::local_clip_id(value.id()?)?;
     let key = local_key(value.key()?)?;
     if key.offer.clip != id || value.format()?.0 != "mime:image/png" {
@@ -306,7 +306,7 @@ pub(crate) fn local_preview(value: dto::DndPreview) -> v1::Result<DndMsg> {
     }
     let image = value
         .image()?
-        .map(|image| -> v1::Result<_> {
+        .map(|image| -> v2::Result<_> {
             Ok(oink_foundation::dnd::DragImage {
                 png: image.png()?.0.into(),
                 width: image.width()?,
@@ -330,8 +330,8 @@ pub(crate) fn local_preview(value: dto::DndPreview) -> v1::Result<DndMsg> {
         image,
     })
 }
-pub(crate) fn encode(value: &DndMsg) -> v1::Result<v1::Message> {
-    use v1::Message as M;
+pub(crate) fn encode(value: &DndMsg) -> v2::Result<v2::Message> {
+    use v2::Message as M;
     Ok(match value {
         DndMsg::Notice(value) => M::DndNotice(notice(value)?),
         DndMsg::NoticeRequest {
@@ -417,8 +417,8 @@ pub(crate) fn encode(value: &DndMsg) -> v1::Result<v1::Message> {
         }
     })
 }
-pub(crate) fn decode(value: v1::Message) -> v1::Result<DndMsg> {
-    use v1::Message as M;
+pub(crate) fn decode(value: v2::Message) -> v2::Result<DndMsg> {
+    use v2::Message as M;
     Ok(match value {
         M::DndNotice(value) => DndMsg::Notice(local_notice(&value)?),
         M::DndNoticeRequest(value) => DndMsg::NoticeRequest {
@@ -471,7 +471,7 @@ pub(crate) fn decode(value: v1::Message) -> v1::Result<DndMsg> {
                 action,
                 cancel_at: value
                     .cancel_at()?
-                    .map(|p| -> v1::Result<_> { Ok(oink_foundation::Point::new(p.x()?, p.y()?)) })
+                    .map(|p| -> v2::Result<_> { Ok(oink_foundation::Point::new(p.x()?, p.y()?)) })
                     .transpose()?,
             }
         }

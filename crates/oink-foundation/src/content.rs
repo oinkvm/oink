@@ -124,6 +124,11 @@ pub enum Unavailable {
     NoProgress,
     StorageFull,
     InvalidData,
+    /// The source device paused sharing.
+    Paused,
+    /// The source device does not send clipboard content to other devices
+    /// (its "sync copied content" switch is off).
+    SendDisabled,
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]

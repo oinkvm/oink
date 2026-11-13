@@ -16,7 +16,7 @@ use oink_network::link::{
 };
 use oink_protocol::{
     frame::{StreamCode, StreamKind},
-    v1::{
+    v2::{
         self, Message, RawValue, dto,
         schema::{WireDto, WireValue},
     },
@@ -86,9 +86,7 @@ impl DiagnosticsStreams {
         matches!(message, Message::DiagnosticsHello(_))
     }
     fn supported(&self, peer: DeviceId) -> bool {
-        self.config
-            .peer_agreement(peer)
-            .is_some_and(|a| a.contains("oink.diagnostics.collect/1"))
+        self.config.peer_opens(peer, StreamKind::Diagnostics)
     }
 
     fn advance(&mut self, peer: DeviceId, now: Instant) {
@@ -141,7 +139,7 @@ impl DiagnosticsStreams {
         if !Self::valid(message) {
             return Err(PostError::TooLarge);
         }
-        let bytes = v1::frame::encode(message, v1::limits::RELIABLE_FRAME).map_err(|_| PostError::TooLarge)?;
+        let bytes = v2::frame::encode(message, v2::limits::RELIABLE_FRAME).map_err(|_| PostError::TooLarge)?;
         let state = self.peers.get_mut(&peer).ok_or(PostError::Closed)?;
         let result = state.tx.as_ref().ok_or(PostError::Closed)?.post(bytes);
         let failure = match result {
@@ -179,7 +177,7 @@ impl DiagnosticsStreams {
                             if Self::valid(&message) {
                                 Ok(message)
                             } else {
-                                Err(v1::ErrorCode::UnknownMessage.into())
+                                Err(v2::ErrorCode::UnknownMessage.into())
                             }
                         }) {
                             Ok(message) => message,
@@ -196,7 +194,11 @@ impl DiagnosticsStreams {
                 // Cleanup must be final: a preceding buffered message cannot restore
                 // the receive state after this same stream was rejected.
                 delivered.retain(|(source, _)| *source != peer);
-                self.links.close_stream(stream, code);
+                // Through the handle, which `stream_closed` then drops: a
+                // `close_stream` command can lose its code to that drop.
+                if let Some(rx) = state.rx.as_ref().filter(|rx| rx.id() == stream) {
+                    rx.close_with(code);
+                }
                 self.stream_closed(stream, StreamClosed::Local);
             }
         }
@@ -337,7 +339,10 @@ impl StreamModule for DiagnosticsStreams {
     }
     fn inbound_low(&mut self, mut operation: InboundLow) {
         if operation.stream.kind() == StreamKind::Diagnostics
-            && matches!(&operation.first, Message::DiagnosticsRequest(_))
+            && matches!(
+                &operation.first,
+                Message::DiagnosticsRequest(_) | Message::DiagnosticsChunk(_)
+            )
             && self
                 .peers
                 .get(&operation.stream.peer())

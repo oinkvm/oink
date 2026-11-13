@@ -43,6 +43,20 @@ fn external_operation() {
         std::fs::symlink_metadata(&source)
     );
     if mode == "rename" || mode == "rename-children" {
+        if std::env::var_os("OINK_PRIVATE_SHELL_PREHYDRATE").is_some() {
+            fn hydrate(path: &Path) -> usize {
+                if path.is_file() {
+                    std::fs::read(path).unwrap();
+                    1
+                } else {
+                    std::fs::read_dir(path)
+                        .unwrap()
+                        .map(|item| hydrate(&item.unwrap().path()))
+                        .sum()
+                }
+            }
+            eprintln!("PRIVATE_SHELL_PREHYDRATED files={}", hydrate(&source));
+        }
         let moves = if mode == "rename-children" {
             std::fs::create_dir(&target).unwrap();
             std::fs::read_dir(&source)
@@ -473,4 +487,263 @@ fn native_empty_selected_root_move() {
         std::fs::read(target.join("right/data.bin")).unwrap(),
         b"ordinary right contents"
     );
+}
+
+/// No installed provider or user clipboard: private sync root, external process
+/// rename, real CF callbacks, and phone cache-to-identity handoff.
+#[test]
+#[ignore = "device: private Cloud Files rename probe under device-test lock"]
+fn native_phone_proxy_moves() {
+    let _ = tracing_subscriber::fmt().with_test_writer().with_ansi(false).try_init();
+    let temp = tempfile::Builder::new().prefix("oink-phone-move-").tempdir().unwrap();
+    let cache = temp.path().join("proxy");
+    std::fs::create_dir(&cache).unwrap();
+    std::fs::write(cache.join("first.bin"), b"first").unwrap();
+    std::fs::write(cache.join("second.bin"), b"second").unwrap();
+    std::fs::create_dir(cache.join("folder")).unwrap();
+    std::fs::write(cache.join("folder/child.bin"), b"child").unwrap();
+    let namespace = crate::content::namespace::Local::received_from(
+        vec![
+            (crate::model::NodeId(1), cache.join("first.bin")),
+            (crate::model::NodeId(2), cache.join("second.bin")),
+            (crate::model::NodeId(3), cache.join("folder")),
+        ],
+        oink_foundation::DeviceId([0x71; 32]),
+    )
+    .unwrap();
+    let files =
+        crate::content::namespace::Files::new(namespace.clone(), crate::sync::files::TargetOs::Windows).unwrap();
+    let entries = files.descriptor_entries().unwrap().unwrap();
+    let service = Service::new(temp.path().join("CloudFiles")).unwrap();
+    struct Cleanup(Arc<Service>);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            self.0.stop();
+            cleanup_native_test_root(&self.0.root);
+        }
+    }
+    let _cleanup = Cleanup(service.clone());
+    let delivery = service.publish(entries, files, Instant::now()).unwrap();
+    reader_catalog(&service, &delivery);
+    let target = temp.path().join("destination");
+    let started = Instant::now();
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "windows::cloud::tests::shell_ops::external_operation",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env("OINK_PRIVATE_SHELL_SOURCE", &delivery.path)
+        .env("OINK_PRIVATE_SHELL_TARGET", &target)
+        .env(
+            "OINK_PRIVATE_SHELL_MODE",
+            std::env::var("OINK_PHONE_MOVE_MODE").unwrap_or_else(|_| "children".into()),
+        )
+        .envs(std::env::var_os("OINK_PHONE_MOVE_WARM").map(|value| ("OINK_PRIVATE_SHELL_PREHYDRATE", value)))
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            assert!(status.success());
+            break;
+        }
+        if Instant::now() >= deadline {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            panic!("external rename stalled");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    eprintln!("PHONE_MOVE batch_returned_ms={}", started.elapsed().as_millis());
+    for (name, node, expected) in [
+        ("first.bin", 1, b"first".as_slice()),
+        ("second.bin", 2, b"second".as_slice()),
+        ("folder", 3, b"child".as_slice()),
+    ] {
+        let destination = target.join(name);
+        // Completion is asynchronous to the caller. Wait for the actual sidecar
+        // commit signal (cache removed), solely to bound a failing probe.
+        while cache.join(name).exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!cache.join(name).exists(), "proxy cache not handed off: {name}");
+        use crate::content::namespace::Namespace;
+        let id = crate::model::NodeId(node);
+        let reference = namespace.tracked_file(id).unwrap().unwrap();
+        let selected = if node == 3 {
+            namespace.list(id, None).unwrap().entries[0].clone()
+        } else {
+            namespace.roots().into_iter().find(|entry| entry.id == id).unwrap()
+        };
+        assert_eq!(
+            crate::content::read_all(&mut namespace.open(selected.id, selected.version, 0).unwrap()).unwrap(),
+            expected
+        );
+        let resolved = reference.resolve().unwrap();
+        assert_eq!(
+            std::fs::read(if node == 3 {
+                resolved.join("child.bin")
+            } else {
+                resolved.clone()
+            })
+            .unwrap(),
+            expected
+        );
+        let again = target.join(format!("again-{name}"));
+        std::fs::rename(&destination, &again).unwrap();
+        assert!(reference.resolve().is_ok());
+        eprintln!(
+            "PHONE_MOVE node={node} elapsed_ms={} cache_removed=true identity_resolved=true second_move=true",
+            started.elapsed().as_millis()
+        );
+    }
+    // Fresh namespace simulates process restart; no proxy payload remains.
+    let restored = crate::content::namespace::Local::received_from(
+        vec![
+            (crate::model::NodeId(1), cache.join("first.bin")),
+            (crate::model::NodeId(2), cache.join("second.bin")),
+            (crate::model::NodeId(3), cache.join("folder")),
+        ],
+        oink_foundation::DeviceId([0x71; 32]),
+    )
+    .unwrap();
+    use crate::content::namespace::Namespace;
+    assert_eq!(restored.roots().len(), 3);
+    eprintln!("PHONE_MOVE restored_roots=3");
+    service.stop();
+    use std::os::windows::fs::MetadataExt as _;
+    for (name, expected) in [
+        ("again-first.bin", b"first".as_slice()),
+        ("again-second.bin", b"second".as_slice()),
+        ("again-folder/child.bin", b"child".as_slice()),
+    ] {
+        let path = target.join(name);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT,
+            0
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), expected);
+    }
+    assert_eq!(
+        std::fs::metadata(target.join("again-folder"))
+            .unwrap()
+            .file_attributes()
+            & FILE_ATTRIBUTE_REPARSE_POINT,
+        0
+    );
+    eprintln!("PHONE_MOVE provider_stopped_readable=3 ordinary_reparse_free=true");
+}
+
+/// Callback-delivery measurement, not a product completion timer. Each case is
+/// selected independently so the device lock is released between scenarios.
+#[test]
+#[ignore = "device: repeated private CF callback-rate measurement"]
+fn native_rename_callback_rate() {
+    let _ = tracing_subscriber::fmt().with_test_writer().with_ansi(false).try_init();
+    let case = std::env::var("OINK_RENAME_RATE_CASE").unwrap();
+    assert!(
+        [
+            "ifile-single",
+            "ifile-multi",
+            "ifile-folder",
+            "movefile-cold",
+            "movefile-warm"
+        ]
+        .contains(&case.as_str())
+    );
+    struct Cleanup(Arc<Service>);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            self.0.stop();
+            cleanup_native_test_root(&self.0.root);
+        }
+    }
+    for run in 1..=5 {
+        let temp = tempfile::Builder::new()
+            .prefix("oink-callback-rate-")
+            .tempdir()
+            .unwrap();
+        let service = Service::new(temp.path().join("CloudFiles")).unwrap();
+        let _cleanup = Cleanup(service.clone());
+        let entries = match case.as_str() {
+            "ifile-multi" => vec![entry("first.bin", 5, false), entry("second.bin", 5, false)],
+            "ifile-folder" => vec![
+                entry("tree", 0, true),
+                entry("tree/child.bin", 5, false),
+                entry("tree/empty", 0, true),
+            ],
+            _ => vec![entry("file.bin", 5, false)],
+        };
+        let delivery = service
+            .publish(entries, Arc::new(Contents(Bytes::new(5))), Instant::now())
+            .unwrap();
+        reader_catalog(&service, &delivery);
+        if case == "movefile-warm" {
+            let check: crate::content::ReaderGuard = Arc::new(|| Ok(()));
+            crate::content::namespace::NativeFiles::download(&*delivery, &check, &|_, _| {}).unwrap();
+        }
+        received::RENAME_PROBE.lock().unwrap().clear();
+        let multi = case == "ifile-multi";
+        let source = if multi {
+            delivery.path.clone()
+        } else {
+            delivery.file_path(0)
+        };
+        let target = temp.path().join("destination");
+        let mode = if case.starts_with("movefile-") {
+            "rename"
+        } else if multi {
+            "children"
+        } else {
+            "move"
+        };
+        let started = Instant::now();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "windows::cloud::tests::shell_ops::external_operation",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("OINK_PRIVATE_SHELL_SOURCE", &source)
+            .env("OINK_PRIVATE_SHELL_TARGET", &target)
+            .env("OINK_PRIVATE_SHELL_MODE", mode)
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                assert!(status.success());
+                break;
+            }
+            if Instant::now() >= deadline {
+                child.kill().unwrap();
+                child.wait().unwrap();
+                panic!("native rate operation stalled");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let operation_ms = started.elapsed().as_millis();
+        assert!(target.exists());
+        // The finite observation window measures notification delivery only.
+        // It never commits references or authorizes a cache deletion.
+        std::thread::sleep(Duration::from_secs(5));
+        let events = received::RENAME_PROBE.lock().unwrap().clone();
+        let acks: Vec<_> = events.iter().filter(|event| !event.0).collect();
+        let completions: Vec<_> = events.iter().filter(|event| event.0).collect();
+        let latencies: Vec<_> = completions
+            .iter()
+            .filter_map(|done| {
+                let ack = acks.iter().find(|ack| ack.1 == done.1 && ack.2 == done.2)?;
+                Some(done.3.saturating_duration_since(ack.3).as_micros())
+            })
+            .collect();
+        eprintln!(
+            "CF_RENAME_RATE case={case} run={run} ack={} completion={} ack_to_completion_us={latencies:?} operation_ms={operation_ms} observation_after_return_ms=5000",
+            acks.len(),
+            completions.len()
+        );
+    }
 }

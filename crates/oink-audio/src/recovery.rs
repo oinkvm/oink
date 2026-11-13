@@ -129,8 +129,8 @@ pub trait EndpointBackend {
     /// `release_only` permits a level-only user override; always recheck the
     /// corresponding ownership latch immediately before the native write.
     fn restore_mute(&self, endpoint: &str, release_only: bool, permit: &RestorePermit) -> Result<(), String>;
-    /// Best-effort pause before an actual owned-output restore, including crash
-    /// recovery. Implementations must isolate native media APIs on a worker and
+    /// Best-effort media pause: always at a real forwarding end, and before an
+    /// actual crash-recovery restore. Implementations must isolate native media APIs on a worker and
     /// bound any wait. No route/claim/session-lifecycle decisions belong here.
     fn pause_before_restore(&self) {}
     /// An event-driven latch, not a comparison of current endpoint values.
@@ -143,7 +143,8 @@ pub trait EndpointBackend {
 }
 
 /// Capability for the bare restore primitive. Only `restore_local_output` can
-/// create it, so a platform caller cannot accidentally skip the preceding pause.
+/// create it, so a platform caller cannot accidentally skip the preceding pause
+/// (either its own, or the one `Journal::end_forwarding` already ran).
 ///
 /// ```compile_fail
 /// let bypass = oink_audio::recovery::RestorePermit { _private: () };
@@ -153,11 +154,23 @@ pub struct RestorePermit {
     _private: (),
 }
 
+/// Proof that the media pause of this forwarding end already ran.
+struct Paused(());
+
 // Both ordinary/crash restoration and level-only release must enter here.
 // The only raw restore calls are inside this function; acquiring a lease has a
 // separate mute-only API. No source/route/claim decisions are made here.
-fn restore_local_output<B: EndpointBackend>(backend: &B, endpoint: &str, release_only: bool) -> Result<(), String> {
-    backend.pause_before_restore();
+// Crash recovery pauses here, only when it actually restores; a forwarding end
+// has already paused unconditionally (`Journal::end_forwarding`).
+fn restore_local_output<B: EndpointBackend>(
+    backend: &B,
+    endpoint: &str,
+    release_only: bool,
+    paused: Option<&Paused>,
+) -> Result<(), String> {
+    if paused.is_none() {
+        backend.pause_before_restore();
+    }
     // Player dispatch can consume the bounded grace period. Recheck user
     // ownership after it; native backends recheck at the actual tagged write too.
     if if release_only {
@@ -345,6 +358,15 @@ impl Journal {
     /// event was seen. Exact volume comparison is conservative: a tiny mismatch
     /// leaves user state untouched. A missing endpoint retains the journal.
     pub fn recover<B: EndpointBackend>(&mut self, backend: &B, after_crash: bool) -> Result<RecoveryReport, String> {
+        self.recover_with(backend, after_crash, None)
+    }
+
+    fn recover_with<B: EndpointBackend>(
+        &mut self,
+        backend: &B,
+        after_crash: bool,
+        paused: Option<&Paused>,
+    ) -> Result<RecoveryReport, String> {
         if self.record.entry.is_none()
             && let Some(entry) = self.record.deferred.first()
         {
@@ -390,7 +412,7 @@ impl Journal {
             self.revoke()?;
             return Ok(report(RecoveryOutcome::UserOverride, false));
         }
-        if let Err(error) = restore_local_output(backend, &entry.original.endpoint, false) {
+        if let Err(error) = restore_local_output(backend, &entry.original.endpoint, false, paused) {
             // A driver can disappear between the readback and the tagged write.
             // Classify that race by the exact endpoint, never by error text.
             if backend.read(&entry.original.endpoint)?.is_none() {
@@ -422,6 +444,30 @@ impl Journal {
         Ok(report(RecoveryOutcome::Restored, after_crash))
     }
 
+    /// The single pause-and-restore entry at a real forwarding end (the live
+    /// mute lease ends; a capture rebuild hands the lease over and never gets
+    /// here). It always pauses media first, also when the output was already
+    /// muted before forwarding or the user took over its controls meanwhile.
+    /// Then it restores only what Oink changed: our own mute, or after a
+    /// level-only user change just that mute; a user mute and the user's level
+    /// are never written. An unavailable endpoint is deferred until it
+    /// returns; IO/ownership/storage errors remain errors.
+    pub fn end_forwarding<B: EndpointBackend>(&mut self, backend: &B) -> Result<RecoveryReport, String> {
+        backend.pause_before_restore();
+        let paused = Paused(());
+        if backend.ownership_lost() {
+            // A level-only change releases our mute without writing the
+            // user's new level; a mute override is never undone.
+            self.release_after_volume_change_with(backend, Some(&paused))?;
+        }
+        let report = self.recover_with(backend, false, Some(&paused))?;
+        if report.outcome == RecoveryOutcome::UserOverride {
+            // Also cover ownership discovered by recover's final readback.
+            self.release_after_volume_change_with(backend, Some(&paused))?;
+        }
+        self.defer_if_unavailable(report)
+    }
+
     /// Retain an unavailable endpoint independently of the next source lease.
     /// IO/ownership/storage errors remain errors; only proven unavailability
     /// defers restoration, and proven deletion resolves it entirely.
@@ -431,6 +477,10 @@ impl Journal {
         after_crash: bool,
     ) -> Result<RecoveryReport, String> {
         let report = self.recover(backend, after_crash)?;
+        self.defer_if_unavailable(report)
+    }
+
+    fn defer_if_unavailable(&mut self, report: RecoveryReport) -> Result<RecoveryReport, String> {
         if report.outcome == RecoveryOutcome::EndpointUnavailable {
             self.defer_unavailable()?;
             tracing::warn!(
@@ -444,6 +494,14 @@ impl Journal {
     /// On a live level-only override, undo our mute without restoring volume.
     /// The full-state lease remains durably revoked, even if this write fails.
     pub fn release_after_volume_change<B: EndpointBackend>(&mut self, backend: &B) -> Result<(), String> {
+        self.release_after_volume_change_with(backend, None)
+    }
+
+    fn release_after_volume_change_with<B: EndpointBackend>(
+        &mut self,
+        backend: &B,
+        paused: Option<&Paused>,
+    ) -> Result<(), String> {
         let Some(entry) = self.record.entry.clone() else {
             return Ok(());
         };
@@ -455,7 +513,7 @@ impl Journal {
             return Ok(());
         };
         if current.muted && !backend.mute_ownership_lost() {
-            restore_local_output(backend, &entry.original.endpoint, true)?;
+            restore_local_output(backend, &entry.original.endpoint, true, paused)?;
         }
         Ok(())
     }

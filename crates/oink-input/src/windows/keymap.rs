@@ -217,7 +217,7 @@ pub(crate) fn lookup_hid(code: KeyCode) -> Option<&'static KeyEntry> {
 /// `KBDLLHOOKSTRUCT::vkCode` when the local NumLock is off. This deliberately
 /// consumes the vkCode supplied by the hook instead of querying async state;
 /// a held key therefore remains paired by its physical scan code.
-#[cfg_attr(not(windows), allow(dead_code))]
+#[cfg(any(windows, test))]
 pub(crate) fn numpad_navigation(scancode: u16, vk: u32) -> Option<KeyCode> {
     let usage = match (scancode, vk) {
         (0x4F, 0x23) => 0x4D, // End

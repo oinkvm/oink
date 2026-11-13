@@ -1,6 +1,6 @@
 use super::*;
 use crate::device_cards::{BlockEdited, BlockListError, BlockReply, BlockedDevice, BlockedDevicesSnapshot};
-use oink_network::{group_merge, pair_merge, roster::Anchor};
+use oink_network::{group_merge, roster::Anchor};
 use serde::{Serialize, de::DeserializeOwned};
 fn failure(code: dto::PairCode, stage: dto::PairStage) -> api::PairProblem {
     api::PairProblem::try_from(&pairing::problem(code, stage)).expect("fixed problem")
@@ -38,7 +38,7 @@ fn phase(value: pairing::Phase) -> u32 {
 }
 impl Owner {
     pub(crate) fn onboarding_pairing_busy(&self) -> bool {
-        let snapshot = self.pairs.snapshot();
+        let snapshot = self.member.pairs.snapshot();
         self.onboarding_connect
             && (!self.connecting.is_empty()
                 || !snapshot.requests.is_empty()
@@ -54,17 +54,8 @@ impl Owner {
         }
         // Requests can have arrived during earlier welcome pages. Keep one only
         // when no accepted/outgoing session already owns the connect screen.
-        let snapshot = self.pairs.snapshot();
-        let busy = !self.connecting.is_empty()
-            || snapshot
-                .sessions
-                .iter()
-                .any(|s| !matches!(s.phase, pairing::Phase::Completed | pairing::Phase::Ended));
-        for request in snapshot.requests.into_iter().skip(usize::from(!busy)) {
-            if let Ok(effects) = self.pairs.decline(request.id, request.revision) {
-                self.pair_effects(effects);
-            }
-        }
+        let outs = self.member.open_window(!self.connecting.is_empty(), &self.state);
+        let _ = self.execute(None, outs);
     }
     fn cached<T: DeserializeOwned>(&self, id: &str, key: &str) -> Result<Option<T>, api::PairProblem> {
         if id.is_empty() || id.len() > 256 {
@@ -130,7 +121,7 @@ impl Owner {
         })
     }
     pub(crate) fn publish_pairings(&mut self) {
-        let current = self.pairs.snapshot();
+        let current = self.member.pairs.snapshot();
         for view in current.requests.iter().chain(&current.sessions) {
             if !self.endpoints.contains_key(&view.id)
                 && let Some(peer) = self.peer_view(view.peer.device_id)
@@ -229,8 +220,7 @@ impl Owner {
                     .filter(|a| a.is_ipv4())
                     .collect::<Vec<_>>();
                 let selected = *addresses.first()?;
-                let compatible = advert.protocols.iter().any(|p| p.major == v1::MAJOR)
-                    && advert.identity_algorithms.iter().any(|a| a == dto::ED25519);
+                let compatible = advert.supports_current_protocol();
                 Some(api::NearbyRow {
                     device: advert.id.into(),
                     name: advert.name.clone(),
@@ -484,7 +474,7 @@ impl Owner {
         }
     }
     pub(super) fn prepared_peer_in_use(&self, peer: DeviceId, address: Option<SocketAddr>) -> bool {
-        let pairs = self.pairs.snapshot();
+        let pairs = self.member.pairs.snapshot();
         self.state.roster().contains(peer)
             || self
                 .queries
@@ -603,7 +593,7 @@ impl Owner {
             self.remember(operation_key, key, &reply);
             return Ok(reply);
         }
-        let current = self.pairs.snapshot();
+        let current = self.member.pairs.snapshot();
         if current.requests.len()
             + current
                 .sessions
@@ -702,10 +692,10 @@ impl Owner {
             .map(|s| s.id)
             .collect::<Vec<_>>()
         {
-            let result = (|| -> v1::Result<dto::PairContext> {
+            let result = (|| -> v2::Result<dto::PairContext> {
                 let anchor = greeting.anchor()?;
                 if anchor == self.state.roster().anchor() {
-                    return Err(v1::ErrorCode::StateConflict.into());
+                    return Err(v2::ErrorCode::StateConflict.into());
                 }
                 dto::PairContext::from_raw(
                     [
@@ -729,7 +719,7 @@ impl Owner {
                 self.fail_connecting(device, dto::PairCode::AlreadyConnected);
                 continue;
             };
-            match self.pairs.start(context, peer, greeting.transcript.clone()) {
+            match self.member.pairs.start(context, peer, greeting.transcript.clone()) {
                 Ok(effects) => {
                     let verified = self.peer_view(device);
                     if let Some(endpoint) = self.endpoints.get_mut(&id) {
@@ -797,7 +787,7 @@ impl Owner {
         id: String,
         revision: u64,
         kind: &str,
-        run: impl FnOnce(&mut Sessions, PairId, u64) -> pairing::Result<Vec<pairing::Effect>>,
+        run: impl FnOnce(&mut pairing::Sessions, PairId, u64) -> pairing::Result<Vec<pairing::Effect>>,
     ) -> ApiResult<api::PairReply<api::Accepted>> {
         let op = format!("{kind}/{id}/{revision}");
         match self.cached(&op, kind) {
@@ -806,7 +796,7 @@ impl Owner {
             _ => {}
         }
         let reply = if let Some(id) = pairing::parse_key(&id) {
-            match run(&mut self.pairs, id, revision) {
+            match run(&mut self.member.pairs, id, revision) {
                 Ok(effects) => {
                     self.pair_effects(effects);
                     api::PairReply::Value(api::Accepted::Accepted)
@@ -835,13 +825,15 @@ impl Owner {
     }
     pub(crate) fn pairing_code(&self, id: String) -> ApiResult<api::CodeView> {
         let id = pairing::parse_key(&id).ok_or_else(stopped)?;
-        let code = self.pairs.code(id).map_err(|_| stopped())?;
+        let code = self.member.pairs.code(id).map_err(|_| stopped())?;
         Ok(api::CodeView {
             six_digits: code.to_string(),
         })
     }
     pub(crate) fn cancel_pairing(&mut self, id: String, revision: u64) -> ApiResult<api::PairReply<api::CancelResult>> {
-        let op = format!("cancel/{id}");
+        // Keyed by revision like accept/decline/submit: a StaleRevision answer
+        // must not be replayed for the next revision of the same pairing (M35).
+        let op = format!("cancel/{id}/{revision}");
         match self.cached(&op, "cancel") {
             Ok(Some(reply)) => return Ok(reply),
             Err(error) => return Ok(reject(error)),
@@ -857,232 +849,73 @@ impl Owner {
                 self.fail_connecting_pair(pair, dto::PairCode::CancelledLocally);
                 api::PairReply::Value(api::CancelResult::Cancelled)
             }
-        } else if self.pairs.view(pair).is_some_and(|v| v.revision != revision) {
-            reject(failure(dto::PairCode::StaleRevision, dto::PairStage::Code))
         } else {
-            match self.transactions.cancel(pair, &mut self.journal).map_err(internal)? {
-                pair_merge::Cancel::Committed(bundle) => api::PairReply::Value(api::CancelResult::AlreadyCommitted {
-                    undo: self.undo_handle(&bundle)?,
-                }),
-                pair_merge::Cancel::Unconfirmed => {
-                    let effects = self.pairs.fail(
-                        pair,
-                        pairing::problem(dto::PairCode::CommitUnconfirmed, dto::PairStage::Commit),
-                    );
-                    self.pair_effects(effects);
+            match self.member.cancel(pair, revision, &self.state) {
+                Ok((member::Cancelled::AlreadyCommitted(bundle), _)) => {
+                    api::PairReply::Value(api::CancelResult::AlreadyCommitted {
+                        undo: self.undo_handle(&bundle)?,
+                    })
+                }
+                Ok((member::Cancelled::CommitUnconfirmed, outs)) => {
+                    let _ = self.execute(None, outs);
                     api::PairReply::Value(api::CancelResult::CommitUnconfirmed)
                 }
-                pair_merge::Cancel::Cancelled => match self.pairs.cancel(pair, revision) {
-                    Ok(effects) => {
-                        self.pair_effects(effects);
-                        api::PairReply::Value(api::CancelResult::Cancelled)
-                    }
-                    Err(problem) => wire_reject(problem),
-                },
+                Ok((member::Cancelled::Cancelled, outs)) => {
+                    let _ = self.execute(None, outs);
+                    api::PairReply::Value(api::CancelResult::Cancelled)
+                }
+                Err(problem) => wire_reject(problem),
             }
         };
         self.remember(op, "cancel".into(), &reply);
         Ok(reply)
     }
-    pub(crate) fn pair_effects(&mut self, effects: Vec<pairing::Effect>) {
-        for effect in effects {
-            match effect {
-                pairing::Effect::Send { peer, message } => {
-                    if let Some(link) = self.peer_link(peer) {
-                        let _ = self.send(link, message);
-                    }
-                }
-                pairing::Effect::Changed => self.publish_pairings(),
-                pairing::Effect::Verified(pair) => {
-                    if let Some(view) = self.pairs.view(pair).cloned() {
-                        match self.transactions.verified(view, &self.state, &mut self.journal) {
-                            Ok(effects) => {
-                                let _ = self.merge_effects(effects);
-                            }
-                            Err(error) => {
-                                tracing::warn!(%error, "pairing verification could not start merge");
-                                let effects = self.pairs.fail(
-                                    pair,
-                                    pairing::problem(dto::PairCode::LocalStorageFailed, dto::PairStage::Prepare),
-                                );
-                                self.pair_effects(effects);
-                            }
-                        }
-                    }
-                }
-                pairing::Effect::Completed(_) => self.publish_pairings(),
-                pairing::Effect::Ended { id, mut problem } => {
-                    match self.transactions.cancel(id, &mut self.journal) {
-                        Ok(pair_merge::Cancel::Committed(_)) => {
-                            self.publish_pairings();
-                            continue;
-                        }
-                        Ok(pair_merge::Cancel::Unconfirmed) => {
-                            problem = pairing::problem(dto::PairCode::CommitUnconfirmed, dto::PairStage::Commit)
-                        }
-                        Ok(pair_merge::Cancel::Cancelled) => {}
-                        Err(error) => {
-                            tracing::warn!(%error, "pairing cancellation could not persist");
-                            problem = pairing::problem(dto::PairCode::LocalStorageFailed, dto::PairStage::Commit);
-                        }
-                    }
-                    self.pairs.terminal_problem(id, problem.clone());
-                    self.publish_pairings();
-                    if let Some(peer) = self.endpoints.get(&id).cloned() {
-                        let event = api::PairingEvent::PairingFailed {
-                            event_id: DecimalU64(0),
-                            pair_id: pairing::key(id),
-                            peer,
-                            problem: api::PairProblem::try_from(&problem).expect("problem"),
-                        };
-                        let _ = self.durable_event(event, None);
-                    }
-                }
-            }
+    /// Both receipts are exchanged: record the durable completion event with
+    /// the decision's receipt (shared member logic), then report it.
+    pub(crate) fn completed(
+        &mut self,
+        pair: PairId,
+        bundle: &dto::MergeTransferBundle,
+        reconciled: bool,
+    ) -> ApiResult<()> {
+        let intent = bundle.certificate().map_err(internal)?.intent().map_err(internal)?;
+        let peer =
+            if self.identity.id() == wire::read_device(&intent.source_issuer().map_err(internal)?).map_err(internal)? {
+                wire::read_device(&intent.target_issuer().map_err(internal)?).map_err(internal)?
+            } else {
+                wire::read_device(&intent.source_issuer().map_err(internal)?).map_err(internal)?
+            };
+        let peer = self.peer_view(peer).ok_or_else(stopped)?;
+        let undo = self.undo_handle(bundle)?;
+        let event = api::PairingEvent::PairingCompleted {
+            event_id: DecimalU64(0),
+            pair_id: pairing::key(pair),
+            peer,
+            merge_id: DeviceId(intent.merge_id().map_err(internal)?.0).to_hex(),
+            target_group: reference(group_merge::anchor(&intent.target().map_err(internal)?).map_err(internal)?),
+            imported_devices: intent
+                .members()
+                .map_err(internal)?
+                .0
+                .into_iter()
+                .map(|m| wire::read_device(&m.device()?).map(Into::into))
+                .collect::<v2::Result<Vec<_>>>()
+                .map_err(internal)?,
+            undo,
+            reconciled,
+        };
+        let raw = [
+            (1, 1u32.write()),
+            (2, RawValue::Bytes(serde_json::to_vec(&event).map_err(internal)?)),
+        ]
+        .into();
+        let (id, new, outs) = self.member.complete(pair, bundle, raw, &self.state).map_err(internal)?;
+        if new {
+            let mut event = event;
+            set_event_id(&mut event, id);
+            self.shared.emit_pairing(event);
         }
-    }
-    pub(crate) fn merge_effects(&mut self, effects: Vec<pair_merge::Effect>) -> ApiResult<()> {
-        self.pending_effects.extend(effects);
-        while let Some(effect) = self.pending_effects.pop_front() {
-            match effect {
-                pair_merge::Effect::Send { peer, message } => {
-                    if let Some(raw) = message.raw().get(&1)
-                        && let Ok(id) = dto::PairId::read(raw).and_then(|p| wire::read_pair(&p))
-                        && matches!(
-                            message,
-                            Message::ConfigPairCommit(_) | Message::ConfigPairCommitPermit(_)
-                        )
-                        && let Ok(effects) = self.pairs.progress(id, pairing::Phase::Committing, Instant::now())
-                    {
-                        self.pair_effects(effects);
-                    }
-                    if let Some(link) = self.peer_link(peer) {
-                        self.send(link, message).map_err(internal)?;
-                    }
-                }
-                pair_merge::Effect::Project => match self.project_decision() {
-                    Ok(true) => {
-                        self.finish_recovery_projection().map_err(internal)?;
-                    }
-                    result => {
-                        self.pending_effects.push_front(pair_merge::Effect::Project);
-                        self.projection_retry = Some(Instant::now() + Duration::from_millis(50));
-                        return result.map(|_| ());
-                    }
-                },
-                pair_merge::Effect::Admit { pair, peer } => {
-                    if let Ok(effects) = self.pairs.progress(pair, pairing::Phase::Committing, Instant::now()) {
-                        self.pair_effects(effects);
-                    }
-                    if let Ok(effects) = self.pairs.progress(pair, pairing::Phase::Admitting, Instant::now()) {
-                        self.pair_effects(effects);
-                    }
-                    if let Some(link) = self.peer_link(peer) {
-                        self.begin_admission(link).map_err(internal)?;
-                    }
-                }
-                pair_merge::Effect::Completed {
-                    pair,
-                    bundle,
-                    reconciled,
-                } => {
-                    let intent = bundle.certificate().map_err(internal)?.intent().map_err(internal)?;
-                    let peer = if self.identity.id()
-                        == wire::read_device(&intent.source_issuer().map_err(internal)?).map_err(internal)?
-                    {
-                        wire::read_device(&intent.target_issuer().map_err(internal)?).map_err(internal)?
-                    } else {
-                        wire::read_device(&intent.source_issuer().map_err(internal)?).map_err(internal)?
-                    };
-                    let peer = self.peer_view(peer).ok_or_else(stopped)?;
-                    let undo = self.undo_handle(&bundle)?;
-                    let event = api::PairingEvent::PairingCompleted {
-                        event_id: DecimalU64(0),
-                        pair_id: pairing::key(pair),
-                        peer,
-                        merge_id: DeviceId(intent.merge_id().map_err(internal)?.0).to_hex(),
-                        target_group: reference(
-                            group_merge::anchor(&intent.target().map_err(internal)?).map_err(internal)?,
-                        ),
-                        imported_devices: intent
-                            .members()
-                            .map_err(internal)?
-                            .0
-                            .into_iter()
-                            .map(|m| wire::read_device(&m.device()?).map(Into::into))
-                            .collect::<v1::Result<Vec<_>>>()
-                            .map_err(internal)?,
-                        undo,
-                        reconciled,
-                    };
-                    self.durable_event(
-                        event,
-                        Some((
-                            pair,
-                            bundle
-                                .certificate()
-                                .map_err(internal)?
-                                .permit_decision()
-                                .map_err(internal)?,
-                        )),
-                    )?;
-                    if let Ok(effects) = self.pairs.progress(pair, pairing::Phase::Committing, Instant::now()) {
-                        self.pair_effects(effects);
-                    }
-                    if let Ok(effects) = self.pairs.progress(pair, pairing::Phase::Admitting, Instant::now()) {
-                        self.pair_effects(effects);
-                    }
-                    if let Ok(effects) = self.pairs.complete(pair) {
-                        self.pair_effects(effects);
-                    }
-                    self.supersede(pair, &intent);
-                    self.transactions.completed(pair);
-                }
-            }
-        }
-        Ok(())
-    }
-    pub(crate) fn supersede(&mut self, winner: PairId, intent: &dto::MergeIntent) {
-        let source = intent.source().ok();
-        let target = intent.target().ok();
-        for view in self
-            .pairs
-            .snapshot()
-            .requests
-            .into_iter()
-            .chain(self.pairs.snapshot().sessions)
-        {
-            if view.id == winner || matches!(view.phase, pairing::Phase::Completed | pairing::Phase::Ended) {
-                continue;
-            }
-            let same = view.context.source_group().ok().map(|g| g.0)
-                == source.as_ref().and_then(|s| s.group().ok()).map(|g| g.0)
-                || view.context.target_group().ok().map(|g| g.0)
-                    == source.as_ref().and_then(|s| s.group().ok()).map(|g| g.0);
-            if same {
-                let same_endpoints = [intent.source_issuer().ok(), intent.target_issuer().ok()]
-                    .into_iter()
-                    .flatten()
-                    .any(|d| wire::read_device(&d) == Ok(view.peer.device_id));
-                let mut reason = pairing::problem(
-                    if same_endpoints {
-                        dto::PairCode::SupersededByPairing
-                    } else {
-                        dto::PairCode::GroupChanged
-                    },
-                    dto::PairStage::Commit,
-                )
-                .into_raw();
-                if same_endpoints {
-                    reason.insert(5, wire::pair(winner).write());
-                }
-                let effects = self
-                    .pairs
-                    .fail(view.id, dto::PairProblem::from_raw(reason).expect("problem"));
-                self.pair_effects(effects);
-            }
-        }
-        let _ = target;
+        self.execute(None, outs).map_err(internal)
     }
     fn undo_handle(&self, bundle: &dto::MergeTransferBundle) -> ApiResult<api::UndoHandle> {
         let intent = bundle.certificate().map_err(internal)?.intent().map_err(internal)?;
@@ -1138,17 +971,17 @@ impl Owner {
         });
         Ok(reply)
     }
-    fn durable_event(&mut self, event: api::PairingEvent, receipt: Option<(PairId, u64)>) -> ApiResult<u64> {
+    pub(crate) fn durable_event(&mut self, event: api::PairingEvent, receipt: Option<(PairId, u64)>) -> ApiResult<u64> {
         let raw = [
             (1, 1u32.write()),
             (2, RawValue::Bytes(serde_json::to_vec(&event).map_err(internal)?)),
         ]
         .into();
-        let before = self.journal.last_event_id().map_err(internal)?;
+        let before = self.member.journal.last_event_id().map_err(internal)?;
         let id = if let Some((pair, decision)) = receipt {
-            self.journal.receipt(pair, decision, raw)
+            self.member.journal.receipt(pair, decision, raw)
         } else {
-            self.journal.event(raw)
+            self.member.journal.event(raw)
         }
         .map_err(internal)?;
         if id > before {
@@ -1174,13 +1007,14 @@ impl Owner {
             },
             problem: api::PairProblem::try_from(&problem).map_err(internal)?,
         };
-        let before = self.journal.last_event_id().map_err(internal)?;
+        let before = self.member.journal.last_event_id().map_err(internal)?;
         let raw = [
             (1, 1u32.write()),
             (2, RawValue::Bytes(serde_json::to_vec(&event).map_err(internal)?)),
         ]
         .into();
         let id = self
+            .member
             .journal
             .aborted_event(recovery.pair, recovery.decision, raw)
             .map_err(internal)?;
@@ -1192,7 +1026,8 @@ impl Owner {
         Ok(())
     }
     pub(crate) fn pairing_events(&self, after: u64) -> ApiResult<Vec<api::PairingEvent>> {
-        self.journal
+        self.member
+            .journal
             .events(after)
             .map_err(internal)?
             .into_iter()
@@ -1210,7 +1045,7 @@ impl Owner {
             .collect()
     }
     pub(crate) fn ack_pairing_event(&mut self, id: u64) -> ApiResult<()> {
-        self.journal.acknowledge(id).map_err(internal)
+        self.member.journal.acknowledge(id).map_err(internal)
     }
     pub(crate) fn blocked_devices(&self) -> ApiResult<BlockedDevicesSnapshot> {
         let blocks = self.blocks.as_ref().ok_or_else(stopped)?;
@@ -1267,7 +1102,7 @@ impl Owner {
                     if changed {
                         self.block_revision += 1;
                         if install {
-                            let effects = self.pairs.block_pending(device);
+                            let effects = self.member.pairs.block_pending(device);
                             self.pair_effects(effects);
                         }
                         self.publish_nearby();

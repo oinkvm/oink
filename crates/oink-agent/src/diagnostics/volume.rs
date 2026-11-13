@@ -17,7 +17,7 @@ impl Recorder {
         target: DeviceId,
         press_id: u64,
         action: oink_routing::input::VolumeKey,
-        reason: oink_protocol::v1::dto::ControlFailure,
+        reason: oink_protocol::v2::dto::ControlFailure,
     ) {
         use oink_routing::input::VolumeKey;
         let anon = self.anonymizer();

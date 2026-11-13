@@ -3,7 +3,7 @@
 //! Policy, demand leases and media transport belong to the agent's microphone actor.
 #[cfg(any(target_os = "macos", windows))]
 mod capture;
-mod resample;
+pub mod resample;
 mod selection;
 pub mod session;
 pub use selection::{DefaultInputHistory, InputCandidate, InputSelection, SelectionError};
@@ -11,6 +11,8 @@ pub use selection::{DefaultInputHistory, InputCandidate, InputSelection, Selecti
 mod windows;
 #[cfg(windows)]
 mod windows_default;
+#[cfg(all(test, any(target_os = "macos", windows)))]
+pub(crate) use capture::CaptureBlocks;
 #[cfg(any(target_os = "macos", windows))]
 pub use capture::{Capture, default_input, input_candidates, inputs, switch_default_input, virtual_output};
 #[cfg(target_os = "macos")]
@@ -174,14 +176,14 @@ mod tests {
     }
 }
 
-/// Local device-owner projections. Sharing itself is a group-scoped ordered
-/// claim; a remote request can never bypass this device's permission preflight.
+/// Local device-owner projections. The shared sender and whether this device
+/// receives are the global audio configuration (route.rs); a remote request
+/// can never bypass this device's permission preflight.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Settings {
     pub input: Option<String>,
     pub volume_percent: u16,
     pub muted: bool,
-    pub receive_muted: bool,
 }
 impl Settings {
     /// The sharing device's own forwarding controls, which the shared-microphone
@@ -197,16 +199,6 @@ impl Default for Settings {
             input: None,
             volume_percent: 100,
             muted: false,
-            // A fresh device stays Local until Receive is explicitly selected.
-            receive_muted: true,
         }
-    }
-}
-
-#[cfg(test)]
-mod mode_tests {
-    #[test]
-    fn fresh_microphone_stays_local() {
-        assert!(super::Settings::default().receive_muted);
     }
 }

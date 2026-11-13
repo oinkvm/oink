@@ -26,7 +26,7 @@ impl Router {
 }
 
 pub(super) fn volume_route(source: DeviceId, target: DeviceId) -> crate::input::VolumeRoute {
-    use oink_protocol::v1::{
+    use oink_protocol::v2::{
         RawValue, dto,
         schema::{WireDto, WireValue},
     };
@@ -59,7 +59,7 @@ pub(super) fn volume_route(source: DeviceId, target: DeviceId) -> crate::input::
     )
     .unwrap();
     let claim =
-        dto::ExitClaimStamp::from_raw([(1, 1u64.write()), (2, boot(target).device_id().unwrap().write())].into())
+        dto::AudioRouteVersion::from_raw([(1, 1u64.write()), (2, boot(target).device_id().unwrap().write())].into())
             .unwrap();
     let context = dto::AudioSessionContext::from_raw(
         [

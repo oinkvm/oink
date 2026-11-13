@@ -1,0 +1,20 @@
+<resources>
+    <style name="Theme.Oink" parent="android:style/Theme.Material.Light.NoActionBar">
+        <item name="android:fontFamily">sans</item>
+        <item name="android:windowLightStatusBar">true</item>
+    </style>
+    <!-- The share entry shows only its card; the sharing app stays visible behind the scrim. -->
+    <style name="Theme.Oink.Share" parent="Theme.Oink">
+        <item name="android:windowIsTranslucent">true</item>
+        <item name="android:windowBackground">@android:color/transparent</item>
+        <item name="android:windowAnimationStyle">@android:style/Animation.Translucent</item>
+    </style>
+    <!-- ClipboardCopyActivity: nothing drawn, no preview window, no open/close animation, no dim. -->
+    <style name="Theme.Oink.Invisible" parent="android:style/Theme.Translucent.NoTitleBar">
+        <item name="android:windowBackground">@android:color/transparent</item>
+        <item name="android:windowAnimationStyle">@null</item>
+        <item name="android:windowDisablePreview">true</item>
+        <item name="android:backgroundDimEnabled">false</item>
+        <item name="android:windowContentOverlay">@null</item>
+    </style>
+</resources>

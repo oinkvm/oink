@@ -22,23 +22,52 @@ pub(crate) const SEND_WINDOW: u64 = 2 * 1024 * 1024;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ServiceType {
     Voice,
-    #[cfg(all(test, target_os = "macos"))]
+    #[cfg(any(target_os = "ios", test))]
     BestEffort,
 }
 impl ServiceType {
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     fn net_service_type(self) -> i32 {
         match self {
+            // NET_SERVICE_TYPE_VO
             Self::Voice => 4,
-            #[cfg(test)]
+            // NET_SERVICE_TYPE_BE, the default of a fresh socket
+            #[cfg(any(target_os = "ios", test))]
             Self::BestEffort => 0,
         }
     }
 }
 
-/// Set once while the socket is owned here. Low uses separate TCP sockets.
+/// iOS QUIC socket's service type: voice while this phone is the speaker exit
+/// or sends its microphone (user 2026-11-11), best effort otherwise.
+///
+/// iOS has no public low-latency Wi-Fi API. A socket's network service type is
+/// what Darwin maps to its traffic class, which picks the Wi-Fi access
+/// category (VO → AC_VO) for the phone's uplink. Audio rides QUIC datagrams on
+/// the one link socket, so the whole socket is marked: while audio flows that
+/// socket carries only it plus small interactive traffic (input, control,
+/// clipboard text, heartbeats), since bulk transfers use the separate Low TCP
+/// sockets. Unlike the Mac (always voice, see [`set_service_type`]) it is
+/// toggled with the role: an idle phone's heartbeats need no voice priority
+/// and voice class is not free on battery or for the other stations sharing
+/// the access point. No DSCP here: Quinn's per-packet TOS (ECN only)
+/// overwrites a socket-level DSCP and the Darwin EF sendmsg adapter is
+/// macOS-only (`udp.rs`); the service type is independent of that TOS.
+#[cfg(any(target_os = "ios", test))]
+pub(crate) fn audio_service_type(audio: bool) -> ServiceType {
+    if audio {
+        ServiceType::Voice
+    } else {
+        ServiceType::BestEffort
+    }
+}
+
+/// macOS: set once while the socket is owned here. Low uses separate TCP
+/// sockets. iOS: set and reset through a duplicate of the endpoint socket's
+/// descriptor (`audio_service_type`); the option belongs to the socket, not
+/// the descriptor. Elsewhere a no-op.
 pub(crate) fn set_service_type(sock: &std::net::UdpSocket, service: ServiceType) {
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     {
         use std::os::fd::AsRawFd;
         let v: libc::c_int = service.net_service_type();
@@ -59,8 +88,11 @@ pub(crate) fn set_service_type(sock: &std::net::UdpSocket, service: ServiceType)
             );
         }
     }
-    #[cfg(not(target_os = "macos"))]
-    let _ = (sock, service); // Windows needs qWAVE or group policy.
+    // Windows needs qWAVE or group policy. Android: Quinn's per-packet TOS
+    // overwrites a socket-level DSCP there too, so IP_TOS would not reach the
+    // wire without a Linux sendmsg adapter like the Darwin one.
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+    let _ = (sock, service);
 }
 
 /// 读回套接字当前的服务类型（测试用）。
@@ -107,7 +139,86 @@ pub(crate) fn udp_send_status() -> crate::UdpSendStatus {
 // Quinn logs terminal send errors when its connection driver exits. Carry the
 // destination in that existing line, also with QoS disabled. No extra send/log.
 #[derive(Debug)]
-struct DestinationSocket(Arc<dyn quinn::AsyncUdpSocket>, Option<SendErrors>);
+struct DestinationSocket {
+    inner: Arc<dyn quinn::AsyncUdpSocket>,
+    send_errors: Option<SendErrors>,
+    /// `Some` on the shared endpoint socket, whose receive keeps going past a
+    /// per-destination unreachability (see `poll_recv`); `None` on a manual
+    /// probe's dedicated socket, which must see that error.
+    recv_errors: Option<std::sync::Mutex<RecvErrorBurst>>,
+}
+impl DestinationSocket {
+    fn endpoint(
+        inner: Arc<dyn quinn::AsyncUdpSocket>,
+        send_errors: Option<SendErrors>,
+    ) -> Arc<dyn quinn::AsyncUdpSocket> {
+        Arc::new(Self {
+            inner,
+            send_errors,
+            recv_errors: Some(Default::default()),
+        })
+    }
+}
+
+/// EHOSTDOWN has no `io::ErrorKind`; libc is a Darwin-only dependency here.
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+const HOST_DOWN: Option<i32> = Some(libc::EHOSTDOWN);
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const HOST_DOWN: Option<i32> = Some(112);
+// WSAEHOSTDOWN
+#[cfg(windows)]
+const HOST_DOWN: Option<i32> = Some(10064);
+#[cfg(not(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "linux",
+    target_os = "android",
+    windows
+)))]
+const HOST_DOWN: Option<i32> = None;
+
+/// A receive error that names one unreachable destination, not this socket.
+/// The kinds also cover Winsock's WSAEHOSTUNREACH / WSAENETUNREACH.
+fn unreachable_recv(error: &std::io::Error) -> Option<&'static str> {
+    match error.kind() {
+        std::io::ErrorKind::HostUnreachable => Some("host_unreachable"),
+        std::io::ErrorKind::NetworkUnreachable => Some("network_unreachable"),
+        _ if HOST_DOWN.is_some_and(|code| error.raw_os_error() == Some(code)) => Some("host_down"),
+        _ => None,
+    }
+}
+
+/// Receive errors closer together than this belong to one burst: one log line.
+const RECV_ERROR_BURST_GAP: std::time::Duration = std::time::Duration::from_secs(10);
+/// Like Quinn's own I/O loops, yield after this many back-to-back errors.
+const RECV_ERROR_LOOP_BOUND: usize = 32;
+
+/// Detection only: which receive errors were skipped, one line per burst.
+#[derive(Debug, Default)]
+struct RecvErrorBurst {
+    last: Option<(Option<i32>, &'static str, std::time::Instant)>,
+    repeats: u64,
+}
+impl RecvErrorBurst {
+    /// `Some(repeats of the previous burst)` when this error starts a burst.
+    fn observe(&mut self, code: Option<i32>, reason: &'static str, now: std::time::Instant) -> Option<u64> {
+        match &mut self.last {
+            Some((last_code, last_reason, at))
+                if *last_code == code
+                    && *last_reason == reason
+                    && now.saturating_duration_since(*at) < RECV_ERROR_BURST_GAP =>
+            {
+                *at = now;
+                self.repeats += 1;
+                None
+            }
+            _ => {
+                self.last = Some((code, reason, now));
+                Some(std::mem::take(&mut self.repeats))
+            }
+        }
+    }
+}
 
 /// Error-only bounded mailbox. Never changes the socket result or sends packets.
 #[derive(Debug, Default)]
@@ -153,11 +264,11 @@ fn send_error(error: std::io::Error, destination: std::net::SocketAddr) -> std::
 }
 impl quinn::AsyncUdpSocket for DestinationSocket {
     fn create_io_poller(self: Arc<Self>) -> std::pin::Pin<Box<dyn quinn::UdpPoller>> {
-        self.0.clone().create_io_poller()
+        self.inner.clone().create_io_poller()
     }
     fn try_send(&self, transmit: &quinn::udp::Transmit<'_>) -> std::io::Result<()> {
-        self.0.try_send(transmit).map_err(|e| {
-            if let Some(errors) = &self.1 {
+        self.inner.try_send(transmit).map_err(|e| {
+            if let Some(errors) = &self.send_errors {
                 errors
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
@@ -172,19 +283,59 @@ impl quinn::AsyncUdpSocket for DestinationSocket {
         bufs: &mut [std::io::IoSliceMut<'_>],
         meta: &mut [quinn::udp::RecvMeta],
     ) -> std::task::Poll<std::io::Result<usize>> {
-        self.0.poll_recv(cx, bufs, meta)
+        let Some(burst) = &self.recv_errors else {
+            return self.inner.poll_recv(cx, bufs, meta);
+        };
+        // macOS 27.2.1 (2026-11-12), seconds after launch while the Local
+        // Network privacy policy was still being installed: one recv on the
+        // shared endpoint socket returned EHOSTUNREACH (os error 65), the same
+        // rejection its sends got. An unconnected UDP socket has no single
+        // peer, so this names some destination, not the socket. Quinn 0.11's
+        // endpoint driver ignores only ConnectionReset on recv and exits on any
+        // other error, after which every connect() is EndpointStopping until
+        // the process restarts. Keep receiving instead, the way the send path
+        // already turns EHOSTUNREACH into packet loss (`datagram.rs`): the
+        // affected connections' loss recovery and dial deadlines still apply.
+        // Here, not in the Darwin adapter, so the Android/Linux endpoint gets
+        // it too (Windows' adapter already skips every recv error), while
+        // manual probes (`wrap_probe_socket`, no `recv_errors`) keep failing
+        // fast on it. Re-poll the inner socket rather than return Pending, so
+        // that it registers the waker; yield after a bounded run of errors.
+        // Which kernel path queued the error on recv was not reproduced.
+        for _ in 0..RECV_ERROR_LOOP_BOUND {
+            let error = match self.inner.poll_recv(cx, bufs, meta) {
+                std::task::Poll::Ready(Err(error)) => error,
+                other => return other,
+            };
+            let Some(reason) = unreachable_recv(&error) else {
+                return std::task::Poll::Ready(Err(error));
+            };
+            let started = burst.lock().unwrap_or_else(|e| e.into_inner()).observe(
+                error.raw_os_error(),
+                reason,
+                std::time::Instant::now(),
+            );
+            if let Some(previous_repeats) = started {
+                tracing::warn!(target: "oink_link_diagnostics", kind = "udp_recv", stage = "kernel",
+                    result = "dropped", reason, os_error = error.raw_os_error().unwrap_or_default(),
+                    os_error_known = error.raw_os_error().is_some(), %error, previous_repeats,
+                    "UDP receive error on the shared endpoint socket; receiving continues");
+            }
+        }
+        cx.waker().wake_by_ref();
+        std::task::Poll::Pending
     }
     fn local_addr(&self) -> std::io::Result<std::net::SocketAddr> {
-        self.0.local_addr()
+        self.inner.local_addr()
     }
     fn may_fragment(&self) -> bool {
-        self.0.may_fragment()
+        self.inner.may_fragment()
     }
     fn max_transmit_segments(&self) -> usize {
-        self.0.max_transmit_segments()
+        self.inner.max_transmit_segments()
     }
     fn max_receive_segments(&self) -> usize {
-        self.0.max_receive_segments()
+        self.inner.max_receive_segments()
     }
 }
 
@@ -201,24 +352,31 @@ impl quinn::AsyncUdpSocket for DestinationSocket {
 /// limited token; that does not establish NIC egress or Quinn per-packet marking.
 /// No Windows marking is configured here. Arbitrary QOSSetOutgoingDSCPValue needs
 /// Administrators/Network Configuration Operators.
-#[cfg(any(target_os = "macos", test))]
+// Android: the endpoint socket wrapper also rebinds on request (review H17).
+#[cfg(any(target_os = "macos", target_os = "android", test))]
 pub(crate) fn wrap_udp_socket(socket: std::net::UdpSocket) -> std::io::Result<Arc<dyn quinn::AsyncUdpSocket>> {
-    Ok(Arc::new(DestinationSocket(wrap_udp_socket_inner(socket)?, None)))
+    Ok(DestinationSocket::endpoint(wrap_udp_socket_inner(socket)?, None))
 }
+/// A manual probe's socket: send failures are recorded, receive errors pass
+/// through unchanged.
 pub(crate) fn observe_udp_socket(
     inner: Arc<dyn quinn::AsyncUdpSocket>,
     errors: SendErrors,
 ) -> Arc<dyn quinn::AsyncUdpSocket> {
-    Arc::new(DestinationSocket(inner, Some(errors)))
+    Arc::new(DestinationSocket {
+        inner,
+        send_errors: Some(errors),
+        recv_errors: None,
+    })
 }
 pub(crate) fn wrap_udp_socket_observed(
     socket: std::net::UdpSocket,
     errors: SendErrors,
 ) -> std::io::Result<Arc<dyn quinn::AsyncUdpSocket>> {
-    Ok(Arc::new(DestinationSocket(
+    Ok(DestinationSocket::endpoint(
         wrap_udp_socket_inner(socket)?,
         Some(errors),
-    )))
+    ))
 }
 /// Manual lookups must surface native unreachability instead of treating it as
 /// packet loss until Quinn's idle timeout. This socket is dedicated/connected;
@@ -282,7 +440,27 @@ mod tests {
         assert_eq!(read_service_type(&interactive), 4);
         assert_eq!(read_service_type(&bulk), 0);
     }
+    #[test]
+    fn audio_role_picks_voice_or_best_effort() {
+        assert_eq!(audio_service_type(true), ServiceType::Voice);
+        assert_eq!(audio_service_type(false), ServiceType::BestEffort);
+    }
+    /// The iOS path (Darwin, same option) on the Mac: marked and unmarked
+    /// through a duplicate descriptor, read back on the endpoint's own.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn service_type_toggles_through_a_duplicate_descriptor() {
+        let endpoint = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let marker = endpoint.try_clone().unwrap();
+        for (audio, expected) in [(true, 4), (false, 0), (true, 4), (false, 0)] {
+            set_service_type(&marker, audio_service_type(audio));
+            assert_eq!(read_service_type(&endpoint), expected, "audio {audio}");
+        }
+    }
 }
+
+#[cfg(test)]
+mod recv_tests;
 
 #[cfg(test)]
 mod send_failure_tests {

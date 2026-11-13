@@ -9,13 +9,13 @@ use oink_clipboard::{
 };
 use oink_foundation::DeviceId;
 use oink_foundation::clipboard_dedupe::{self as dedupe, Fingerprint, Identity, Source};
-use oink_protocol::v1::dto;
+use oink_protocol::v2::dto;
 use std::{
     collections::VecDeque,
     path::PathBuf,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -25,11 +25,12 @@ use tokio::sync::{
 };
 mod clock;
 #[cfg(all(test, debug_assertions))]
-mod dedupe_tests;
-#[cfg(all(test, debug_assertions))]
 mod fetch_tests;
 #[cfg(all(test, debug_assertions))]
 mod health_tests;
+mod history;
+mod history_link;
+mod mobile;
 #[cfg(all(test, debug_assertions))]
 mod native_transfer_tests;
 #[cfg(all(test, debug_assertions))]
@@ -65,7 +66,9 @@ struct Publication {
     result: Result<u64, oink_clipboard::ClipboardError>,
 }
 enum Input {
-    Reconfigure,
+    /// Apply the current enabled/paused/send/receive state; carries the
+    /// `Shared::generation` of the change that sent it.
+    Reconfigure(u64),
     LocalChange(u64),
     Captured(
         u64,
@@ -79,6 +82,16 @@ enum Input {
         ticket: Arc<WriteTicket>,
         publication: Publication,
     },
+    HistoryReady(
+        oink_foundation::GroupId,
+        Vec<oink_foundation::clipboard_history::HistoryChange>,
+    ),
+    HistoryMaterialized(
+        oink_foundation::GroupId,
+        Inventory,
+        oink_clipboard::model::RepresentationId,
+        oink_clipboard::FileReader,
+    ),
     FetchFiles,
     CancelFiles,
     #[cfg(target_os = "macos")]
@@ -86,28 +99,57 @@ enum Input {
     Barrier(oneshot::Sender<()>),
     Stop(oneshot::Sender<()>),
 }
-/// What the capture worker learned for duplicate detection (`clipboard_dedupe`).
+/// Fingerprint of a captured clipboard and whether another synchronizer wrote it.
 pub(crate) struct CapturedIdentity {
-    /// Content fingerprint of local data. None when it was not computed:
-    /// deduplication off, or the marker named a known clip.
-    fingerprint: Option<Fingerprint>,
-    /// Universal Clipboard content: promised by another device, never read.
+    fingerprint: Fingerprint,
     external: bool,
-    /// An Oink clip marker naming a clip this device knows.
+    /// A recognised Oink clip marker naming a known clip: `fingerprint` is
+    /// metadata only (nothing but the marker was read).
     marker: Option<ClipId>,
 }
-/// Clipboard state before an uncaptured local change, kept until the capture
-/// decides whether the change duplicates the content it replaced.
-struct EchoBase {
-    identity: Option<Identity>,
-    current: Option<(DeviceId, dto::ClipboardOffer)>,
+/// How a local change was recognised as an echo.
+#[derive(Clone, Copy, Debug)]
+enum EchoBy {
+    Marker(ClipId),
+    Content,
 }
 /// A clip this device recently announced or wrote; its marker may come back.
 struct Recent {
     clip: ClipId,
-    identity: Option<Identity>,
+    identity: Identity,
+    current: Option<(DeviceId, dto::ClipboardOffer)>,
 }
 const RECENT_CLIPS: usize = 8;
+/// The content identity of the native clipboard and the clip it stands for
+/// (None for content no clip names, e.g. a direct mobile share). Content
+/// deduplication compares a change with this identity only while that clip is
+/// still the current one: once the group moved on to a newer offer, copying
+/// the earlier content again is a new copy.
+#[derive(Clone)]
+struct Held {
+    identity: Identity,
+    clip: Option<ClipId>,
+}
+/// Our own offer that was current when sharing paused or the clipboard
+/// settings changed (`Task::reconfigure`). Resuming on the same native
+/// change count publishes this exact offer again (same ClipId, generation and
+/// clock): peers already hold it, so it is not a new copy and cannot outrank a
+/// copy made elsewhere meanwhile. A changed clipboard is compared with it like
+/// any other local change.
+struct Resumable {
+    count: u64,
+    offer: dto::ClipboardOffer,
+    held: Option<Held>,
+    /// The withdrawn source registration, replaced when the offer is served again.
+    lease: Option<content::SourceLease>,
+}
+/// Clipboard state before an uncaptured local change, kept until the capture
+/// decides whether the change is an echo of the content it replaced.
+struct EchoBase {
+    identity: Option<Held>,
+    current: Option<(DeviceId, dto::ClipboardOffer)>,
+    witnessed: Option<dto::ClipboardOffer>,
+}
 struct Shared {
     _native_connection: Option<content::linked::Connection>,
     native: Arc<content::Registry>,
@@ -118,9 +160,21 @@ struct Shared {
     receive_policy: oink_clipboard::policy::SharingPolicy,
     enabled: AtomicBool,
     paused: AtomicBool,
+    /// Serializes changes of `enabled`, `paused` and the send/receive
+    /// settings with raising `generation`.
+    changes: Mutex<()>,
+    /// Raised before each such change becomes visible. The actor applies a
+    /// `Reconfigure` only when it is the latest: an older one would apply the
+    /// newer state a second time, and that second reconfiguration cancels
+    /// what the first started (the write of an offer accepted in between;
+    /// pause and resume faster than the actor ran, 2026-11-10).
+    generation: AtomicU64,
     activity: Mutex<VecDeque<ClipActivity>>,
     transfer: Mutex<Option<FileTransferStatus>>,
     dnd_files: Mutex<Option<Arc<crate::dnd::DndFiles>>>,
+    /// Portable payload/thumbnail bytes, owned by the shared history window.
+    retained: Arc<oink_clipboard::retained::RetainedClips>,
+    history: Arc<oink_clipboard::history::Store>,
 }
 #[derive(Clone)]
 pub struct ClipHandle {
@@ -137,30 +191,38 @@ impl ClipHandle {
         *self.shared.settings.lock().unwrap()
     }
     pub fn set_settings(&self, settings: ClipboardSettings) {
+        let _change = self.shared.changes.lock().unwrap();
         let mut current = self.shared.settings.lock().unwrap();
         if *current == settings {
             return;
         }
-        // Deduplication is read at each capture: toggling it must not revoke
-        // and re-announce the current clipboard like a sharing change does.
-        let dedupe_only = ClipboardSettings {
-            dedupe: settings.dedupe,
-            ..*current
-        } == settings;
+        // Only the send/receive switches change what is shared. The other
+        // settings are read where they are used: changing them must not
+        // withdraw the clipboard or cancel transfers.
+        let directions = (current.send, current.receive) != (settings.send, settings.receive);
+        if directions {
+            self.shared.generation.fetch_add(1, Ordering::AcqRel);
+        }
         *current = settings;
         drop(current);
-        if !dedupe_only {
+        if directions {
             self.reconfigure();
         }
     }
     /// The caller durably commits owner option3 before applying it here.
     pub fn set_enabled(&self, enabled: bool) {
-        if self.shared.enabled.swap(enabled, Ordering::AcqRel) != enabled {
+        let _change = self.shared.changes.lock().unwrap();
+        if self.shared.enabled.load(Ordering::Acquire) != enabled {
+            self.shared.generation.fetch_add(1, Ordering::AcqRel);
+            self.shared.enabled.store(enabled, Ordering::Release);
             self.reconfigure();
         }
     }
     pub fn set_paused(&self, paused: bool) {
-        if self.shared.paused.swap(paused, Ordering::AcqRel) != paused {
+        let _change = self.shared.changes.lock().unwrap();
+        if self.shared.paused.load(Ordering::Acquire) != paused {
+            self.shared.generation.fetch_add(1, Ordering::AcqRel);
+            self.shared.paused.store(paused, Ordering::Release);
             self.reconfigure();
         }
     }
@@ -173,6 +235,8 @@ impl ClipHandle {
     pub(crate) fn config_state_changed(&self, node: &crate::node::Node) {
         self.set_paused(node.fully_paused());
     }
+    /// Called with `changes` held, after `generation` was raised and the new
+    /// state stored.
     fn reconfigure(&self) {
         let active = self.shared.enabled.load(Ordering::Acquire) && !self.shared.paused.load(Ordering::Acquire);
         let settings = self.settings();
@@ -184,7 +248,9 @@ impl ClipHandle {
         }
         self.shared.links.cancel_all();
         self.shared.links.pause_changed(!active);
-        let _ = self.tx.send(Input::Reconfigure);
+        let _ = self
+            .tx
+            .send(Input::Reconfigure(self.shared.generation.load(Ordering::Acquire)));
     }
     pub fn fetch_files(&self) {
         let _ = self.tx.send(Input::FetchFiles);
@@ -227,9 +293,12 @@ struct Task {
     ordering: oink_clipboard::sync::Ordering,
     clock: clock::Clock,
     fault: Option<dto::ResourceFaultCode>,
+    history: history::History,
     native_source: Option<content::SourceLease>,
     capture: Option<tokio::task::JoinHandle<()>>,
     capture_again: bool,
+    /// A remote offer was accepted while `capture` ran; its result is older.
+    capture_superseded: bool,
     backend: Arc<dyn ClipboardBackend>,
     data_dir: PathBuf,
     me: DeviceId,
@@ -245,12 +314,14 @@ struct Task {
     fetch_requested: Option<ClipId>,
     native_write: Option<NativeWrite>,
     queued_write: Option<(ClipId, oink_clipboard::NativeSpec)>,
-    /// Content identity of the native clipboard (`clipboard_dedupe`). Known
-    /// only for this device's own captures; None for content Oink wrote (it
-    /// is provided lazily by its source and never read to compare), after an
-    /// uncaptured local change and after a failed capture.
-    identity: Option<Identity>,
+    /// Content identity of the native clipboard (`clipboard_dedupe`). None
+    /// while unknown: after an uncaptured local change or a failed capture.
+    identity: Option<Held>,
+    /// Our offer withdrawn by the last pause or reconfiguration.
+    resumable: Option<Resumable>,
     echo_base: Option<EchoBase>,
+    /// Fingerprint of the offer being written, adopted once the write lands.
+    writing: Option<(ClipId, Fingerprint)>,
     /// Clips whose Oink marker identifies a write-back (newest last).
     recent: VecDeque<Recent>,
     on_transfer: OnTransfer,
@@ -258,47 +329,12 @@ struct Task {
     on_activity: OnActivity,
     name_of: NameOf,
 }
-fn offer_clip(offer: &dto::ClipboardOffer) -> Option<ClipId> {
+fn clip_of(offer: &dto::ClipboardOffer) -> Option<ClipId> {
     offer
         .id()
         .ok()
         .and_then(|id| oink_clipboard::wire::local_offer_id(id).ok())
         .map(|id| id.clip)
-}
-/// Capture worker: read the Oink clip marker (only that small type), remove it
-/// from the captured provider (it never leaves this device), then fingerprint
-/// local content when deduplication may compare it. Universal Clipboard
-/// content is promised by another device and is never read.
-fn captured_identity(
-    captured: &mut Result<oink_clipboard::CapturedClipboard, oink_clipboard::ClipboardError>,
-    known: &[ClipId],
-    compare: bool,
-) -> Option<CapturedIdentity> {
-    let provider = captured.as_mut().ok()?.content.take()?;
-    let marker = oink_clipboard::dedupe::read_marker(provider.as_ref())
-        .map(|id| id.clip)
-        .filter(|clip| known.contains(clip));
-    match oink_clipboard::dedupe::without_marker(provider) {
-        Ok(provider) => {
-            let external = oink_clipboard::dedupe::external(&provider.inventory());
-            let fingerprint =
-                (compare && marker.is_none()).then(|| oink_clipboard::dedupe::fingerprint(provider.as_ref(), external));
-            if let Ok(captured) = captured.as_mut() {
-                captured.content = Some(provider);
-            }
-            Some(CapturedIdentity {
-                fingerprint,
-                external,
-                marker,
-            })
-        }
-        Err(error) => {
-            *captured = Err(oink_clipboard::ClipboardError::ContentUnavailable(content::reason(
-                &error,
-            )));
-            None
-        }
-    }
 }
 fn copy_event(id: Option<oink_clipboard::model::OfferId>, stage: oink_clipboard::copy_diagnostics::Stage, count: u64) {
     oink_clipboard::copy_diagnostics::event(
@@ -328,8 +364,16 @@ impl Task {
             self.capture_again = true;
             return;
         }
-        let known = self.known_clips();
-        let compare = self.shared.settings.lock().unwrap().dedupe;
+        let recent: Vec<ClipId> = self.recent.iter().map(|recent| recent.clip).collect();
+        // The clip the clipboard held before this change: our offer or the
+        // offer Oink wrote. Its marker coming back is always that clip.
+        let current = match &self.echo_base {
+            Some(base) => base.current.as_ref().and_then(|(_, offer)| clip_of(offer)),
+            None => self.resumable.as_ref().and_then(|resumable| clip_of(&resumable.offer)),
+        };
+        // Content digests are only read for deduplication; with it off a copy
+        // never makes the source application render its data for us.
+        let read_content = self.shared.settings.lock().unwrap().dedupe;
         let backend = self.backend.clone();
         let data = self.data_dir.clone();
         let tx = self.tx.clone();
@@ -338,7 +382,35 @@ impl Task {
             copy_event(None, oink_clipboard::copy_diagnostics::Stage::CaptureBegin, count);
             let started = Instant::now();
             let mut captured = backend.capture(&data);
-            let identity = captured_identity(&mut captured, &known, compare);
+            // First the Oink clip marker (only that small type is read), then
+            // the content rules; see oink_clipboard::dedupe. The marker never
+            // leaves this device: it is removed from the captured provider.
+            let identity = captured.as_mut().ok().and_then(|c| {
+                let provider = c.content.take()?;
+                let marker = oink_clipboard::dedupe::read_marker(provider.as_ref()).map(|id| id.clip);
+                let provider = oink_clipboard::dedupe::without_marker(provider).ok()?;
+                let inventory = provider.inventory();
+                let external = oink_clipboard::dedupe::external(&inventory);
+                // A clipboard manager writes private formats back unchanged:
+                // re-selecting an older entry brings back an earlier clip's
+                // marker. That is the earlier clip only when Universal
+                // Clipboard brought it (its content carries the UC type); a
+                // local rewrite of an earlier marker is a new copy (M9).
+                let marker = marker.filter(|clip| Some(*clip) == current || (external && recent.contains(clip)));
+                let metadata = oink_clipboard::dedupe::from_inventory(&inventory);
+                // Local data only: promised (external) content is not read.
+                let identity = CapturedIdentity {
+                    fingerprint: if marker.is_some() || !read_content {
+                        metadata
+                    } else {
+                        oink_clipboard::dedupe::fingerprint(provider.as_ref(), external)
+                    },
+                    external,
+                    marker,
+                };
+                c.content = Some(provider);
+                Some(identity)
+            });
             oink_clipboard::copy_diagnostics::event(
                 None,
                 oink_clipboard::copy_diagnostics::Stage::CaptureEnd,
@@ -392,15 +464,29 @@ impl Task {
         self.copy_report = crate::telemetry::producer().and_then(|p| p.stamp());
         self.apply_report = None;
         copy_event(None, oink_clipboard::copy_diagnostics::Stage::Observed, count);
-        let base = EchoBase {
-            identity: self.identity.clone(),
-            current: self.ordering.current_with_source(),
+        let base = match self.resumable.take() {
+            // The clipboard changed after our offer was withdrawn: compare
+            // the change with that offer, which can still be rebound.
+            Some(resumable) => {
+                self.native_source = resumable.lease;
+                EchoBase {
+                    identity: resumable.held,
+                    current: Some((self.me, resumable.offer.clone())),
+                    witnessed: Some(resumable.offer),
+                }
+            }
+            None => EchoBase {
+                identity: self.identity.clone(),
+                current: self.ordering.current_with_source(),
+                witnessed: self.streams.witnessed_offer().cloned(),
+            },
         };
         if self.ordering.local_change(count, Instant::now()) {
             // Keep the state from before the FIRST uncaptured change: the
             // intermediate clipboards were never announced.
             self.echo_base.get_or_insert(base);
             self.identity = None;
+            self.writing = None;
         }
         if !self.sending() {
             self.ordering.revoke_local();
@@ -411,7 +497,8 @@ impl Task {
         self.set_transfer(None);
     }
     fn persist(&mut self) -> bool {
-        if self.clock.save(self.ordering.clock()).is_ok() {
+        if self.shared.history.witness(self.ordering.clock()).is_ok() && self.clock.save(self.ordering.clock()).is_ok()
+        {
             return true;
         }
         self.fault = Some(dto::ResourceFaultCode::BackendFailed);
@@ -450,6 +537,15 @@ impl Task {
         let base = self.echo_base.take();
         if !self.sending() {
             self.capture_discard(D::Inactive, before);
+            return;
+        }
+        // A capture not caused by a local change (resume, reconfiguration,
+        // startup) still running when a newer group offer was accepted holds
+        // the clipboard as it was before that offer: announcing it would
+        // supersede the newer copy.
+        if std::mem::take(&mut self.capture_superseded) {
+            self.echo_base = base;
+            self.capture_discard(D::Superseded, before);
             return;
         }
         if std::mem::take(&mut self.capture_again) {
@@ -522,20 +618,47 @@ impl Task {
             self.capture_discard(D::InvalidInventory, count);
             return;
         };
-        let captured_identity = captured_identity.unwrap_or(CapturedIdentity {
-            fingerprint: None,
+        let CapturedIdentity {
+            fingerprint,
+            external,
+            marker,
+        } = captured_identity.unwrap_or(CapturedIdentity {
+            fingerprint: Fingerprint::default(),
             external: false,
             marker: None,
         });
-        if let Some(base) = base
-            && self.duplicate(base, &captured_identity, &provider, native_key)
+        let by = marker.map_or(EchoBy::Content, EchoBy::Marker);
+        let source = if external {
+            Source::External
+        } else {
+            Source::Device(self.me)
+        };
+        let mut base = base;
+        if base.is_none()
+            && let Some(resumable) = self.resumable.take()
         {
-            // Nothing new was announced: no publish interval to report.
-            self.copy_report = None;
+            if resumable.count == count {
+                if self.resume(resumable, &provider, native_key, identity_source.clone()) {
+                    return;
+                }
+            } else {
+                self.native_source = resumable.lease;
+                base = Some(EchoBase {
+                    identity: resumable.held,
+                    current: Some((self.me, resumable.offer.clone())),
+                    witnessed: Some(resumable.offer),
+                });
+            }
+        }
+        if let Some(base) = base
+            && self.local_echo(base, &fingerprint, source, by, &provider, native_key)
+        {
             return;
         }
+        let digests = oink_clipboard::dedupe::digests(&fingerprint, &provider.inventory()).unwrap_or_default();
         let offer = match self.ordering.capture(
             inventory,
+            digests,
             count,
             captured.snapshot.sensitivity,
             crate::layout_sync::now_ms(),
@@ -583,17 +706,14 @@ impl Task {
                 return;
             }
         };
+        self.capture_history(&offer, &lease, Some(fingerprint.clone()), None);
         self.native_source = Some(lease);
-        let identity = captured_identity.fingerprint.map(|fingerprint| Identity {
-            fingerprint,
-            source: if captured_identity.external {
-                Source::External
-            } else {
-                Source::Device(self.me)
-            },
+        let identity = Identity { fingerprint, source };
+        self.remember(id.clip, identity.clone(), Some((self.me, offer.clone())));
+        self.identity = Some(Held {
+            identity,
+            clip: Some(id.clip),
         });
-        self.remember(id.clip, identity.clone());
-        self.identity = identity;
         self.record(
             id.clip.origin,
             &oink_clipboard::wire::local_inventory(&offer.inventory().unwrap()).unwrap(),
@@ -608,76 +728,97 @@ impl Task {
     }
     /// `clipboard_dedupe` on the sending side: a local change naming a known
     /// clip by its Oink marker, or (with deduplication on) a format subset of
-    /// this device's own previous copy, is a duplicate. It is not announced
-    /// and the previous clip identity stays current. When that identity is our
-    /// own announced offer, peers keep reading it, so it is rebound to the new
+    /// the content it replaced, is a duplicate. It is not announced and the
+    /// previous clip identity stays current. When that identity is our own
+    /// announced offer, peers keep reading it, so it is rebound to the new
     /// native clipboard; if it cannot be, the change is announced normally.
-    fn duplicate(
+    fn local_echo(
         &mut self,
         base: EchoBase,
-        captured: &CapturedIdentity,
+        fingerprint: &Fingerprint,
+        source: Source,
+        by: EchoBy,
         provider: &Arc<dyn Provider>,
         native_key: Option<[u8; 32]>,
     ) -> bool {
-        let source = if captured.external {
-            Source::External
-        } else {
-            Source::Device(self.me)
-        };
-        let base_clip = base.current.as_ref().and_then(|(_, offer)| offer_clip(offer));
-        let (identity, current, comparison) = match captured.marker {
-            Some(clip) if base_clip == Some(clip) => (base.identity, base.current, "marker"),
-            Some(clip) => {
-                // An earlier clip of ours came back (a synchronizer delivering
-                // late, or a clipboard history): the clipboard is that clip
-                // again. Not announced; it cannot be rebound (its source is gone).
-                let Some(recent) = self.recent.iter().find(|recent| recent.clip == clip) else {
-                    return false;
-                };
-                tracing::debug!(
-                    direction = "local",
-                    new_source = ?source,
-                    marker = true,
-                    comparison = "marker-earlier-clip",
-                    "clipboard duplicate ignored: not announced"
-                );
-                self.identity = recent.identity.clone();
-                self.ordering.restore(None);
-                return true;
+        let base_clip = base.current.as_ref().and_then(|(_, offer)| clip_of(offer));
+        let mut base = base;
+        if let EchoBy::Marker(clip) = by
+            && base_clip != Some(clip)
+        {
+            // Only a Universal Clipboard write-back reaches here (the capture
+            // worker drops other earlier-clip markers): the clipboard is that
+            // earlier clip again. Not announced; it cannot be rebound (its
+            // source is gone).
+            let Some(recent) = self.recent.iter().find(|recent| recent.clip == clip) else {
+                return false;
+            };
+            tracing::debug!(
+                direction = "local",
+                new_source = ?source,
+                current_source = ?recent.identity.source,
+                comparison = "marker-earlier-clip",
+                "clipboard duplicate ignored: not announced"
+            );
+            base = EchoBase {
+                identity: Some(Held {
+                    identity: recent.identity.clone(),
+                    clip: Some(recent.clip),
+                }),
+                current: recent.current.clone(),
+                witnessed: recent.current.as_ref().map(|(_, offer)| offer.clone()),
+            };
+            if let Some(witnessed) = &base.witnessed {
+                self.streams.witness_offer(witnessed);
             }
-            None => {
-                if !self.shared.settings.lock().unwrap().dedupe {
-                    tracing::trace!(direction = "local", "clipboard deduplication is off");
-                    return false;
-                }
-                let Some(identity) = base.identity else {
-                    // Content Oink wrote is read lazily from its source device:
-                    // never read to compare. Protocol v1 offers carry no digests.
-                    tracing::trace!(direction = "local", new_source = ?source, "clipboard change not compared: previous content unknown");
-                    return false;
-                };
-                let Some(fingerprint) = &captured.fingerprint else {
-                    return false;
-                };
-                if let Err(fresh) = dedupe::echo(fingerprint, &identity) {
-                    if captured.external {
-                        tracing::debug!(direction = "local", new_source = ?source, comparison = ?fresh, "clipboard change not compared: Universal Clipboard content is not read");
-                    } else {
-                        tracing::trace!(direction = "local", new_source = ?source, current_source = ?identity.source, comparison = ?fresh, "clipboard change is a new copy");
+            self.ordering.restore(base.current);
+            self.identity = base.identity;
+            return true;
+        }
+        if let EchoBy::Marker(clip) = by
+            && base.identity.is_none()
+        {
+            base.identity = self
+                .recent
+                .iter()
+                .find(|recent| recent.clip == clip)
+                .map(|recent| Held {
+                    identity: recent.identity.clone(),
+                    clip: Some(recent.clip),
+                });
+        }
+        let Some(held) = base.identity else {
+            return false;
+        };
+        let comparison = match by {
+            // The setting governs content comparison only; markers are exact.
+            EchoBy::Marker(_) => "marker",
+            EchoBy::Content => {
+                let rules = {
+                    let settings = self.shared.settings.lock().unwrap();
+                    dedupe::Rules {
+                        dedupe: settings.dedupe,
+                        receive: settings.receive,
                     }
+                };
+                // The previous content belongs to an older clip than the
+                // group's current one when a newer offer was accepted but
+                // could not be written (D11). No current clip at all (its
+                // source went offline) is not a newer one.
+                let held_is_current = base_clip.is_none() || held.clip == base_clip;
+                // The shared content rule (`clipboard_dedupe::duplicate`, also
+                // used by the phone's privileged capture).
+                if let Err(reason) = dedupe::duplicate(fingerprint, &held.identity, rules, held_is_current) {
+                    tracing::trace!(direction = "local", new_source = ?source, current_source = ?held.identity.source, comparison = ?reason, "clipboard change is a new copy");
                     return false;
                 }
-                (Some(identity), base.current, "subset")
+                "subset"
             }
         };
-        let own = current.as_ref().is_some_and(|(origin, _)| *origin == self.me);
+        let own = base.current.as_ref().is_some_and(|(origin, _)| *origin == self.me);
         if own {
             let Some(lease) = self.native_source.take() else {
-                tracing::debug!(
-                    direction = "local",
-                    comparison,
-                    "clipboard duplicate announced: own offer has no source"
-                );
+                tracing::debug!(direction = "local", new_source = ?source, current_source = ?held.identity.source, "clipboard duplicate announced: own offer has no source");
                 return false;
             };
             match content::rebound(lease.inventory(), provider.clone()) {
@@ -685,13 +826,13 @@ impl Task {
                     Ok(lease) => self.native_source = Some(lease),
                     Err(error) => {
                         // The old lease is gone with the replaced native slot.
-                        tracing::debug!(direction = "local", comparison, kind = ?error.kind(), "clipboard duplicate announced: own offer could not be rebound");
+                        tracing::debug!(direction = "local", kind = ?error.kind(), "clipboard duplicate announced: own offer could not be rebound");
                         return false;
                     }
                 },
                 Err(error) => {
                     self.native_source = Some(lease);
-                    tracing::debug!(direction = "local", comparison, reason = ?content::reason(&error), "clipboard duplicate announced: own offer cannot be served from the new clipboard");
+                    tracing::debug!(direction = "local", reason = ?content::reason(&error), new_source = ?source, current_source = ?held.identity.source, "clipboard duplicate announced: own offer cannot be served from the new clipboard");
                     return false;
                 }
             }
@@ -699,39 +840,186 @@ impl Task {
         tracing::debug!(
             direction = "local",
             new_source = ?source,
-            current_source = ?identity.as_ref().map(|identity| identity.source),
-            marker = comparison == "marker",
+            current_source = ?held.identity.source,
             comparison,
             rebound = own,
+            entries = fingerprint.entries.len(),
             "clipboard duplicate ignored: not announced"
         );
-        if let Some((_, offer)) = current.as_ref().filter(|(origin, _)| *origin == self.me) {
-            // A local change withdrew it from the streams; peers already hold
-            // this offer and their ordering fence drops the repeat.
+        if let Some((_, offer)) = base.current.as_ref().filter(|(origin, _)| *origin == self.me) {
+            // Peers already hold this offer; its ordering fence drops the repeat.
             self.streams.set_offer(Some(offer.clone()));
+        } else if let Some(witnessed) = &base.witnessed {
+            self.streams.witness_offer(witnessed);
         }
-        self.ordering.restore(current);
-        self.identity = identity;
+        self.ordering.restore(base.current);
+        self.identity = Some(held);
         true
     }
-    /// Clips whose marker identifies a write-back: recent ones and the current.
-    fn known_clips(&self) -> Vec<ClipId> {
-        let mut known: Vec<ClipId> = self.recent.iter().map(|recent| recent.clip).collect();
-        known.extend(
-            self.echo_base
-                .as_ref()
-                .and_then(|base| base.current.as_ref().map(|(_, offer)| offer))
-                .or(self.ordering.current())
-                .and_then(offer_clip),
+    /// The clipboard did not change since our offer was withdrawn (pause or
+    /// reconfiguration): publish that same offer again and serve it from the
+    /// clipboard. False when it cannot be served; the change is then a new copy.
+    fn resume(
+        &mut self,
+        resumable: Resumable,
+        provider: &Arc<dyn Provider>,
+        native_key: Option<[u8; 32]>,
+        identity_source: Option<Arc<dyn content::namespace::Namespace>>,
+    ) -> bool {
+        let Resumable { offer, held, lease, .. } = resumable;
+        let Ok(id) = offer.id().and_then(oink_clipboard::wire::local_offer_id) else {
+            return false;
+        };
+        // A proxied offer is served from the proxy cache, not the clipboard.
+        if !offer.proxy().is_ok_and(|proxy| proxy.is_some()) {
+            // The withdrawn registration was cancelled with sharing.
+            drop(lease);
+            match self.shared.native.register_clipboard_identified(
+                content::identified(provider.clone(), id),
+                native_key,
+                identity_source,
+            ) {
+                Ok(lease) => {
+                    lease.set_history(
+                        offer.clock().unwrap_or(0),
+                        matches!(
+                            offer.sensitivity(),
+                            Ok(dto::Sensitivity::Concealed | dto::Sensitivity::Transient)
+                        ),
+                    );
+                    // Announced again: a phone that joined while sharing was
+                    // withdrawn gets this offer as the current one.
+                    self.native_source = Some(lease);
+                }
+                Err(error) => {
+                    tracing::debug!(kind = ?error.kind(), "withdrawn clipboard offer cannot be served again");
+                    return false;
+                }
+            }
+        }
+        tracing::info!(
+            offer = id.clip.seq,
+            "clipboard unchanged since sharing was withdrawn: publishing the same offer again"
         );
-        known
+        self.ordering.restore(Some((self.me, offer.clone())));
+        self.identity = held;
+        self.streams.set_offer(Some(offer));
+        true
     }
-    fn remember(&mut self, clip: ClipId, identity: Option<Identity>) {
+    fn capture_history(
+        &self,
+        offer: &dto::ClipboardOffer,
+        lease: &content::SourceLease,
+        fingerprint: Option<Fingerprint>,
+        proxy: Option<PathBuf>,
+    ) {
+        let group = self.shared.history.group();
+        lease.set_history(
+            offer.clock().unwrap_or(0),
+            matches!(
+                offer.sensitivity(),
+                Ok(dto::Sensitivity::Concealed | dto::Sensitivity::Transient)
+            ),
+        );
+        let capture = history::Capture {
+            group,
+            store: self.shared.history.clone(),
+            registry: self.shared.native.clone(),
+            offer: offer.clone(),
+            provider: lease.provider(),
+            fingerprint,
+            proxy,
+        };
+        let tx = self.tx.clone();
+        tokio::task::spawn_blocking(move || match capture.run() {
+            Ok(changes) => {
+                let _ = tx.send(Input::HistoryReady(group, changes));
+            }
+            Err(error) => tracing::warn!(kind=?error.kind(), "shared clipboard history capture failed"),
+        });
+    }
+    fn purge_history_offer(&mut self, id: oink_clipboard::model::OfferId) {
+        let clip = id.clip;
+        self.shared.native.forget_history(id);
+        self.streams.forget_offer(id);
+        let known_count = self
+            .ordering
+            .current()
+            .filter(|offer| clip_of(offer) == Some(clip))
+            .and_then(|offer| {
+                if clip.origin == self.me {
+                    offer.source_change_count().ok()
+                } else {
+                    self.last_write
+                }
+            });
+        if let Some(count) = known_count
+            && count == self.backend.change_count()
+        {
+            self.ordering.written(count);
+            self.observed = count;
+            self.last_write = Some(count);
+        }
+        self.ordering.withdraw(clip);
+        if self
+            .native_source
+            .as_ref()
+            .is_some_and(|lease| lease.inventory().id == id)
+            && let Some(lease) = self.native_source.take()
+        {
+            lease.cancel();
+        }
+        if self.resumable.as_ref().is_some_and(|r| clip_of(&r.offer) == Some(clip)) {
+            self.resumable = None;
+        }
+        if self.queued_write.as_ref().is_some_and(|(current, _)| *current == clip)
+            && let Some((_, spec)) = self.queued_write.take()
+        {
+            spec.contents.cancel();
+        }
+        if let Some(write) = &self.native_write
+            && write.id == clip
+        {
+            write.ticket.valid.store(false, Ordering::Release);
+            write.contents.cancel();
+        }
+        {
+            let mut target = self.shared.native_target.lock().unwrap();
+            if target.as_ref().is_some_and(|(current, _)| *current == clip)
+                && let Some((_, remote)) = target.take()
+            {
+                remote.cancel();
+            }
+        }
+        self.recent.retain(|recent| recent.clip != clip);
+        if self.identity.as_ref().is_some_and(|held| held.clip == Some(clip)) {
+            self.identity = None;
+        }
+        if self.echo_base.as_ref().is_some_and(|base| {
+            base.current
+                .as_ref()
+                .is_some_and(|(_, offer)| clip_of(offer) == Some(clip))
+                || base
+                    .witnessed
+                    .as_ref()
+                    .is_some_and(|offer| clip_of(offer) == Some(clip))
+        }) {
+            self.echo_base = None;
+        }
+        if self.writing.as_ref().is_some_and(|(current, _)| *current == clip) {
+            self.writing = None;
+        }
+    }
+    fn remember(&mut self, clip: ClipId, identity: Identity, current: Option<(DeviceId, dto::ClipboardOffer)>) {
         self.recent.retain(|recent| recent.clip != clip);
         if self.recent.len() == RECENT_CLIPS {
             self.recent.pop_front();
         }
-        self.recent.push_back(Recent { clip, identity });
+        self.recent.push_back(Recent {
+            clip,
+            identity,
+            current,
+        });
     }
     fn current_id(&self) -> Option<ClipId> {
         self.ordering
@@ -743,21 +1031,91 @@ impl Task {
     }
     fn may_write(&mut self, id: ClipId) -> bool {
         self.observe(self.backend.change_count());
+        // A fully inline phone publication is already local data. The Share
+        // Extension may exit after Low's orderly merge, before native writing
+        // starts; the sending link must not revoke these committed bytes.
+        let inline_phone_head = self.inline_phone_head(id);
         self.receiving()
             && self.cancelled != Some(id)
             && self.current_id() == Some(id)
-            && self.remote_scope.is_some_and(|(current, peer, stream)| {
-                current == id
-                    && self.streams.inbound_id(peer) == Some(stream)
-                    && self.shared.links.offer_current(peer, id)
-            })
+            && (inline_phone_head
+                || self.remote_scope.is_some_and(|(current, peer, stream)| {
+                    current == id
+                        && self.streams.inbound_id(peer) == Some(stream)
+                        && self.shared.links.offer_current(peer, id)
+                }))
+    }
+    fn inline_phone_head(&self, id: ClipId) -> bool {
+        self.shared.links.is_phone(id.origin)
+            && self
+                .shared
+                .history
+                .window()
+                .records()
+                .first()
+                .is_some_and(|head| head.id.clip == id && history::phone_offer(head).is_some())
     }
     fn spec(&self, offer: &dto::ClipboardOffer) -> Result<oink_clipboard::NativeSpec, oink_clipboard::ClipboardError> {
         use oink_clipboard::ClipboardError as E;
-        let raw = offer.inventory().map_err(|_| E::Unsupported)?;
         let id = offer
             .id()
             .and_then(oink_clipboard::wire::local_offer_id)
+            .map_err(|_| E::Unsupported)?;
+        if self.inline_phone_head(id.clip) {
+            // Phone publications are fully inline and already committed to
+            // this PC. Native writing uses those local bytes, with no phone
+            // link/provider lifetime or send-direction permission dependency.
+            let cached = self.shared.history.local_provider(id, None).ok_or(E::Unsupported)?;
+            let provider = self.shared.receive_policy.provider(cached);
+            if let Some((_, remote)) = self.shared.native_target.lock().unwrap().take() {
+                remote.cancel();
+            }
+            self.set_transfer(None);
+            return Ok(oink_clipboard::NativeSpec {
+                inventory: provider.inventory(),
+                contents: provider,
+                files: vec![],
+                file_contents: None,
+                sensitivity: oink_clipboard::wire::local_sensitivity(offer.sensitivity().map_err(|_| E::Unsupported)?)
+                    .map_err(|_| E::Unsupported)?,
+            });
+        }
+        let raw = offer.inventory().map_err(|_| E::Unsupported)?;
+        let mut portable_inventory = oink_clipboard::wire::local_inventory(&raw).map_err(|_| E::Unsupported)?;
+        if self.shared.links.history_capable(portable_inventory.id.clip.origin) {
+            for item in &mut portable_inventory.items {
+                if item.file.is_some() && !item.virtual_files {
+                    continue;
+                }
+                for rep in &mut item.representations {
+                    if let Some(format) = oink_clipboard::history::portable(rep.standard) {
+                        let portable_name = oink_clipboard::wire::portable(oink_clipboard::history::standard(format)).0;
+                        if rep.format == oink_clipboard::model::NativeFormat::Unknown(portable_name) {
+                            continue;
+                        }
+                        rep.format = oink_clipboard::model::NativeFormat::Unknown(
+                            oink_clipboard::wire::portable(oink_clipboard::history::standard(format)).0,
+                        );
+                        rep.medium = oink_clipboard::model::Medium::Bytes;
+                        // Source inline bytes can be native (UTF-16, TIFF, DIB).
+                        // Canonical reads must use the provider's translator.
+                        rep.data = oink_clipboard::model::RepresentationData::Reader {
+                            size: oink_clipboard::model::ContentSize::Unknown,
+                        };
+                    }
+                }
+            }
+        }
+        let raw = oink_clipboard::wire::inventory(&portable_inventory).map_err(|_| E::Unsupported)?;
+        let id = offer
+            .id()
+            .and_then(oink_clipboard::wire::local_offer_id)
+            .map_err(|_| E::Unsupported)?;
+        // A proxied phone upload is announced under the proxy's clip ID; its
+        // received files belong to the phone (the authenticated real sender).
+        let sender = offer
+            .real_sender()
+            .and_then(|sender| oink_network::wire_identity::read_device(&sender))
             .map_err(|_| E::Unsupported)?;
         let target = if cfg!(target_os = "macos") {
             oink_foundation::clipboard::ClipPlatform::Mac
@@ -786,12 +1144,43 @@ impl Task {
                 oink_clipboard::store::BatchId::random().map_err(|_| E::Unsupported)?,
                 raw,
                 target,
-                self.shared.links.clone(),
+                if self.shared.links.history_capable(id.clip.origin) {
+                    use oink_clipboard::sync::files::BulkLink;
+                    Arc::new(history_link::Link {
+                        files: self.shared.links.clone(),
+                        network: self.streams.network(),
+                        store: self.shared.history.clone(),
+                        offer: id,
+                        origin: self.shared.links.clone().bind(id.clip.origin, id.clip),
+                        unavailable: Default::default(),
+                    }) as Arc<dyn BulkLink>
+                } else {
+                    self.shared.links.clone()
+                },
                 Demand::Clipboard,
                 tokio::runtime::Handle::current(),
             )
             .map_err(|_| E::Unsupported)?;
+            let tx = self.tx.clone();
+            let group = self.shared.history.group();
+            let received_inventory = remote.inventory();
+            // Sensitive history owns only its bounded inline body at the head.
+            // A late native materialization must not recreate a purged cache.
+            if !matches!(
+                offer.sensitivity(),
+                Ok(dto::Sensitivity::Concealed | dto::Sensitivity::Transient)
+            ) {
+                remote.on_materialized(Arc::new(move |id, reader| {
+                    let _ = tx.send(Input::HistoryMaterialized(
+                        group,
+                        received_inventory.clone(),
+                        id,
+                        reader,
+                    ));
+                }));
+            }
             remote.set_receiver(self.me);
+            remote.set_sender(sender);
             self.set_transfer(None);
             *self.shared.native_target.lock().unwrap() = Some((id.clip, remote.clone()));
             (remote, true)
@@ -849,7 +1238,7 @@ impl Task {
                 }
             });
         }
-        oink_clipboard::received::remember_source(id.clip.origin, (self.name_of)(id.clip.origin));
+        oink_clipboard::received::remember_source(sender, (self.name_of)(sender));
         remote.automatic_pull();
         Ok(oink_clipboard::NativeSpec {
             inventory,
@@ -886,6 +1275,11 @@ impl Task {
                 return;
             }
         };
+        if let Ok(fingerprint) = oink_clipboard::dedupe::from_offer(&offer) {
+            // The offer's digests are the fingerprint: the lazily written
+            // clipboard is never read to compare (that would fetch remotely).
+            self.writing = Some((id, fingerprint));
+        }
         self.enqueue_native_write(id, spec);
     }
     fn cancel_native_write(&mut self) {
@@ -944,6 +1338,7 @@ impl Task {
                 }
             });
             let mut inventory = spec.inventory.clone();
+            let contents = spec.contents.clone();
             let mut files = !spec.files.is_empty();
             let materialized = files && spec.file_contents.is_none();
             let non_files = spec.clone().without_files().ok().flatten();
@@ -971,6 +1366,25 @@ impl Task {
                 inventory = non_files.inventory.clone();
                 files = false;
                 result = backend.write_native_cancellable(non_files, guard, current);
+            }
+            // Canonical portable sizes can differ from the source's native
+            // encoding and are unknown before reading. Once native publication
+            // materialized them, report those actual sizes in the activity,
+            // without reading the clipboard again or inventing estimates.
+            let completed = contents.inventory();
+            for item in &mut inventory.items {
+                for rep in &mut item.representations {
+                    if matches!(
+                        rep.data,
+                        oink_clipboard::model::RepresentationData::Reader {
+                            size: oink_clipboard::model::ContentSize::Unknown
+                        }
+                    ) && let Some(size @ oink_clipboard::model::ContentSize::Known(_)) =
+                        content::find(&completed, rep.id).and_then(|r| r.data.size())
+                    {
+                        rep.data = oink_clipboard::model::RepresentationData::Reader { size };
+                    }
+                }
             }
             oink_clipboard::copy_diagnostics::event(
                 Some(inventory.id),
@@ -1079,11 +1493,20 @@ impl Task {
         self.observed = count;
         self.last_write = Some(count);
         self.echo_base = None;
-        // Content Oink wrote is provided lazily by its source device: it is
-        // never read to compare, so the next local change is always announced
-        // unless its Oink marker names this clip.
-        self.identity = None;
-        self.remember(id, None);
+        self.identity = self
+            .writing
+            .take()
+            .filter(|(writing, _)| *writing == id)
+            .map(|(_, fingerprint)| Held {
+                identity: Identity {
+                    fingerprint,
+                    source: Source::Device(id.origin),
+                },
+                clip: Some(id),
+            });
+        if let Some(held) = self.identity.clone() {
+            self.remember(id, held.identity, self.ordering.current_with_source());
+        }
         self.ordering.written(count);
         self.provider_retry = None;
         self.native_source = None;
@@ -1183,8 +1606,23 @@ impl Task {
         }
     }
     fn reconfigure(&mut self) {
+        // Our current offer, while the clipboard is unchanged since it was
+        // captured, is kept for resuming (see `Resumable`).
+        if self.resumable.is_none()
+            && self.echo_base.is_none()
+            && self.capture.is_none()
+            && self.ordering.deadline().is_none()
+            && let Some((origin, offer)) = self.ordering.current_with_source()
+            && origin == self.me
+        {
+            self.resumable = Some(Resumable {
+                count: self.observed,
+                offer,
+                held: self.identity.clone(),
+                lease: self.native_source.take(),
+            });
+        }
         self.echo_base = None;
-        self.identity = None;
         self.cancel_native_write();
         self.fetch_requested = None;
         self.provider_retry = None;

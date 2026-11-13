@@ -1,7 +1,7 @@
 //! Typed cache counters and the supported UI category projection.
 use oink_clipboard::cache::{CacheCategory, CacheClear, CacheSize, CacheUsage};
 use oink_foundation::session::Boot;
-use oink_protocol::v1::{
+use oink_protocol::v2::{
     self, RawValue as V, dto,
     schema::{WireDto, WireValue},
 };
@@ -25,6 +25,7 @@ fn category(value: CacheCategory) -> u64 {
         CacheCategory::DeliveredFiles => 5,
         CacheCategory::SourceSnapshots => 6,
         CacheCategory::PromiseExports => 7,
+        CacheCategory::TransferProxy => 8,
         CacheCategory::Other => unreachable!("UI-only aggregate"),
     }
 }
@@ -38,11 +39,12 @@ fn local_category(value: u32) -> CacheCategory {
         5 => CacheCategory::DeliveredFiles,
         6 => CacheCategory::SourceSnapshots,
         7 => CacheCategory::PromiseExports,
-        8 => CacheCategory::Other,
+        8 => CacheCategory::TransferProxy,
+        9 => CacheCategory::Other,
         _ => CacheCategory::Other,
     }
 }
-pub(super) fn project(wire: &dto::CacheUsageValue) -> v1::Result<CacheUsage> {
+pub(super) fn project(wire: &dto::CacheUsageValue) -> v2::Result<CacheUsage> {
     let mut usage = CacheUsage {
         categories: vec![],
         total_bytes: wire.total_bytes()?,
@@ -54,15 +56,15 @@ pub(super) fn project(wire: &dto::CacheUsageValue) -> v1::Result<CacheUsage> {
         let bytes = size.bytes()?;
         let kept_bytes = size.kept_bytes()?;
         if kept_bytes > bytes {
-            return Err(v1::ErrorCode::MalformedFrame.into());
+            return Err(v2::ErrorCode::MalformedFrame.into());
         }
-        total = total.checked_add(bytes).ok_or(v1::ErrorCode::LimitExceeded)?;
+        total = total.checked_add(bytes).ok_or(v2::ErrorCode::LimitExceeded)?;
         if let Some(old) = usage.categories.iter_mut().find(|v| v.category == category) {
-            old.bytes = old.bytes.checked_add(bytes).ok_or(v1::ErrorCode::LimitExceeded)?;
+            old.bytes = old.bytes.checked_add(bytes).ok_or(v2::ErrorCode::LimitExceeded)?;
             old.kept_bytes = old
                 .kept_bytes
                 .checked_add(kept_bytes)
-                .ok_or(v1::ErrorCode::LimitExceeded)?;
+                .ok_or(v2::ErrorCode::LimitExceeded)?;
         } else {
             usage.categories.push(CacheSize {
                 category,
@@ -72,17 +74,17 @@ pub(super) fn project(wire: &dto::CacheUsageValue) -> v1::Result<CacheUsage> {
         }
     }
     if total != usage.total_bytes {
-        return Err(v1::ErrorCode::MalformedFrame.into());
+        return Err(v2::ErrorCode::MalformedFrame.into());
     }
     Ok(usage)
 }
-pub(super) fn wire_usage(value: &CacheUsage) -> v1::Result<dto::CacheUsageValue> {
+pub(super) fn wire_usage(value: &CacheUsage) -> v2::Result<dto::CacheUsageValue> {
     if value
         .categories
         .iter()
         .any(|size| size.category == CacheCategory::Other)
     {
-        return Err(v1::ErrorCode::UnsupportedValue.into());
+        return Err(v2::ErrorCode::UnsupportedValue.into());
     }
     let sizes = value
         .categories
@@ -98,7 +100,7 @@ pub(super) fn wire_usage(value: &CacheUsage) -> v1::Result<dto::CacheUsageValue>
             )
             .map(|s| s.write())
         })
-        .collect::<v1::Result<Vec<_>>>()?;
+        .collect::<v2::Result<Vec<_>>>()?;
     dto::CacheUsageValue::from_raw(
         [
             (1, V::Array(sizes)),
@@ -108,7 +110,7 @@ pub(super) fn wire_usage(value: &CacheUsage) -> v1::Result<dto::CacheUsageValue>
         .into(),
     )
 }
-pub(super) fn wire_clear(value: &CacheClear) -> v1::Result<dto::CacheClear> {
+pub(super) fn wire_clear(value: &CacheClear) -> v2::Result<dto::CacheClear> {
     dto::CacheClear::from_raw(
         [
             (1, V::Uint(value.removed_bytes)),
@@ -118,7 +120,7 @@ pub(super) fn wire_clear(value: &CacheClear) -> v1::Result<dto::CacheClear> {
         .into(),
     )
 }
-pub(super) fn clear_projection(value: &dto::CacheClear) -> v1::Result<CacheClear> {
+pub(super) fn clear_projection(value: &dto::CacheClear) -> v2::Result<CacheClear> {
     Ok(CacheClear {
         removed_bytes: value.removed_bytes()?,
         kept_bytes: value.kept_bytes()?,

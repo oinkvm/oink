@@ -3,8 +3,6 @@
 pub mod clipboard;
 #[cfg(feature = "input")]
 pub mod input;
-#[cfg(feature = "protocol")]
-pub mod protocol;
 
 #[cfg(feature = "network")]
 pub mod network;

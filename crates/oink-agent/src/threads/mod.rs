@@ -105,12 +105,12 @@ pub enum MainCommand {
     Low {
         peer: oink_foundation::DeviceId,
         stream: oink_network::link::StreamId,
-        message: oink_protocol::v1::Message,
+        message: oink_protocol::v2::Message,
     },
     Attachment {
         peer: oink_foundation::DeviceId,
         stream: oink_network::link::StreamId,
-        message: oink_protocol::v1::Message,
+        message: oink_protocol::v2::Message,
     },
 }
 

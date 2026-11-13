@@ -1,14 +1,14 @@
 //! Fixed-storage v1 media frames. The transport owns the flow prefix; these
 //! helpers encode/inspect only the registered AudioPacket and AudioSleep bodies.
 use crate::{dsp, negotiation::Profile, source::Packet};
-use oink_protocol::v1::{
+use oink_protocol::v2::{
     self, ErrorCode,
     frame::OpaqueFrame,
     hot::{self, Value},
 };
 use std::time::Instant;
 
-pub const FRAME_CAPACITY: usize = v1::limits::DATAGRAM - 4;
+pub const FRAME_CAPACITY: usize = v2::limits::DATAGRAM - 4;
 /// Both audio uses share the same codec, packet body and native sink pipeline.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -18,10 +18,10 @@ pub enum Kind {
     Microphone,
 }
 impl Kind {
-    pub fn to_wire(self) -> v1::dto::AudioMediaKind {
+    pub fn to_wire(self) -> v2::dto::AudioMediaKind {
         match self {
-            Self::Speaker => v1::dto::AudioMediaKind::Speaker,
-            Self::Microphone => v1::dto::AudioMediaKind::Microphone,
+            Self::Speaker => v2::dto::AudioMediaKind::Speaker,
+            Self::Microphone => v2::dto::AudioMediaKind::Microphone,
         }
     }
 
@@ -59,10 +59,10 @@ pub enum Media<'a> {
         burst: u64,
     },
 }
-pub fn encode(packet: &Packet, stream: u64, started: Instant, bytes: &mut [u8]) -> v1::Result<usize> {
+pub fn encode(packet: &Packet, stream: u64, started: Instant, bytes: &mut [u8]) -> v2::Result<usize> {
     encode_kind(Kind::Speaker, packet, stream, started, bytes)
 }
-pub fn encode_kind(kind: Kind, packet: &Packet, stream: u64, started: Instant, bytes: &mut [u8]) -> v1::Result<usize> {
+pub fn encode_kind(kind: Kind, packet: &Packet, stream: u64, started: Instant, bytes: &mut [u8]) -> v2::Result<usize> {
     if stream == 0 || packet.burst == 0 {
         return Err(ErrorCode::MalformedFrame.into());
     }
@@ -99,10 +99,10 @@ pub fn encode_kind(kind: Kind, packet: &Packet, stream: u64, started: Instant, b
         )
     }
 }
-pub fn decode(bytes: &[u8], stream: u64, profile: Profile) -> v1::Result<Media<'_>> {
+pub fn decode(bytes: &[u8], stream: u64, profile: Profile) -> v2::Result<Media<'_>> {
     decode_kind(Kind::Speaker, bytes, stream, profile)
 }
-pub fn decode_kind(kind: Kind, bytes: &[u8], stream: u64, profile: Profile) -> v1::Result<Media<'_>> {
+pub fn decode_kind(kind: Kind, bytes: &[u8], stream: u64, profile: Profile) -> v2::Result<Media<'_>> {
     if stream == 0 {
         return Err(ErrorCode::MalformedFrame.into());
     }
@@ -110,7 +110,7 @@ pub fn decode_kind(kind: Kind, bytes: &[u8], stream: u64, profile: Profile) -> v
     // Both registered kinds intentionally have the same field schema. Borrow
     // its projection directly after checking the discriminator; no owning tree.
     if frame.header.type_id == kind.packet_id() {
-        let packet = hot::View::<v1::dto::AudioPacket>::parse(frame.payload(), FRAME_CAPACITY)?;
+        let packet = hot::View::<v2::dto::AudioPacket>::parse(frame.payload(), FRAME_CAPACITY)?;
         let payload = packet.payload()?;
         if packet.stream_id()? != stream || packet.burst()? == 0 || !dsp::valid_payload(profile.config(), payload) {
             return Err(ErrorCode::UnsupportedValue.into());
@@ -123,7 +123,7 @@ pub fn decode_kind(kind: Kind, bytes: &[u8], stream: u64, profile: Profile) -> v
             payload,
         })
     } else if frame.header.type_id == kind.sleep_id() {
-        let packet = hot::View::<v1::dto::AudioSleep>::parse(frame.payload(), FRAME_CAPACITY)?;
+        let packet = hot::View::<v2::dto::AudioSleep>::parse(frame.payload(), FRAME_CAPACITY)?;
         if packet.stream_id()? != stream || packet.burst()? == 0 {
             return Err(ErrorCode::UnsupportedValue.into());
         }

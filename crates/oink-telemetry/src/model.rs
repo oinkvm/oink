@@ -53,6 +53,13 @@ closed!(Platform {
     Unknown
 });
 closed!(NetworkPath { Direct, Relay, Unknown });
+// A runtime failure the process survives by restarting a component. Closed
+// identifiers only, like crash classes; no message text crosses the boundary.
+closed!(FaultKind {
+    // The network layer's shared QUIC endpoint driver ended; the backend host
+    // restarted the network layer (2026-11-12).
+    NetworkEndpointStopped
+});
 closed!(Transport { Reliable, Lossy });
 /// Schema 4: `pcm` means PCM24 only; schema 3's broad values are never relabeled.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -708,6 +715,15 @@ pub struct PerformanceDistribution {
     pub window_us: Option<u64>,
     pub seal_us: u64,
 }
+/// A handled runtime failure, reported as a Sentry error event (level
+/// `error`). It shares the crash category's queue and budgets.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeFault {
+    pub build: BuildContext,
+    pub component: Component,
+    pub fault: FaultKind,
+}
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "report", content = "data", rename_all = "snake_case", deny_unknown_fields)]
 // Fixed storage also permits allocation-free numeric producer queues.
@@ -716,34 +732,43 @@ pub enum Report {
     SafeCrash(SafeCrash),
     MeasuredInterval(MeasuredInterval),
     PerformanceDistribution(PerformanceDistribution),
+    RuntimeFault(RuntimeFault),
 }
 impl Report {
+    /// The error category (Sentry `error` events): crashes and runtime faults.
     pub fn crash(&self) -> bool {
-        matches!(self, Self::SafeCrash(_))
+        matches!(self, Self::SafeCrash(_) | Self::RuntimeFault(_))
     }
     pub fn build(&self) -> BuildContext {
         match self {
             Self::SafeCrash(c) => c.build,
             Self::MeasuredInterval(m) => m.context.build,
             Self::PerformanceDistribution(m) => m.context.build,
+            Self::RuntimeFault(f) => f.build,
         }
     }
     pub fn context(&self) -> Option<MeasurementContext> {
         match self {
-            Self::SafeCrash(_) => None,
+            Self::SafeCrash(_) | Self::RuntimeFault(_) => None,
             Self::MeasuredInterval(m) => Some(m.context),
             Self::PerformanceDistribution(m) => Some(m.context),
         }
     }
     pub fn duration_us(&self) -> u64 {
         match self {
-            Self::SafeCrash(_) => 0,
+            Self::SafeCrash(_) | Self::RuntimeFault(_) => 0,
             Self::MeasuredInterval(m) => m.elapsed_us,
             Self::PerformanceDistribution(m) => m.seal_us,
         }
     }
     pub fn validate(&self) -> Result<()> {
         match self {
+            // Only the backend agent restarts its network layer.
+            Self::RuntimeFault(f) => {
+                if f.component != Component::Agent {
+                    return Err(Error::Invalid);
+                }
+            }
             Self::SafeCrash(c) => {
                 if c.source.is_some() && (c.crash_kind != CrashKind::RustPanic || c.line.is_none()) {
                     return Err(Error::Invalid);

@@ -153,16 +153,18 @@ async fn empty_recovery_schedule_still_expires_proof_lookups() {
         .group
         .call(|owner| {
             let now = Instant::now();
-            assert!(owner.recovery_due.is_empty());
+            assert!(!owner.member.recovery_scheduled());
             let source = owner.state.roster().anchor();
             let expired = LinkId(u64::MAX);
             let pending = LinkId(u64::MAX - 1);
-            owner.lookups.insert(expired, (source, now));
-            owner.lookups.insert(pending, (source, now + Duration::from_secs(10)));
+            owner.member.inject_lookup(expired, source, now);
+            owner
+                .member
+                .inject_lookup(pending, source, now + Duration::from_secs(10));
             owner.expire_recovery(now);
-            assert!(!owner.lookups.contains_key(&expired));
-            assert!(owner.lookups.contains_key(&pending));
-            assert!(owner.recovery_due.is_empty());
+            assert!(!owner.member.looking_up(expired));
+            assert!(owner.member.looking_up(pending));
+            assert!(!owner.member.recovery_scheduled());
             Ok(())
         })
         .unwrap();
@@ -217,9 +219,12 @@ async fn production_profile_negotiates_mac_file_tree_metadata() {
         // Link admission precedes live Facts; the synthetic roster's OS is
         // "test" until the normal Facts publication arrives.
         assert!(until(|| files.peer_os(peer).as_deref() == Some(std::env::consts::OS)).await);
-        for cap in ["oink.files.safe-symlinks/1", "oink.files.exec-bits/1"] {
-            assert_eq!(link.agreement.contains(cap), cfg!(target_os = "macos"), "{cap}");
-        }
+        // The merged clipboard domain is negotiated on every platform; the
+        // Mac-only file metadata (safe symlinks, exec bits) is a platform
+        // fact, not a capability (protocol-v2 1.1). Before the merge this
+        // looped over the two retired file capabilities; a mechanical rename
+        // left it expecting no clipboard/2 off macOS.
+        assert!(link.permits(oink_protocol::v2::registry::type_id::ClipboardOffer));
         assert_eq!(files.peer_safe_symlinks(peer, link.link), cfg!(target_os = "macos"));
         assert_eq!(files.peer_exec_bits(peer, link.link), cfg!(target_os = "macos"));
     }
@@ -282,6 +287,7 @@ async fn start_with_bind(
                 links: links.clone(),
                 port,
                 application: application.clone(),
+                pairing: true,
                 config: config.clone(),
                 owner_gate: gate.clone(),
             },
@@ -342,6 +348,7 @@ async fn restart(node: &mut Running) {
             links: links.clone(),
             port,
             application: node.application.clone(),
+            pairing: true,
             config: node.config.clone(),
             owner_gate: node.gate.clone(),
         },
@@ -755,7 +762,7 @@ async fn durable_projection_waits_for_owner_gate_and_native_application_before_p
         };
         submit(&nodes[1], &id, 1, code);
         assert!(
-            until(|| Journal::load(
+            until(|| oink_network::pair_journal::Journal::load(
                 &nodes[0].directory.path().join(oink_network::pair_journal::FILE),
                 nodes[0].identity.id()
             )
@@ -838,6 +845,84 @@ async fn display_geometry_and_owner_facts_converge_without_replicating_pause() {
     .unwrap();
     assert!(nodes[0].group.applied().paused);
     assert!(!nodes[1].group.applied().paused);
+    stop(&nodes).await;
+}
+/// Public 0.3.6 stored the group-wide device order as retained register 0x1302
+/// with this DeviceOrder shape, an explicit `deleted: false` (key 5) and the
+/// format-1 register digest (key 6) that its local storage kept. The upgraded
+/// group module starts from it and keeps the user's custom order.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn device_order_stored_by_0_3_6_at_register_0x1302_survives_startup() {
+    use sha2::{Digest as _, Sha256};
+    let keys = identities(2);
+    let [a, b] = [keys[0].id(), keys[1].id()];
+    let state = State::create(&keys[0], "synthetic", "test", 1).unwrap();
+    let state = state
+        .with_roster(&state.roster().add(&keys[0], b, "synthetic", "test", 2).unwrap())
+        .unwrap();
+    let entry = |device: DeviceId, order: i64| {
+        let epoch = state.roster().member(device).unwrap().epoch;
+        RawValue::Map(
+            [
+                (1, wire::device(device).write()),
+                (2, epoch.write()),
+                (3, order.write()),
+            ]
+            .into(),
+        )
+    };
+    // b moved above a: not the join order the reconcile would produce.
+    let version: v2::RawMap = [(1, 3u64.write()), (3, wire::device(a).write())].into();
+    let mut register: v2::RawMap = [
+        (1, 0x1302u32.write()),
+        (3, RawValue::Map(version)),
+        (
+            4,
+            RawValue::Map([(1, RawValue::Array(vec![entry(b, -1), entry(a, 0)]))].into()),
+        ),
+        (5, false.write()),
+    ]
+    .into();
+    let body = RawValue::Map(register.clone());
+    let digest = Sha256::digest(body.encode(v2::limits::CONFIG_STATE).unwrap());
+    register.insert(6, RawValue::Bytes(digest.to_vec()));
+    let registers: Vec<RawValue> = state
+        .wire()
+        .registers()
+        .unwrap()
+        .0
+        .into_iter()
+        .filter(|r| r.kind() != Ok(0x1302))
+        .map(|r| r.write())
+        .chain([RawValue::Map(register)])
+        .collect();
+    let mut raw = state.wire().raw().clone();
+    raw.insert(2, RawValue::Array(registers));
+    let stored = group_store::StoredGroupState::new(a, dto::GroupState::from_raw(raw).unwrap()).unwrap();
+    let expected = BTreeMap::from([(b, -1), (a, 0)]);
+    let nodes = start(vec![stored]).await;
+    assert_eq!(nodes[0].group.applied().device_order, expected);
+    let members: BTreeSet<_> = nodes[0].group.applied().members.iter().copied().collect();
+    assert_eq!(members, BTreeSet::from([a, b]));
+    // Startup reconciliation keeps the stored order on disk as well.
+    assert!(
+        until(|| {
+            let stored = group_store::load(&nodes[0].directory.path().join(group_store::STATE_FILE), a)
+                .unwrap()
+                .unwrap();
+            let roster = stored.state.roster().unwrap();
+            let anchor = Anchor {
+                group: stored.group(),
+                root: oink_network::roster::root_id(&roster).unwrap(),
+            };
+            State::verify(stored.to_wire().unwrap(), anchor)
+                .unwrap()
+                .device_order()
+                .unwrap()
+                == expected
+        })
+        .await
+    );
     stop(&nodes).await;
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1306,9 +1391,9 @@ async fn greeting_reply_closing_its_link_returns_an_error_without_panicking_the_
                 connection,
                 agreement: prior.agreement.clone(),
                 negotiated: prior.negotiated.clone(),
-                local_offer: v1::frame::encode(&Message::ConnectionOffer(local_offer), v1::limits::CONFIG_FRAME)
+                local_offer: v2::frame::encode(&Message::ConnectionOffer(local_offer), v2::limits::CONFIG_FRAME)
                     .unwrap(),
-                peer_offer: v1::frame::encode(&Message::ConnectionOffer(peer_offer), v1::limits::CONFIG_FRAME).unwrap(),
+                peer_offer: v2::frame::encode(&Message::ConnectionOffer(peer_offer), v2::limits::CONFIG_FRAME).unwrap(),
             };
             let reverse = Selected {
                 peer_boot: local,
@@ -1360,7 +1445,7 @@ async fn greeting_reply_closing_its_link_returns_an_error_without_panicking_the_
             let result =
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| owner.control(link, &hello.unwrap())));
             assert!(!owner.sessions.contains_key(&link));
-            Ok(matches!(result, Ok(Err(error)) if error.code == v1::ErrorCode::NotReady))
+            Ok(matches!(result, Ok(Err(error)) if error.code == v2::ErrorCode::NotReady))
         })
         .unwrap();
     // The actor must still answer commands after dropping only the failed link.
@@ -1456,7 +1541,7 @@ async fn endpoint_facts_advertise_the_explicit_ipv4_listener_address() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn migration_wake_refreshes_endpoint_facts_without_display_change() {
-    use oink_protocol::v1::schema::WireValue;
+    use oink_protocol::v2::schema::WireValue;
     let nodes = start_with_bind(fresh(1), None, std::net::Ipv4Addr::UNSPECIFIED.into()).await;
     let current = oink_network::discovery::local_ipv4()
         .into_iter()
@@ -2063,7 +2148,15 @@ fn sleep_for_redial_test(owner: &mut Owner) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn reachable_member_recovers_on_its_own_retry_after_many_timeouts() {
-    own_retry_recovery(Duration::ZERO).await;
+    own_retry_recovery(Duration::ZERO, false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn own_retry_recovery_survives_an_attempt_lost_before_ready() {
+    // The source's first attempt reaches the target but ends before Ready
+    // (as a loaded admission can): the target still cannot originate, so the
+    // source's next own retry recovers, as the outbound end.
+    own_retry_recovery(Duration::ZERO, true).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2071,10 +2164,14 @@ async fn own_retry_recovery_allows_delayed_peer_owner() {
     // Keep the peer owner unavailable across the idle retry and one candidate
     // budget. Its network thread still accepts TLS; C0 can finish when the
     // owner resumes, well inside the greeting's ten-second deadline.
-    own_retry_recovery(*RECONNECT_BACKOFF.iter().max().unwrap() + oink_network::link::DIAL_BUDGET).await;
+    own_retry_recovery(
+        *RECONNECT_BACKOFF.iter().max().unwrap() + oink_network::link::DIAL_BUDGET,
+        false,
+    )
+    .await;
 }
 
-async fn own_retry_recovery(peer_owner_delay: Duration) {
+async fn own_retry_recovery(peer_owner_delay: Duration, lose_first_attempt: bool) {
     let nodes = start(same_group(2)).await;
     assert!(until(|| ready(&nodes)).await);
     for node in &nodes {
@@ -2095,15 +2192,18 @@ async fn own_retry_recovery(peer_owner_delay: Duration) {
                 .unwrap()))
         .await
     );
-    let source = nodes[0].identity.id();
     let target = nodes[1].identity.id();
     nodes[1]
         .group
         .call(move |owner| {
             // The returned peer can accept incoming connections, but cannot
             // originate one. Recovery must come from the source's own retry.
+            // Model that for the whole run: holding its dial flag `active`
+            // lasted only until the first attempt connected, and an attempt
+            // that failed before Ready (seen once under a loaded full run)
+            // let this peer dial first and win as the outbound end.
             owner.sleeping = false;
-            owner.dials.entry(source).or_default().active = true;
+            owner.no_outbound_dials = true;
             owner.network_checked = Instant::now() + Duration::from_secs(60);
             Ok(())
         })
@@ -2146,6 +2246,31 @@ async fn own_retry_recovery(peer_owner_delay: Duration) {
             drop(release);
         }
     });
+    if lose_first_attempt {
+        // Hold the target's owner so the attempt cannot finish C0, end it from
+        // the source as a failed admission would, then let the target see both
+        // its Connected and its Lost.
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let (entered, entering) = tokio::sync::oneshot::channel();
+        nodes[1].group.send(move |_| {
+            entered.send(()).unwrap();
+            let _ = released.recv();
+        });
+        entering.await.unwrap();
+        let attempt = tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                if let Some(entry) = nodes[0].links.links().by_peer(target) {
+                    break entry.link;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the source's first own retry reaches the target");
+        nodes[0].links.disconnect(attempt, Disconnect::HandshakeTimeout);
+        assert!(until(|| nodes[0].links.links().by_peer(target).is_none()).await);
+        drop(release);
+    }
     // The five-second cap is idle time after failure, not a Ready deadline.
     // This fixture has drained prior dials and the next direct loopback round
     // succeeds: allow its TLS, bootstrap/selection, route installation, C0
@@ -2241,20 +2366,19 @@ async fn full_trust_unknown_peer_cannot_self_admit_through_greeting_request_repl
                         .unwrap(),
                 )
                 .unwrap();
-            let hash = prior.hash().unwrap();
             let selected = Selected {
                 peer_boot: peer,
                 connection: wire::read_connection(&mine.greeting.offer().unwrap().connection_id().unwrap()).unwrap(),
                 agreement: prior.agreement.clone(),
                 negotiated: prior.negotiated.clone(),
-                local_offer: v1::frame::encode(
+                local_offer: v2::frame::encode(
                     &Message::ConnectionOffer(mine.greeting.offer().unwrap()),
-                    v1::limits::CONFIG_FRAME,
+                    v2::limits::CONFIG_FRAME,
                 )
                 .unwrap(),
-                peer_offer: v1::frame::encode(
+                peer_offer: v2::frame::encode(
                     &Message::ConnectionOffer(prior.greeting.offer().unwrap()),
-                    v1::limits::CONFIG_FRAME,
+                    v2::limits::CONFIG_FRAME,
                 )
                 .unwrap(),
             };
@@ -2298,18 +2422,18 @@ async fn full_trust_unknown_peer_cannot_self_admit_through_greeting_request_repl
             session.direction = Direction::Outbound;
             let greeting_ok = owner.control(link, &info).is_err() && owner.sessions[&link].sent.is_none();
             let begin_rejected = owner.begin_admission(link).is_err();
-            let lookup_rejected = owner.lookup(link).is_err() && !owner.lookups.contains_key(&link);
-            let request = admission::request(&claimed, peer_id, hash, 0).unwrap();
+            let lookup_rejected = owner.lookup(link).is_err() && !owner.member.looking_up(link);
+            let request = admission::request(&claimed, peer_id, 0).unwrap();
             let request_error = owner
-                .control(link, &v1::frame::encode(&request, v1::limits::CONFIG_FRAME).unwrap())
+                .control(link, &v2::frame::encode(&request, v2::limits::CONFIG_FRAME).unwrap())
                 .is_err();
             let request_rejected =
                 request_error && owner.sessions[&link].accepted.is_none() && owner.state.digest().unwrap() == original;
             // A previously sent request must not let Reply bypass current local trust.
             owner.sessions.get_mut(&link).unwrap().sent = Some(owner.state.clone());
-            let reply = admission::reply(&claimed, peer_id, hash, 0).unwrap();
+            let reply = admission::reply(&claimed, peer_id, 0).unwrap();
             let reply_rejected = owner
-                .control(link, &v1::frame::encode(&reply, v1::limits::CONFIG_FRAME).unwrap())
+                .control(link, &v2::frame::encode(&reply, v2::limits::CONFIG_FRAME).unwrap())
                 .is_err()
                 && owner.state.digest().unwrap() == original;
             let ready_rejected = owner.ready(link).is_err() && !owner.sessions[&link].ready;
@@ -2454,7 +2578,7 @@ async fn repeated_membership_cycles_pair_rejoin_and_revoke_one_device_across_thr
                 .call(move |owner| {
                     let link = owner.selected_session(a).unwrap().0;
                     let bytes =
-                        v1::frame::encode(&Message::ConfigState(removed.wire().clone()), v1::limits::CONFIG_FRAME)
+                        v2::frame::encode(&Message::ConfigState(removed.wire().clone()), v2::limits::CONFIG_FRAME)
                             .unwrap();
                     // Deliver an older member's queued revocation on a real,
                     // currently authenticated C0 and wait for actual consumption.
@@ -2545,7 +2669,7 @@ async fn telemetry_facts_refresh_observations_without_rebuilding_configuration()
                 }
             }
             let facts = dto::DeviceFacts::from_raw(raw).unwrap();
-            let bytes = v1::frame::encode(&Message::ConfigFacts(facts.clone()), v1::limits::CONFIG_FRAME).unwrap();
+            let bytes = v2::frame::encode(&Message::ConfigFacts(facts.clone()), v2::limits::CONFIG_FRAME).unwrap();
             owner.control(link, &bytes).map_err(internal)?;
             assert_eq!(*owner.facts[&peer], facts);
             assert_eq!(
@@ -2585,9 +2709,9 @@ async fn telemetry_facts_refresh_observations_without_rebuilding_configuration()
             let mut raw = facts.into_raw();
             raw.insert(2, (next + 1).write());
             raw.insert(6, RawValue::from("changed name"));
-            let bytes = v1::frame::encode(
+            let bytes = v2::frame::encode(
                 &Message::ConfigFacts(dto::DeviceFacts::from_raw(raw).unwrap()),
-                v1::limits::CONFIG_FRAME,
+                v2::limits::CONFIG_FRAME,
             )
             .unwrap();
             owner.control(link, &bytes).map_err(internal)?;
@@ -2725,4 +2849,161 @@ fn only_timed_retries_after_a_failure_are_background_dials() {
     dial.ready_link = Some(LinkId(2));
     dial.lost(LinkId(2), now);
     assert_eq!(dial.origin(), DialOrigin::Initial);
+}
+
+/// A real C0 peer publishes only Android facts, never authors its own layout.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn phone_facts_enter_shared_layout_rotate_and_retain_offline_edits() {
+    let nodes = start(same_group(2)).await;
+    assert!(until(|| ready(&nodes)).await);
+    let pc_index = usize::from(nodes[0].identity.id() > nodes[1].identity.id());
+    let phone_index = 1 - pc_index;
+    let pc = &nodes[pc_index];
+    let phone = &nodes[phone_index];
+    let phone_id = phone.identity.id();
+    pc.group.initialize_displays(vec![display("main")]).unwrap();
+    let publish = |width: u32, height: u32| {
+        phone
+            .group
+            .call(move |owner| {
+                owner
+                    .local
+                    .edit(|raw| {
+                        raw.insert(7, RawValue::from("android"));
+                        raw.insert(25, dto::DeviceKind::Mobile.write());
+                        raw.insert(32, true.write());
+                        raw.remove(&18); // Phones do not publish the desktop gain/visibility baseline.
+                        let displays = if width == 0 {
+                            vec![]
+                        } else {
+                            vec![
+                                dto::DisplayFact::from_raw(
+                                    [
+                                        (1, RawValue::from(oink_foundation::display::ANDROID_INPUT_DISPLAY)),
+                                        (2, RawValue::from("Built-in display")),
+                                        (
+                                            3,
+                                            RawValue::Map(
+                                                [
+                                                    (1, 0f64.write()),
+                                                    (2, 0f64.write()),
+                                                    (3, f64::from(width).write()),
+                                                    (4, f64::from(height).write()),
+                                                ]
+                                                .into(),
+                                            ),
+                                        ),
+                                        (5, width.write()),
+                                        (6, height.write()),
+                                        (8, if width > height { 90u16 } else { 0u16 }.write()),
+                                        (9, 1f64.write()),
+                                        (10, true.write()),
+                                        (11, true.write()),
+                                        (12, false.write()),
+                                    ]
+                                    .into(),
+                                )?
+                                .write(),
+                            ]
+                        };
+                        raw.insert(12, RawValue::Array(displays));
+                        Ok(())
+                    })
+                    .map_err(internal)?;
+                owner.publish_facts()?;
+                Ok(())
+            })
+            .unwrap();
+    };
+    publish(400, 800);
+    assert!(until(|| pc.group.applied().layout.device_transform(phone_id).is_some()).await);
+    let before = pc.group.applied();
+    let transform = before.layout.device_transform(phone_id).unwrap();
+    assert!(before.layout.overlaps().is_empty());
+    let snapshot = crate::layout_profiles::render::capture(&before.layout, &before.owners);
+    assert!(
+        snapshot.native.iter().any(|n| n.device.0 == phone_id
+            && n.screens[0].screen.display == oink_foundation::display::ANDROID_INPUT_DISPLAY)
+    );
+    assert!(snapshot.placements.iter().any(|p| p.device.0 == phone_id));
+    let physical = crate::layout_profiles::topology::from_facts(&pc.group.members()).unwrap();
+    assert!(physical.iter().any(|d| d.device.0 == phone_id));
+    assert!(pc.group.router_layout().load().devices.contains(&phone_id));
+    assert!(
+        pc.group
+            .members()
+            .members
+            .iter()
+            .find(|m| m.device == phone_id)
+            .unwrap()
+            .is_mobile()
+    );
+    publish(800, 400);
+    assert!(
+        until(|| pc
+            .group
+            .applied()
+            .layout
+            .screens
+            .iter()
+            .any(|s| s.id.device == phone_id && s.local.w == 800.))
+        .await
+    );
+    assert_eq!(pc.group.applied().layout.device_transform(phone_id), Some(transform));
+    publish(400, 800);
+    assert!(
+        until(|| pc
+            .group
+            .applied()
+            .layout
+            .screens
+            .iter()
+            .any(|s| s.id.device == phone_id && s.local.w == 400.))
+        .await
+    );
+    assert_eq!(pc.group.applied().layout.device_transform(phone_id), Some(transform));
+    publish(0, 0);
+    assert!(until(|| !pc.group.router_layout().load().devices.contains(&phone_id)).await);
+    assert_eq!(pc.group.applied().layout.device_transform(phone_id), Some(transform));
+    phone.group.stop().await;
+    phone.links.stop().await;
+    assert!(
+        until(|| pc
+            .group
+            .members()
+            .members
+            .iter()
+            .any(|m| m.device == phone_id && !m.online))
+        .await
+    );
+    let edited = oink_foundation::Point::new(2., 3.);
+    pc.group
+        .edit_layout(
+            Box::new(move |layout| {
+                layout.place_device(phone_id, edited, transform.1 * 1.2, true);
+                for screen in &mut layout.screens {
+                    if screen.id.device == phone_id {
+                        screen.device_hidden = true;
+                        screen.device_visibility_known = true;
+                    }
+                }
+            }),
+            dto::LayoutSource::Manual,
+        )
+        .unwrap();
+    let retained = pc.group.applied();
+    assert_eq!(
+        retained.layout.device_transform(phone_id),
+        Some((edited, transform.1 * 1.2))
+    );
+    assert!(
+        retained
+            .layout
+            .screens
+            .iter()
+            .filter(|s| s.id.device == phone_id)
+            .all(|s| s.device_hidden)
+    );
+    pc.group.stop().await;
+    pc.links.stop().await;
 }

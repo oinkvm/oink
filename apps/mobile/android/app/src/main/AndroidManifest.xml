@@ -1,0 +1,159 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android" xmlns:tools="http://schemas.android.com/tools">
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-feature android:name="android.hardware.microphone" android:required="false" />
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
+    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.CHANGE_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+    <!-- LowLatencyWifi: WifiLock.acquire() requires it. -->
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+    <!-- Development permission granted by the authorized ADB bootstrap, never by the App itself. -->
+    <uses-permission android:name="android.permission.WRITE_SECURE_SETTINGS" tools:ignore="ProtectedPermissions" />
+    <application android:name=".OinkApplication" android:label="Oink" android:icon="@mipmap/ic_launcher_pink_light" android:roundIcon="@mipmap/ic_launcher_pink_light" android:theme="@style/Theme.Oink" android:allowBackup="true" android:fullBackupContent="@xml/backup_rules" android:dataExtractionRules="@xml/data_extraction_rules" android:supportsRtl="true">
+        <!-- adjustNothing: the Compose layout already pads by the IME inset (safeDrawing). Some
+             ROMs (MIUI) also resize the window, which lifted the composer twice. -->
+        <activity android:name=".MainActivity" android:configChanges="orientation|screenSize" android:windowSoftInputMode="adjustNothing" android:exported="true" />
+        <activity android:name=".LauncherActivity" android:theme="@android:style/Theme.NoDisplay" android:exported="false" android:taskAffinity="${applicationId}.launcher" android:excludeFromRecents="true" android:noHistory="true" />
+        <activity-alias android:name=".Launcher_pink_Light" android:targetActivity=".LauncherActivity" android:icon="@mipmap/ic_launcher_pink_light" android:roundIcon="@mipmap/ic_launcher_pink_light" android:enabled="true" android:exported="true"><intent-filter><action android:name="android.intent.action.MAIN" /><category android:name="android.intent.category.LAUNCHER" /></intent-filter></activity-alias>
+        <activity-alias android:name=".Launcher_pink_Dark" android:targetActivity=".LauncherActivity" android:icon="@mipmap/ic_launcher_pink_dark" android:roundIcon="@mipmap/ic_launcher_pink_dark" android:enabled="false" android:exported="true"><intent-filter><action android:name="android.intent.action.MAIN" /><category android:name="android.intent.category.LAUNCHER" /></intent-filter></activity-alias>
+        <activity-alias android:name=".Launcher_orange_Light" android:targetActivity=".LauncherActivity" android:icon="@mipmap/ic_launcher_orange_light" android:roundIcon="@mipmap/ic_launcher_orange_light" android:enabled="false" android:exported="true"><intent-filter><action android:name="android.intent.action.MAIN" /><category android:name="android.intent.category.LAUNCHER" /></intent-filter></activity-alias>
+        <activity-alias android:name=".Launcher_orange_Dark" android:targetActivity=".LauncherActivity" android:icon="@mipmap/ic_launcher_orange_dark" android:roundIcon="@mipmap/ic_launcher_orange_dark" android:enabled="false" android:exported="true"><intent-filter><action android:name="android.intent.action.MAIN" /><category android:name="android.intent.category.LAUNCHER" /></intent-filter></activity-alias>
+        <activity-alias android:name=".Launcher_violet_Light" android:targetActivity=".LauncherActivity" android:icon="@mipmap/ic_launcher_violet_light" android:roundIcon="@mipmap/ic_launcher_violet_light" android:enabled="false" android:exported="true"><intent-filter><action android:name="android.intent.action.MAIN" /><category android:name="android.intent.category.LAUNCHER" /></intent-filter></activity-alias>
+        <activity-alias android:name=".Launcher_violet_Dark" android:targetActivity=".LauncherActivity" android:icon="@mipmap/ic_launcher_violet_dark" android:roundIcon="@mipmap/ic_launcher_violet_dark" android:enabled="false" android:exported="true"><intent-filter><action android:name="android.intent.action.MAIN" /><category android:name="android.intent.category.LAUNCHER" /></intent-filter></activity-alias>
+        <activity-alias android:name=".Launcher_blue_Light" android:targetActivity=".LauncherActivity" android:icon="@mipmap/ic_launcher_blue_light" android:roundIcon="@mipmap/ic_launcher_blue_light" android:enabled="false" android:exported="true"><intent-filter><action android:name="android.intent.action.MAIN" /><category android:name="android.intent.category.LAUNCHER" /></intent-filter></activity-alias>
+        <activity-alias android:name=".Launcher_blue_Dark" android:targetActivity=".LauncherActivity" android:icon="@mipmap/ic_launcher_blue_dark" android:roundIcon="@mipmap/ic_launcher_blue_dark" android:enabled="false" android:exported="true"><intent-filter><action android:name="android.intent.action.MAIN" /><category android:name="android.intent.category.LAUNCHER" /></intent-filter></activity-alias>
+        <activity-alias android:name=".Launcher_teal_Light" android:targetActivity=".LauncherActivity" android:icon="@mipmap/ic_launcher_teal_light" android:roundIcon="@mipmap/ic_launcher_teal_light" android:enabled="false" android:exported="true"><intent-filter><action android:name="android.intent.action.MAIN" /><category android:name="android.intent.category.LAUNCHER" /></intent-filter></activity-alias>
+        <activity-alias android:name=".Launcher_teal_Dark" android:targetActivity=".LauncherActivity" android:icon="@mipmap/ic_launcher_teal_dark" android:roundIcon="@mipmap/ic_launcher_teal_dark" android:enabled="false" android:exported="true"><intent-filter><action android:name="android.intent.action.MAIN" /><category android:name="android.intent.category.LAUNCHER" /></intent-filter></activity-alias>
+        <activity android:name=".ShareActivity" android:exported="true" android:theme="@style/Theme.Oink.Share">
+            <intent-filter>
+                <action android:name="android.intent.action.SEND" />
+                <action android:name="android.intent.action.SEND_MULTIPLE" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="*/*" />
+            </intent-filter>
+        </activity>
+        <activity-alias android:name=".OpenImages" android:targetActivity=".ShareActivity" android:label="文件传输" android:enabled="false" android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:scheme="content" />
+                <data android:mimeType="image/*" />
+            </intent-filter>
+        </activity-alias>
+        <activity-alias android:name=".OpenVideos" android:targetActivity=".ShareActivity" android:label="文件传输" android:enabled="false" android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:scheme="content" />
+                <data android:mimeType="video/*" />
+            </intent-filter>
+        </activity-alias>
+        <activity-alias android:name=".OpenAudio" android:targetActivity=".ShareActivity" android:label="文件传输" android:enabled="false" android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:scheme="content" />
+                <data android:mimeType="audio/*" />
+            </intent-filter>
+        </activity-alias>
+        <activity-alias android:name=".OpenDocuments" android:targetActivity=".ShareActivity" android:label="文件传输" android:enabled="false" android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:scheme="content" />
+                <data android:mimeType="application/pdf" />
+                <data android:mimeType="text/*" />
+                <data android:mimeType="application/msword" />
+                <data android:mimeType="application/vnd.ms-excel" />
+                <data android:mimeType="application/vnd.ms-powerpoint" />
+                <data android:mimeType="application/vnd.openxmlformats-officedocument.wordprocessingml.document" />
+                <data android:mimeType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" />
+                <data android:mimeType="application/vnd.openxmlformats-officedocument.presentationml.presentation" />
+                <data android:mimeType="application/rtf" />
+                <data android:mimeType="application/vnd.oasis.opendocument.text" />
+                <data android:mimeType="application/vnd.oasis.opendocument.spreadsheet" />
+                <data android:mimeType="application/vnd.oasis.opendocument.presentation" />
+            </intent-filter>
+        </activity-alias>
+        <activity-alias android:name=".OpenArchives" android:targetActivity=".ShareActivity" android:label="文件传输" android:enabled="false" android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:scheme="content" />
+                <data android:mimeType="application/zip" />
+                <data android:mimeType="application/x-zip-compressed" />
+                <data android:mimeType="application/x-7z-compressed" />
+                <data android:mimeType="application/x-rar-compressed" />
+                <data android:mimeType="application/vnd.rar" />
+                <data android:mimeType="application/gzip" />
+                <data android:mimeType="application/x-tar" />
+                <data android:mimeType="application/x-bzip2" />
+            </intent-filter>
+        </activity-alias>
+        <activity-alias android:name=".OpenPackages" android:targetActivity=".ShareActivity" android:label="文件传输" android:enabled="false" android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:scheme="content" />
+                <data android:mimeType="application/vnd.android.package-archive" />
+            </intent-filter>
+        </activity-alias>
+        <activity-alias android:name=".OpenOther" android:targetActivity=".ShareActivity" android:label="文件传输" android:enabled="false" android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:scheme="content" />
+                <data android:mimeType="*/*" />
+                <data android:mimeType="application/octet-stream" />
+            </intent-filter>
+        </activity-alias>
+        <receiver android:name=".recovery.RecoveryBootReceiver" android:directBootAware="true" android:exported="false">
+            <intent-filter>
+                <action android:name="android.intent.action.LOCKED_BOOT_COMPLETED" />
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+            </intent-filter>
+        </receiver>
+        <!-- The privileged-mode pairing notification's reply (the code typed while Settings stays open). -->
+        <receiver android:name=".recovery.PairingCodeReceiver" android:exported="false" />
+        <service android:name=".recovery.RecoveryService" android:directBootAware="true" android:exported="false" android:foregroundServiceType="connectedDevice" />
+        <!-- Oink's only foreground service and persistent notification (user 2026-11-11): connectedDevice
+             always; mediaPlayback and microphone are added at runtime while this phone plays or shares audio. -->
+        <service android:name=".ConnectionService" android:exported="false" android:foregroundServiceType="connectedDevice|mediaPlayback|microphone" />
+        <!-- The persistent notification's 「从共享剪贴板复制」 tap: invisible, its own hidden task. -->
+        <activity android:name=".ClipboardCopyActivity" android:theme="@style/Theme.Oink.Invisible" android:exported="false"
+            android:taskAffinity="${applicationId}.copy" android:launchMode="singleTask" android:excludeFromRecents="true" android:noHistory="true"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|uiMode" />
+        <!-- Quick Settings tiles (user 2026-11-11); non-active mode (no ACTIVE_TILE): bound whenever the panel opens. -->
+        <service android:name=".tiles.CopyTileService" android:label="复制" android:icon="@drawable/ic_tile_copy" android:exported="true" android:permission="android.permission.BIND_QUICK_SETTINGS_TILE">
+            <intent-filter><action android:name="android.service.quicksettings.action.QS_TILE" /></intent-filter>
+        </service>
+        <service android:name=".tiles.PasteTileService" android:label="粘贴" android:icon="@drawable/ic_tile_paste" android:exported="true" android:permission="android.permission.BIND_QUICK_SETTINGS_TILE">
+            <intent-filter><action android:name="android.service.quicksettings.action.QS_TILE" /></intent-filter>
+        </service>
+        <service android:name=".tiles.SpeakerTileService" android:label="接收音频" android:icon="@drawable/ic_tile_speaker" android:exported="true" android:permission="android.permission.BIND_QUICK_SETTINGS_TILE">
+            <intent-filter><action android:name="android.service.quicksettings.action.QS_TILE" /></intent-filter>
+            <meta-data android:name="android.service.quicksettings.TOGGLEABLE_TILE" android:value="true" />
+        </service>
+        <service android:name=".tiles.ForwardTileService" android:label="音频转发" android:icon="@drawable/ic_tile_forward" android:exported="true" android:permission="android.permission.BIND_QUICK_SETTINGS_TILE">
+            <intent-filter><action android:name="android.service.quicksettings.action.QS_TILE" /></intent-filter>
+        </service>
+        <service android:name=".tiles.MicrophoneTileService" android:label="共享麦克风" android:icon="@drawable/ic_tile_microphone" android:exported="true" android:permission="android.permission.BIND_QUICK_SETTINGS_TILE">
+            <intent-filter><action android:name="android.service.quicksettings.action.QS_TILE" /></intent-filter>
+            <meta-data android:name="android.service.quicksettings.TOGGLEABLE_TILE" android:value="true" />
+        </service>
+        <provider android:name=".privilege.PrivilegeProvider" android:directBootAware="true" android:authorities="${applicationId}.privilege" android:exported="true" android:permission="android.permission.DUMP" />
+        <!-- Received clipboard files and downloaded transfer files (opened with the system viewer). -->
+        <provider android:name="androidx.core.content.FileProvider" android:authorities="${applicationId}.received" android:exported="false" android:grantUriPermissions="true">
+            <meta-data android:name="android.support.FILE_PROVIDER_PATHS" android:resource="@xml/file_paths" />
+        </provider>
+    </application>
+</manifest>

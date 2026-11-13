@@ -27,7 +27,7 @@ pub struct Settings {
     #[serde(default = "enabled_by_default")]
     pub remove_ds_store: bool,
     /// "Clipboard deduplication": do not announce a local change that is a
-    /// format subset of the previous clipboard content (crate::dedupe). Local.
+    /// format subset of the current clipboard content (crate::dedupe). Local.
     #[serde(default = "enabled_by_default")]
     pub dedupe: bool,
 }
@@ -127,6 +127,14 @@ impl SharingPolicy {
     pub fn provider(&self, provider: Arc<dyn Provider>) -> Arc<dyn Provider> {
         Arc::new(Filtered {
             provider,
+            policy: self.clone(),
+        })
+    }
+    /// The same live revocation for a file namespace served without a
+    /// provider (announced files rebuilt from their recorded paths).
+    pub fn files(&self, inner: Arc<dyn Namespace>) -> Arc<dyn Namespace> {
+        Arc::new(FilteredFiles {
+            inner,
             policy: self.clone(),
         })
     }
@@ -317,6 +325,13 @@ impl Namespace for FilteredFiles {
     }
     fn retain_files(&self, retention: content::FileRetention) {
         self.inner.retain_files(retention);
+    }
+    fn announced_roots(&self) -> Vec<(NodeId, std::path::PathBuf, [u64; 2])> {
+        if self.policy.check().is_ok() {
+            self.inner.announced_roots()
+        } else {
+            Vec::new()
+        }
     }
     fn roots(&self) -> Vec<FileNode> {
         if self.policy.check().is_ok() {

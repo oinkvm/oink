@@ -162,7 +162,7 @@ mod tests {
     #[test]
     fn foreground_decisions_survive_the_existing_gesture_record_codec() {
         use super::super::wire_values::Value;
-        use oink_protocol::v1::{dto::DiagGestureSummary, schema::WireDto};
+        use oink_protocol::v2::{dto::DiagGestureSummary, schema::WireDto};
         for (decision, desktop, start) in [
             (Decision::ShowDesktop, Some(false), None),
             (Decision::RestoreDesktop, Some(true), None),

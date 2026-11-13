@@ -365,15 +365,8 @@ Stable manifests carry stable releases only; beta manifests carry both.
   apply only to builds below 306000. ATS stays forbidden for every build.
 - `feed.py monitor` also checks every v2 manifest on every source.
 
-- Windows v2 releases are derived from the per-build records
-  `windows/releases/<build>/release.json` in the site (the registered records,
-  same signed MSI package objects), like Mac's `mac/releases/`. Only a merged
-  candidate changes those files, so every deployed v2 catalog is checked against
-  the deployed records. The registry's record lists are not used: `reserve.py`
-  pushes them (v1 catalog, merge fence) before the deployment, and a failed
-  deployment leaves them ahead of the site until a retry deploys.
-  `release.py register` writes the record into the publisher's checkout and
-  reserves v2 sequences with v1.
+- Windows v2 releases are derived from the registered v1 records (same signed
+  MSI package objects). `release.py register` reserves v2 sequences with v1.
 - Mac publication also downloads the notarized DMG, checks length/SHA-256,
   Gatekeeper (`spctl -t open`) and the mounted app identity, signs the exact
   DMG bytes with the official `sign_update`, and writes the public record

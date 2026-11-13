@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { editTransform, readKeyboardMapping } from './model';
+import { keyboardForTarget, editTransform, readKeyboardMapping } from './model';
 import { DEFAULT_PREFS } from './prefs';
 import type { InputTransform } from '../api/types';
 describe('target-specific key mapping edits',()=>{
@@ -124,4 +124,63 @@ describe('custom mapping independent of active preset',()=>{
     expect(decoded.allowFnMapping).toBe(false);
     expect(decoded.capsSplit).toBe(false);
   });
+});
+
+describe('Android target row',()=>{
+  const none={preset:'none' as const,table:[]};
+  const current:InputTransform={macos:{reverse_wheel:true,keyboard:none},windows:{reverse_wheel:true,keyboard:none},overrides:[]};
+  it('creates the Android row from a Mac in macOS feel without touching the PC rows',()=>{
+    const result=editTransform(current,'mac',{...DEFAULT_PREFS,keyPreset:'mac'},undefined,'android');
+    expect(result.macos).toBe(current.macos);expect(result.windows).toBe(current.windows);
+    expect(result.android?.reverse_wheel).toBe(true);
+    expect(result.android?.keyboard.preset).toBe('mac_feel');
+    // ⌘ (left GUI) acts as Ctrl, Ctrl as Meta, on both sides.
+    expect(result.android?.keyboard.table).toEqual(expect.arrayContaining([{from:0x700e3,to:0x700e0},{from:0x700e0,to:0x700e3},{from:0x700e7,to:0x700e4}]));
+    expect(readKeyboardMapping(result.android!.keyboard,'mac','android').keyPreset).toBe('mac');
+  });
+  it('stores the Windows source Android feel as a positional row and reads it back as Android',()=>{
+    const result=editTransform(current,'win',{...DEFAULT_PREFS,keyPreset:'android'},undefined,'android');
+    expect(result.android?.keyboard.preset).toBe('win_feel');
+    expect(result.android?.keyboard.table.every(m=>m.from===m.to)).toBe(true);
+    const decoded=readKeyboardMapping(result.android!.keyboard,'win','android');
+    expect(decoded.keyPreset).toBe('android');
+    expect(decoded.map.keys).toMatchObject({ctrl:'ctrl',win:'win',alt:'alt'});
+  });
+  it('maps Mac modifiers by position in Android feel, including the right side',()=>{
+    const result=editTransform(current,'mac',{...DEFAULT_PREFS,keyPreset:'android'},undefined,'android');
+    expect(result.android?.keyboard.preset).toBe('win_feel');
+    expect(result.android?.keyboard.table).toEqual(expect.arrayContaining([
+      {from:0x700e0,to:0x700e0},{from:0x700e2,to:0x700e3},{from:0x700e3,to:0x700e2},
+      {from:0x700e4,to:0x700e4},{from:0x700e6,to:0x700e7},{from:0x700e7,to:0x700e6},
+    ]));
+    const decoded=readKeyboardMapping(result.android!.keyboard,'mac','android');
+    expect(decoded.keyPreset).toBe('android');
+    expect(decoded.map.keys).toMatchObject({control:'ctrl',option:'win',command:'alt'});
+  });
+  it('shows an explicit unmapped Mac row truthfully without rewriting it on wheel edits',()=>{
+    const value={...current,android:{reverse_wheel:false,keyboard:none}};
+    const decoded=readKeyboardMapping(none,'mac','android');
+    expect(decoded.keyPreset).toBe('custom');
+    expect(decoded.map.keys).toMatchObject({control:'ctrl',option:'alt',command:'win'});
+    const prefs={...DEFAULT_PREFS,keyPreset:decoded.keyPreset,keyCustom:{...DEFAULT_PREFS.keyCustom,mac:decoded.map}};
+    expect(editTransform(value,'mac',prefs,true,'android').android?.keyboard).toBe(none);
+    expect(editTransform(value,'mac',{...prefs,allowFnMapping:true},undefined,'android').android?.keyboard.preset).toBe('custom');
+    expect(editTransform(value,'mac',{...prefs,capsSplit:true,keyCustom:{...prefs.keyCustom,mac:{...decoded.map,capsLong:'caps'}}},undefined,'android').android?.keyboard.preset).toBe('custom');
+  });
+  it('reads a same-system identity row as the local feel with local key names',()=>{
+    const decoded=readKeyboardMapping(none,'mac','macos');
+    expect(decoded.keyPreset).toBe('mac');
+    expect(decoded.map.keys).toMatchObject({control:'control',option:'option',command:'command'});
+  });
+});
+
+it('uses Mac feel only for an omitted Android row from a Mac source', () => {
+  const empty = {preset:'none' as const,table:[],caps_tap_hold:null,saved_custom:null};
+  const current = {macos:{reverse_wheel:false,keyboard:empty},windows:{reverse_wheel:false,keyboard:empty},overrides:[]};
+  expect(readKeyboardMapping(keyboardForTarget(current,'mac','android'),'mac','android').keyPreset).toBe('mac');
+  expect(readKeyboardMapping(keyboardForTarget(current,'win','android'),'win','android').keyPreset).toBe('android');
+  for (const preset of ['none','custom'] as const) {
+    const keyboard = {...empty,preset};
+    expect(keyboardForTarget({...current,android:{reverse_wheel:false,keyboard}},'mac','android')).toBe(keyboard);
+  }
 });

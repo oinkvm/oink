@@ -141,15 +141,28 @@ fn input(cmd: Command) -> Option<INPUT> {
             scan,
             extended,
             down,
+            vk_scan,
         } => (
             INPUT_KEYBOARD,
             MOUSEINPUT::default(),
             KEYBDINPUT {
                 wVk: if scan { 0 } else { code },
-                wScan: if scan { code } else { 0 },
+                wScan: if scan { code } else { vk_scan },
                 dwFlags: if scan { KEYEVENTF_SCANCODE } else { 0 }
                     | if extended { KEYEVENTF_EXTENDEDKEY } else { 0 }
                     | if down { 0 } else { KEYEVENTF_KEYUP },
+                time: 0,
+                dwExtraInfo: TAG,
+            },
+        ),
+        // Text is a press and release per unit; nothing is held across commands.
+        Command::Unicode { unit, down } => (
+            INPUT_KEYBOARD,
+            MOUSEINPUT::default(),
+            KEYBDINPUT {
+                wVk: 0,
+                wScan: unit,
+                dwFlags: KEYEVENTF_UNICODE | if down { 0 } else { KEYEVENTF_KEYUP },
                 time: 0,
                 dwExtraInfo: TAG,
             },
@@ -282,6 +295,7 @@ impl Injector {
                 scan,
                 extended,
                 down,
+                vk_scan,
             } => {
                 let key = (1 + u16::from(scan) + u16::from(extended) * 2, code);
                 if down {
@@ -292,6 +306,7 @@ impl Injector {
                             scan,
                             extended,
                             down: false,
+                            vk_scan,
                         },
                     );
                 } else {
@@ -1326,6 +1341,7 @@ mod drag_press_tests {
             scan: true,
             extended: false,
             down: true,
+            vk_scan: 0,
         })
         .unwrap();
         // SAFETY: Key constructs INPUT_KEYBOARD without sending it.

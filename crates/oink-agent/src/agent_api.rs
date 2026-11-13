@@ -10,7 +10,7 @@ use crate::threads::input::InputCommand;
 use oink_display::layout as dl;
 use oink_foundation::input::PermissionState;
 use oink_foundation::{DeviceId, Point, Size};
-use oink_protocol::v1::{
+use oink_protocol::v2::{
     dto::{self, DeviceFacts},
     schema::WireValue,
 };
@@ -70,8 +70,22 @@ pub(crate) fn parse_os(s: &str) -> Os {
         "macos" => Os::Macos,
         "windows" => Os::Windows,
         "linux" => Os::Linux,
+        // Phones publish these in DeviceFacts key 7 (oink-mobile-core).
+        "android" => Os::Android,
+        "ios" => Os::Ios,
         _ => Os::Other,
     }
+}
+
+/// Phones publish "android" / "ios" (oink-mobile-core); the member list showed
+/// them as "other" before these variants existed.
+#[cfg(test)]
+#[test]
+fn phone_platforms_are_not_other() {
+    assert_eq!(parse_os("android"), Os::Android);
+    assert_eq!(parse_os("ios"), Os::Ios);
+    assert_eq!(parse_os("macos"), Os::Macos);
+    assert_eq!(parse_os("plan9"), Os::Other);
 }
 
 pub(crate) fn local_os_version() -> String {
@@ -225,6 +239,66 @@ fn link_info(node: &Node, peer: DeviceId) -> Option<LinkInfo> {
         }),
     })
 }
+/// Route submenu projection of one peer (route-selection design 6).
+pub(crate) fn member_routes(
+    table: &oink_network::link::LinkTable,
+    peer: DeviceId,
+    name: impl Fn(DeviceId) -> String,
+) -> crate::api::MemberRoutes {
+    use oink_network::link::{Direction, LinkPath, LinkState, RouteRecord, RouteRowState};
+    let entry = table.by_peer(peer);
+    let route = entry.and_then(|e| e.route.as_ref());
+    let ms = |d: Option<std::time::Duration>| d.map(|d| d.as_secs_f64() * 1000.);
+    let via = entry.and_then(|e| match e.path {
+        LinkPath::Relayed { via } if e.state == LinkState::Ready => Some(via),
+        _ => None,
+    });
+    let passive = via.is_none() && route.is_some_and(|r| r.direction == Direction::Inbound);
+    crate::api::MemberRoutes {
+        device: peer.into(),
+        available: route.is_some(),
+        relayed: via.is_some(),
+        relay_via_name: via.map(name),
+        passive,
+        peer_ip: entry.and_then(|e| e.remote_address).map(|a| a.ip().to_string()),
+        current_rtt_ms: ms(route.and_then(|r| r.current_median)).or_else(|| ms(entry.and_then(|e| e.rtt))),
+        selection: match route
+            .filter(|r| !r.pin_unavailable && r.direction == Direction::Outbound)
+            .and_then(|r| r.pin)
+        {
+            None => crate::api::RouteSelection::Auto,
+            Some(RouteRecord::Dial(ip)) => crate::api::RouteSelection::Address { ip: ip.to_string() },
+            Some(RouteRecord::Incoming(_)) => crate::api::RouteSelection::Auto,
+        },
+        remembered_ip: route.and_then(|r| match r.pin {
+            Some(RouteRecord::Dial(ip)) => Some(ip.to_string()),
+            _ => None,
+        }),
+        selection_unavailable: route.is_some_and(|r| r.pin_unavailable),
+        auto_choice: route.and_then(|r| r.auto_choice).map(|ip| ip.to_string()),
+        pending_switch: route.and_then(|r| r.pending_switch).map(|ip| ip.to_string()),
+        can_replace: route.is_some_and(|r| r.can_replace),
+        pending: route.is_some_and(|r| r.pending_manual),
+        rows: route
+            .map(|r| {
+                r.rows
+                    .iter()
+                    .map(|row| crate::api::RouteRow {
+                        ip: row.address.ip().to_string(),
+                        port: row.address.port(),
+                        state: match row.state {
+                            RouteRowState::Measuring => crate::api::RouteRowState::Measuring,
+                            RouteRowState::Reachable => crate::api::RouteRowState::Reachable,
+                            RouteRowState::Unreachable => crate::api::RouteRowState::Unreachable,
+                        },
+                        rtt_ms: ms(row.median),
+                        current: row.current,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+    }
+}
 pub(crate) fn group_view(node: &Node) -> ApiResult<GroupView> {
     let group = node.link_config()?;
     let state = group.applied();
@@ -341,7 +415,7 @@ fn platform_permission_kinds(os: Os, macos_major: i64) -> &'static [PermissionKi
         Os::Macos if macos_major >= 15 => &[Accessibility, InputMonitoring, LocalNetwork, Microphone],
         Os::Macos => &[Accessibility, InputMonitoring, Microphone],
         Os::Windows => &[Firewall, SystemService, Microphone],
-        Os::Linux | Os::Other => &[],
+        Os::Linux | Os::Android | Os::Ios | Os::Other => &[],
     }
 }
 
@@ -354,7 +428,7 @@ fn permission_settings_target(kind: PermissionKind, os: Os, macos_major: i64) ->
     match os {
         Os::Macos => kind.macos_settings_url(),
         Os::Windows => kind.windows_settings_uri(),
-        Os::Linux | Os::Other => None,
+        Os::Linux | Os::Android | Os::Ios | Os::Other => None,
     }
 }
 
@@ -697,9 +771,9 @@ pub(crate) fn layout_api(node: &Node) -> ApiResult<Layout> {
 fn screen_preference_patch(
     display: String,
     key: u32,
-    value: oink_protocol::v1::RawValue,
-) -> oink_protocol::v1::RawValue {
-    use oink_protocol::v1::RawValue;
+    value: oink_protocol::v2::RawValue,
+) -> oink_protocol::v2::RawValue {
+    use oink_protocol::v2::RawValue;
     RawValue::Map(
         [(
             1,
@@ -873,6 +947,28 @@ impl AgentApi for Node {
             crate::device_controls::requests::volume_request(binding, id, volume_percent, muted)
         }))
     }
+    fn mobile_audio_state(&self, device: DeviceKey) -> ApiResult<Option<MobileAudioState>> {
+        let members = self.link_config()?.members();
+        Ok(self
+            .inner
+            .audio
+            .get()
+            .and_then(|audio| audio.mobile_audio_state(device.0, &members)))
+    }
+    fn start_mobile_audio_endpoint(&self, target: MobileAudioTarget) -> ApiResult<()> {
+        self.inner
+            .audio
+            .get()
+            .ok_or_else(|| unavailable("audio unavailable"))?
+            .control_mobile_audio(crate::audio::mobile_endpoints::EndpointAction::Start, target)
+    }
+    fn release_mobile_audio_endpoint(&self, target: MobileAudioTarget) -> ApiResult<()> {
+        self.inner
+            .audio
+            .get()
+            .ok_or_else(|| unavailable("audio unavailable"))?
+            .control_mobile_audio(crate::audio::mobile_endpoints::EndpointAction::Release, target)
+    }
     fn set_local_paused(&self, request_id: String, paused: bool) -> ApiResult<crate::device_cards::DeviceControlReply> {
         Ok(self.local_pause_control(request_id, paused))
     }
@@ -894,6 +990,20 @@ impl AgentApi for Node {
     }
     fn member_addresses(&self, device: DeviceKey) -> ApiResult<Vec<String>> {
         self.link_config()?.member_addresses(device.0)
+    }
+    fn member_routes(&self, device: DeviceKey) -> ApiResult<crate::api::MemberRoutes> {
+        Ok(member_routes(&self.links()?.links(), device.0, |via| {
+            self.device_name(via)
+        }))
+    }
+    fn set_member_route(&self, device: DeviceKey, selection: crate::api::RouteSelection) -> ApiResult<bool> {
+        let choice = match selection {
+            crate::api::RouteSelection::Auto => oink_network::link::RouteChoice::Auto,
+            crate::api::RouteSelection::Address { ip } => {
+                oink_network::link::RouteChoice::Pin(ip.parse().map_err(|_| crate::api::ApiError::InvalidAddress)?)
+            }
+        };
+        Ok(self.links()?.set_route(device.0, choice))
     }
     fn set_member_address(&self, device: DeviceKey, address: String) -> ApiResult<()> {
         self.link_config()?.set_member_address(device.0, address)
@@ -1113,7 +1223,7 @@ impl AgentApi for Node {
         self.edit_device_option(
             self.id().into(),
             dto::LocalOption::MicrophoneInput,
-            input.map(oink_protocol::v1::schema::Text::<512>).write(),
+            input.map(oink_protocol::v2::schema::Text::<512>).write(),
         )
     }
     fn set_audio_settings(&self, settings: PreferencePatch<oink_audio::Settings>) -> ApiResult<()> {
@@ -1145,11 +1255,13 @@ impl AgentApi for Node {
             let current = crate::config::read_transform(current).map_err(|error| ApiError::InvalidState {
                 message: error.to_string(),
             })?;
-            // Diff known projections so omitted future fields stay owner-owned.
+            let mut next: oink_foundation::input_transform::InputTransform = settings.into();
+            // Older callers send the two desktop rows. Omission leaves the Android row alone.
+            next.android = next.android.or_else(|| current.android.clone());
             Ok(crate::config::owner::typed_patch(
                 dto::LocalOption::InputTransform,
                 &crate::config::write_transform(&current),
-                &crate::config::write_transform(&settings.into()),
+                &crate::config::write_transform(&next),
             ))
         })
     }
@@ -1168,6 +1280,18 @@ impl AgentApi for Node {
             target: device.0,
             reply,
         });
+        result
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .map_err(|_| unavailable("input owner did not acknowledge focus admission"))?
+            .map_err(|reason| match reason {
+                oink_routing::FocusLockError::Paused => command_err("local device is paused".into()),
+                oink_routing::FocusLockError::Unavailable => unavailable("focus target is unavailable"),
+            })
+    }
+    fn move_pointer_to(&self, device: DeviceKey) -> ApiResult<()> {
+        let (reply, result) = std::sync::mpsc::sync_channel(1);
+        self.input_thread()?
+            .send(InputCommand::MovePointerTo(device.0, Some(reply)));
         result
             .recv_timeout(std::time::Duration::from_secs(10))
             .map_err(|_| unavailable("input owner did not acknowledge focus admission"))?
@@ -2281,5 +2405,91 @@ mod permission_tests {
             }
             node.shutdown().await;
         });
+    }
+}
+
+#[cfg(test)]
+mod route_projection_tests {
+    use super::member_routes;
+    use crate::api::RouteSelection;
+    use oink_foundation::{
+        DeviceId,
+        session::{Boot, BootPair, PathId},
+    };
+    use oink_network::link::{
+        Direction, LinkEntry, LinkId, LinkPath, LinkState, LinkTable, RouteRecord, RouteRow, RouteRowState, RouteView,
+    };
+
+    #[test]
+    fn current_selection_is_separate_from_memory_and_incoming_uses_actual_peer_ip() {
+        let me = DeviceId([1; 32]);
+        let peer = DeviceId([2; 32]);
+        let boot = |device_id| Boot {
+            device_id,
+            nonce: [1; 16],
+        };
+        let target = "192.0.2.2".parse().unwrap();
+        let mut table = LinkTable {
+            links: vec![LinkEntry {
+                link: LinkId(1),
+                peer,
+                peer_boot: boot(peer),
+                path_id: PathId {
+                    boot_pair: BootPair::new(boot(me), boot(peer)).unwrap(),
+                    coordinator_counter: 1,
+                },
+                route_revision: 0,
+                agreement: Default::default(),
+                peer_formats: None,
+                peer_audio: None,
+                state: LinkState::Ready,
+                path: LinkPath::Direct,
+                remote_address: Some("198.51.100.2:50000".parse().unwrap()),
+                rtt: None,
+                rtt_measured_at: None,
+                lost_packets: 0,
+                sent_packets: 0,
+                udp_bytes_sent: 0,
+                udp_datagrams_sent: 0,
+                udp_bytes_received: 0,
+                low_available: true,
+                low_failure: None,
+                route: Some(RouteView {
+                    direction: Direction::Inbound,
+                    current_target: Some("192.0.2.1".parse().unwrap()),
+                    current_median: None,
+                    pin: Some(RouteRecord::Dial(target)),
+                    pin_set_by: Some(me),
+                    pin_unavailable: true,
+                    rows: vec![RouteRow {
+                        address: (target, 47470).into(),
+                        state: RouteRowState::Unreachable,
+                        median: None,
+                        current: false,
+                    }],
+                    auto_choice: None,
+                    pending_switch: None,
+                    can_replace: false,
+                    pending_manual: false,
+                    relay: None,
+                }),
+            }],
+        };
+        let view = member_routes(&table, peer, |_| "Relay".into());
+        assert_eq!(view.selection, RouteSelection::Auto);
+        assert_eq!(view.remembered_ip.as_deref(), Some("192.0.2.2"));
+        assert_eq!(view.peer_ip.as_deref(), Some("198.51.100.2"));
+        assert!(view.passive && view.selection_unavailable);
+        let route = table.links[0].route.as_mut().unwrap();
+        route.direction = Direction::Outbound;
+        route.pin_unavailable = false;
+        let view = member_routes(&table, peer, |_| "Relay".into());
+        assert_eq!(view.selection, RouteSelection::Address { ip: target.to_string() });
+        let route = table.links[0].route.as_mut().unwrap();
+        route.direction = Direction::Inbound;
+        route.pin = Some(RouteRecord::Incoming("192.0.2.1".parse().unwrap()));
+        let view = member_routes(&table, peer, |_| "Relay".into());
+        assert_eq!(view.selection, RouteSelection::Auto);
+        assert!(view.remembered_ip.is_none());
     }
 }

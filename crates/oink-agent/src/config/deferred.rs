@@ -2,7 +2,7 @@
 //! effective projection change immediately. Every write still uses atomic_write.
 use super::AgentConfig;
 use oink_foundation::maintenance::{self, ActivityKind, Lease};
-use oink_protocol::v1::{RawValue, dto};
+use oink_protocol::v2::{RawValue, dto};
 use std::{
     sync::Arc,
     time::{Duration, Instant},
@@ -86,7 +86,7 @@ impl AgentConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use oink_protocol::v1::schema::WireValue;
+    use oink_protocol::v2::schema::WireValue;
     fn patch(percent: u16) -> RawValue {
         RawValue::Map([(1, percent.write()), (2, false.write())].into_iter().collect())
     }

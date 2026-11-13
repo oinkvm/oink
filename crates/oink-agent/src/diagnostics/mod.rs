@@ -15,6 +15,7 @@ pub(crate) mod keyboard;
 pub(crate) mod layout;
 #[cfg(all(test, debug_assertions))]
 mod layout_tests;
+pub(crate) mod mobile;
 mod privacy;
 mod protocol_violations;
 #[cfg(all(test, debug_assertions))]
@@ -269,6 +270,7 @@ impl Recorder {
     ) -> anyhow::Result<Self> {
         let anon = Anonymizer::for_membership(me, group);
         let mut store = store::Store::open_with_clock(dir, anon.device(me), enabled, clock.clone())?;
+        store.mobile_anonymizer = Some(anon.clone());
         let recovery_source = store.clone();
         // Every live segment needs its producer's identity, even if this peer
         // never invokes the local export API. Keep the recovery source unchanged
@@ -518,7 +520,10 @@ impl Recorder {
         s.previous_instance = None;
         self.inner.queue.store(Arc::new(ArrayQueue::new(QUEUE)));
         s.set_enabled(false)?;
-        s.device = anon.device(me);
+        let device = anon.device(me);
+        s.mobile_proxy.set_holder(device.clone());
+        s.device = device;
+        s.mobile_anonymizer = Some(anon.clone());
         s.snapshot = environment;
         s.write_domain()?;
         self.inner.anon.store(Arc::new(anon));
@@ -635,6 +640,13 @@ impl Recorder {
         store.snapshot = snapshot;
     }
     /// Called on the ordinary diagnostics task; configuration owns redaction.
+    /// Deletes proxied mobile diagnostics of phones that left the group and
+    /// applies the proxy retention period. Blocking file I/O.
+    pub(crate) fn retain_mobile_sources(&self, members: &std::collections::BTreeSet<String>) {
+        if let Err(error) = lock(&self.inner.store).mobile_proxy.retain_sources(members) {
+            tracing::warn!(%error, "mobile diagnostic proxy membership cleanup failed");
+        }
+    }
     pub fn configuration(&self, config: &crate::config_module::ConfigModule) {
         if self.inner.enabled.load(Ordering::Acquire) {
             let anon = self.anonymizer();
@@ -760,7 +772,7 @@ impl Recorder {
         })
     }
     pub fn save(&self, reason: Reason) -> anyhow::Result<BundleInfo> {
-        if matches!(reason, Reason::Emergency | Reason::PeerRestart) {
+        if matches!(reason, Reason::Emergency | Reason::PeerRestart | Reason::NetworkFailure) {
             self.wait_automatic_recovery()?;
         } else {
             self.ensure_recovered()?;
@@ -1100,6 +1112,20 @@ impl std::fmt::Debug for Recorder {
 }
 
 impl Recorder {
+    /// This backend's network layer ended with a fatal error (`code` is the
+    /// `NetworkFatal` name); the host restarts the backend next.
+    pub(crate) fn network_failure(&self, code: &'static str) {
+        self.record(Event::Log {
+            module: module_path!().into(),
+            line: line!(),
+            level: 0,
+            fields: Vec::new(),
+            labels: vec![
+                ("event".into(), "network_failure".into()),
+                ("reason".into(), code.into()),
+            ],
+        });
+    }
     pub(crate) fn peer_lifecycle(&self, peer: DeviceId, phase: &'static str, instance: Option<&str>) {
         let mut labels = vec![
             ("peer".into(), self.anonymizer().device(peer)),
@@ -1135,8 +1161,9 @@ impl Recorder {
             msg = inner;
         }
         let mut event = match msg {
-            InputMsg::TouchpadContacts(_) | InputMsg::VolumeKeyOrigin { .. } => return,
-            InputMsg::Motion { seq, dx, dy } => SafeInput::RemoteMotion {
+            // Text content is never recorded.
+            InputMsg::TouchpadContacts(_) | InputMsg::VolumeKeyOrigin { .. } | InputMsg::Text { .. } => return,
+            InputMsg::Motion { seq, dx, dy } | InputMsg::PointerMotion { seq, dx, dy } => SafeInput::RemoteMotion {
                 seq: *seq,
                 dx: *dx,
                 dy: *dy,

@@ -325,6 +325,18 @@ impl AgentHost {
         self.stop_all(true);
     }
 
+    /// [`supervise`]: stop this platform host like [`Self::shutdown_and_wait`]
+    /// (its ports are free again) but keep the process's instance lock for the
+    /// host that replaces it.
+    fn shutdown_for_restart(mut self) -> InstanceLock {
+        let lock = self
+            ._instance
+            .take()
+            .expect("a supervised platform host owns the instance lock");
+        self.stop_all(true);
+        lock
+    }
+
     fn stop_all(&mut self, wait_for_ports: bool) {
         if let Some(rt) = self.rt.take() {
             let deadline = Instant::now() + Duration::from_secs(3);
@@ -385,6 +397,101 @@ impl Drop for AgentHost {
     }
 }
 
+/// Set when the user quits while no backend runs (during a restart's
+/// back-off): the pending restart is abandoned and the process exits.
+static RESTART_CANCELLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Quit requested with no running backend: abandon a pending restart.
+pub(crate) fn cancel_restart() {
+    RESTART_CANCELLED.store(true, std::sync::atomic::Ordering::Release);
+}
+
+/// Runs the platform backend until it stops for good. When it stopped because
+/// its network layer ended with a fatal error ([`Node::restart_reason`]), the
+/// host is shut down and started again through this same startup path, in
+/// this process with the same instance lock, after
+/// [`oink_network::link::restart::Backoff`] (1 s doubling to 30 s, reset after
+/// a stable minute). The new backend has a new Boot and new owners: a Boot
+/// cannot rejoin with a fresh network layer, and neither platform has a
+/// process supervisor for the backend (the UI follows the restart instead,
+/// `ipc::CLOSING_RESTARTING`). `started` runs after every start; its second
+/// argument counts the restarts so far.
+pub(crate) fn supervise(
+    net: NetworkConfig,
+    lock: InstanceLock,
+    started: impl FnMut(&AgentHost, u32),
+) -> anyhow::Result<()> {
+    supervise_with(
+        lock,
+        |lock| AgentHost::start_platform_locked(net.clone(), lock, IpcMode::Required),
+        started,
+    )
+}
+
+/// [`supervise`] with the host's start step injected (tests start fake
+/// platform hosts). `start` must leave the lock in the host it returns.
+fn supervise_with(
+    lock: InstanceLock,
+    mut start: impl FnMut(InstanceLock) -> anyhow::Result<AgentHost>,
+    mut started: impl FnMut(&AgentHost, u32),
+) -> anyhow::Result<()> {
+    let mut backoff = oink_network::link::restart::Backoff::default();
+    let mut lock = lock;
+    let mut restarts = 0u32;
+    loop {
+        let host = start(lock)?;
+        // A quit is cancelled only while no backend runs; this one handles it.
+        RESTART_CANCELLED.store(false, std::sync::atomic::Ordering::Release);
+        started(&host, restarts);
+        let since = Instant::now();
+        host.block_on(host.node().wait_for_stop());
+        let Some(fatal) = host.node().restart_reason() else {
+            tracing::info!("backend stopping");
+            host.shutdown();
+            return Ok(());
+        };
+        let (delay, attempt) = backoff.next(since.elapsed());
+        tracing::warn!(
+            reason = fatal.code(),
+            attempt,
+            delay_ms = delay.as_millis() as u64,
+            ran_ms = since.elapsed().as_millis() as u64,
+            "restarting the backend after a network-layer failure"
+        );
+        lock = host.shutdown_for_restart();
+        // The retired backend is not reachable for UI or quit requests.
+        crate::backend::detach();
+        restarts += 1;
+        if !wait_before_restart(delay)? {
+            tracing::info!("quit or termination before the backend restarted");
+            return Ok(());
+        }
+        tracing::info!(attempt, "starting the backend again");
+    }
+}
+
+/// The back-off between two backend hosts; false when the user quit or the
+/// process was asked to terminate meanwhile.
+fn wait_before_restart(delay: Duration) -> anyhow::Result<bool> {
+    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+    let termination = {
+        let _enter = rt.enter();
+        Termination::listen()?
+    };
+    Ok(rt.block_on(async move {
+        let cancelled = async {
+            while !RESTART_CANCELLED.load(std::sync::atomic::Ordering::Acquire) {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        };
+        tokio::select! {
+            () = tokio::time::sleep(delay) => !RESTART_CANCELLED.load(std::sync::atomic::Ordering::Acquire),
+            () = termination.wait() => false,
+            () = cancelled => false,
+        }
+    }))
+}
+
 /// 服务进程的退出码：已有服务进程在同一数据目录上运行（本进程什么也没做就退出）。
 pub const EXIT_ALREADY_RUNNING: u8 = 3;
 
@@ -418,20 +525,21 @@ pub fn run_service() -> u8 {
             tracing::info!(?lifetime, "backend process lifetime");
         }
         let started = Instant::now();
-        let host = AgentHost::start_platform_with(IpcMode::Required)?;
-        crate::backend::attach(host.node());
-        let name = host.node().device_name(host.node().id());
-        tracing::info!(
-            pid = std::process::id(),
-            name = %name,
-            port = host.node().links().map(|l| l.local_addr().port()).unwrap_or(0),
-            ms = started.elapsed().as_millis() as u64,
-            "service process running (no window)"
-        );
-        host.block_on(host.node().wait_for_stop());
-        tracing::info!("service process stopping");
-        host.shutdown();
-        Ok(())
+        let net = NetworkConfig::default();
+        // 先取单实例锁，再创建任何 backend（第二个实例不能装上第二套键鼠钩子）。
+        let lock = instance::acquire(&net.data_dir)?;
+        supervise(net, lock, |host, restarts| {
+            crate::backend::attach(host.node());
+            let name = host.node().device_name(host.node().id());
+            tracing::info!(
+                pid = std::process::id(),
+                name = %name,
+                port = host.node().links().map(|l| l.local_addr().port()).unwrap_or(0),
+                ms = started.elapsed().as_millis() as u64,
+                restarts,
+                "service process running (no window)"
+            );
+        })
     });
     service_exit_code(result)
 }
@@ -704,6 +812,102 @@ mod lifecycle_tests {
         worker.join().unwrap();
         entered.unwrap();
         result.expect("host waited for native stop instead of its cleanup deadline")
+    }
+
+    /// User 2026-11-12: a network layer that ends with a fatal error stops
+    /// the backend, its host starts it again through the same startup path
+    /// (new Boot, same instance lock and port) and the link comes back.
+    #[test]
+    fn a_network_failure_restarts_the_backend_and_its_link_comes_back() {
+        let _scenario = crate::test_watchdog::Scenario::new(
+            module_path!(),
+            "a_network_failure_restarts_the_backend_and_its_link_comes_back",
+        );
+        let options = |dir: &std::path::Path, name: &str, port: u16| NodeOptions {
+            net: oink_test_support::network_config(dir.into(), name, port),
+            input: Arc::new(oink_test_support::input::FakeInput::new()),
+            displays: vec![oink_foundation::display::DisplayInfo {
+                key: name.into(),
+                name: name.into(),
+                bounds: oink_foundation::Rect::new(0.0, 0.0, 1600.0, 1000.0),
+                pixel_width: 1600,
+                pixel_height: 1000,
+                reference_extent: None,
+                rotation_deg: 0,
+                is_primary: true,
+                is_builtin: false,
+                is_virtual: false,
+            }],
+            display_backend: None,
+            clipboard: None,
+            mode_switch_in_callback: true,
+            capture_reports_key_repeat: true,
+            cursor_trail: false,
+        };
+        let peer_dir = tempfile::tempdir().unwrap();
+        let peer = AgentHost::start(options(peer_dir.path(), "peer", 0), false).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_path_buf();
+        // One port for every start: the restarted backend binds it again.
+        let port = oink_network::test_ports::reserve(std::net::Ipv4Addr::LOCALHOST.into());
+        let lock = instance::acquire(&path).unwrap();
+        let (sender, starts) = std::sync::mpsc::channel::<(Node, u32)>();
+        let supervisor = std::thread::spawn(move || {
+            supervise_with(
+                lock,
+                |lock| {
+                    let mut host = AgentHost::start(options(&path, "restarting", port), false)?;
+                    host._instance = Some(lock);
+                    Ok(host)
+                },
+                |host, restarts| sender.send((host.node().clone(), restarts)).unwrap(),
+            )
+        });
+        let (first, restarts) = starts.recv_timeout(Duration::from_secs(60)).unwrap();
+        assert_eq!(restarts, 0);
+        let peer_id = peer.node().id();
+        peer.block_on(crate::snapshot_tests::pair(&first, peer.node()));
+        let linked = |node: &Node, other| node.links().is_ok_and(|links| links.links().ready(other));
+        peer.block_on(crate::snapshot_tests::until("linked before the failure", || {
+            linked(&first, peer_id) && linked(peer.node(), first.id())
+        }));
+        let recording = first
+            .inner
+            .diagnostics
+            .get()
+            .is_some_and(|diagnostics| diagnostics.recorder.enabled());
+        oink_network::link::testing::inject_fatal(&first.links().unwrap());
+        let (second, restarts) = starts.recv_timeout(Duration::from_secs(60)).unwrap();
+        assert_eq!(restarts, 1);
+        assert!(
+            matches!(
+                first.restart_reason(),
+                Some(oink_network::link::NetworkFatal::EndpointDriverStopped { .. })
+            ),
+            "{:?}",
+            first.restart_reason()
+        );
+        assert_eq!(second.id(), first.id());
+        assert_ne!(second.inner.boot, first.inner.boot, "a restart takes a new Boot");
+        assert_eq!(second.restart_reason(), None);
+        assert_eq!(second.links().unwrap().local_addr().port(), port);
+        if recording {
+            let bundles = second.inner.diagnostics.get().unwrap().recorder.list().unwrap();
+            assert!(
+                bundles
+                    .iter()
+                    .any(|b| b.reason == crate::diagnostics::Reason::NetworkFailure),
+                "{bundles:?}"
+            );
+        }
+        // Membership is durable: the new backend reconnects without pairing.
+        peer.block_on(crate::snapshot_tests::until("linked after the restart", || {
+            linked(&second, peer_id) && linked(peer.node(), second.id())
+        }));
+        // An ordinary stop ends the supervisor instead of restarting.
+        second.request_stop();
+        supervisor.join().unwrap().unwrap();
+        peer.shutdown_and_wait();
     }
 
     #[cfg(unix)]

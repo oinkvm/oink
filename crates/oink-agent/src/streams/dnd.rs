@@ -5,7 +5,7 @@ use oink_foundation::DeviceId;
 use oink_network::link::{InboundLow, InboundStream, LinkId, LinkLayer, LinkLost, StreamClosed, StreamId};
 use oink_protocol::{
     frame::{StreamCode, StreamKind},
-    v1::{self, Message, dto},
+    v2::{self, Message, dto},
 };
 use std::collections::HashMap;
 
@@ -70,7 +70,7 @@ impl DndStreams {
         if self.paused || !state.attached || !valid(&message) {
             return false;
         }
-        let Ok(bytes) = v1::frame::encode(&message, v1::limits::LOW_FRAME) else {
+        let Ok(bytes) = v2::frame::encode(&message, v2::limits::LOW_FRAME) else {
             return false;
         };
         let send_max = oink_foundation::transfer::LowOptions::message_bytes(bytes.len());

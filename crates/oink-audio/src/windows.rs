@@ -55,6 +55,26 @@ pub struct Capture {
     worker: Option<JoinHandle<()>>,
     muted_owned: Arc<AtomicBool>,
     info: CaptureInfo,
+    /// The worker leaves its mute lease here on exit; the owner decides between
+    /// restoring it (forwarding end) and handing it to the next capture.
+    parked_mute: Arc<Mutex<Option<LeaseThread>>>,
+}
+
+/// The source-output mute lease of one forwarding session, between a retired
+/// capture and its replacement. A capture rebuild is not a forwarding end: the
+/// endpoint stays muted and no media pause runs. Dropping it (forwarding ended
+/// before a replacement adopted it) restores local output, pausing media first.
+pub struct HeldSourceMute(LeaseThread);
+impl HeldSourceMute {
+    /// Restore local output now and report an unconfirmed restoration.
+    pub fn finish(mut self) -> Option<String> {
+        self.0.finish().err()
+    }
+}
+impl std::fmt::Debug for HeldSourceMute {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("HeldSourceMute").field(&self.0.id).finish()
+    }
 }
 
 impl Capture {
@@ -64,13 +84,65 @@ impl Capture {
     pub fn restart_reason(&self) -> Option<String> {
         self.restart.lock().ok().and_then(|reason| reason.clone())
     }
+    /// Join IO and restore the mute lease (pause first) before the owner
+    /// publishes stop/off state.
     pub fn finish(&mut self) -> Option<String> {
         self.shutdown();
+        if let Some(mut lease) = self.take_parked()
+            && let Err(error) = lease.finish()
+        {
+            self.record_cleanup_failure(error);
+        }
         self.cleanup_error.lock().ok().and_then(|error| error.clone())
     }
 
+    /// Join IO for a rebuild within the same forwarding session. The mute lease
+    /// is returned for `continue_encoded` instead of being restored, unless it
+    /// already lost ownership or the default output changed (restored here).
+    pub fn finish_keep_mute(&mut self) -> (Option<String>, Option<HeldSourceMute>) {
+        self.shutdown();
+        let held = match self.take_parked() {
+            Some(lease) if lease.transferable() && !self.default_output_changed() => Some(HeldSourceMute(lease)),
+            Some(mut lease) => {
+                if let Err(error) = lease.finish() {
+                    self.record_cleanup_failure(error);
+                }
+                None
+            }
+            None => None,
+        };
+        (self.cleanup_error.lock().ok().and_then(|error| error.clone()), held)
+    }
+
+    fn take_parked(&self) -> Option<LeaseThread> {
+        self.parked_mute.lock().ok().and_then(|mut parked| parked.take())
+    }
+
+    fn record_cleanup_failure(&self, error: String) {
+        if let Ok(mut cleanup) = self.cleanup_error.lock() {
+            *cleanup = Some(error.clone());
+        }
+        if let Ok(mut current) = self.error.lock() {
+            *current = Some(error);
+        }
+        // A failed lease release must not announce a successful native rebuild.
+        if let Ok(mut restart) = self.restart.lock() {
+            *restart = None;
+        }
+    }
+
     pub fn start_encoded(encoder: crate::source::Encoder, mute: bool, dir: PathBuf) -> Result<Self, String> {
-        Self::start_inner(Box::new(encoder), mute.then_some(dir), Some(0))
+        Self::start_inner(Box::new(encoder), mute.then_some(dir), Some(0), None)
+    }
+
+    /// Muted replacement capture for the same forwarding session: adopts the
+    /// retired capture's mute lease instead of restoring and re-muting.
+    pub fn continue_encoded(
+        encoder: crate::source::Encoder,
+        held: HeldSourceMute,
+        dir: PathBuf,
+    ) -> Result<Self, String> {
+        Self::start_inner(Box::new(encoder), Some(dir), Some(0), Some(held.0))
     }
 
     /// Actual WASAPI parameters observed after stream startup, including an
@@ -83,6 +155,7 @@ impl Capture {
         encoder: Box<crate::source::Encoder>,
         recovery_dir: Option<PathBuf>,
         requested: Option<u32>,
+        held: Option<LeaseThread>,
     ) -> Result<Self, String> {
         let stop = Arc::new(AtomicBool::new(false));
         let error = Arc::new(Mutex::new(None));
@@ -98,8 +171,13 @@ impl Capture {
         let worker_restart = restart.clone();
         let cleanup_error = Arc::new(Mutex::new(None));
         let worker_cleanup_error = cleanup_error.clone();
-        let muted_owned = Arc::new(AtomicBool::new(false));
+        // An adopted lease keeps publishing ownership through its own flag.
+        let muted_owned = held
+            .as_ref()
+            .map_or_else(|| Arc::new(AtomicBool::new(false)), |held| held.muted_owned.clone());
         let worker_muted = Arc::clone(&muted_owned);
+        let parked_mute = Arc::new(Mutex::new(None));
+        let worker_parked = parked_mute.clone();
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
         let worker = thread::Builder::new()
             .name("oink-wasapi-capture".into())
@@ -110,10 +188,11 @@ impl Capture {
                     recovery_dir.as_deref(),
                     worker_muted,
                     requested,
+                    held,
                     WorkerSignals {
                         stop: &worker_stop,
                         changes: &worker_changes,
-                        cleanup_error: &worker_cleanup_error,
+                        parked: &worker_parked,
                     },
                 );
 
@@ -159,6 +238,7 @@ impl Capture {
             worker: Some(worker),
             muted_owned,
             info: CaptureInfo::default(),
+            parked_mute,
         };
         match ready_rx.recv() {
             Ok(Ok(info)) => {
@@ -166,11 +246,11 @@ impl Capture {
                 Ok(capture)
             }
             Ok(Err(error)) => {
-                capture.shutdown();
+                let _ = capture.finish();
                 Err(error)
             }
             Err(_) => {
-                capture.shutdown();
+                let _ = capture.finish();
                 Err("WASAPI capture worker terminated during initialization".into())
             }
         }
@@ -196,7 +276,7 @@ impl Capture {
     }
 
     /// Successful capture stop after an external endpoint control notification.
-    /// Published only after IO and the mute lease have been released.
+    /// Published after IO stopped; `finish` then releases the mute lease.
     pub fn local_controls_changed(&self) -> bool {
         self.local_controls_changed.load(Ordering::Acquire)
     }
@@ -211,7 +291,7 @@ impl Capture {
 
 impl Drop for Capture {
     fn drop(&mut self) {
-        self.shutdown();
+        let _ = self.finish();
     }
 }
 
@@ -259,7 +339,7 @@ fn endpoint_id(device: &IMMDevice) -> Result<String, String> {
 struct WorkerSignals<'a> {
     stop: &'a AtomicBool,
     changes: &'a Arc<source_devices::Changes>,
-    cleanup_error: &'a Mutex<Option<String>>,
+    parked: &'a Mutex<Option<LeaseThread>>,
 }
 fn capture_worker(
     encoder: Box<crate::source::Encoder>,
@@ -267,13 +347,11 @@ fn capture_worker(
     recovery_dir: Option<&Path>,
     muted_owned: Arc<AtomicBool>,
     requested: Option<u32>,
+    // An early return before adoption drops (restores) a held lease.
+    mut held: Option<LeaseThread>,
     signals: WorkerSignals<'_>,
 ) -> Result<bool, String> {
-    let WorkerSignals {
-        stop,
-        changes,
-        cleanup_error,
-    } = signals;
+    let WorkerSignals { stop, changes, parked } = signals;
     let _com = ComApartment::initialize()?;
     // SAFETY: all interfaces are created, used, and released on this initialized
     // COM thread. WASAPI receives a valid 48kHz stereo IEEE float format. Buffer
@@ -338,23 +416,33 @@ fn capture_worker(
         };
         // Declare the lease first so unwinding drops the running audio client
         // before restoration touches its endpoint's mute state.
-        let mut mute_lease = None;
+        let mut mute_lease: Option<LeaseThread>;
         opened
             .client
             .Start()
             .map_err(|error| format!("start WASAPI capture: {error}"))?;
         let running = RunningClient(opened.client.clone());
         opened.report_started();
-        if let Some(dir) = recovery_dir {
-            mute_lease = Some(MuteLease::start(device, dir, muted_owned)?);
-        }
+        mute_lease = match held.take() {
+            // A rebuild of the same forwarding on the same endpoint: the
+            // endpoint never unmutes between the two captures.
+            Some(held) if held.id == id => Some(held),
+            held => {
+                // A lease for another endpoint ends here (restored on drop).
+                drop(held);
+                match recovery_dir {
+                    Some(dir) => Some(LeaseThread::start(&id, dir, muted_owned)?),
+                    None => None,
+                }
+            }
+        };
         let mut realtime = RealtimeCapture::start(&opened, clock, buffer_duration, encoder)?;
         if ready.send(Ok(opened.info.clone())).is_err() {
             return Ok(false);
         }
         let result: Result<bool, String> = (|| {
             while !stop.load(Ordering::Acquire) {
-                if let Some(lease) = &mut mute_lease
+                if let Some(lease) = &mute_lease
                     && lease.check_ownership()?
                 {
                     return Ok(true);
@@ -384,13 +472,159 @@ fn capture_worker(
         }
         realtime.stop();
         drop(running);
-        if let Some(lease) = &mut mute_lease
-            && let Err(error) = lease.finish()
-        {
-            *cleanup_error.lock().unwrap() = Some(error.clone());
-            return Err(error);
+        // IO is gone; the mute is not. Only the owner knows whether this exit
+        // ends forwarding (restore) or is a rebuild (handover).
+        if let Some(lease) = mute_lease.take() {
+            *parked.lock().unwrap() = Some(lease);
         }
         result
+    }
+}
+
+/// Full-system echo reference: WASAPI loopback of the exact render endpoint
+/// Oink plays to (endpoint loopback includes this process, as the reference
+/// must). No permission, no mute lease, no endpoint setting is touched. A
+/// polling MMCSS thread only copies packets into the reference handoff.
+/// Returns Ok when `stop` is set, or the reason the Oink playback reference
+/// must be used instead.
+pub(crate) fn run_system_reference(
+    control: &Arc<crate::echo::Control>,
+    output_id: &str,
+    stop: &AtomicBool,
+) -> Result<(), (crate::echo::SystemStatus, String)> {
+    use crate::echo::{SystemFeed, SystemPacket, SystemStatus};
+    use windows::core::Interface;
+    const DEVICE_INVALIDATED: i32 = 0x8889_0004_u32 as i32;
+    let id = output_id
+        .strip_prefix("wasapi:")
+        .ok_or_else(|| (SystemStatus::Unsupported, format!("not a WASAPI output: {output_id}")))?;
+    let _com = ComApartment::initialize().map_err(|e| (SystemStatus::StartFailed, e))?;
+    let enumerator = enumerator().map_err(|e| (SystemStatus::StartFailed, e))?;
+    let device = exact_device(&enumerator, id)
+        .map_err(|e| (SystemStatus::StartFailed, e))?
+        .ok_or_else(|| {
+            (
+                SystemStatus::OutputChanged,
+                "output endpoint is no longer active".into(),
+            )
+        })?;
+    // Driver-default shared period, polled: never asks the shared engine for
+    // a different periodicity than Oink's own render stream set.
+    let opened = OpenedCapture::open(&device, None).map_err(|e| (SystemStatus::StartFailed, e))?;
+    let rate = opened.info.sample_rate;
+    let max_frames = opened.max_frames as usize;
+    let buffer_duration = Duration::from_nanos((max_frames as u64 * 1_000_000_000).div_ceil(u64::from(rate.max(1))));
+    let clock = QpcClock::calibrate().map_err(|e| (SystemStatus::Unsupported, format!("QPC unavailable: {e}")))?;
+    // SAFETY: initialized client on this COM thread.
+    unsafe { opened.client.Start() }.map_err(|e| (SystemStatus::StartFailed, format!("start loopback: {e}")))?;
+    let _running = RunningClient(opened.client.clone());
+    let mut scratch = vec![0.0f32; max_frames * 2];
+    let mut schedule = crate::realtime::Schedule::device(0, 0).map_err(|e| (SystemStatus::StartFailed, e))?;
+    // Loopback stops delivering while the endpoint renders nothing (no
+    // packet, not a SILENT packet): such a pause is silence. The margin
+    // covers the client buffer, so silence is never declared for a span
+    // whose packet is still queued.
+    let mut feed = SystemFeed::new(
+        control.clone(),
+        rate,
+        true,
+        buffer_duration * 2 + Duration::from_millis(10),
+        max_frames * 8,
+    );
+    tracing::info!(rate, max_frames, backend = %opened.info.backend,
+        latency_frames = ?opened.info.reported_latency_frames,
+        "full-system echo reference loopback running");
+    let guard = schedule
+        .enter()
+        .map_err(|e| (SystemStatus::StartFailed, format!("enter MMCSS: {e}")))?;
+    let mut failure: Option<(SystemStatus, String)> = None;
+    'poll: while !stop.load(Ordering::Acquire) {
+        let mut delivered = false;
+        for _ in 0..8 {
+            let mut pending = 0;
+            // SAFETY: live capture interface; raw HRESULTs avoid error-text work.
+            let result = unsafe { (opened.capture.vtable().GetNextPacketSize)(opened.capture.as_raw(), &mut pending) };
+            if result.0 < 0 {
+                failure = Some((result.0, "GetNextPacketSize")).map(classify(DEVICE_INVALIDATED));
+                break 'poll;
+            }
+            if pending == 0 {
+                break;
+            }
+            let (mut data, mut frames, mut flags, mut position, mut qpc) = (std::ptr::null_mut(), 0, 0, 0, 0);
+            // SAFETY: pointers stay valid until the matching ReleaseBuffer.
+            let result = unsafe {
+                (opened.capture.vtable().GetBuffer)(
+                    opened.capture.as_raw(),
+                    &mut data,
+                    &mut frames,
+                    &mut flags,
+                    &mut position,
+                    &mut qpc,
+                )
+            };
+            if result.0 < 0 {
+                failure = Some((result.0, "GetBuffer")).map(classify(DEVICE_INVALIDATED));
+                break 'poll;
+            }
+            let arrived = Instant::now();
+            let silent = flags & AUDCLNT_BUFFERFLAGS_SILENT.0 as u32 != 0;
+            let count = (frames as usize).min(max_frames);
+            let samples = &mut scratch[..count * 2];
+            if silent || data.is_null() {
+                samples.fill(0.0);
+            } else {
+                // SAFETY: exactly the returned stereo f32 bytes, read before release.
+                let bytes = unsafe { std::slice::from_raw_parts(data, count * 8) };
+                for (sample, bytes) in samples.iter_mut().zip(bytes.as_chunks::<4>().0) {
+                    *sample = f32::from_le_bytes(*bytes);
+                }
+            }
+            // SAFETY: same interface and the exact returned frame count.
+            let result = unsafe { (opened.capture.vtable().ReleaseBuffer)(opened.capture.as_raw(), frames) };
+            if result.0 < 0 {
+                failure = Some((result.0, "ReleaseBuffer")).map(classify(DEVICE_INVALIDATED));
+                break 'poll;
+            }
+            if count == 0 {
+                continue;
+            }
+            delivered = true;
+            let timed = flags & AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR.0 as u32 == 0;
+            let discontinuity =
+                flags & AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY.0 as u32 != 0 || count != frames as usize;
+            feed.packet(SystemPacket {
+                samples,
+                stamp: timed.then(|| clock.map(qpc, arrived, buffer_duration)).flatten(),
+                position: timed.then_some(position),
+                discontinuity,
+                arrived,
+            });
+        }
+        let now = Instant::now();
+        if !delivered {
+            feed.idle(now);
+        }
+        feed.account(now);
+        thread::sleep(Duration::from_millis(2));
+    }
+    drop(guard);
+    match failure {
+        Some((status, text)) => {
+            feed.fail(status, text.clone());
+            Err((status, text))
+        }
+        None => Ok(()),
+    }
+}
+fn classify(invalidated: i32) -> impl Fn((i32, &str)) -> (crate::echo::SystemStatus, String) {
+    move |(code, call)| {
+        let status = if code == invalidated {
+            crate::echo::SystemStatus::OutputChanged
+        } else {
+            crate::echo::SystemStatus::CaptureFailed
+        };
+        (status, format!("loopback {call} failed: HRESULT 0x{:08X}", code as u32))
     }
 }
 
@@ -1019,6 +1253,9 @@ struct MuteLease {
     observer: VolumeSubscription,
     journal: Journal,
     _system_lock: EndpointMuteLock,
+    /// Forwarding only began once mute was confirmed; a failed setup is no
+    /// forwarding end and never pauses media.
+    acquired: bool,
     finished: bool,
 }
 impl MuteLease {
@@ -1042,6 +1279,7 @@ impl MuteLease {
             journal,
             observer,
             _system_lock: system_lock,
+            acquired: false,
             finished: false,
         };
         if lease.observer.ownership_lost() || lease.observer.read(&lease.observer.id)? != Some(before.clone()) {
@@ -1067,6 +1305,7 @@ impl MuteLease {
             lease.journal.revoke()?;
             return Err("user changed endpoint controls during mute setup".into());
         }
+        lease.acquired = true;
         Ok(lease)
     }
 
@@ -1083,16 +1322,154 @@ impl MuteLease {
             return Ok(());
         }
         self.observer.muted_owned.store(false, Ordering::Release);
-        if self.observer.ownership_lost() {
-            self.journal.release_after_volume_change(&self.observer)?;
-        }
-        let report = self.journal.recover_or_defer(&self.observer, false)?;
+        let report = if self.acquired {
+            // A real forwarding end: pause (also for a pre-muted output or
+            // after a user takeover), then restore only what Oink changed.
+            self.journal.end_forwarding(&self.observer)?
+        } else {
+            // Failed setup: resolve the write-ahead entry without a pause.
+            if self.observer.ownership_lost() {
+                self.journal.release_after_volume_change(&self.observer)?;
+            }
+            self.journal.recover_or_defer(&self.observer, false)?
+        };
         self.finished = true;
         tracing::info!(?report, "audio endpoint mute lease finished");
         Ok(())
     }
 }
 impl Drop for MuteLease {
+    fn drop(&mut self) {
+        if let Err(error) = self.finish() {
+            tracing::error!(%error, "audio mute restoration incomplete; inspect retained recovery journal");
+        }
+    }
+}
+
+enum LeaseCommand {
+    Check(SyncSender<Result<bool, String>>),
+    Finish(SyncSender<Result<(), String>>),
+}
+
+/// A source mute lease running on its own COM thread for its whole life.
+///
+/// Why a thread: the global ownership mutex is thread-affine (ReleaseMutex from
+/// another thread fails and leaves it owned until that thread exits, i.e.
+/// abandoned), and the endpoint volume interface and its change callback belong
+/// to the apartment that created them. A capture rebuild moves only this handle
+/// to the replacement capture worker; the lease itself never migrates. The
+/// ownership latch is an atomic, so the capture loop polls it without a round
+/// trip. Compiled and unit-tested on Windows 11 (2026-11-12); an installed
+/// build has not exercised a real rebuild yet.
+struct LeaseThread {
+    id: String,
+    revoked: Arc<AtomicBool>,
+    muted_owned: Arc<AtomicBool>,
+    commands: SyncSender<LeaseCommand>,
+    worker: Option<JoinHandle<()>>,
+}
+impl std::fmt::Debug for LeaseThread {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LeaseThread").field("endpoint", &self.id).finish()
+    }
+}
+impl LeaseThread {
+    fn start(id: &str, dir: &Path, muted_owned: Arc<AtomicBool>) -> Result<Self, String> {
+        let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+        let (commands, command_rx) = mpsc::sync_channel::<LeaseCommand>(1);
+        let lease_id = id.to_owned();
+        let dir = dir.to_path_buf();
+        let owned = muted_owned.clone();
+        let worker = thread::Builder::new()
+            .name("oink-audio-mute".into())
+            .spawn(move || {
+                let com = match ComApartment::initialize() {
+                    Ok(com) => com,
+                    Err(error) => {
+                        let _ = ready_tx.send(Err(error));
+                        return;
+                    }
+                };
+                let started = enumerator()
+                    .and_then(|enumerator| exact_device(&enumerator, &lease_id))
+                    .and_then(|device| device.ok_or_else(|| "audio endpoint unavailable before mute".to_string()))
+                    .and_then(|device| MuteLease::start(device, &dir, owned));
+                let mut lease = match started {
+                    Ok(lease) => lease,
+                    Err(error) => {
+                        let _ = ready_tx.send(Err(error));
+                        return;
+                    }
+                };
+                let _ = ready_tx.send(Ok(lease.observer.revoked.clone()));
+                // A dropped handle without Finish still restores via MuteLease's Drop.
+                while let Ok(command) = command_rx.recv() {
+                    match command {
+                        LeaseCommand::Check(reply) => {
+                            let _ = reply.send(lease.check_ownership());
+                        }
+                        LeaseCommand::Finish(reply) => {
+                            let _ = reply.send(lease.finish());
+                            break;
+                        }
+                    }
+                }
+                // COM interfaces are released before this thread's apartment.
+                drop(lease);
+                drop(com);
+            })
+            .map_err(|error| format!("spawn audio mute lease thread: {error}"))?;
+        let revoked = match ready_rx.recv() {
+            Ok(Ok(revoked)) => revoked,
+            result => {
+                let _ = worker.join();
+                return Err(match result {
+                    Ok(Err(error)) => error,
+                    _ => "audio mute lease thread stopped during setup".into(),
+                });
+            }
+        };
+        Ok(Self {
+            id: id.to_owned(),
+            revoked,
+            muted_owned,
+            commands,
+            worker: Some(worker),
+        })
+    }
+
+    fn request<T>(&self, command: impl FnOnce(SyncSender<Result<T, String>>) -> LeaseCommand) -> Result<T, String> {
+        let (reply, response) = mpsc::sync_channel(1);
+        self.commands
+            .send(command(reply))
+            .map_err(|_| "audio mute lease thread stopped".to_string())?;
+        response
+            .recv()
+            .map_err(|_| "audio mute lease thread stopped".to_string())?
+    }
+
+    fn check_ownership(&self) -> Result<bool, String> {
+        if !self.revoked.load(Ordering::Acquire) {
+            return Ok(false);
+        }
+        self.request(LeaseCommand::Check)
+    }
+
+    /// Still owns the exact endpoint state it muted (no user control change).
+    fn transferable(&self) -> bool {
+        !self.revoked.load(Ordering::Acquire)
+    }
+
+    fn finish(&mut self) -> Result<(), String> {
+        let Some(worker) = self.worker.take() else {
+            return Ok(());
+        };
+        let result = self.request(LeaseCommand::Finish);
+        let _ = worker.join();
+        result
+    }
+}
+impl Drop for LeaseThread {
     fn drop(&mut self) {
         if let Err(error) = self.finish() {
             tracing::error!(%error, "audio mute restoration incomplete; inspect retained recovery journal");
@@ -1121,6 +1498,7 @@ mod tests {
             worker: Some(worker),
             muted_owned: Arc::new(AtomicBool::new(false)),
             info: Default::default(),
+            parked_mute: Arc::default(),
         };
         assert!(capture.local_controls_changed());
         assert!(capture.error().is_none());

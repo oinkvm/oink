@@ -1,13 +1,13 @@
 use super::*;
 impl Owner {
-    pub(crate) fn receive_revocation(&mut self, candidate: State) -> v1::Result<()> {
-        self.commit(candidate).map_err(|_| v1::ErrorCode::StateConflict)?;
+    pub(crate) fn receive_revocation(&mut self, candidate: State) -> v2::Result<()> {
+        self.commit(candidate).map_err(|_| v2::ErrorCode::StateConflict)?;
         let links = self.sessions.keys().copied().collect::<Vec<_>>();
         for link in links {
             self.close(link, Disconnect::MemberRemoved);
         }
         self.fresh_after_revocation()
-            .map_err(|_| v1::ErrorCode::StateConflict)?;
+            .map_err(|_| v2::ErrorCode::StateConflict)?;
         Ok(())
     }
     pub(crate) fn fresh_after_revocation(&mut self) -> ApiResult<()> {
@@ -27,7 +27,7 @@ impl Owner {
 
     pub(crate) fn commit(&mut self, candidate: State) -> ApiResult<()> {
         let digest = candidate.digest().map_err(internal)?;
-        if let Some(pending) = self.journal.pending_projection().map_err(internal)?
+        if let Some(pending) = self.member.journal.pending_projection().map_err(internal)?
             && oink_network::group_merge::digest(&pending).map_err(internal)? != digest
         {
             return Err(internal("committed projection pending"));
@@ -48,29 +48,21 @@ impl Owner {
             None
         };
         let mut stored = self.stored.clone();
-        stored.state = candidate.wire().clone();
+        stored
+            .replace_runtime_state(candidate.wire().clone())
+            .map_err(internal)?;
         group_store::save(&self.data_dir.join(group_store::STATE_FILE), &stored).map_err(internal)?;
         if changes_group {
             let mut config = self.config.lock().map_err(internal)?;
             let group = candidate.roster().anchor().group;
-            let merging = self
-                .state
-                .roster()
-                .members()
-                .all(|member| candidate.roster().contains(member.device));
-            let switch = |owner: &mut crate::config::owner::OwnerStore| {
-                if merging {
-                    owner.merge_group(group, self.identity.id())
-                } else {
-                    owner.switch_group(group, self.identity.id())
-                }
-            };
+            // A whole-group merge is a group switch too: the audio owner merges
+            // with the target group as after a start, so the target group's
+            // exit stays (global audio configuration, user 2026-11-11 B).
+            let switch = |owner: &mut crate::config::owner::OwnerStore| owner.switch_group(group);
             let mut next_owner = config.owner().clone();
             switch(&mut next_owner).map_err(internal)?;
             let mut next_facts = self.local.clone();
-            next_facts
-                .group(group, &next_owner, self.identity.id())
-                .map_err(internal)?;
+            next_facts.group(group, &next_owner).map_err(internal)?;
             config.update_owner(switch).map_err(internal)?;
             self.local = next_facts;
         }
@@ -97,22 +89,33 @@ impl Owner {
     /// Membership allocation is a separate durable edit, after the exact signed
     /// merge projection. It completes before accepting the next serial join.
     pub(crate) fn reconcile_pointer_shortcuts(&mut self) -> ApiResult<()> {
-        if !self.pointer_shortcuts_pending
-            || self.needs_apply
+        if self.needs_apply
             || !self.state.roster().contains(self.identity.id())
-            || self.journal.pending_projection().map_err(internal)?.is_some()
+            || self.member.journal.pending_projection().map_err(internal)?.is_some()
         {
             return Ok(());
         }
-        let next = self
+        if self.pointer_shortcuts_pending {
+            // Membership changes also place new members in the device order.
+            let next = self
+                .state
+                .reconcile_pointer_slots(self.identity.id())
+                .and_then(|state| state.reconcile_device_order(self.identity.id()))
+                .map_err(internal)?;
+            if next.digest().map_err(internal)? != self.state.digest().map_err(internal)? {
+                self.commit(next)?;
+            }
+            self.pointer_shortcuts_pending = false;
+        }
+        // The pointer base computer (protocol §14.3): written only when empty
+        // or when its device left; the layout's first screens also fill it.
+        if let Some(next) = self
             .state
-            .reconcile_pointer_slots(self.identity.id())
-            .and_then(|state| state.reconcile_device_order(self.identity.id()))
-            .map_err(internal)?;
-        if next.digest().map_err(internal)? != self.state.digest().map_err(internal)? {
+            .reconcile_pointer_base(self.identity.id())
+            .map_err(internal)?
+        {
             self.commit(next)?;
         }
-        self.pointer_shortcuts_pending = false;
         Ok(())
     }
     fn reconcile_source_grants(&self) {
@@ -161,7 +164,7 @@ impl Owner {
         }
         if !self.display_layout_pending()?
             || self.display_layout_dependency.as_ref().is_some_and(|(_, current)| {
-                v1::retained::layout_version_cmp(current, &version).is_ok_and(|o| o.is_lt())
+                v2::retained::layout_version_cmp(current, &version).is_ok_and(|o| o.is_lt())
             })
         {
             self.display_layout_dependency = Some((group, version));
@@ -174,7 +177,7 @@ impl Owner {
         };
         let current = self.state.layout().and_then(|r| r.version()).map_err(internal)?;
         if *group == self.state.roster().anchor().group
-            && v1::retained::layout_version_cmp(&current, version)
+            && v2::retained::layout_version_cmp(&current, version)
                 .map_err(internal)?
                 .is_lt()
         {
@@ -195,7 +198,7 @@ impl Owner {
         // signed merge projection must remain exact until its journal is settled.
         if !self.displays_observed
             || !self.state.roster().contains(self.identity.id())
-            || self.journal.pending_projection().map_err(internal)?.is_some()
+            || self.member.journal.pending_projection().map_err(internal)?.is_some()
         {
             return Ok(());
         }
@@ -203,7 +206,7 @@ impl Owner {
             return Ok(());
         }
         let register = self.state.layout().map_err(internal)?;
-        let layout = v1::layout::register_value(&register).map_err(internal)?;
+        let layout = v2::layout::register_value(&register).map_err(internal)?;
         let members = self.state.roster().members().map(|m| m.device).collect::<Vec<_>>();
         let update = layout_wire::sync_local_displays(
             &layout,
@@ -229,68 +232,65 @@ impl Owner {
                 Ok(())
             })
             .map_err(internal)?;
-        self.commit(State::verify(stored.state, self.state.roster().anchor()).map_err(internal)?)
+        self.commit(State::verify(stored.to_wire().map_err(internal)?, self.state.roster().anchor()).map_err(internal)?)
     }
-    pub(crate) fn project_decision(&mut self) -> ApiResult<bool> {
-        let Some(wire) = self.journal.pending_projection().map_err(internal)? else {
-            return Ok(true);
-        };
-        if let Some(bundle) = self.journal.pending_bundle().map_err(internal)? {
-            let intent = bundle.certificate().and_then(|c| c.intent()).map_err(internal)?;
-            if let Err(error) = self.application.prepare_profile_join_with_target(
-                &intent,
-                &bundle.plan().and_then(|p| p.target_base()).map_err(internal)?,
-            ) {
-                tracing::warn!(%error, "profile handoff deferred before group projection");
-                self.projection_retry = Some(Instant::now() + Duration::from_millis(50));
-                return Ok(false);
+    /// Phones publish native facts, not layout edits. One live desktop authors
+    /// their geometry through the same whole-layout register as desktop hotplug.
+    /// Retain the last geometry when the helper goes away: offline/disabled
+    /// phones remain rigid editable devices and regain their placement on return.
+    fn reconcile_phone_displays(&mut self, ready: &BTreeSet<DeviceId>) -> ApiResult<()> {
+        let writer = std::iter::once(self.identity.id())
+            .chain(ready.iter().copied().filter(|id| {
+                self.facts
+                    .get(id)
+                    .is_some_and(|f| f.device_kind() == Ok(dto::DeviceKind::Desktop))
+            }))
+            .min();
+        if writer != Some(self.identity.id())
+            || self.member.journal.pending_projection().map_err(internal)?.is_some()
+            || self.display_layout_pending()?
+        {
+            return Ok(());
+        }
+        let register = self.state.layout().map_err(internal)?;
+        let before = v2::layout::register_value(&register).map_err(internal)?;
+        let mut current = before.clone();
+        let members = self.state.roster().members().map(|m| m.device).collect::<Vec<_>>();
+        for (device, facts) in &self.facts {
+            if !ready.contains(device)
+                || !members.contains(device)
+                || facts.os().map_err(internal)?.0 != "android"
+                || facts.android_privileged() != Ok(true)
+            {
+                continue;
             }
-        }
-        let roster = wire.roster().map_err(internal)?;
-        let anchor = Anchor {
-            group: GroupId(wire.group().map_err(internal)?.0),
-            root: roster.root_id().map_err(internal)?.0,
-        };
-        let candidate = State::verify(wire, anchor).map_err(internal)?;
-        let digest = candidate.digest().map_err(internal)?;
-        if self.projection_announced != Some(digest) {
-            if let Some(bundle) = self.journal.pending_bundle().map_err(internal)? {
-                self.gossip_transition(&bundle).map_err(internal)?;
-                let intent = bundle.certificate().map_err(internal)?.intent().map_err(internal)?;
-                let pair = wire::read_pair(&intent.pair_id().map_err(internal)?).map_err(internal)?;
-                self.supersede(pair, &intent);
+            let displays = facts
+                .displays()
+                .map_err(internal)?
+                .0
+                .iter()
+                .filter_map(crate::agent_api::display_fact)
+                .filter(|d| d.key == oink_foundation::display::ANDROID_INPUT_DISPLAY)
+                .collect::<Vec<_>>();
+            if displays.is_empty() {
+                continue;
             }
-            self.projection_announced = Some(digest);
+            current =
+                layout_wire::sync_local_displays(&current, *device, &members, &displays, &Default::default(), now_ms())
+                    .map_err(internal)?
+                    .layout;
         }
-        if candidate.roster().anchor() != self.state.roster().anchor() {
-            for (id, session) in &mut self.sessions {
-                if session.ready {
-                    session.ready = false;
-                    session.deadline = Some(Instant::now() + ADMISSION_TIMEOUT);
-                    self.links.retire(*id);
-                    // The transition proof was queued on every old ready C0
-                    // before retiring business authority. Resume signed member
-                    // admission on those same C0s after projection, including
-                    // links between two members that learned the proof elsewhere.
-                    // Otherwise neither endpoint restarts their retired lane.
-                    if candidate.roster().contains(session.peer_boot.device_id)
-                        && !self.recovery_projected.iter().any(|(link, _, _)| link == id)
-                    {
-                        self.recovery_projected.push((*id, None, false));
-                    }
-                }
-            }
+        if current == before {
+            return Ok(());
         }
-        if let Err(error) = self.commit(candidate) {
-            tracing::warn!(%error, "committed group projection deferred");
-            self.projection_retry = Some(Instant::now() + Duration::from_millis(50));
-            return Ok(false);
-        }
-        self.journal.projected(digest).map_err(internal)?;
-        self.projection_retry = None;
-        self.projection_announced = None;
-        self.reconcile_pointer_shortcuts()?;
-        Ok(true)
+        let mut stored = self.stored.clone();
+        stored
+            .edit_layout(&register.version().map_err(internal)?, |raw| {
+                *raw = current.into_raw();
+                Ok(())
+            })
+            .map_err(internal)?;
+        self.commit(State::verify(stored.to_wire().map_err(internal)?, self.state.roster().anchor()).map_err(internal)?)
     }
     pub(crate) fn publish(&mut self) -> ApiResult<()> {
         if self.needs_apply {
@@ -307,6 +307,7 @@ impl Owner {
             })
             .map(|link| link.peer)
             .collect();
+        self.reconcile_phone_displays(&ready)?;
         let previous = self.shared.members.load();
         let previous_group = self.shared.applied.load().group;
         let mut went_offline = false;
@@ -327,7 +328,7 @@ impl Owner {
             tracing::warn!(%error, "could not persist last live link time; will retry");
         }
         let register = self.state.layout().map_err(internal)?;
-        let value = v1::layout::register_value(&register).map_err(internal)?;
+        let value = v2::layout::register_value(&register).map_err(internal)?;
         let mut layout = layout_wire::from_wire(&value).map_err(internal)?;
         // Retained geometry is replicated verbatim, while executable geometry
         // can only reference current members. Offline members remain in the roster.
@@ -339,6 +340,9 @@ impl Owner {
         for (device, facts) in std::iter::once((self.identity.id(), self.local.value()))
             .chain(self.facts.iter().map(|(d, f)| (*d, f.as_ref())))
         {
+            if self.state.roster().contains(device) && facts.os().is_ok_and(|os| os.0 == "android") {
+                owners.insert(device, OwnerLayoutPreferences::default());
+            }
             if self.state.roster().contains(device)
                 && let Some(preferences) = facts.preferences().map_err(internal)?
                 && let Ok(owner) = layout_wire::owner_preferences(&preferences.0)
@@ -374,6 +378,8 @@ impl Owner {
                         // Screen participation controls portals, not input availability:
                         // explicit pointer shortcuts can enter retained hidden screens.
                         && owners.contains_key(device)
+                        && (facts.os().is_ok_and(|os| os.0 != "android")
+                            || (facts.android_privileged() == Ok(true) && facts.displays().is_ok_and(|d| !d.0.is_empty())))
                 })
                 .collect()
         };
@@ -405,10 +411,14 @@ impl Owner {
             }
         }
         let drawing_owners = Arc::new(drawing_owners);
+        // The registry pause policy becomes the send rule of every stream:
+        // while paused, Suspend messages stay back, Allow ones still leave.
+        self.links.set_sharing_paused(paused);
         self.shared.applied.publish(AppliedState {
             group: self.state.roster().anchor().group,
             roster_digest: self.state.roster().digest().map_err(internal)?,
             pointer_slots: self.state.pointer_slots().map_err(internal)?,
+            pointer_base: self.state.pointer_base().map_err(internal)?,
             device_order: self.state.device_order().map_err(internal)?,
             members: members.clone(),
             layout: layout.clone(),
@@ -438,6 +448,7 @@ impl Owner {
                             .map(Arc::new)
                     })
                 };
+                let online = own || ready.contains(&member.device);
                 MemberInfo {
                     device: member.device,
                     is_self: own,
@@ -453,14 +464,15 @@ impl Owner {
                         .map(|n| n.0)
                         .or_else(|| member.os.clone())
                         .unwrap_or_default(),
-                    online: own || ready.contains(&member.device),
+                    online,
                     facts,
                     added_by: Some(member.issuer),
                     added_at_ms: member.issued_ms,
                     last_connected_ms: self
                         .presence
                         .last_connected(self.state.roster().anchor().group, member.device),
-                    protocol_incompatible: self.incompatible.contains(&member.device),
+                    // Discovery hints must never supersede a live authenticated connection.
+                    protocol_incompatible: !online && self.protocol_incompatible(member.device),
                     address_stale: self.dials.get(&member.device).is_some_and(|d| d.failures >= 4),
                 }
             })
@@ -516,7 +528,7 @@ impl Owner {
     }
 
     pub(crate) fn publish_facts(&mut self) -> ApiResult<u64> {
-        if self.needs_apply || self.journal.pending_projection().map_err(internal)?.is_some() {
+        if self.needs_apply || self.member.journal.pending_projection().map_err(internal)?.is_some() {
             return Err(internal("group projection pending"));
         }
         self.observe_links()?;
@@ -549,14 +561,7 @@ impl Owner {
         preferences: Vec<dto::DevicePreference>,
         pause: dto::LocalPauseState,
     ) -> ApiResult<u64> {
-        let watermark = self
-            .config
-            .lock()
-            .map_err(internal)?
-            .owner()
-            .claims(self.stored.group())
-            .watermark();
-        self.local.owner(preferences, pause, watermark).map_err(internal)?;
+        self.local.owner(preferences, pause).map_err(internal)?;
         self.publish()?;
         self.publish_facts()
     }
@@ -623,36 +628,15 @@ impl Owner {
                 (s.ready && s.peer_boot.device_id == peer && self.state.roster().contains(peer)).then_some(*id)
             })
             .ok_or_else(stopped)?;
-        if message.type_id() == 0x0110
-            && !self
-                .links
-                .links()
-                .links
-                .iter()
-                .find(|l| l.link == id)
-                .is_some_and(|l| l.agreement.contains("oink.power/1"))
-        {
-            return Err(invalid("power capability was not negotiated"));
-        }
-        if (0x0d2c..=0x0d2e).contains(&message.type_id())
-            && !self.links.links().links.iter().find(|l| l.link == id).is_some_and(|l| {
-                l.state == oink_network::link::LinkState::Ready && l.agreement.contains("oink.notify/1")
-            })
-        {
-            return Err(invalid("notification capability was not negotiated"));
-        }
-        if (0x0d2f..=0x0d30).contains(&message.type_id())
-            && !self
-                .links
-                .links()
-                .links
-                .iter()
-                .find(|l| l.link == id)
-                .is_some_and(|l| l.agreement.contains("oink.layout.arrangement/1"))
-        {
-            return Err(invalid("arrangement capability was not negotiated"));
-        }
-        self.send(id, message).map_err(internal)
+        // The send gate refuses what this C0 did not negotiate (power and
+        // notifications need oink.device/2, arrangement oink.layout/2).
+        self.send(id, message).map_err(|error| {
+            if error.code == v2::ErrorCode::UnnegotiatedCapability {
+                invalid("the device did not negotiate this control")
+            } else {
+                internal(error)
+            }
+        })
     }
     pub(crate) fn protocol_error(&mut self, link: LinkId, error: dto::ProtocolError) -> ApiResult<()> {
         let session = self.sessions.get(&link).ok_or_else(stopped)?;
@@ -684,7 +668,7 @@ impl Owner {
         source: dto::LayoutSource,
     ) -> ApiResult<()> {
         let register = self.state.layout().map_err(internal)?;
-        let before = v1::layout::register_value(&register).map_err(internal)?;
+        let before = v2::layout::register_value(&register).map_err(internal)?;
         let mut domain = layout_wire::from_wire(&before).map_err(internal)?;
         let previous = domain.clone();
         edit(&mut domain);
@@ -698,7 +682,8 @@ impl Owner {
                 layout_wire::patch(raw, &before, &after)
             })
             .map_err(internal)?;
-        let candidate = State::verify(stored.state.clone(), self.state.roster().anchor()).map_err(internal)?;
+        let candidate =
+            State::verify(stored.to_wire().map_err(internal)?, self.state.roster().anchor()).map_err(internal)?;
         self.commit(candidate)
     }
     pub(crate) fn displays_changed(&mut self, displays: Vec<DisplayInfo>) -> ApiResult<()> {
@@ -717,7 +702,7 @@ impl Owner {
             return Ok(());
         }
         let register = self.state.layout().map_err(internal)?;
-        let before = v1::layout::register_value(&register).map_err(internal)?;
+        let before = v2::layout::register_value(&register).map_err(internal)?;
         let members = self.state.roster().members().map(|m| m.device).collect::<Vec<_>>();
         let update = layout_wire::sync_local_displays(
             &before,
@@ -738,7 +723,9 @@ impl Owner {
                     Ok(())
                 })
                 .map_err(internal)?;
-            self.commit(State::verify(stored.state, self.state.roster().anchor()).map_err(internal)?)?;
+            self.commit(
+                State::verify(stored.to_wire().map_err(internal)?, self.state.roster().anchor()).map_err(internal)?,
+            )?;
         }
         let ids = update
             .layout
@@ -747,7 +734,7 @@ impl Owner {
             .0
             .into_iter()
             .map(|s| s.id())
-            .collect::<v1::Result<Vec<_>>>()
+            .collect::<v2::Result<Vec<_>>>()
             .map_err(internal)?;
         self.detached.applied(&ids);
         detached::save(&self.data_dir.join(detached::DETACHED_FILE), &self.detached).map_err(internal)?;
@@ -769,7 +756,7 @@ impl Owner {
         }
         let mut displays = Vec::new();
         for d in &self.displays {
-            let mut raw: v1::RawMap = [
+            let mut raw: v2::RawMap = [
                 (1, RawValue::from(d.key.as_str())),
                 (2, RawValue::from(d.name.as_str())),
                 (3, rect(d.bounds)),
@@ -784,6 +771,9 @@ impl Owner {
             .into();
             if let Some(size) = d.reference_extent {
                 raw.insert(7, RawValue::Map([(1, size.w.write()), (2, size.h.write())].into()));
+            }
+            if let Some(scale) = oink_display::system_scale(&d.key) {
+                raw.insert(13, scale.write());
             }
             displays.push(dto::DisplayFact::from_raw(raw).map_err(internal)?.write());
         }
@@ -823,7 +813,7 @@ impl Owner {
                 )
                 .map(|e| e.write())
             })
-            .collect::<v1::Result<Vec<_>>>()
+            .collect::<v2::Result<Vec<_>>>()
             .map_err(internal)?;
         self.local
             .edit(|raw| {
@@ -836,12 +826,10 @@ impl Owner {
         if device == self.identity.id() {
             return Err(invalid("use leave group"));
         }
-        let roster = self
-            .state
-            .roster()
-            .remove(&self.identity, device, expected, now_ms())
+        let candidate = self
+            .member
+            .removal(&self.state, device, expected, now_ms())
             .map_err(internal)?;
-        let candidate = self.state.with_roster(&roster).map_err(internal)?;
         self.commit(candidate)?;
         // The signed revocation was just queued by commit. Retire application
         // authority now, retaining C0 until the recipient applies it and closes.
@@ -861,12 +849,11 @@ impl Owner {
         if self.state.roster().members().count() == 1 {
             return Err(invalid("already alone"));
         }
-        let roster = self
-            .state
-            .roster()
-            .remove(&self.identity, self.identity.id(), None, now_ms())
+        let old = self.state.roster().anchor().group;
+        let revoked = self
+            .member
+            .removal(&self.state, self.identity.id(), None, now_ms())
             .map_err(internal)?;
-        let revoked = self.state.with_roster(&roster).map_err(internal)?;
         // Persist and apply our signed departure before notifying the group.
         // Starting the new group may wait for an owner preference transaction;
         // that contention must not roll back or partially publish the departure.
@@ -881,7 +868,11 @@ impl Owner {
             session.deadline = Some(Instant::now() + Duration::from_secs(10));
             self.links.retire_for_departure(*id);
         }
-        self.fresh_after_revocation()
+        self.fresh_after_revocation()?;
+        // Pairings whose request named the group we left can no longer commit.
+        let outs = self.member.left(old, &self.state);
+        let _ = self.execute(None, outs);
+        Ok(())
     }
     pub(crate) fn move_device_order(
         &mut self,

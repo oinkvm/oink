@@ -163,7 +163,7 @@ async fn link_loss_retires_source_offer_and_resumes_without_preference_changes()
 async fn prepared_ack_is_required_and_claim_retake_never_revives_old_session() {
     let mut running = Running::new().await;
     running.held_prepared_acks = Some(Vec::new());
-    running.claim(1, true);
+    running.select_exit(1, true);
     running
         .until(|r| r.owners[0].capture.is_some() && !r.held_prepared_acks.as_ref().unwrap().is_empty())
         .await;
@@ -189,15 +189,18 @@ async fn prepared_ack_is_required_and_claim_retake_never_revives_old_session() {
             .values()
             .all(|session| session.ready())
     );
-    running.claim(1, false);
+    running.select_exit(1, false);
     running
-        .until(|r| matches!(r.owners[0].resolution, Resolution::None { .. }))
+        .until(|r| matches!(r.owners[0].resolution, Resolution::None))
         .await;
     assert!(running.owners[0].capture.is_none());
-    running.claim(1, true);
+    running.select_exit(1, true);
     running.until(Running::prepared_route_ready).await;
     let current = running.owners[0].source_session.prepared().unwrap().clone();
-    assert_ne!(current.session().exit_claim(), old.session().unwrap().exit_claim());
+    assert_ne!(
+        current.session().route_version(),
+        old.session().unwrap().route_version()
+    );
     running.owners[0].message(peer, Message::AudioPrepared(old));
     assert_eq!(running.owners[0].source_session.prepared(), Some(&current));
     assert!(running.owners[0].capture.is_some());
@@ -257,7 +260,7 @@ async fn stale_group_and_requester_boot_refuse_before_persist_or_native_write() 
     let owner = &mut running.owners[0];
     let current = boot(owner.links.boot());
     let group = owner.group.applied().group;
-    let option = dto::LocalOption::ForwardingEnabled;
+    let option = dto::LocalOption::ForwardingControls;
     let revision = lock(&owner.store).owner().revision(option).unwrap();
     let settings = owner.settings.clone();
     assert_eq!(

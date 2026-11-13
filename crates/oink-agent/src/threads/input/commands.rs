@@ -11,7 +11,7 @@ use std::sync::{
 
 const ACTION_CAPACITY: usize = 1024;
 const LOCAL_STATE_CAPACITY: usize = 24;
-const STATE_CAPACITY: usize = LOCAL_STATE_CAPACITY + 2 * oink_protocol::v1::limits::MEMBERS;
+const STATE_CAPACITY: usize = LOCAL_STATE_CAPACITY + 2 * oink_protocol::v2::limits::MEMBERS;
 
 type StateKey = (u8, Option<oink_foundation::DeviceId>);
 
@@ -30,6 +30,8 @@ fn state_key(command: &InputCommand) -> Option<StateKey> {
         PeerAdmission(admission) => return Some((17, Some(admission.boot.device_id))),
         RetirePeer(boot) => return Some((17, Some(boot.device_id))),
         SessionLocked(_) => 19,
+        PointerBase(_) => 24,
+        TextFocus(_) => 25,
         LocalFeel(_) => 6,
         LocalDisplays(_) | LocalDisplayFailure => 7,
         EdgeResistance(_) => 9,
@@ -50,7 +52,7 @@ fn state_key(command: &InputCommand) -> Option<StateKey> {
         | CommitUpdate { .. }
         | AbortUpdate { .. }
         | LockFocusTo { .. }
-        | MovePointerTo(_)
+        | MovePointerTo(..)
         | ReturnPointerHome
         | DiagnosticsSnapshot
         | Outbound { .. }
@@ -87,6 +89,8 @@ impl Clone for StateCommand {
             PeerAdmission(v) => PeerAdmission(v.clone()),
             RetirePeer(v) => RetirePeer(*v),
             SessionLocked(v) => SessionLocked(*v),
+            PointerBase(v) => PointerBase(v.clone()),
+            TextFocus(v) => TextFocus(*v),
             LocalFeel(v) => LocalFeel(v.clone()),
             LocalDisplays(v) => LocalDisplays(v.clone()),
             LocalDisplayFailure => LocalDisplayFailure,
@@ -110,11 +114,13 @@ impl Clone for StateCommand {
             PeerFacts {
                 boot,
                 os,
+                mobile,
                 displays,
                 transform,
             } => PeerFacts {
                 boot: *boot,
                 os: *os,
+                mobile: *mobile,
                 displays: displays.clone(),
                 transform: transform.clone(),
             },

@@ -1,0 +1,22 @@
+Oink AEC3 native subset
+
+WebRTC project authors (BSD-3-Clause), PulseAudio audio-processing import
+at d0569cfa50c1858ee279d77b3fc8870be6902441. See vendor/webrtc/LICENSE,
+COPYING, AUTHORS and PATENTS. No tonarino Rust wrapper is included or linked.
+
+Takuya OOURA FFT, Copyright 1996-2001. See
+vendor/webrtc/common_audio/third_party/ooura/LICENSE. Upstream WebRTC changes
+are covered by its BSD license and additional patent grant. This package is
+acknowledged as requested by its permission notice; Oink makes no FFT edits.
+
+Abseil 20240722.0 (Apache-2.0), headers only. See vendor/abseil/LICENSE.
+
+Oink modifications: retain the initial comfort-noise estimate storage until
+control-thread destruction (realtime-storage.patch). Compile-time namespace
+and QMF symbol isolation, fixed stereo configuration, no dynamic channel
+switching, AEC3 only, no noise suppression or automatic gain control. The
+refined/coarse fixed filter lengths are 256/128 ms; the initial delay is zero.
+The 48 kHz split filterbank and residual echo suppressor are part of the AEC path.
+The thin C ABI and build recipe are Oink code. vendor-manifest.json lists every
+vendored source/header/license SHA-256. sources.txt and avx2-sources.txt specify
+the compiled closure; build.rs adds architecture-specific resampler/FFT files.

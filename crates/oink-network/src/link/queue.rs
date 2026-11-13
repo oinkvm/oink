@@ -34,7 +34,8 @@ pub(super) struct Queue {
     spec: QueueSpec,
     bytes: AtomicUsize,
     closed: AtomicBool,
-    cancelled: AtomicBool,
+    /// Wire value of the code the handle closed with (`StreamCode::None` = 0).
+    close_code: AtomicU64,
     wake: ArcSwapOption<WakeSlot>,
     producer_wake: ArcSwapOption<WakeSlot>,
     pub(super) notify: Notify,
@@ -62,7 +63,7 @@ impl Queue {
             spec,
             bytes: AtomicUsize::new(0),
             closed: AtomicBool::new(false),
-            cancelled: AtomicBool::new(false),
+            close_code: AtomicU64::new(0),
             wake: ArcSwapOption::empty(),
             producer_wake: ArcSwapOption::empty(),
             notify: Notify::new(),
@@ -109,17 +110,19 @@ impl Queue {
         }
     }
     pub(super) fn cancel(&self) {
+        self.close_with(oink_protocol::frame::StreamCode::Cancelled);
+    }
+    pub(super) fn close_with(&self, code: oink_protocol::frame::StreamCode) {
         // Publish the cause before closing/waking: the network owner can consume
-        // this queue before an ordinary module processes its close notification.
-        self.cancelled.store(true, Ordering::Release);
+        // this queue before an ordinary module processes its close notification
+        // (or a `close_stream` command sent just before the handle is dropped).
+        if code != oink_protocol::frame::StreamCode::None {
+            self.close_code.store(code.to_wire(), Ordering::Release);
+        }
         self.close();
     }
     pub(super) fn close_code(&self) -> oink_protocol::frame::StreamCode {
-        if self.cancelled.load(Ordering::Acquire) {
-            oink_protocol::frame::StreamCode::Cancelled
-        } else {
-            oink_protocol::frame::StreamCode::None
-        }
+        oink_protocol::frame::StreamCode::from_wire(self.close_code.load(Ordering::Acquire))
     }
     pub(super) fn post(&self, encoded: Vec<u8>, limit: usize) -> Result<(), PostError> {
         // Also timestamps the in-memory stream test pair, where writer and reader
@@ -228,7 +231,7 @@ impl Queue {
 
 /// Fixed slots keep the realtime datagram handoff free of per-packet allocation.
 struct Datagram {
-    bytes: [u8; oink_protocol::v1::limits::DATAGRAM],
+    bytes: [u8; oink_protocol::v2::limits::DATAGRAM],
     len: usize,
     arrived: std::time::Instant,
     pending: oink_foundation::pending_age::Pending,
@@ -353,7 +356,7 @@ impl DatagramQueue {
         if self.is_closed() {
             return Err(super::DatagramError::Closed);
         }
-        if encoded.len() + self.datagram_prefix.load(Ordering::Acquire) > oink_protocol::v1::limits::DATAGRAM
+        if encoded.len() + self.datagram_prefix.load(Ordering::Acquire) > oink_protocol::v2::limits::DATAGRAM
             || encoded.len() > self.spec.bytes as usize
         {
             self.dropped.fetch_add(1, Ordering::Relaxed);
@@ -383,7 +386,7 @@ impl DatagramQueue {
         };
         let mut item = Datagram {
             pending,
-            bytes: [0; oink_protocol::v1::limits::DATAGRAM],
+            bytes: [0; oink_protocol::v2::limits::DATAGRAM],
             len: encoded.len(),
             arrived,
         };
@@ -435,7 +438,7 @@ impl DatagramQueue {
 /// Registered numeric fields only; never retain or decode a payload into an owning tree.
 /// The fixed IDs are frozen protocol allocations. Tests tie them to the registry.
 fn crossing_token(bytes: &[u8], first_motion_epoch: &AtomicU64) -> Option<Token> {
-    use oink_protocol::v1::{frame::OpaqueFrame, hot::Map, limits};
+    use oink_protocol::v2::{frame::OpaqueFrame, hot::Map, limits};
     let kind = u16::from_le_bytes(bytes.get(..2)?.try_into().ok()?);
     if kind != 0x0101 && (kind != 0x0201 || first_motion_epoch.load(Ordering::Relaxed) == 0) {
         return None;
@@ -477,12 +480,12 @@ mod tests {
         }));
         let baseline = wakes.load(Ordering::Relaxed);
         let mut bytes = [0; 1100];
-        let size = oink_protocol::v1::hot::encode_into(
+        let size = oink_protocol::v2::hot::encode_into(
             0x0606,
             &[
-                (1, oink_protocol::v1::hot::Value::Uint(1)),
-                (2, oink_protocol::v1::hot::Value::Uint(1)),
-                (3, oink_protocol::v1::hot::Value::Uint(1)),
+                (1, oink_protocol::v2::hot::Value::Uint(1)),
+                (2, oink_protocol::v2::hot::Value::Uint(1)),
+                (3, oink_protocol::v2::hot::Value::Uint(1)),
             ],
             &mut bytes,
             1100,
@@ -538,15 +541,15 @@ mod tests {
                 .collect()
         }
         assert_eq!(
-            oink_protocol::v1::registry::message(0x0101).unwrap().name,
+            oink_protocol::v2::registry::message(0x0101).unwrap().name,
             "ControlFocusEnter"
         );
         assert_eq!(
-            oink_protocol::v1::registry::message(0x0201).unwrap().name,
+            oink_protocol::v2::registry::message(0x0201).unwrap().name,
             "InputMotion"
         );
-        let focus = fixture(include_str!("../../../oink-protocol/tests/fixtures/v1/0101-future.hex"));
-        let motion = fixture(include_str!("../../../oink-protocol/tests/fixtures/v1/0201-future.hex"));
+        let focus = fixture(include_str!("../../../oink-protocol/tests/fixtures/v2/0101-future.hex"));
+        let motion = fixture(include_str!("../../../oink-protocol/tests/fixtures/v2/0201-future.hex"));
         let pending = AtomicU64::new(0);
         assert_eq!(crossing_token(&motion, &pending), None);
         assert_eq!(crossing_token(&focus, &pending), Some(Token { epoch: 1, sequence: 0 }));

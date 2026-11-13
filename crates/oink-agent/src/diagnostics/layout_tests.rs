@@ -3,7 +3,7 @@ use super::*;
 use crate::config_module::runtime_tests::{display, ready, same_group, start, stop, until};
 use oink_display::layout::SizeSource;
 use oink_foundation::Size;
-use oink_protocol::v1::dto::LayoutSource;
+use oink_protocol::v2::dto::LayoutSource;
 
 fn owner_settings(
     node: &crate::config_module::runtime_tests::Running,

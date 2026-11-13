@@ -238,25 +238,13 @@ impl BulkLink for TestLink {
                     requested.send(demand).unwrap();
                 }
                 match request {
-                    ContentMsg::TargetStored { delivery, receipt } => {
-                        registry.clipboard_receipt(DeviceId([2; 32]), delivery, Some(receipt));
-                        source
-                            .send(&ContentMsg::TerminalAck {
-                                delivery,
-                                receipt: Some(receipt),
-                            })
-                            .await
-                            .unwrap()
+                    ContentMsg::TargetStored { delivery } => {
+                        registry.clipboard_receipt(DeviceId([2; 32]), delivery, None);
+                        source.send(&ContentMsg::TerminalAck { delivery }).await.unwrap()
                     }
                     ContentMsg::Failed { delivery, .. } => {
                         registry.clipboard_receipt(DeviceId([2; 32]), delivery, None);
-                        source
-                            .send(&ContentMsg::TerminalAck {
-                                delivery,
-                                receipt: None,
-                            })
-                            .await
-                            .unwrap()
+                        source.send(&ContentMsg::TerminalAck { delivery }).await.unwrap()
                     }
                     request => {
                         if let Err(error) = registry.serve(DeviceId([2; 32]), request, &mut source).await {
@@ -320,6 +308,10 @@ async fn native_representation_readers_share_verified_memory_without_receiver_fi
         "receiving native representations must not create a disk batch"
     );
     let reading = remote.clone();
+    assert_eq!(
+        find(&remote.inventory(), RepresentationId(1)).unwrap().data.size(),
+        Some(ContentSize::Unknown)
+    );
     let (mut first, mut second) = tokio::task::spawn_blocking(move || {
         (
             reading.open(RepresentationId(1)).unwrap(),
@@ -329,6 +321,11 @@ async fn native_representation_readers_share_verified_memory_without_receiver_fi
     .await
     .unwrap();
     assert_eq!(link.opened.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(
+        find(&remote.inventory(), RepresentationId(1)).unwrap().data.size(),
+        Some(ContentSize::Known(8)),
+        "completed canonical bytes provide the actual activity size"
+    );
     lease.cancel();
     source.bytes.lock().unwrap().clear();
     drop(remote);
@@ -393,7 +390,7 @@ async fn real_drop_demand_unblocks_retained_source_and_native_reader_uses_local_
         .wait_for(|p| p.phase == TransferPhase::Stored && p.source_acknowledged)
         .await
         .unwrap();
-    assert!(remote.receipt().is_some());
+    assert!(remote.stored());
     lease.cancel();
     drop(lease);
     drop(deferred);
@@ -536,7 +533,7 @@ async fn hover_reads_active_provider_without_starting_delivery() {
     assert_eq!(bytes, b"original");
     assert_eq!(requests.recv().await, Some(hover));
     assert_eq!(link.opened.load(std::sync::atomic::Ordering::SeqCst), 1);
-    assert!(remote.receipt().is_none(), "hover is not a completed delivery");
+    assert!(!remote.stored(), "hover is not a completed delivery");
     assert!(
         deferred.complete(original),
         "hover did not commit or finish the native source"
@@ -586,7 +583,7 @@ async fn native_preview_reads_cross_platform_hover_without_committing_the_source
     assert_eq!(preview, [ClipData::Text("original".into())]);
     assert_eq!(requests.recv().await, Some(Demand::Hover(holder)));
     assert!(requests.try_recv().is_err());
-    assert!(remote.receipt().is_none());
+    assert!(!remote.stored());
     assert!(
         deferred.complete(original),
         "preview must leave the native source uncommitted"
@@ -643,7 +640,7 @@ async fn preview_timeout_leaves_hover_cache_usable_and_does_not_start_delivery()
         .expect("blocked hover must not delay Begin until the transfer watchdog");
     release.send(()).unwrap();
     assert_eq!(reason(&error), Unavailable::NoProgress);
-    assert!(remote.receipt().is_none());
+    assert!(!remote.stored());
     let reader = remote.clone();
     let bytes = tokio::task::spawn_blocking(move || read_all(&mut reader.open(RepresentationId(1)).unwrap()))
         .await
@@ -665,7 +662,7 @@ async fn preview_timeout_leaves_hover_cache_usable_and_does_not_start_delivery()
         ),
         Unavailable::Permission
     );
-    assert!(remote.receipt().is_none());
+    assert!(!remote.stored());
     remote.cancel();
 }
 
@@ -717,7 +714,7 @@ async fn release_intent_alone_does_not_upgrade_an_outstanding_hover_to_drop() {
         requests.try_recv().is_err(),
         "release intent alone authorizes no source drop"
     );
-    assert!(remote.receipt().is_none());
+    assert!(!remote.stored());
     let reader = remote.clone();
     let pending = tokio::task::spawn_blocking(move || read_all(&mut reader.open(RepresentationId(1)).unwrap()));
     assert_eq!(requests.recv().await, Some(Demand::Drop(holder)));
@@ -941,7 +938,7 @@ async fn network_reconstruction_profile_is_checked_before_a_source_read() {
     let lease = registry.register(Arc::new(fixture())).unwrap();
     let inventory = lease.inventory();
     let mut channel = NoIo;
-    use oink_protocol::v1::{RawValue as V, dto, schema::WireDto};
+    use oink_protocol::v2::{RawValue as V, dto, schema::WireDto};
     let empty = dto::FormatSupport::from_raw(
         [
             (1, V::Array(vec![])),
@@ -988,6 +985,25 @@ fn terminal_file_failures_are_not_retried_as_operating_system_interrupts() {
         let mut reader = terminal_reader(Box::new(Once(Some(failure))));
         assert_eq!(reason(&reader.read_exact(&mut [0; 3]).unwrap_err()), failure);
     }
+}
+
+#[test]
+fn generation_guard_failure_ends_cache_copy_without_retry() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let checks = Arc::new(AtomicUsize::new(0));
+    let observed = checks.clone();
+    let mut reader = guarded(
+        Box::new(io::Cursor::new(vec![7; 16])),
+        Arc::new(move || match observed.fetch_add(1, Ordering::SeqCst) {
+            0 => Ok(()),
+            1 => Err(unavailable(Unavailable::Superseded)),
+            _ => panic!("semantic clipboard cancellation must not be retried"),
+        }),
+    )
+    .unwrap();
+    let error = io::copy(&mut reader, &mut io::sink()).unwrap_err();
+    assert_eq!(reason(&error), Unavailable::Superseded);
+    assert_eq!(checks.load(Ordering::SeqCst), 2);
 }
 
 /// Already projected bytes, as supplied by a remote provider to native targets.
@@ -1488,4 +1504,340 @@ fn portable_image_prefers_existing_png_and_preserves_fallback_and_native_order()
     source.png_failure = Some(Unavailable::Superseded);
     assert_eq!(reason(&portable(&source).unwrap_err()), Unavailable::Superseded);
     assert_eq!(reads.lock().unwrap().as_slice(), [RepresentationId(2)]);
+}
+
+/// A copied bitmap: a native PNG whose portable form is the same bytes.
+struct CopiedPng(Inventory);
+impl Provider for CopiedPng {
+    fn inventory(&self) -> Inventory {
+        self.0.clone()
+    }
+    fn open(&self, id: RepresentationId) -> io::Result<FileReader> {
+        Portable(self.0.clone()).open(id)
+    }
+    fn translator(&self) -> Arc<dyn Translator> {
+        struct Png;
+        impl Translator for Png {
+            fn standard(&self, _: &Representation, bytes: &[u8]) -> io::Result<Vec<ClipData>> {
+                Ok(vec![ClipData::Png(bytes.to_vec())])
+            }
+        }
+        Arc::new(Png)
+    }
+}
+
+/// A copied bitmap (Mac `public.png`) and the phone-side read of its slot.
+fn copied_png(seq: u64, png: Vec<u8>) -> CopiedPng {
+    let mut inventory = fixture().inventory();
+    inventory.id.clip.seq = seq;
+    inventory.id.generation = seq;
+    inventory.items[0].representations.truncate(1);
+    let rep = &mut inventory.items[0].representations[0];
+    rep.id = RepresentationId(1);
+    rep.format = NativeFormat::Mac("public.png".into());
+    rep.standard = Some(StandardFormat::Png);
+    rep.data = RepresentationData::Inline(png);
+    CopiedPng(inventory)
+}
+
+fn mobile_read(offer: OfferId) -> oink_protocol::v2::dto::ClipboardContentRead {
+    use oink_protocol::v2::schema::{FixedBytes, WireDto, WireValue};
+    oink_protocol::v2::dto::ClipboardContentRead::from_raw(
+        [
+            (1, FixedBytes([9u8; 16]).write()),
+            (2, crate::wire::offer_id(offer).write()),
+            (3, 1u32.write()),
+            (4, 1u32.write()),
+        ]
+        .into(),
+    )
+    .unwrap()
+}
+
+async fn read_slot(
+    registry: &Arc<Registry>,
+    offer: OfferId,
+    retained: Option<&crate::retained::RetainedClips>,
+) -> Result<Vec<u8>, Unavailable> {
+    let (out, mut replies) = tokio::sync::mpsc::unbounded_channel();
+    let (_requests, input) = tokio::sync::mpsc::unbounded_channel();
+    let mut channel = Pipe { out: Some(out), input };
+    registry
+        .serve_mobile_representation(DeviceId([2; 32]), &mobile_read(offer), retained, &mut channel)
+        .await
+        .unwrap();
+    drop(channel);
+    let mut bytes = Vec::new();
+    while let Some(reply) = replies.recv().await {
+        match reply {
+            ContentMsg::RepresentationBytes {
+                offset, bytes: chunk, ..
+            } => {
+                assert_eq!(offset, bytes.len() as u64);
+                bytes.extend(chunk);
+            }
+            ContentMsg::RepresentationEnd { size, .. } => {
+                assert_eq!(size, bytes.len() as u64);
+                return Ok(bytes);
+            }
+            ContentMsg::RepresentationFailed { reason, .. } => return Err(reason),
+            other => panic!("unexpected reply {other:?}"),
+        }
+    }
+    panic!("no terminal reply")
+}
+
+pub(crate) fn test_png(width: u32, height: u32) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut encoder = png::Encoder::new(&mut out, width, height);
+    encoder.set_color(png::ColorType::Rgb);
+    encoder.set_depth(png::BitDepth::Eight);
+    let mut writer = encoder.write_header().unwrap();
+    writer
+        .write_image_data(&[200, 30, 30].repeat((width * height) as usize))
+        .unwrap();
+    writer.finish().unwrap();
+    out
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_retained_copy_serves_the_phone_after_the_clipboard_moved_on() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = crate::retained::RetainedClips::new(dir.path());
+    let registry = Arc::new(Registry::default());
+    let png = test_png(64, 32);
+    let copied = copied_png(5, png.clone());
+    let offer = copied.inventory().id;
+    let lease = registry.register(Arc::new(copied)).unwrap();
+    assert_eq!(registry.retain_for_phones(&lease, &store).unwrap(), 1);
+    // The native clipboard changes: the source is superseded and released.
+    lease.cancel();
+    drop(lease);
+    assert_eq!(read_slot(&registry, offer, Some(&store)).await, Ok(png.clone()));
+    // Without the retained copy the same read reports the missing source.
+    assert_eq!(read_slot(&registry, offer, None).await, Err(Unavailable::NoSuchItem));
+    // A source that was never retained is unaffected by the store.
+    let other = copied_png(6, png.clone());
+    let other_offer = other.inventory().id;
+    let other_lease = registry.register(Arc::new(other)).unwrap();
+    assert_eq!(read_slot(&registry, other_offer, Some(&store)).await, Ok(png));
+    other_lease.cancel();
+    assert_eq!(
+        read_slot(&registry, other_offer, Some(&store)).await,
+        Err(Unavailable::Superseded)
+    );
+}
+
+#[test]
+fn file_items_and_text_are_not_retained() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = crate::retained::RetainedClips::new(dir.path());
+    let registry = Registry::default();
+    let mut text = fixture().inventory();
+    text.items[0]
+        .representations
+        .retain(|rep| rep.standard == Some(StandardFormat::Text));
+    text.items[0].representations[0].data = RepresentationData::Inline(b"text".to_vec());
+    let lease = registry.register(Arc::new(Portable(text))).unwrap();
+    assert_eq!(registry.retain_for_phones(&lease, &store).unwrap(), 0);
+}
+
+/// A copy whose portable bytes are its inline bytes, whatever their format.
+struct Copied(Inventory);
+impl Provider for Copied {
+    fn inventory(&self) -> Inventory {
+        self.0.clone()
+    }
+    fn open(&self, id: RepresentationId) -> io::Result<FileReader> {
+        Portable(self.0.clone()).open(id)
+    }
+    fn translator(&self) -> Arc<dyn Translator> {
+        struct Decode;
+        impl Translator for Decode {
+            fn standard(&self, rep: &Representation, bytes: &[u8]) -> io::Result<Vec<ClipData>> {
+                decode_standard(rep, bytes)
+            }
+        }
+        Arc::new(Decode)
+    }
+}
+
+fn inline(id: u32, format: &str, standard: StandardFormat, bytes: &[u8]) -> Representation {
+    Representation {
+        id: RepresentationId(id),
+        format: NativeFormat::Mac(format.into()),
+        medium: Medium::Bytes,
+        aspect: 1,
+        index: -1,
+        standard: Some(standard),
+        data: RepresentationData::Inline(bytes.to_vec()),
+    }
+}
+
+fn copied(seq: u64, representations: Vec<Representation>) -> Copied {
+    let mut inventory = fixture().inventory();
+    inventory.id.clip.seq = seq;
+    inventory.id.generation = seq;
+    inventory.items[0].representations = representations;
+    Copied(inventory)
+}
+
+/// User 2026-11-12: rich text a phone shows (an item without plain text) is
+/// kept 24 h like a bitmap and served after the clipboard moved on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rich_text_is_retained_for_phones_and_served_after_the_clipboard_moved_on() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = crate::retained::RetainedClips::new(dir.path());
+    let registry = Arc::new(Registry::default());
+    let html = b"<p>rich <b>only</b></p>".to_vec();
+    let copy = copied(8, vec![inline(1, "public.html", StandardFormat::Html, &html)]);
+    let offer = copy.inventory().id;
+    let lease = registry.register(Arc::new(copy)).unwrap();
+    assert_eq!(registry.retain_for_phones(&lease, &store).unwrap(), 1);
+    lease.cancel();
+    drop(lease);
+    assert_eq!(read_slot(&registry, offer, Some(&store)).await, Ok(html));
+    assert_eq!(read_slot(&registry, offer, None).await, Err(Unavailable::NoSuchItem));
+}
+
+/// User 2026-11-12 (phones keep rich text): text with rich text keeps the
+/// plain text and the rich text a phone fetches (HTML before RTF) as a pair
+/// for 24 h, served after the clipboard moved on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn text_with_rich_text_keeps_the_plain_text_and_the_html_for_phones() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = crate::retained::RetainedClips::new(dir.path());
+    let registry = Arc::new(Registry::default());
+    let html = b"<p>x <b>bold</b></p>".to_vec();
+    let text = copied(
+        9,
+        vec![
+            inline(1, "public.html", StandardFormat::Html, &html),
+            inline(2, "public.rtf", StandardFormat::Rtf, b"{\\rtf1 x}"),
+            inline(3, "public.utf8-plain-text", StandardFormat::Text, b"x bold"),
+        ],
+    );
+    let offer = text.inventory().id;
+    let lease = registry.register(Arc::new(text)).unwrap();
+    assert_eq!(registry.retain_for_phones(&lease, &store).unwrap(), 2);
+    assert!(store.contains(offer, 1, 3) && store.contains(offer, 1, 1));
+    assert!(!store.contains(offer, 1, 2), "RTF is not fetched next to HTML");
+    lease.cancel();
+    drop(lease);
+    assert_eq!(read_slot(&registry, offer, Some(&store)).await, Ok(html));
+    // RTF is the rich text when there is no HTML.
+    let rtf = copied(
+        11,
+        vec![
+            inline(1, "public.rtf", StandardFormat::Rtf, b"{\\rtf1 y}"),
+            inline(2, "public.utf8-plain-text", StandardFormat::Text, b"y"),
+        ],
+    );
+    let rtf_offer = rtf.inventory().id;
+    let lease = registry.register(Arc::new(rtf)).unwrap();
+    assert_eq!(registry.retain_for_phones(&lease, &store).unwrap(), 2);
+    assert!(store.contains(rtf_offer, 1, 1) && store.contains(rtf_offer, 1, 2));
+}
+
+/// Only the slots a phone asks for are kept: plain text without rich text is
+/// not kept, and of an image's bitmap formats only the first.
+#[test]
+fn only_the_representation_a_phone_shows_is_retained() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = crate::retained::RetainedClips::new(dir.path());
+    let registry = Registry::default();
+    let text = copied(9, vec![inline(3, "public.utf8-plain-text", StandardFormat::Text, b"x")]);
+    let text_offer = text.inventory().id;
+    let lease = registry.register(Arc::new(text)).unwrap();
+    assert_eq!(registry.retain_for_phones(&lease, &store).unwrap(), 0);
+    assert!(!store.contains(text_offer, 1, 3));
+    let png = test_png(4, 4);
+    let image = copied(
+        10,
+        vec![
+            inline(1, "public.html", StandardFormat::Html, b"<img>"),
+            inline(2, "public.png", StandardFormat::Png, &png),
+            inline(3, "public.tiff", StandardFormat::Png, &png),
+        ],
+    );
+    let image_offer = image.inventory().id;
+    let lease = registry.register(Arc::new(image)).unwrap();
+    assert_eq!(registry.retain_for_phones(&lease, &store).unwrap(), 1);
+    assert!(store.contains(image_offer, 1, 2));
+    assert!(!store.contains(image_offer, 1, 1) && !store.contains(image_offer, 1, 3));
+    // Announced again (a phone joined, sharing resumed): kept, not read again.
+    assert_eq!(registry.retain_for_phones(&lease, &store).unwrap(), 1);
+}
+
+#[cfg(any(target_os = "macos", windows))]
+#[test]
+fn thumbnails_come_from_the_retained_copy_and_report_a_missing_original_as_expired() {
+    use crate::retained::Target;
+    let dir = tempfile::tempdir().unwrap();
+    let store = crate::retained::RetainedClips::new(dir.path());
+    let registry = Registry::default();
+    let copied = copied_png(7, test_png(1600, 900));
+    let offer = copied.inventory().id;
+    let target = Target::Representation {
+        item: 1,
+        representation: 1,
+    };
+    let lease = registry.register(Arc::new(copied)).unwrap();
+    // Live source, nothing retained yet.
+    let ThumbnailOutcome::Ready(live) = registry.thumbnail(offer, target, 512, 128 * 1024, None) else {
+        panic!("live thumbnail");
+    };
+    assert_eq!((live.mime, live.width, live.height), ("image/jpeg", 512, 288));
+    registry.retain_for_phones(&lease, &store).unwrap();
+    lease.cancel();
+    drop(lease);
+    let ThumbnailOutcome::Ready(retained) = registry.thumbnail(offer, target, 512, 128 * 1024, Some(&store)) else {
+        panic!("retained thumbnail");
+    };
+    assert_eq!((retained.width, retained.height), (512, 288));
+    // "清理缓存" removes the copy and the cached thumbnail.
+    store.usage(true);
+    assert_eq!(
+        registry.thumbnail(offer, target, 512, 128 * 1024, Some(&store)),
+        ThumbnailOutcome::Expired
+    );
+    assert_eq!(
+        registry.thumbnail(offer, Target::File { node: 1, version: 1 }, 512, 4096, Some(&store)),
+        ThumbnailOutcome::Expired
+    );
+}
+
+/// A phone's upload is announced by its proxy PC under the proxy's clip ID.
+/// The receiving PC files it under the real sender (the phone), so
+/// received-files folders follow the device the content came from.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn received_files_follow_the_offer_real_sender() {
+    use crate::content::namespace::Namespace;
+    let dir = tempfile::tempdir().unwrap();
+    let (requested, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let link = Arc::new(TestLink {
+        registry: Arc::default(),
+        opened: std::sync::atomic::AtomicUsize::new(0),
+        requested,
+    });
+    let inventory = fixture().inventory();
+    let announcer = inventory.id.clip.origin;
+    let remote = Remote::new(
+        dir.path(),
+        BatchId([8; 16]),
+        inventory,
+        ClipPlatform::Mac,
+        link,
+        Demand::Clipboard,
+    )
+    .unwrap();
+    assert_eq!(remote.origin(), Some(announcer));
+    let phone = oink_foundation::DeviceId([0x5a; 32]);
+    assert_ne!(phone, announcer);
+    remote.set_sender(phone);
+    assert_eq!(
+        remote.origin(),
+        Some(phone),
+        "the proxy PC's folder took the phone's files"
+    );
 }

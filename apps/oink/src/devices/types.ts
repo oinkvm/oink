@@ -1,4 +1,7 @@
-export type DeviceOS = 'mac' | 'win' | 'linux' | 'other';
+export type DeviceOS = 'mac' | 'win' | 'android' | 'ios' | 'linux' | 'other';
+/** The backend's OS name (pairing views carry it as a plain string). */
+export const deviceOs = (os: string | null | undefined): DeviceOS => os === 'macos' ? 'mac' : os === 'windows' ? 'win' : os === 'android' || os === 'ios' || os === 'linux' ? os : 'other';
+export const isMobile = (d: { os: DeviceOS }) => d.os === 'android' || d.os === 'ios';
 export type DeviceGroup = 'self' | 'online' | 'offline';
 export type CursorState = 'local' | 'remote' | 'locked' | 'unknown';
 export type ShareState = 'shared' | 'local' | 'fault' | 'unknown';
@@ -22,10 +25,22 @@ export interface SpeakerState {
     /** Local mode: the device's own system output volume (0..100) and mute, when its card reports them. */
     localOutput?: { volume: number; muted: boolean } | null;
 }
+export interface MobileEndpoint { enabled: boolean; canStart: boolean }
 export interface Device {
     id: string;
     name: string;
     os: DeviceOS;
+    /** Mobile facts are supplied by the v2 device snapshot; unknown is valid. */
+    formFactor?: 'phone' | 'tablet' | 'foldable' | 'unknown';
+    /** Android only: privileged mode is on and running (DeviceFacts key 32),
+     * so the badge wears the crown. Offline devices never do. */
+    privileged?: boolean;
+    /** Phones only. `enabled`: the phone is the exit / sender in the global
+     * audio configuration (its card mode); a PC may always turn it back to
+     * local ("切回本地", a card audio mode). `canStart`: this PC may start the
+     * endpoint (an Android phone, AudioEndpointState). */
+    mobileAudio?: { speaker: MobileEndpoint; microphone: MobileEndpoint; forward?: MobileEndpoint };
+    protocolCompatible?: boolean;
     group: DeviceGroup;
     offlineReason?: 'disconnected'|'connecting'|'address_stale'|'protocol_incompatible';
     ip: string;

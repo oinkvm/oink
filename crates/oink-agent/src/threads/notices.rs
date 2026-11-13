@@ -38,7 +38,7 @@ fn key(notice: InputNotice) -> (Option<oink_foundation::DeviceId>, u8) {
 impl Notices {
     pub(super) fn new() -> Arc<Self> {
         Arc::new(Self {
-            slots: (0..(oink_protocol::v1::limits::MEMBERS * 3 + 2))
+            slots: (0..(oink_protocol::v2::limits::MEMBERS * 3 + 2))
                 .map(|_| ArcSwapOption::empty())
                 .collect(),
             sequence: AtomicU64::new(0),

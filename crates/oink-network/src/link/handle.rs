@@ -13,18 +13,27 @@ use std::{
 use tokio::sync::{Notify, mpsc, oneshot};
 
 pub(super) enum Command {
+    UpdateProfile(crate::negotiation::OfferProfile),
     Dial(DeviceId, Vec<SocketAddr>, DialMode, DialOrigin),
     Disconnect(LinkId, Disconnect),
     HalfOpen(LinkId),
     Ready(LinkId),
     ConfigFence(std::sync::mpsc::SyncSender<()>),
-    Agreement(LinkId, oink_protocol::v1::admission::Agreement),
+    RebindSocket(oneshot::Sender<std::io::Result<()>>),
+    /// This device is the speaker exit or sends its microphone (iOS marks the socket).
+    AudioMarking(bool),
+    Agreement(LinkId, oink_protocol::v2::admission::Agreement),
     Retire(LinkId),
     OldMemberLane(LinkId, bool),
-    Formats(LinkId, oink_protocol::v1::dto::FormatSupport),
-    Audio(LinkId, Vec<oink_protocol::v1::dto::AudioSupport>),
-    Violation(LinkId, oink_protocol::v1::admission::Violation),
+    Formats(LinkId, oink_protocol::v2::dto::FormatSupport),
+    Audio(LinkId, Vec<oink_protocol::v2::dto::AudioSupport>),
+    Violation(LinkId, oink_protocol::v2::admission::Violation),
     Addresses(DeviceId, Vec<SocketAddr>),
+    RouteAddresses(DeviceId, Vec<SocketAddr>),
+    RouteRecord(LinkId, Option<RouteRecord>),
+    SetRoute(DeviceId, RouteChoice, std::sync::mpsc::SyncSender<bool>),
+    RouteProbing(bool),
+    LocalAddresses(Vec<std::net::Ipv4Addr>),
     Register(Vec<StreamKind>, mpsc::UnboundedSender<ModuleEvent>),
     Open {
         id: StreamId,
@@ -41,6 +50,13 @@ pub(super) enum Command {
     ProbeAddress(SocketAddr, oneshot::Sender<Result<DeviceId, AddressProbeError>>),
     #[cfg(any(test, feature = "test-support"))]
     BlockDirect(DeviceId, bool),
+    /// Test only: the network thread ends as on this fatal error.
+    #[cfg(any(test, feature = "test-support"))]
+    InjectFatal(super::NetworkFatal),
+    /// Test only: the endpoint socket fails for good, as after a failed
+    /// rebind; Quinn's endpoint driver then ends on its next receive.
+    #[cfg(test)]
+    FailEndpointSocket,
     Stop,
     Probe(oink_foundation::session::ConnectionId, bool),
     LowInbound(Box<InboundLow>),
@@ -48,15 +64,24 @@ pub(super) enum Command {
     ResetN1(LinkId),
     #[cfg(test)]
     InspectConnections(oneshot::Sender<(usize, usize, usize)>),
+    /// Test only: the arbiter switches this pair to its own standby to `address`.
+    #[cfg(test)]
+    SwitchRoute(DeviceId, SocketAddr, std::sync::mpsc::SyncSender<bool>),
+    /// Test only: open new streams on the own standby to this address.
+    #[cfg(test)]
+    StreamsOn(Option<SocketAddr>),
 }
 pub(super) struct Shared {
     pub boot: Boot,
     pub profile: crate::negotiation::OfferProfile,
+    pub dynamic_profile: std::sync::Mutex<crate::negotiation::OfferProfile>,
     pub address: OnceLock<SocketAddr>,
     pub commands: mpsc::UnboundedSender<Command>,
     pub wake: Arc<Notify>,
     pub done: Notify,
     pub stopped: AtomicBool,
+    /// Set by the network thread before `stopped` when it ended on its own.
+    pub fatal: OnceLock<super::NetworkFatal>,
     #[cfg(test)]
     pub expired_service_budget: AtomicBool,
     #[cfg(test)]
@@ -129,6 +154,7 @@ impl LinkLayer {
         let shared = Arc::new(Shared {
             boot: config.boot,
             profile: config.profile.clone(),
+            dynamic_profile: std::sync::Mutex::new(config.profile.clone()),
             address: OnceLock::new(),
             commands,
             wake: wake.clone(),
@@ -136,6 +162,7 @@ impl LinkLayer {
             pool: OnceLock::new(),
             done: Notify::new(),
             stopped: AtomicBool::new(false),
+            fatal: OnceLock::new(),
             #[cfg(test)]
             expired_service_budget: AtomicBool::new(false),
             #[cfg(test)]
@@ -243,11 +270,28 @@ impl LinkLayer {
         tag: StreamTag,
         spec: QueueSpec,
         datagram: Option<QueueSpec>,
-    ) -> Result<(SendStream, Option<DatagramSend>), LinkGone> {
+    ) -> Result<(SendStream, Option<DatagramSend>), OpenError> {
         assert!(tag.kind.is_business(), "private stream kind");
-        if self.0.stopped.load(Ordering::Acquire) || !self.links().links.iter().any(|l| l.link == link) {
-            return Err(LinkGone);
+        let links = self.links();
+        let entry = links.links.iter().find(|l| l.link == link);
+        let Some(entry) = entry.filter(|_| !self.0.stopped.load(Ordering::Acquire)) else {
+            return Err(OpenError::LinkGone);
+        };
+        if !super::gate::opens(&entry.agreement, tag.kind as u16) {
+            return Err(OpenError::Unnegotiated);
         }
+        let reliable_gate = super::gate::Gate::negotiated(
+            &entry.agreement,
+            tag.kind as u16,
+            oink_protocol::v2::registry::Transport::Reliable,
+            self.0.hub.sharing_paused.clone(),
+        );
+        let datagram_gate = super::gate::Gate::negotiated(
+            &entry.agreement,
+            tag.kind as u16,
+            oink_protocol::v2::registry::Transport::Datagram,
+            self.0.hub.sharing_paused.clone(),
+        );
         let id = StreamId {
             link,
             dir: StreamDir::Out,
@@ -270,12 +314,17 @@ impl LinkLayer {
         });
         let parent = queue.clone();
         Ok((
-            SendStream { id, queue },
+            SendStream {
+                id,
+                queue,
+                gate: reliable_gate,
+            },
             datagram.map(|queue| DatagramSend {
                 follows: id,
                 _owner: Arc::new(super::stream::DatagramOwner(queue.clone())),
                 queue,
                 parent: Some(parent),
+                gate: datagram_gate,
             }),
         ))
     }
@@ -294,11 +343,13 @@ mod config_order_tests {
                 nonce: [1; 16],
             },
             profile: Default::default(),
+            dynamic_profile: std::sync::Mutex::new(Default::default()),
             address: OnceLock::new(),
             commands,
             wake: wake.clone(),
             done: Notify::new(),
             stopped: AtomicBool::new(false),
+            fatal: OnceLock::new(),
             #[cfg(test)]
             expired_service_budget: AtomicBool::new(false),
             heartbeat_batches: Default::default(),

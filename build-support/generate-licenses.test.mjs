@@ -10,6 +10,10 @@ test('native asset inventory matches source bytes and covers backend tray artwor
   for (const asset of native.assets) {
     const bytes = readFileSync(new URL(`../${asset.path}`, import.meta.url));
     assert.equal(createHash('sha256').update(bytes).digest('hex'), asset.sha256, asset.path);
+    for (const copy of asset.copies ?? []) {
+      const copied = readFileSync(new URL(`../${copy.path}`, import.meta.url));
+      assert.equal(createHash('sha256').update(copied).digest('hex'), copy.sha256, copy.path);
+    }
   }
   const tray = 'crates/oink-agent/src/tray/images/';
   for (const name of readdirSync(new URL(`../${tray}`, import.meta.url)).filter(name => name.endsWith('.png'))) {

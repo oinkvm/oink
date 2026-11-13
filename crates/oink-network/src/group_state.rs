@@ -5,7 +5,7 @@ use crate::{
     wire_identity as wire,
 };
 use oink_foundation::{DeviceId, GroupId};
-use oink_protocol::v1::{
+use oink_protocol::v2::{
     self, RawMap, RawValue, dto, retained,
     schema::{WireDto, WireValue},
 };
@@ -16,7 +16,20 @@ pub struct State {
     roster: Roster,
 }
 impl State {
-    pub fn create(identity: &Identity, name: &str, os: &str, now: u64) -> v1::Result<Self> {
+    /// Load a previously persisted v2 group state and derive its immutable
+    /// roster anchor from the signed Create record.  Callers must obtain this
+    /// wire tree from durable group storage; this constructor deliberately
+    /// cannot manufacture a new group.
+    pub fn from_wire(state: dto::GroupState) -> v2::Result<Self> {
+        let roster = state.roster()?;
+        let anchor = Anchor {
+            group: GroupId(roster.group()?.0),
+            root: crate::roster::root_id(&roster)?,
+        };
+        Self::verify(state, anchor)
+    }
+
+    pub fn create(identity: &Identity, name: &str, os: &str, now: u64) -> v2::Result<Self> {
         let group = GroupId(rand::random());
         let roster = Roster::create(identity, group, name, os, now)?;
         let layout = dto::LayoutValue::from_raw(
@@ -29,8 +42,7 @@ impl State {
         )?;
         let version =
             dto::ConfigVersion::from_raw([(1, 1u64.write()), (3, wire::device(identity.id()).write())].into())?;
-        let mut register: RawMap = [(1, 2u32.write()), (3, version.write()), (4, layout.write())].into();
-        register.insert(6, retained::register_digest(&register)?.write());
+        let register: RawMap = [(1, 2u32.write()), (3, version.write()), (4, layout.write())].into();
         Self::verify(
             dto::GroupState::from_raw(
                 [
@@ -45,11 +57,11 @@ impl State {
         .reconcile_pointer_slots(identity.id())?
         .reconcile_device_order(identity.id())
     }
-    pub fn verify(state: dto::GroupState, anchor: Anchor) -> v1::Result<Self> {
+    pub fn verify(state: dto::GroupState, anchor: Anchor) -> v2::Result<Self> {
         if state.group()?.0 != anchor.group.0 {
-            return Err(v1::ErrorCode::AuthenticationFailed.into());
+            return Err(v2::ErrorCode::AuthenticationFailed.into());
         }
-        state.encode(v1::limits::CONFIG_STATE)?;
+        state.encode(v2::limits::CONFIG_STATE)?;
         let roster = Roster::verify(state.roster()?, anchor)?;
         let mut layout = false;
         for register in state.registers()?.0 {
@@ -60,11 +72,14 @@ impl State {
             }
         }
         if !layout {
-            return Err(v1::ErrorCode::MalformedFrame.into());
+            return Err(v2::ErrorCode::MalformedFrame.into());
         }
         let state = Self { wire: state, roster };
+        // Every known optional register decodes here, so no reader after
+        // admission or load meets a value of another shape.
         state.pointer_slots()?;
         state.device_order()?;
+        state.pointer_base()?;
         Ok(state)
     }
     pub fn wire(&self) -> &dto::GroupState {
@@ -73,24 +88,26 @@ impl State {
     pub fn roster(&self) -> &Roster {
         &self.roster
     }
-    pub fn digest(&self) -> v1::Result<[u8; 32]> {
-        Ok(retained::sha256(&self.wire.encode(v1::limits::CONFIG_STATE)?).0)
+    pub fn digest(&self) -> v2::Result<[u8; 32]> {
+        Ok(crate::wire_identity::object_digest(
+            &self.wire.encode(v2::limits::CONFIG_STATE)?,
+        ))
     }
-    pub fn layout(&self) -> v1::Result<dto::Register> {
+    pub fn layout(&self) -> v2::Result<dto::Register> {
         self.wire
             .registers()?
             .0
             .into_iter()
             .find(|r| r.kind() == Ok(2))
-            .ok_or(v1::ErrorCode::MalformedFrame.into())
+            .ok_or(v2::ErrorCode::MalformedFrame.into())
     }
-    pub fn register(&self, kind: u32) -> v1::Result<Option<dto::Register>> {
+    pub fn register(&self, kind: u32) -> v2::Result<Option<dto::Register>> {
         Ok(self.wire.registers()?.0.into_iter().find(|r| r.kind() == Ok(kind)))
     }
     /// Set the given keys of one optional retained register value, authored by
     /// `writer` on top of its current version. Unknown value keys are kept, and
     /// an unchanged value is a no-op.
-    pub(crate) fn put_register(&self, kind: u32, writer: DeviceId, value: RawMap) -> v1::Result<Self> {
+    pub(crate) fn put_register(&self, kind: u32, writer: DeviceId, value: RawMap) -> v2::Result<Self> {
         let current = self.register(kind)?;
         let mut patched = current.as_ref().map(|r| r.value()).transpose()?.unwrap_or_default();
         patched.extend(value);
@@ -104,9 +121,7 @@ impl State {
             })?
         } else {
             let version = dto::ConfigVersion::from_raw([(1, 1u64.write()), (3, wire::device(writer).write())].into())?;
-            let mut raw: RawMap = [(1, kind.write()), (3, version.write()), (4, RawValue::Map(patched))].into();
-            let digest = retained::register_digest(&raw)?;
-            raw.insert(6, digest.write());
+            let raw: RawMap = [(1, kind.write()), (3, version.write()), (4, RawValue::Map(patched))].into();
             dto::Register::from_raw(raw)?
         };
         let mut registers = self
@@ -122,37 +137,37 @@ impl State {
         raw.insert(2, RawValue::Array(registers.iter().map(WireValue::write).collect()));
         Self::verify(dto::GroupState::from_raw(raw)?, self.roster.anchor())
     }
-    pub fn with_roster(&self, roster: &Roster) -> v1::Result<Self> {
+    pub fn with_roster(&self, roster: &Roster) -> v2::Result<Self> {
         let mut raw = self.wire.raw().clone();
         raw.insert(3, roster.wire().write());
         Self::verify(dto::GroupState::from_raw(raw)?, self.roster.anchor())
     }
-    pub fn merge(&self, incoming: &dto::GroupState, peer: DeviceId, local: DeviceId) -> v1::Result<Self> {
+    pub fn merge(&self, incoming: &dto::GroupState, peer: DeviceId, local: DeviceId) -> v2::Result<Self> {
         let other = Self::verify(incoming.clone(), self.roster.anchor())?;
         let roster = self.roster.merge(other.roster.wire())?;
         if !roster.contains(peer) || !roster.contains(local) {
-            return Err(v1::ErrorCode::AuthenticationFailed.into());
+            return Err(v2::ErrorCode::AuthenticationFailed.into());
         }
         self.merge_verified(incoming, other, roster)
     }
     /// An already admitted peer may deliver a signed removal of itself or this
     /// node. Retain that removal before the runtime revokes application authority.
-    pub fn receive_update(&self, incoming: &dto::GroupState, peer: DeviceId, local: DeviceId) -> v1::Result<Self> {
+    pub fn receive_update(&self, incoming: &dto::GroupState, peer: DeviceId, local: DeviceId) -> v2::Result<Self> {
         if !self.roster.contains(peer) || !self.roster.contains(local) {
-            return Err(v1::ErrorCode::AuthenticationFailed.into());
+            return Err(v2::ErrorCode::AuthenticationFailed.into());
         }
         let other = Self::verify(incoming.clone(), self.roster.anchor())?;
         let roster = self.roster.merge(other.roster.wire())?;
         self.merge_verified(incoming, other, roster)
     }
-    fn merge_verified(&self, incoming: &dto::GroupState, other: Self, roster: Roster) -> v1::Result<Self> {
+    fn merge_verified(&self, incoming: &dto::GroupState, other: Self, roster: Roster) -> v2::Result<Self> {
         let mut registers = self
             .wire
             .registers()?
             .0
             .into_iter()
             .map(|r| Ok((r.kind()?, r)))
-            .collect::<v1::Result<BTreeMap<_, _>>>()?;
+            .collect::<v2::Result<BTreeMap<_, _>>>()?;
         for incoming in other.wire.registers()?.0 {
             let kind = incoming.kind()?;
             let merged = if let Some(current) = registers.get(&kind) {
@@ -168,29 +183,29 @@ impl State {
         Self::verify(dto::GroupState::from_raw(raw)?, self.roster.anchor())
     }
 }
-pub fn validate_layout(layout: &dto::LayoutValue) -> v1::Result<()> {
+pub fn validate_layout(layout: &dto::LayoutValue) -> v2::Result<()> {
     let mut devices = std::collections::BTreeSet::new();
     for group in layout.devices()?.0 {
         let device = wire::read_device(&group.device()?)?;
         if !devices.insert(device) || group.scale()? <= 0.0 {
-            return Err(v1::ErrorCode::StateConflict.into());
+            return Err(v2::ErrorCode::StateConflict.into());
         }
         group.origin()?;
         let mut ids = std::collections::BTreeSet::new();
         for screen in group.screens()?.0 {
             let id = screen.id()?;
             if wire::read_device(&id.device()?)? != device || !ids.insert(id.display()?.0) {
-                return Err(v1::ErrorCode::StateConflict.into());
+                return Err(v2::ErrorCode::StateConflict.into());
             }
             validate_rect(&screen.local()?)?;
         }
     }
     Ok(())
 }
-pub fn validate_rect(rect: &dto::Rect) -> v1::Result<()> {
+pub fn validate_rect(rect: &dto::Rect) -> v2::Result<()> {
     let (x, y, w, h) = (rect.x()?, rect.y()?, rect.w()?, rect.h()?);
     if w <= 0.0 || h <= 0.0 || !(x + w).is_finite() || !(y + h).is_finite() {
-        return Err(v1::ErrorCode::UnsupportedValue.into());
+        return Err(v2::ErrorCode::UnsupportedValue.into());
     }
     Ok(())
 }
@@ -213,7 +228,7 @@ mod tests {
                 let version =
                     dto::ConfigVersion::from_raw([(1, 1u64.write()), (3, wire::device(writer).write())].into())
                         .unwrap();
-                let mut raw: RawMap = [
+                let raw: RawMap = [
                     (1, 8u32.write()),
                     (3, version.write()),
                     (
@@ -222,7 +237,6 @@ mod tests {
                     ),
                 ]
                 .into();
-                raw.insert(6, retained::register_digest(&raw).unwrap().write());
                 dto::Register::from_raw(raw).unwrap()
             };
             registers.retain(|r| r.kind() != Ok(8));
@@ -241,9 +255,9 @@ mod tests {
         let on = edit(&base, a.id(), true);
         // Opaque encoding/decoding preserves this additive register, as an old peer does.
         let relay = dto::GroupState::from_raw(
-            v1::cbor::decode_map(
-                &on.wire().encode(v1::limits::CONFIG_STATE).unwrap(),
-                v1::limits::CONFIG_STATE,
+            v2::cbor::decode_map(
+                &on.wire().encode(v2::limits::CONFIG_STATE).unwrap(),
+                v2::limits::CONFIG_STATE,
             )
             .unwrap(),
         )

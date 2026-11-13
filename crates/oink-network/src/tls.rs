@@ -12,7 +12,7 @@ use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
 use rustls::{DigitallySignedStruct, DistinguishedName, SignatureScheme};
 use std::sync::Arc;
 
-pub const ALPN: &[u8] = oink_protocol::v1::QUIC_ALPN;
+pub const ALPN: &[u8] = oink_protocol::v2::QUIC_ALPN;
 /// 证书里的名字（不参与验证）。
 pub const SERVER_NAME: &str = "oink.invalid";
 
@@ -52,7 +52,7 @@ impl Credentials {
             .with_protocol_versions(&[&rustls::version::TLS13])?
             .with_client_cert_verifier(Arc::new(PeerVerifier { expected: None }))
             .with_single_cert(vec![self.cert.clone()], self.key())?;
-        cfg.alpn_protocols = vec![oink_protocol::v1::LOW_ALPN.to_vec()];
+        cfg.alpn_protocols = vec![oink_protocol::v2::LOW_ALPN.to_vec()];
         cfg.max_early_data_size = 0;
         Ok(cfg)
     }
@@ -67,7 +67,7 @@ impl Credentials {
                 expected: Some(expected),
             }))
             .with_client_auth_cert(vec![self.cert.clone()], self.key())?;
-        cfg.alpn_protocols = vec![oink_protocol::v1::LOW_ALPN.to_vec()];
+        cfg.alpn_protocols = vec![oink_protocol::v2::LOW_ALPN.to_vec()];
         cfg.enable_early_data = false;
         Ok(cfg)
     }
@@ -281,13 +281,13 @@ mod tests {
         let credentials = Credentials::new(&Identity::generate()).unwrap();
         let server = credentials.server_config().unwrap();
         let client = credentials.client_config(None).unwrap();
-        assert_eq!(server.alpn_protocols, [b"oink-wire/1".to_vec()]);
+        assert_eq!(server.alpn_protocols, [b"oink-wire/2".to_vec()]);
         assert_eq!(client.alpn_protocols, server.alpn_protocols);
         assert_eq!(server.max_early_data_size, 0);
         assert!(!client.enable_early_data);
         let server = credentials.bulk_server_config().unwrap();
         let client = credentials.bulk_client_config(Identity::generate().id()).unwrap();
-        assert_eq!(server.alpn_protocols, [b"oink-low/1".to_vec()]);
+        assert_eq!(server.alpn_protocols, [b"oink-low/2".to_vec()]);
         assert_eq!(client.alpn_protocols, server.alpn_protocols);
         assert_eq!(server.max_early_data_size, 0);
         assert!(!client.enable_early_data);

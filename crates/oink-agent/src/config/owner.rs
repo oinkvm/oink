@@ -1,8 +1,10 @@
 //! Device-authored preferences. Only this store advances local revisions; peer
-//! facts are never merged into its items. Audio ordering records are group-local.
+//! facts are never merged into its items. This device's own audio
+//! configuration (exit / sender / forward / receive) is stored device-level.
 use super::store::{self, StoreError};
+use oink_audio::route::{Flag, OwnConfig};
 use oink_foundation::{DeviceId, GroupId};
-use oink_protocol::v1::{
+use oink_protocol::v2::{
     RawMap, RawValue,
     dto::{self, ControlFailure, DevicePreference, LocalOption},
     schema::{WireDto, WireValue},
@@ -10,34 +12,22 @@ use oink_protocol::v1::{
 use std::collections::BTreeSet;
 
 pub const MAX_OWNER_BYTES: usize = 4 * 1024 * 1024;
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct ClaimRecord {
-    pub owner: DeviceId,
-    pub revision: u64,
-    pub claim: Option<dto::AudioExitClaim>,
-}
-#[derive(Clone, Debug, Default, PartialEq)]
-pub struct GroupClaims {
-    pub seen_counter: u64,
-    pub records: Vec<ClaimRecord>,
-    pub watermark: Option<dto::AudioExitClaim>,
-}
-impl GroupClaims {
-    pub fn watermark(&self) -> Option<dto::AudioExitClaim> {
-        self.records
-            .iter()
-            .filter_map(|record| record.claim.as_ref())
-            .chain(self.watermark.iter())
-            .max_by_key(|claim| oink_audio::claims::claim_order(claim).expect("validated ordering witness"))
-            .cloned()
-    }
-}
+const RETIRED_EXIT_CLAIM: u32 = 20;
+const RETIRED_MICROPHONE_CLAIM: u32 = 22;
+/// Retired LocalOption 4 (ForwardingEnabled) and 24 (MicrophoneReceiveMuted):
+/// kept as saved, never published or edited; read once as the initial
+/// forward / receive switches when key 5 does not exist yet.
+const RETIRED_FORWARDING: u32 = 4;
+const RETIRED_RECEIVE_MUTED: u32 = 24;
+const AUDIO_KEY: u32 = 5;
 
 /// CBOR map: 1 schema, 2 ordered DevicePreference list, 3 group records,
-/// 4 active group (optional). Each group: 1 group ID, 2 seen counter,
-/// 3 records [{1 owner, 2 revision, 3 claim/null}], 4 ordering witness/null.
-/// All unknown keys are retained.
+/// 4 active group (optional), 5 this device's own audio configuration
+/// (optional): {1 speaker exit: bool, 2 microphone sender: bool, 3 forward:
+/// AudioFlag, 4 receive: AudioFlag, 5 HLC last: u64}. Each group: 1 group ID.
+/// Group keys 2-5 held the per-owner exit claims of earlier builds and key 6
+/// the per-group route setting of early 0.4.0 builds; like all unknown keys
+/// they are retained and never read.
 #[derive(Clone, Debug, PartialEq)]
 pub struct OwnerStore {
     raw: RawMap,
@@ -77,7 +67,7 @@ impl OwnerStore {
         Ok(true)
     }
     pub fn decode(bytes: &[u8]) -> Result<Self, StoreError> {
-        Self::from_raw(oink_protocol::v1::cbor::decode_map(bytes, MAX_OWNER_BYTES)?)
+        Self::from_raw(oink_protocol::v2::cbor::decode_map(bytes, MAX_OWNER_BYTES)?)
     }
     pub fn encode(&self) -> Result<Vec<u8>, StoreError> {
         let mut raw = self.raw.clone();
@@ -85,7 +75,7 @@ impl OwnerStore {
             2,
             RawValue::Array(self.stored_preferences().iter().map(WireValue::write).collect()),
         );
-        Ok(oink_protocol::v1::cbor::encode_map(&raw, MAX_OWNER_BYTES)?)
+        Ok(oink_protocol::v2::cbor::encode_map(&raw, MAX_OWNER_BYTES)?)
     }
     fn from_raw(raw: RawMap) -> Result<Self, StoreError> {
         store::schema(&raw)?;
@@ -109,13 +99,12 @@ impl OwnerStore {
             if !seen.insert(store::group(store::required(map, 1)?)?) {
                 return Err(StoreError::Invalid);
             }
-            parse_claims(map)?;
-            if let Some(microphone) = map.get(&5) {
-                parse_claims(microphone.as_map()?)?;
-            }
         }
         if let Some(group) = raw.get(&4) {
             store::group(group)?;
+        }
+        if let Some(audio) = raw.get(&AUDIO_KEY) {
+            parse_audio(audio)?;
         }
         Ok(Self { raw })
     }
@@ -125,15 +114,24 @@ impl OwnerStore {
             .iter()
             .map(|item| DevicePreference::read(item).expect("validated preference"))
             // Option 5 is retired locally. A stale saved guard is never authority.
-            .filter(|item| item.option() != Ok(LocalOption::KeyboardDisabled))
+            // Options 20/22 were per-device exit/microphone claims, replaced by
+            // the group route setting; an earlier build's saved item is dropped.
+            .filter(|item| {
+                !matches!(
+                    item.option().map(LocalOption::number),
+                    Ok(5 | RETIRED_EXIT_CLAIM | RETIRED_MICROPHONE_CLAIM)
+                )
+            })
             .collect()
     }
     /// Frozen v1 projection: Disabled is represented by the original bool option,
     /// never by sending the local-only KeyboardMode value 2 to an old peer.
+    /// The retired forward / receive options are never published.
     pub fn preferences(&self) -> Vec<DevicePreference> {
         let mut items: Vec<_> = self
             .stored_preferences()
             .into_iter()
+            .filter(|item| !retired_audio_option(item))
             .map(|item| self.wire_item(item))
             .collect();
         if let Some(item) = self.item(LocalOption::KeyboardDisabled) {
@@ -166,6 +164,7 @@ impl OwnerStore {
         }
         self.stored_preferences()
             .into_iter()
+            .filter(|item| !retired_audio_option(item))
             .find(|item| item.option() == Ok(option))
     }
     pub fn revision(&self, option: LocalOption) -> Option<u64> {
@@ -177,7 +176,6 @@ impl OwnerStore {
 
     /// Composite command values are narrow patches. Keyed-list changes carry
     /// {1: upserts, 2: removals}; omission never erases another known or future path.
-    /// Audio option20 is command-derived and uses commit_claims instead.
     pub fn edit(
         &mut self,
         option: LocalOption,
@@ -197,9 +195,6 @@ impl OwnerStore {
             };
             self.edit(LocalOption::KeyboardMode, expected, value)?;
             return self.item(option).ok_or(ControlFailure::UnsupportedOption);
-        }
-        if matches!(option, LocalOption::AudioExitClaim | LocalOption::MicrophoneShareClaim) {
-            return Err(ControlFailure::UnsupportedOption);
         }
         let current = self.item(option).ok_or(ControlFailure::UnsupportedOption)?;
         if current.revision().map_err(invalid)? != expected {
@@ -285,240 +280,72 @@ impl OwnerStore {
     pub fn active_group(&self) -> Option<GroupId> {
         self.raw.get(&4).and_then(|value| store::group(value).ok())
     }
-    pub fn claims(&self, group: GroupId) -> GroupClaims {
-        self.claims_for(group, LocalOption::AudioExitClaim)
-    }
-    pub fn microphone_claims(&self, group: GroupId) -> GroupClaims {
-        self.claims_for(group, LocalOption::MicrophoneShareClaim)
-    }
-    fn claims_for(&self, group: GroupId, option: LocalOption) -> GroupClaims {
-        self.group_raw(group)
-            .and_then(|raw| {
-                if option == LocalOption::MicrophoneShareClaim {
-                    raw.get(&5).and_then(|v| v.as_map().ok())
-                } else {
-                    Some(raw)
-                }
-            })
-            .map(|raw| parse_claims(raw).expect("validated group"))
-            .unwrap_or_default()
-    }
-    fn group_raw(&self, group: GroupId) -> Option<&RawMap> {
-        array(self.raw.get(&3).expect("validated groups"))
-            .expect("validated groups")
-            .iter()
-            .map(|v| v.as_map().expect("validated group"))
-            .find(|raw| store::group(raw.get(&1).expect("group ID")).ok() == Some(group))
-    }
-    /// Switch the option20 projection without moving source-group claims. The
-    /// global option revision advances even when both projections are null.
-    pub fn switch_group(&mut self, group: GroupId, owner: DeviceId) -> Result<(), StoreError> {
-        if self.active_group() == Some(group) {
-            return Ok(());
-        }
-        let mut candidate = self.clone();
-        candidate.raw.insert(4, RawValue::Bytes(group.0.to_vec()));
-        for option in [LocalOption::AudioExitClaim, LocalOption::MicrophoneShareClaim] {
-            let Some(item) = candidate.item(option) else { continue };
-            let revision = item.revision()?.checked_add(1).ok_or(StoreError::LimitExceeded)?;
-            let mut claims = candidate.claims_for(group, option);
-            let claim = claims
-                .records
-                .iter()
-                .find(|r| r.owner == owner)
-                .and_then(|r| r.claim.clone());
-            let record = ClaimRecord {
-                owner,
-                revision,
-                claim: claim.clone(),
-            };
-            if let Some(existing) = claims.records.iter_mut().find(|r| r.owner == owner) {
-                *existing = record;
-            } else {
-                claims.records.push(record);
-            }
-            let mut raw = item.into_raw();
-            raw.insert(2, revision.write());
-            raw.insert(3, claim.write());
-            candidate.set_item(DevicePreference::from_raw(raw)?);
-            candidate.commit_claims_for(group, owner, claims, option)?;
-        }
-        *self = candidate;
+    /// Group switches keep no per-group audio state: the audio owner merges
+    /// with the new group as after a start (global audio configuration).
+    pub fn switch_group(&mut self, group: GroupId) -> Result<(), StoreError> {
+        self.raw.insert(4, RawValue::Bytes(group.0.to_vec()));
         Ok(())
     }
-    /// A verified group merge carries active local roles into the new group.
-    /// Ordinary group switches still restore that group's independent history.
-    /// Each carried claim gets a fresh ordered stamp, so concurrent merge
-    /// participants converge and the losing local owner durably yields.
-    pub fn merge_group(&mut self, group: GroupId, owner: DeviceId) -> Result<(), StoreError> {
-        if self.active_group() == Some(group) {
-            return Ok(());
+    /// This device's own audio configuration and the HLC's last stamp. Before
+    /// this build wrote key 5 once, the retired options 4 / 24 are the
+    /// initial forward / receive switches (0.3.x and early 0.4.0 settings);
+    /// exit and sender are never taken from older claims or route records
+    /// (choose the exit once after upgrading).
+    pub fn audio(&self, me: DeviceId) -> (OwnConfig, u64) {
+        if let Some(audio) = self.raw.get(&AUDIO_KEY) {
+            return parse_audio(audio).expect("validated audio configuration");
         }
+        let mut own = OwnConfig::local(me);
+        own.forward.on = self.retired_bool(RETIRED_FORWARDING).unwrap_or(false);
+        own.receive.on = !self.retired_bool(RETIRED_RECEIVE_MUTED).unwrap_or(true);
+        (own, 0)
+    }
+    pub fn commit_audio(&mut self, own: OwnConfig, hlc_last: u64) -> Result<(), StoreError> {
         let mut candidate = self.clone();
-        candidate.switch_group(group, owner)?;
-        for option in [LocalOption::AudioExitClaim, LocalOption::MicrophoneShareClaim] {
-            let Some(item) = self.item(option) else { continue };
-            let claim = Option::<dto::AudioExitClaim>::read(&item.value()?)?;
-            if !claim.is_some_and(|c| c.claimed() == Ok(true)) {
-                continue;
-            }
-            let previous = self
-                .active_group()
-                .map(|g| self.claims_for(g, option))
-                .unwrap_or_default();
-            let mut claims = candidate.claims_for(group, option);
-            let counter = claims
-                .seen_counter
-                .max(previous.seen_counter)
-                .checked_add(1)
-                .ok_or(StoreError::LimitExceeded)?;
-            let stamp = oink_audio::claims::Stamp { counter, owner };
-            let claim = dto::AudioExitClaim::from_raw([(1, stamp.to_wire().write()), (2, true.write())].into())?;
-            let revision = candidate.revision(option).ok_or(StoreError::Invalid)?;
-            let local = claims
-                .records
-                .iter_mut()
-                .find(|r| r.owner == owner)
-                .ok_or(StoreError::Invalid)?;
-            local.claim = Some(claim.clone());
-            // switch_group already advances the local projection once; this is
-            // one atomic transition, never an intermediate published baseline.
-            local.revision = revision.checked_add(1).ok_or(StoreError::LimitExceeded)?;
-            claims.seen_counter = counter;
-            claims.watermark = Some(claim);
-            candidate.commit_claims_for(group, owner, claims, option)?;
-        }
-        *self = candidate;
-        Ok(())
-    }
-    /// Persist the pure audio owner's proposed authenticated records together
-    /// with option20. Removed-member records and group history are never pruned.
-    pub fn commit_claims(&mut self, group: GroupId, owner: DeviceId, claims: GroupClaims) -> Result<(), StoreError> {
-        self.commit_claims_for(group, owner, claims, LocalOption::AudioExitClaim)
-    }
-    pub fn commit_microphone_claims(
-        &mut self,
-        group: GroupId,
-        owner: DeviceId,
-        claims: GroupClaims,
-    ) -> Result<(), StoreError> {
-        self.commit_claims_for(group, owner, claims, LocalOption::MicrophoneShareClaim)
-    }
-    /// Release and receiver unmute share one retained-store transaction.
-    pub fn release_microphone_claim(
-        &mut self,
-        group: GroupId,
-        owner: DeviceId,
-        claims: GroupClaims,
-    ) -> Result<(), StoreError> {
-        let mut candidate = self.clone();
-        candidate.commit_microphone_claims(group, owner, claims)?;
-        let option = LocalOption::MicrophoneReceiveMuted;
-        let revision = candidate.revision(option).ok_or(StoreError::Invalid)?;
-        candidate
-            .edit(option, revision, false.write())
-            .map_err(|_| StoreError::Invalid)?;
-        *self = candidate;
-        Ok(())
-    }
-    fn commit_claims_for(
-        &mut self,
-        group: GroupId,
-        owner: DeviceId,
-        claims: GroupClaims,
-        option: LocalOption,
-    ) -> Result<(), StoreError> {
-        let previous = self.claims_for(group, option);
-        if claims.seen_counter < previous.seen_counter {
-            return Err(StoreError::Invalid);
-        }
-        let order =
-            |claim: &dto::AudioExitClaim| oink_audio::claims::claim_order(claim).map_err(|_| StoreError::Invalid);
-        if claims.watermark.as_ref().map(order).transpose()? < previous.watermark.as_ref().map(order).transpose()? {
-            return Err(StoreError::Invalid);
-        }
-        if previous
-            .records
-            .iter()
-            .any(|old| !claims.records.iter().any(|new| new.owner == old.owner))
-        {
-            return Err(StoreError::Invalid);
-        }
-        let mut outer = self.group_raw(group).cloned().unwrap_or_default();
-        let mut map = if option == LocalOption::MicrophoneShareClaim {
-            outer
-                .get(&5)
-                .map(|v| v.as_map().cloned())
-                .transpose()?
-                .unwrap_or_default()
-        } else {
-            outer.clone()
-        };
-        let prior = map.get(&3).map(array).transpose()?.unwrap_or_default();
-        let mut records = Vec::new();
-        for record in &claims.records {
-            if let Some(old) = previous.records.iter().find(|old| old.owner == record.owner)
-                && (record.revision < old.revision || (record.revision == old.revision && record != old))
-            {
-                return Err(StoreError::Invalid);
-            }
-            let mut raw = prior
-                .iter()
-                .map(|v| v.as_map().expect("validated claim"))
-                .find(|raw| store::device(raw.get(&1).expect("owner")).ok() == Some(record.owner))
-                .cloned()
-                .unwrap_or_default();
-            raw.entry(1).or_insert_with(|| store::wire_device(record.owner).write());
-            raw.insert(2, record.revision.write());
-            raw.insert(3, record.claim.write());
-            records.push(RawValue::Map(raw));
-        }
-        map.insert(1, RawValue::Bytes(group.0.to_vec()));
-        map.insert(2, claims.seen_counter.write());
-        map.insert(3, RawValue::Array(records));
-        map.insert(4, claims.watermark.write());
-        parse_claims(&map)?;
-        if option == LocalOption::MicrophoneShareClaim {
-            outer.entry(1).or_insert_with(|| RawValue::Bytes(group.0.to_vec()));
-            outer.entry(2).or_insert_with(|| 0u64.write());
-            outer.entry(3).or_insert_with(|| RawValue::Array(Vec::new()));
-            outer.entry(4).or_insert(RawValue::Null);
-            outer.insert(5, RawValue::Map(map));
-            map = outer;
-        }
-        let mut candidate = self.clone();
-        let RawValue::Array(groups) = candidate.raw.get_mut(&3).expect("groups") else {
-            unreachable!()
-        };
-        if let Some(index) = groups
-            .iter()
-            .position(|v| store::group(v.as_map().expect("group").get(&1).expect("ID")).ok() == Some(group))
-        {
-            groups[index] = RawValue::Map(map);
-        } else {
-            groups.push(RawValue::Map(map));
-        }
-        if candidate.active_group() == Some(group)
-            && let Some(local) = claims.records.iter().find(|record| record.owner == owner)
-        {
-            let mut item = candidate.item(option).ok_or(StoreError::Invalid)?.into_raw();
-            let current_revision = item.get(&2).ok_or(StoreError::Invalid)?.as_u64()?;
-            if local.revision < current_revision {
-                return Err(StoreError::Invalid);
-            }
-            if local.revision == current_revision && item.get(&3) != Some(&local.claim.write()) {
-                return Err(StoreError::Invalid);
-            }
-            item.insert(2, local.revision.write());
-            item.insert(3, local.claim.write());
-            candidate.set_item(DevicePreference::from_raw(item)?);
-        }
+        candidate.raw.insert(
+            AUDIO_KEY,
+            RawValue::Map(
+                [
+                    (1, own.speaker_exit.write()),
+                    (2, own.microphone_send.write()),
+                    (3, own.forward.to_wire().write()),
+                    (4, own.receive.to_wire().write()),
+                    (5, hlc_last.write()),
+                ]
+                .into(),
+            ),
+        );
         candidate.encode()?;
         *self = candidate;
         Ok(())
     }
+    fn retired_bool(&self, option: u32) -> Option<bool> {
+        self.stored_preferences()
+            .into_iter()
+            .find(|item| item.option().map(LocalOption::number) == Ok(option))
+            .and_then(|item| bool::read(&item.value().ok()?).ok())
+    }
 }
-fn invalid(_: oink_protocol::v1::Error) -> ControlFailure {
+fn retired_audio_option(item: &DevicePreference) -> bool {
+    matches!(
+        item.option().map(LocalOption::number),
+        Ok(RETIRED_FORWARDING | RETIRED_RECEIVE_MUTED)
+    )
+}
+fn parse_audio(value: &RawValue) -> Result<(OwnConfig, u64), StoreError> {
+    let raw = value.as_map()?;
+    let flag = |key| -> Result<Flag, StoreError> {
+        Flag::from_wire(&dto::AudioFlag::read(store::required(raw, key)?)?).map_err(|_| StoreError::Invalid)
+    };
+    let own = OwnConfig {
+        speaker_exit: bool::read(store::required(raw, 1)?)?,
+        microphone_send: bool::read(store::required(raw, 2)?)?,
+        forward: flag(3)?,
+        receive: flag(4)?,
+    };
+    Ok((own, u64::read(store::required(raw, 5)?)?))
+}
+fn invalid(_: oink_protocol::v2::Error) -> ControlFailure {
     ControlFailure::InvalidValue
 }
 fn array(value: &RawValue) -> Result<&[RawValue], StoreError> {
@@ -526,46 +353,6 @@ fn array(value: &RawValue) -> Result<&[RawValue], StoreError> {
         RawValue::Array(v) => Ok(v),
         _ => Err(StoreError::Invalid),
     }
-}
-fn parse_claims(raw: &RawMap) -> Result<GroupClaims, StoreError> {
-    let seen_counter = store::required(raw, 2)?.as_u64()?;
-    let mut seen = BTreeSet::new();
-    let mut records = Vec::new();
-    for value in array(store::required(raw, 3)?)? {
-        let raw = value.as_map()?;
-        let owner = store::device(store::required(raw, 1)?)?;
-        let revision = store::required(raw, 2)?.as_u64()?;
-        if revision == 0 || !seen.insert(owner) {
-            return Err(StoreError::Invalid);
-        }
-        let claim = Option::<dto::AudioExitClaim>::read(store::required(raw, 3)?)?;
-        if let Some(claim) = &claim {
-            let stamp = claim.stamp()?;
-            if store::device(&stamp.owner()?.write())? != owner || stamp.counter()? > seen_counter {
-                return Err(StoreError::Invalid);
-            }
-        }
-        records.push(ClaimRecord { owner, revision, claim });
-    }
-    let watermark = raw
-        .get(&4)
-        .map(Option::<dto::AudioExitClaim>::read)
-        .transpose()?
-        .flatten();
-    if let Some(claim) = &watermark
-        && oink_audio::claims::claim_order(claim)
-            .map_err(|_| StoreError::Invalid)?
-            .0
-            .counter
-            > seen_counter
-    {
-        return Err(StoreError::Invalid);
-    }
-    Ok(GroupClaims {
-        seen_counter,
-        records,
-        watermark,
-    })
 }
 
 pub fn validate_value(option: LocalOption, value: &RawValue) -> Result<(), ControlFailure> {
@@ -588,7 +375,6 @@ pub fn validate_value(option: LocalOption, value: &RawValue) -> Result<(), Contr
             }
         }
         ClipboardEnabled
-        | ForwardingEnabled
         | KeyboardDisabled
         | ScreenShared
         | CursorTrail
@@ -597,8 +383,7 @@ pub fn validate_value(option: LocalOption, value: &RawValue) -> Result<(), Contr
         | NativeMultifinger
         | MacScrollFeel
         | SyncSystemArrangement
-        | DisableHiddenDisplays
-        | MicrophoneReceiveMuted => {
+        | DisableHiddenDisplays => {
             bool::read(value).map_err(invalid)?;
         }
         CursorTrailDuration => {
@@ -631,7 +416,10 @@ pub fn validate_value(option: LocalOption, value: &RawValue) -> Result<(), Contr
             for target in [
                 transform.macos().map_err(invalid)?,
                 transform.windows().map_err(invalid)?,
-            ] {
+            ]
+            .into_iter()
+            .chain(transform.android().map_err(invalid)?)
+            {
                 validate_keyboard(&target.keyboard().map_err(invalid)?)?;
             }
             let mut seen = BTreeSet::new();
@@ -662,11 +450,8 @@ pub fn validate_value(option: LocalOption, value: &RawValue) -> Result<(), Contr
             dto::ForwardingControlsValue::read(value).map_err(invalid)?;
         }
         MicrophoneInput => {
-            let input = Option::<oink_protocol::v1::schema::Text<512>>::read(value).map_err(invalid)?;
+            let input = Option::<oink_protocol::v2::schema::Text<512>>::read(value).map_err(invalid)?;
             oink_audio::validate_receive_output(input.as_ref().map(|v| v.0.as_str())).map_err(|_| bad)?;
-        }
-        AudioExitClaim | MicrophoneShareClaim => {
-            Option::<dto::AudioExitClaim>::read(value).map_err(invalid)?;
         }
         _ => return Err(ControlFailure::UnsupportedOption),
     }
@@ -751,7 +536,7 @@ fn patch_map(current: &mut RawValue, patch: &RawValue, shape: Shape) -> Result<(
         use Shape::*;
         let child = match (shape, key) {
             (ScreenPreferences, 1) => Some((Screen, true)),
-            (Transform, 1 | 2) => Some((Target, false)),
+            (Transform, 1 | 2 | 4) => Some((Target, false)),
             (Transform, 3) => Some((Override, true)),
             (Target, 2) | (Override, 3) => Some((Keyboard, false)),
             (Keyboard, 2) => Some((Key, true)),
@@ -763,7 +548,8 @@ fn patch_map(current: &mut RawValue, patch: &RawValue, shape: Shape) -> Result<(
         let valid = match shape {
             ScreenPreferences | Target | Key | Caps | Forwarding => key <= 2,
             Screen | Keyboard | SavedCustom => key <= 4,
-            Transform | Override => key <= 3,
+            Transform => key <= 4,
+            Override => key <= 3,
             Policy => key <= 6,
         };
         if key == 0 || !valid {
@@ -771,7 +557,7 @@ fn patch_map(current: &mut RawValue, patch: &RawValue, shape: Shape) -> Result<(
         }
         let optional = matches!(
             (shape, key),
-            (Policy, 1) | (Override, 2 | 3) | (Keyboard, 3 | 4) | (SavedCustom, 2)
+            (Transform, 4) | (Policy, 1) | (Override, 2 | 3) | (Keyboard, 3 | 4) | (SavedCustom, 2)
         );
         if optional && matches!(value, RawValue::Null) {
             if current.get(&key).is_some_and(|value| !matches!(value, RawValue::Null)) {
@@ -896,7 +682,7 @@ fn diff_map(before: &RawValue, after: &RawValue, shape: Shape) -> RawValue {
         use Shape::*;
         let child = match (shape, key) {
             (ScreenPreferences, 1) => Some((Screen, true)),
-            (Transform, 1 | 2) => Some((Target, false)),
+            (Transform, 1 | 2 | 4) => Some((Target, false)),
             (Transform, 3) => Some((Override, true)),
             (Target, 2) | (Override, 3) => Some((Keyboard, false)),
             (Keyboard, 2) => Some((Key, true)),
@@ -964,21 +750,12 @@ fn diff_list(before: &RawValue, after: &RawValue, shape: Shape) -> RawValue {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use oink_audio::route::Version;
     fn fresh() -> OwnerStore {
         OwnerStore::new(super::super::projection::values(&super::super::Settings::default())).unwrap()
     }
     fn map(entries: impl IntoIterator<Item = (u32, RawValue)>) -> RawValue {
         RawValue::Map(entries.into_iter().collect())
-    }
-    fn claim(owner: DeviceId, counter: u64, claimed: bool) -> dto::AudioExitClaim {
-        dto::AudioExitClaim::from_raw(
-            [
-                (1, map([(1, counter.write()), (2, store::wire_device(owner).write())])),
-                (2, claimed.write()),
-            ]
-            .into(),
-        )
-        .unwrap()
     }
     #[test]
     fn keyboard_and_mouse_modes_share_runtime_and_release_lifecycle() {
@@ -1064,11 +841,11 @@ mod tests {
             .write(),
         );
         items.sort_by_key(|item| DevicePreference::read(item).unwrap().option().unwrap().number());
-        let bytes = oink_protocol::v1::cbor::encode_map(&owner.raw, MAX_OWNER_BYTES).unwrap();
+        let bytes = oink_protocol::v2::cbor::encode_map(&owner.raw, MAX_OWNER_BYTES).unwrap();
         let restored = OwnerStore::decode(&bytes).unwrap();
         assert_eq!(restored.value(LocalOption::KeyboardMode), Some(1u32.write()));
         assert_eq!(restored.value(LocalOption::KeyboardDisabled), Some(false.write()));
-        let raw = oink_protocol::v1::cbor::decode_map(&restored.encode().unwrap(), MAX_OWNER_BYTES).unwrap();
+        let raw = oink_protocol::v2::cbor::decode_map(&restored.encode().unwrap(), MAX_OWNER_BYTES).unwrap();
         assert!(
             store::entries(&raw)
                 .unwrap()
@@ -1236,237 +1013,92 @@ mod tests {
         assert_eq!(loaded, before);
     }
     #[test]
-    fn microphone_release_unmutes_receiver_in_same_retained_projection() {
-        let mut owner = fresh();
+    fn own_audio_configuration_persists_device_level_with_the_clock() {
         let me = DeviceId([1; 32]);
+        let mut owner = fresh();
+        let (initial, last) = owner.audio(me);
+        assert_eq!(
+            (initial, last),
+            (OwnConfig::local(me), 0),
+            "a fresh install is all local"
+        );
+        let flag = |on, stamp| Flag {
+            on,
+            version: Version { stamp, author: me },
+        };
+        let own = OwnConfig {
+            speaker_exit: true,
+            microphone_send: false,
+            forward: flag(true, 7 << 16),
+            receive: flag(false, 8 << 16),
+        };
+        owner.commit_audio(own, 9 << 16).unwrap();
+        // Not per group: a switch keeps it.
+        owner.switch_group(GroupId([3; 16])).unwrap();
+        let restored = OwnerStore::decode(&owner.encode().unwrap()).unwrap();
+        assert_eq!(restored.audio(me), (own, 9 << 16));
+        assert!(
+            restored
+                .preferences()
+                .iter()
+                .all(|item| !matches!(item.option().unwrap().number(), 4 | 24))
+        );
+    }
+    #[test]
+    fn retired_forward_and_receive_options_seed_the_switches_once_and_are_kept() {
+        let me = DeviceId([1; 32]);
+        let mut owner = fresh();
         let group = GroupId([3; 16]);
-        owner.switch_group(group, me).unwrap();
-        let option = LocalOption::MicrophoneReceiveMuted;
-        owner
-            .edit(option, owner.revision(option).unwrap(), true.write())
-            .unwrap();
-        let muted_revision = owner.revision(option).unwrap();
-        let mut claims = owner.microphone_claims(group);
-        claims.seen_counter = 1;
-        claims.records = vec![ClaimRecord {
-            owner: me,
-            revision: owner.revision(LocalOption::MicrophoneShareClaim).unwrap() + 1,
-            claim: Some(claim(me, 1, true)),
-        }];
-        owner.commit_microphone_claims(group, me, claims.clone()).unwrap();
-        claims.seen_counter = 2;
-        claims.records[0].revision += 1;
-        claims.records[0].claim = Some(claim(me, 2, false));
-        owner.release_microphone_claim(group, me, claims.clone()).unwrap();
-        let loaded = OwnerStore::decode(&owner.encode().unwrap()).unwrap();
-        assert_eq!(loaded.value(option), Some(false.write()));
-        assert_eq!(loaded.revision(option), Some(muted_revision + 1));
-        assert_eq!(loaded.microphone_claims(group), claims);
-        // Releasing an already unmuted receiver never adds an extra mute revision.
-        owner.release_microphone_claim(group, me, claims).unwrap();
-        assert_eq!(owner.revision(option), Some(muted_revision + 1));
-    }
-    #[test]
-    fn group_merge_carries_both_roles_without_crossing_their_claim_namespaces() {
-        let mut owner = fresh();
-        let me = DeviceId([1; 32]);
-        let a = GroupId([3; 16]);
-        let b = GroupId([4; 16]);
-        owner.switch_group(a, me).unwrap();
-        for option in [LocalOption::AudioExitClaim, LocalOption::MicrophoneShareClaim] {
-            let mut claims = owner.claims_for(a, option);
-            let revision = owner.revision(option).unwrap() + 1;
-            claims.seen_counter = 7;
-            claims.records = vec![ClaimRecord {
-                owner: me,
-                revision,
-                claim: Some(claim(me, 7, true)),
-            }];
-            owner.commit_claims_for(a, me, claims, option).unwrap();
+        // An earlier build: options 4 / 24, a group record with claims (keys
+        // 2-5) and an early 0.4.0 route setting (key 6).
+        let legacy_group = map([
+            (1, RawValue::Bytes(group.0.to_vec())),
+            (2, 7u64.write()),
+            (3, RawValue::Array(vec![])),
+            (4, RawValue::Null),
+            (
+                6,
+                map([(1, map([(1, 3u64.write()), (2, store::wire_device(me).write())]))]),
+            ),
+        ]);
+        owner.raw.insert(3, RawValue::Array(vec![legacy_group.clone()]));
+        let RawValue::Array(items) = owner.raw.get_mut(&2).unwrap() else {
+            unreachable!()
+        };
+        for (option, value) in [
+            (RETIRED_FORWARDING, true.write()),
+            (RETIRED_EXIT_CLAIM, RawValue::Null),
+            (RETIRED_MICROPHONE_CLAIM, RawValue::Null),
+            (RETIRED_RECEIVE_MUTED, false.write()),
+        ] {
+            items.push(map([(1, option.write()), (2, 3u64.write()), (3, value)]));
         }
-        let original = owner.clone();
-        owner.merge_group(b, me).unwrap();
-        for option in [LocalOption::AudioExitClaim, LocalOption::MicrophoneShareClaim] {
-            assert_eq!(owner.claims_for(a, option), original.claims_for(a, option));
-            let records = owner.claims_for(b, option);
-            assert_eq!(records.seen_counter, 8);
-            assert!(records.records[0].claim.as_ref().unwrap().claimed().unwrap());
-        }
-        let microphone = owner.microphone_claims(b);
-        let mut speaker = owner.claims(b);
-        speaker.seen_counter = 9;
-        speaker.records[0].revision += 1;
-        speaker.records[0].claim = Some(claim(me, 9, false));
-        owner.commit_claims(b, me, speaker).unwrap();
-        assert_eq!(owner.microphone_claims(b), microphone);
-        assert_eq!(
-            OwnerStore::decode(&owner.encode().unwrap())
-                .unwrap()
-                .microphone_claims(b),
-            microphone
+        items.sort_by_key(|item| item.as_map().unwrap()[&1].as_u64().unwrap());
+        let loaded =
+            OwnerStore::decode(&oink_protocol::v2::cbor::encode_map(&owner.raw, MAX_OWNER_BYTES).unwrap()).unwrap();
+        let (own, _) = loaded.audio(me);
+        assert!(own.forward.on && own.receive.on, "seeded from options 4 / 24");
+        assert!(!own.speaker_exit && !own.microphone_send, "no exit from older claims");
+        assert!(
+            loaded
+                .preferences()
+                .iter()
+                .all(|item| !matches!(item.option().unwrap().number(), 4 | 20 | 22 | 24))
         );
-    }
-    #[test]
-    fn group_switch_and_claim_records_commit_one_projection_without_losing_history() {
-        let mut owner = fresh();
-        let me = DeviceId([1; 32]);
-        let peer = DeviceId([2; 32]);
-        let a = GroupId([3; 16]);
-        let b = GroupId([4; 16]);
-        owner.switch_group(a, me).unwrap();
-        assert_eq!(owner.revision(LocalOption::AudioExitClaim), Some(2));
+        assert_eq!(loaded.item(LocalOption::from_number(4)), None, "never edited");
+        let mut updated = loaded.clone();
+        updated.commit_audio(OwnConfig::local(me), 1).unwrap();
+        let reloaded = OwnerStore::decode(&updated.encode().unwrap()).unwrap();
+        assert_eq!(reloaded.audio(me), (OwnConfig::local(me), 1), "key 5 wins once written");
         assert_eq!(
-            owner.claims(a).records[0],
-            ClaimRecord {
-                owner: me,
-                revision: 2,
-                claim: None
-            }
+            reloaded.retired_bool(RETIRED_FORWARDING),
+            Some(true),
+            "the old option is kept"
         );
-        let claims = GroupClaims {
-            watermark: None,
-            seen_counter: u64::MAX,
-            records: vec![
-                ClaimRecord {
-                    owner: me,
-                    revision: 3,
-                    claim: Some(claim(me, 4, true)),
-                },
-                ClaimRecord {
-                    owner: peer,
-                    revision: 8,
-                    claim: Some(claim(peer, u64::MAX, false)),
-                },
-            ],
-        };
-        owner.commit_claims(a, me, claims.clone()).unwrap();
-        assert_eq!(owner.revision(LocalOption::AudioExitClaim), Some(3));
         assert_eq!(
-            owner.value(LocalOption::AudioExitClaim),
-            claims.records[0].claim.as_ref().map(WireValue::write)
-        );
-        owner.switch_group(b, me).unwrap();
-        assert_eq!(owner.value(LocalOption::AudioExitClaim), Some(RawValue::Null));
-        assert_eq!(owner.claims(a), claims);
-        assert_eq!(owner.claims(b).seen_counter, 0);
-        owner.switch_group(a, me).unwrap();
-        assert_eq!(owner.revision(LocalOption::AudioExitClaim), Some(5));
-        let restored = OwnerStore::decode(&owner.encode().unwrap()).unwrap();
-        assert_eq!(restored, owner);
-        assert_eq!(restored.claims(a).seen_counter, u64::MAX);
-        assert_eq!(restored.claims(a).records[0].revision, 5);
-        let returned = restored.claims(a).records[0].claim.clone().unwrap();
-        assert!(returned.claimed().unwrap());
-        assert_eq!(returned.stamp().unwrap().counter().unwrap(), 4);
-        let mut invalid = restored.claims(a);
-        invalid.records.pop();
-        assert!(owner.commit_claims(a, me, invalid).is_err());
-        assert_eq!(owner, restored);
-    }
-    #[test]
-    fn relayed_ordering_witness_is_durable_group_local_and_cannot_regress() {
-        let mut owner = fresh();
-        let me = DeviceId([1; 32]);
-        let removed = DeviceId([9; 32]);
-        let a = GroupId([3; 16]);
-        let b = GroupId([4; 16]);
-        owner.switch_group(a, me).unwrap();
-        let mut records = owner.claims(a);
-        records.seen_counter = 8;
-        records.watermark = Some(claim(removed, 8, false));
-        owner.commit_claims(a, me, records.clone()).unwrap();
-        let mut restored = OwnerStore::decode(&owner.encode().unwrap()).unwrap();
-        assert_eq!(restored.claims(a), records);
-        assert!(restored.claims(a).records.iter().all(|record| record.owner != removed));
-        restored.switch_group(b, me).unwrap();
-        assert_eq!(restored.claims(b).watermark(), None);
-        assert_eq!(restored.claims(b).seen_counter, 0);
-        restored.switch_group(a, me).unwrap();
-        assert_eq!(restored.claims(a).watermark(), records.watermark);
-        let mut regressed = restored.claims(a);
-        regressed.watermark = Some(claim(removed, 8, true));
-        assert!(restored.commit_claims(a, me, regressed).is_err());
-    }
-    #[test]
-    fn group_switch_restores_saved_withdrawal_without_importing_source_claim() {
-        let mut owner = fresh();
-        let me = DeviceId([1; 32]);
-        let a = GroupId([3; 16]);
-        let b = GroupId([4; 16]);
-        owner.switch_group(a, me).unwrap();
-        let withdrawn = claim(me, 9, false);
-        owner
-            .commit_claims(
-                a,
-                me,
-                GroupClaims {
-                    watermark: None,
-                    seen_counter: 9,
-                    records: vec![ClaimRecord {
-                        owner: me,
-                        revision: 3,
-                        claim: Some(withdrawn.clone()),
-                    }],
-                },
-            )
-            .unwrap();
-        owner.switch_group(b, me).unwrap();
-        owner
-            .commit_claims(
-                b,
-                me,
-                GroupClaims {
-                    watermark: None,
-                    seen_counter: 20,
-                    records: vec![ClaimRecord {
-                        owner: me,
-                        revision: 5,
-                        claim: Some(claim(me, 20, true)),
-                    }],
-                },
-            )
-            .unwrap();
-        let source = owner.claims(b);
-        owner.switch_group(a, me).unwrap();
-        assert_eq!(owner.value(LocalOption::AudioExitClaim), Some(withdrawn.write()));
-        assert_eq!(owner.revision(LocalOption::AudioExitClaim), Some(6));
-        assert_eq!(owner.claims(a).seen_counter, 9);
-        assert_eq!(owner.claims(b), source);
-        let restored = OwnerStore::decode(&owner.encode().unwrap()).unwrap();
-        assert_eq!(restored, owner);
-    }
-    #[test]
-    fn group_record_updates_keep_retained_owner_identity_extensions() {
-        let mut owner = fresh();
-        let me = DeviceId([1; 32]);
-        let group = GroupId([3; 16]);
-        owner.switch_group(group, me).unwrap();
-        let RawValue::Array(groups) = owner.raw.get_mut(&3).unwrap() else {
-            unreachable!()
-        };
-        let RawValue::Map(group_raw) = &mut groups[0] else {
-            unreachable!()
-        };
-        let RawValue::Array(records) = group_raw.get_mut(&3).unwrap() else {
-            unreachable!()
-        };
-        let RawValue::Map(record) = &mut records[0] else {
-            unreachable!()
-        };
-        let RawValue::Map(id) = record.get_mut(&1).unwrap() else {
-            unreachable!()
-        };
-        id.insert(99, RawValue::Bytes(vec![7, 8]));
-        let mut records = owner.claims(group);
-        records.seen_counter = 1;
-        records.records[0].revision += 1;
-        records.records[0].claim = Some(claim(me, 1, true));
-        owner.commit_claims(group, me, records).unwrap();
-        let restored = OwnerStore::decode(&owner.encode().unwrap()).unwrap();
-        let record = &array(restored.group_raw(group).unwrap().get(&3).unwrap()).unwrap()[0];
-        assert_eq!(
-            record.as_map().unwrap()[&1].as_map().unwrap()[&99],
-            RawValue::Bytes(vec![7, 8])
+            reloaded.raw[&3],
+            RawValue::Array(vec![legacy_group]),
+            "group records are kept"
         );
     }
     #[test]

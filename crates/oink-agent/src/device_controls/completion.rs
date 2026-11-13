@@ -1,10 +1,10 @@
 //! Validate an owner response against the exact outstanding request before it
 //! clears pending UI state. A decodable response alone is not evidence of apply.
 use crate::device_cards::DeviceControlResult;
-use oink_protocol::v1::{Message, dto};
+use oink_protocol::v2::{Message, dto};
 type Failure = dto::ControlFailure;
 
-fn field<T>(value: oink_protocol::v1::Result<T>) -> Result<T, Failure> {
+fn field<T>(value: oink_protocol::v2::Result<T>) -> Result<T, Failure> {
     value.map_err(|_| Failure::InvalidValue)
 }
 fn success(outcome: dto::ControlOutcome, reason: Failure) -> Result<bool, Failure> {
@@ -80,7 +80,7 @@ pub fn validate(request: &Message, response: &Message) -> Result<DeviceControlRe
                 let current = field(response.current())?.ok_or(Failure::StateConflict)?;
                 let version = field(current.version())?;
                 if field(version.exit())? != field(expected.exit())?
-                    || field(version.exit_claim())? != field(expected.exit_claim())?
+                    || field(version.route_version())? != field(expected.route_version())?
                     || field(version.output_id())? != field(expected.output_id())?
                     || field(version.output_generation())? != field(expected.output_generation())?
                     || field(current.status())? != dto::ExitVolumeStatus::Ready
@@ -109,7 +109,7 @@ pub fn validate(request: &Message, response: &Message) -> Result<DeviceControlRe
 mod tests {
     use super::*;
     use crate::{device_cards::*, device_controls::requests};
-    use oink_protocol::v1::{
+    use oink_protocol::v2::{
         RawValue,
         schema::{WireDto, WireValue},
     };

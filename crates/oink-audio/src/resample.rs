@@ -95,8 +95,11 @@ impl History {
     }
 }
 
+// Native capture conversion; only the desktop capture paths construct it.
+#[cfg(any(target_os = "macos", windows))]
 use std::time::{Duration, Instant};
 
+#[cfg(any(target_os = "macos", windows))]
 pub(crate) struct StereoResampler {
     kernel: crate::resample::Kernel,
     history: crate::resample::History,
@@ -109,6 +112,7 @@ pub(crate) struct StereoResampler {
     pending_sequence: u64,
 }
 
+#[cfg(any(target_os = "macos", windows))]
 impl StereoResampler {
     #[cfg(all(test, target_os = "macos"))]
     pub(crate) fn new(rate: f64) -> Self {
@@ -232,6 +236,7 @@ mod quality_tests {
         (signal, error)
     }
     #[test]
+    #[cfg(any(target_os = "macos", windows))]
     fn capture_chunk_boundaries_preserve_samples_and_impulse_delay() {
         for (input_rate, output_rate) in [(44_100.0, 48_000.0), (96_000.0, 48_000.0), (44_100.0, 44_100.0)] {
             let input: Vec<_> = (0..4096)
@@ -310,6 +315,7 @@ mod quality_tests {
         }
     }
     #[test]
+    #[cfg(any(target_os = "macos", windows))]
     fn impulse_measures_filter_latency_and_unity_capture_bypasses_it() {
         let kernel = Kernel::new(1.0);
         let peak = (0..96)

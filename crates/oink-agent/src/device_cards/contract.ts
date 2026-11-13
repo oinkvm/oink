@@ -10,8 +10,8 @@ export type GroupId = string; // group identifier, never a shared cryptographic 
 export type DecimalU64 = string;
 export type UtcMs = number; // integer, 0..Number.MAX_SAFE_INTEGER
 export type SharingMode = "shared" | "local" | "disabled";
-export type CardOs = "macos" | "windows" | "linux" | "other";
-export type CardLogo = "macos" | "windows10" | "linux" | "generic";
+export type CardOs = "macos" | "windows" | "android" | "ios" | "linux" | "other";
+export type CardLogo = "macos" | "windows10" | "android" | "android_privileged" | "ios" | "iphone" | "ipad" | "linux" | "generic";
 export type OfflineKind = "disconnected" | "connecting" | "address_stale" | "protocol_incompatible";
 export type Signal =
   | { kind: "measured"; rttMs: number; bars: 1 | 2 | 3;
@@ -55,8 +55,8 @@ export type CardActionUnavailable =
   | "remote_fault" | "not_member" | "busy";
 export type CardAction =
   | { kind: "invoke"; command: "set_screen_mode" | "set_local_option"
-      | "clear_audio_exit" | "make_audio_exit" | "set_game_mode"
-      | "set_device_paused"; token: string }
+      | "clear_audio_exit" | "make_audio_exit" | "set_audio_mode"
+      | "set_game_mode" | "set_device_paused"; token: string }
   | { kind: "open_permissions" } // self fault only; UI-local navigation
   | { kind: "unavailable"; reason: CardActionUnavailable };
 export interface ResourceCard<M extends string, I extends string = M> {
@@ -78,7 +78,7 @@ export interface SpeakerCard extends ResourceCard<
 > {
   makeExitAction: CardAction;
   forwardingControlsToken: string | null; // owner15 Boot/revision fence
-  forwardingEnabled: boolean | null; // this row's source switch
+  forwardingEnabled: boolean | null; // this row's forward switch (global audio configuration)
   localOutput: { volumePercent: number /* 0..100 */; muted: boolean } | null;
   activity: "idle" | "playing" | "forwarding" | "sound_sleep"
     | "preparing" | "waiting_for_exit" | "paused" | "sleeping"
@@ -160,7 +160,7 @@ export interface ExitVolumeCard {
   muted: boolean | null; // system mute, not forwarding mute
   condition: "ready" | "offline" | "state_unknown" | "unsupported"
     | "unavailable" | "permission_denied" | "backend_failed";
-  versionToken: string | null; // exact exit claim + Boot/output generation/revision
+  versionToken: string | null; // exact exit route version + Boot/output generation/revision| null; // exact exit claim + Boot/output generation/revision
   canSet: boolean;
   refusal: CardActionUnavailable | "output_unavailable"
     | "permission_denied" | null;

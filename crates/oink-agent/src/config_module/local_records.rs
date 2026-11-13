@@ -1,15 +1,15 @@
 //! Retained address hints and display-only facts. Neither store grants current
-//! membership, Boot freshness, claim authority or permission to send input.
+//! membership, Boot freshness, audio route authority or permission to send input.
 use crate::config::store::{self, StoreError};
 use oink_foundation::{DeviceId, GroupId};
-use oink_protocol::v1::{
+use oink_protocol::v2::{
     self, RawMap, RawValue, dto,
     schema::{WireDto, WireValue},
 };
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     io::Read,
-    net::{Ipv4Addr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
 };
 
@@ -17,9 +17,18 @@ pub const ADDRESSES_FILE: &str = "addresses.json";
 pub const FACTS_FILE: &str = "metadata-cache.cbor";
 const MAX_ADDRESSES_BYTES: usize = 1024 * 1024;
 const MAX_FACTS_BYTES: usize = 16 * 1024 * 1024;
+/// IPv4 addresses remembered per device (user 2026-11-12). A phone opens a
+/// new ephemeral port on every endpoint start and moves between networks;
+/// without a bound every port it ever used stayed a dial candidate and the
+/// first round spent all dial slots on stale ones (a Mac test machine, 2026-11-12).
+pub const MAX_IPS_PER_DEVICE: usize = 8;
 
 /// Schema1 JSON: {schema:1,entries:[{device:{algorithm,public_key},ipv4,port}]}.
 /// Newest remembered hints come first. Unknown envelope and entry keys survive.
+/// One entry per (device, IPv4) carrying the newest port, at most
+/// [`MAX_IPS_PER_DEVICE`] per device: the least recently remembered IP goes
+/// first. Applied on every record and on load (an over-full file is
+/// rewritten trimmed).
 #[derive(Clone, Debug)]
 pub struct AddressStore {
     path: PathBuf,
@@ -41,7 +50,26 @@ impl AddressStore {
             Err(error) => return Err(error.into()),
         };
         validate_addresses(&raw)?;
-        Ok(Self { path, raw })
+        let mut raw = raw;
+        let mut store_trimmed = false;
+        if let Some(entries) = raw.get_mut("entries").and_then(serde_json::Value::as_array_mut) {
+            store_trimmed = trim_addresses(entries);
+        }
+        let store = Self { path, raw };
+        if store_trimmed {
+            // Same trimming as every record; written back at once so the
+            // file shows what is dialed. Memory is already trimmed: a failed
+            // write leaves the next successful record to persist it.
+            match serde_json::to_vec_pretty(&store.raw) {
+                Ok(bytes) => {
+                    if let Err(error) = oink_foundation::storage::atomic_write(&store.path, &bytes) {
+                        tracing::warn!(%error, "trimmed address book could not be written back");
+                    }
+                }
+                Err(error) => tracing::warn!(%error, "trimmed address book could not be encoded"),
+            }
+        }
+        Ok(store)
     }
     pub fn candidates(&self, device: DeviceId) -> Vec<SocketAddr> {
         address_entries(&self.raw)
@@ -67,17 +95,13 @@ impl AddressStore {
             .get_mut("entries")
             .and_then(serde_json::Value::as_array_mut)
             .ok_or(StoreError::Invalid)?;
-        let index = entries
-            .iter()
-            .position(|entry| parse_address(entry).is_ok_and(|value| value == (device, address.into())));
-        let entry = match index {
-            Some(0) => return Ok(false),
-            Some(index) => entries.remove(index),
-            None => {
-                serde_json::json!({"device":{"algorithm":"ed25519","public_key":device.to_hex()},"ipv4":address.ip().to_string(),"port":address.port()})
-            }
-        };
+        let index = same_ip(entries, device, address);
+        if index == Some(0) && parse_address(&entries[0]).is_ok_and(|(_, known)| known.port() == address.port()) {
+            return Ok(false);
+        }
+        let entry = take_or_new(entries, index, device, address)?;
         entries.insert(0, entry);
+        trim_addresses(entries);
         let bytes = serde_json::to_vec_pretty(&candidate).map_err(|_| StoreError::Invalid)?;
         if bytes.len() > MAX_ADDRESSES_BYTES {
             return Err(StoreError::LimitExceeded);
@@ -89,6 +113,198 @@ impl AddressStore {
         self.raw = candidate;
         Ok(true)
     }
+}
+/// Route pins (route-selection design 5.5), stored in the same schema-1 file:
+/// `"pinned": true` on the address entry this device dials, or the envelope's
+/// `"routes": [{device, keep_incoming: "<this device's IPv4>"}]` when the peer
+/// dials. At most one per peer.
+impl AddressStore {
+    pub fn route_record(&self, device: DeviceId) -> Option<oink_network::link::RouteRecord> {
+        let entries = address_entries(&self.raw).expect("validated addresses");
+        let pinned = entries.iter().find_map(|entry| {
+            let (id, address) = parse_address(entry).ok()?;
+            (id == device && entry.get("pinned").and_then(serde_json::Value::as_bool) == Some(true)).then_some(address)
+        });
+        if let Some(SocketAddr::V4(address)) = pinned {
+            return Some(oink_network::link::RouteRecord::Dial(*address.ip()));
+        }
+        self.raw
+            .get("routes")
+            .and_then(serde_json::Value::as_array)?
+            .iter()
+            .find_map(|route| {
+                (route_device(route)? == device)
+                    .then(|| route.get("keep_incoming")?.as_str()?.parse::<Ipv4Addr>().ok())
+                    .flatten()
+            })
+            .map(oink_network::link::RouteRecord::Incoming)
+    }
+    /// Only the saved manual endpoint joins the published connected-route
+    /// probes. Ordinary historical hints remain exclusive to initial dialing.
+    pub fn route_candidates(&self, device: DeviceId, mut published: Vec<SocketAddr>) -> Vec<SocketAddr> {
+        if let Some(oink_network::link::RouteRecord::Dial(ip)) = self.route_record(device)
+            && !published.iter().any(|a| a.ip() == ip)
+            && let Some(address) = self.candidates(device).into_iter().find(|a| a.ip() == ip)
+        {
+            published.push(address);
+        }
+        published
+    }
+    /// Replace this peer's pin. `Dial` needs its target endpoint, from a route
+    /// row or authenticated peer facts, even when dialing has not succeeded.
+    /// It becomes the newest dial hint too.
+    pub fn set_route_record(
+        &mut self,
+        device: DeviceId,
+        record: Option<oink_network::link::RouteRecord>,
+        dialed: Option<SocketAddr>,
+    ) -> Result<(), StoreError> {
+        let mut candidate = self.raw.clone();
+        let entries = candidate
+            .get_mut("entries")
+            .and_then(serde_json::Value::as_array_mut)
+            .ok_or(StoreError::Invalid)?;
+        for entry in entries.iter_mut() {
+            if parse_address(entry).is_ok_and(|(id, _)| id == device)
+                && let Some(map) = entry.as_object_mut()
+            {
+                map.remove("pinned");
+            }
+        }
+        if let Some(object) = candidate.as_object_mut()
+            && let Some(routes) = object.get_mut("routes").and_then(serde_json::Value::as_array_mut)
+        {
+            routes.retain(|route| route_device(route) != Some(device));
+        }
+        match record {
+            None => {}
+            Some(oink_network::link::RouteRecord::Dial(ip)) => {
+                let Some(SocketAddr::V4(address)) = dialed.filter(|a| a.ip() == std::net::IpAddr::V4(ip)) else {
+                    return Err(StoreError::Invalid);
+                };
+                let entries = candidate
+                    .get_mut("entries")
+                    .and_then(serde_json::Value::as_array_mut)
+                    .ok_or(StoreError::Invalid)?;
+                let index = same_ip(entries, device, address);
+                let mut entry = take_or_new(entries, index, device, address)?;
+                entry
+                    .as_object_mut()
+                    .ok_or(StoreError::Invalid)?
+                    .insert("pinned".into(), serde_json::Value::Bool(true));
+                entries.insert(0, entry);
+                trim_addresses(entries);
+            }
+            Some(oink_network::link::RouteRecord::Incoming(ip)) => {
+                let object = candidate.as_object_mut().ok_or(StoreError::Invalid)?;
+                let routes = object
+                    .entry("routes")
+                    .or_insert_with(|| serde_json::Value::Array(Vec::new()))
+                    .as_array_mut()
+                    .ok_or(StoreError::Invalid)?;
+                routes.push(serde_json::json!({
+                    "device":{"algorithm":"ed25519","public_key":device.to_hex()},
+                    "keep_incoming": ip.to_string(),
+                }));
+            }
+        }
+        if candidate == self.raw {
+            return Ok(());
+        }
+        let bytes = serde_json::to_vec_pretty(&candidate).map_err(|_| StoreError::Invalid)?;
+        if bytes.len() > MAX_ADDRESSES_BYTES {
+            return Err(StoreError::LimitExceeded);
+        }
+        if let Some(parent) = self.path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        oink_foundation::storage::atomic_write(&self.path, &bytes)?;
+        self.raw = candidate;
+        Ok(())
+    }
+}
+/// Index of this device's entry for `address`'s IPv4, whatever its port.
+fn same_ip(entries: &[serde_json::Value], device: DeviceId, address: std::net::SocketAddrV4) -> Option<usize> {
+    entries.iter().position(|entry| {
+        parse_address(entry).is_ok_and(|(id, known)| id == device && known.ip() == IpAddr::V4(*address.ip()))
+    })
+}
+/// Removes the entry at `index` and gives it `address`'s port (unknown keys
+/// and a pin survive), or makes a new entry.
+fn take_or_new(
+    entries: &mut Vec<serde_json::Value>,
+    index: Option<usize>,
+    device: DeviceId,
+    address: std::net::SocketAddrV4,
+) -> Result<serde_json::Value, StoreError> {
+    Ok(match index {
+        Some(index) => {
+            let mut entry = entries.remove(index);
+            entry
+                .as_object_mut()
+                .ok_or(StoreError::Invalid)?
+                .insert("port".into(), address.port().into());
+            entry
+        }
+        None => {
+            serde_json::json!({"device":{"algorithm":"ed25519","public_key":device.to_hex()},"ipv4":address.ip().to_string(),"port":address.port()})
+        }
+    })
+}
+fn pinned(entry: &serde_json::Value) -> bool {
+    entry.get("pinned").and_then(serde_json::Value::as_bool) == Some(true)
+}
+/// Entries are newest first. Keeps the newest entry of every (device, IPv4)
+/// and the [`MAX_IPS_PER_DEVICE`] most recent IPs of every device; true when
+/// something was dropped. A route pin (one per peer) moves to the kept entry
+/// of its IP and is never dropped: it is the address the user chose.
+fn trim_addresses(entries: &mut Vec<serde_json::Value>) -> bool {
+    let before = entries.len();
+    let mut kept: Vec<(DeviceId, IpAddr, serde_json::Value)> = Vec::with_capacity(before);
+    for entry in entries.drain(..) {
+        let (device, address) = parse_address(&entry).expect("validated address");
+        if let Some((_, _, newer)) = kept.iter_mut().find(|(id, ip, _)| *id == device && *ip == address.ip()) {
+            if pinned(&entry)
+                && let Some(map) = newer.as_object_mut()
+            {
+                map.insert("pinned".into(), serde_json::Value::Bool(true));
+            }
+            continue;
+        }
+        kept.push((device, address.ip(), entry));
+    }
+    let mut per_device: BTreeMap<DeviceId, usize> = BTreeMap::new();
+    for (device, _, _) in &kept {
+        *per_device.entry(*device).or_default() += 1;
+    }
+    // Oldest first: drop least recently used IPs until each device fits.
+    let mut index = kept.len();
+    while index > 0 {
+        index -= 1;
+        let (device, _, entry) = &kept[index];
+        let count = per_device.get_mut(device).expect("counted device");
+        if *count > MAX_IPS_PER_DEVICE && !pinned(entry) {
+            *count -= 1;
+            kept.remove(index);
+        }
+    }
+    entries.extend(kept.into_iter().map(|(_, _, entry)| entry));
+    entries.len() != before
+}
+fn route_device(route: &serde_json::Value) -> Option<DeviceId> {
+    let device = route.get("device")?;
+    if device.get("algorithm")?.as_str()? != "ed25519" {
+        return None;
+    }
+    let key = device.get("public_key")?.as_str()?;
+    if key.len() != 64 {
+        return None;
+    }
+    let mut bytes = [0; 32];
+    for (index, byte) in bytes.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(key.get(index * 2..index * 2 + 2)?, 16).ok()?;
+    }
+    Some(DeviceId(bytes))
 }
 fn address_entries(raw: &serde_json::Value) -> Result<&Vec<serde_json::Value>, StoreError> {
     raw.get("entries")
@@ -161,7 +377,7 @@ impl FactsCache {
         for entry in store::entries(&raw)? {
             let record = cache_record(entry.as_map()?)?;
             let facts = historical_facts(&record)?;
-            facts.encode(v1::limits::CONFIG_FRAME)?;
+            facts.encode(v2::limits::CONFIG_FRAME)?;
             if !seen.insert(facts_key(&facts)?) {
                 return Err(StoreError::Invalid);
             }
@@ -188,9 +404,9 @@ impl FactsCache {
             })
     }
     /// Call after authenticating the complete live facts. This cache does not
-    /// compare Boot freshness or provide the durable audio claim baseline.
+    /// compare Boot freshness or carry the group audio route setting.
     pub fn observe(&mut self, facts: dto::DeviceFacts) -> Result<(), StoreError> {
-        facts.encode(v1::limits::CONFIG_FRAME)?;
+        facts.encode(v2::limits::CONFIG_FRAME)?;
         let key = facts_key(&facts)?;
         let record = RawValue::Map(cache_record(facts.raw())?);
         let mut candidate = self.raw.clone();
@@ -209,7 +425,7 @@ impl FactsCache {
         } else {
             entries.push(record);
         }
-        v1::cbor::encode_map(&candidate, MAX_FACTS_BYTES)?;
+        v2::cbor::encode_map(&candidate, MAX_FACTS_BYTES)?;
         self.raw = candidate;
         self.dirty = true;
         Ok(())
@@ -224,8 +440,8 @@ impl FactsCache {
     }
 }
 // Keep the disk representation narrower than DeviceFacts. The allowlist follows
-// offline readers in agent_api, runtime_state and layout_profiles; authentication,
-// claims, permissions and runtime controls use live facts, never this record.
+// offline readers in agent_api, runtime_state, layout_profiles and device_cards; authentication,
+// the audio configuration, permissions and runtime controls use live facts, never this record.
 fn subset(raw: &RawMap, keys: &[u32]) -> RawMap {
     raw.iter()
         .filter(|(key, _)| keys.contains(key))
@@ -235,7 +451,9 @@ fn subset(raw: &RawMap, keys: &[u32]) -> RawMap {
 fn cache_record(raw: &RawMap) -> Result<RawMap, StoreError> {
     let boot = store::required(raw, 1)?.as_map()?;
     let device = store::device(store::required(boot, 1)?)?;
-    let mut record = subset(raw, &[5, 6, 7, 8, 9]);
+    // 31 (form_factor) feeds the iPhone/iPad badge of offline device cards.
+    // 28..=30 are retired DeviceFacts keys (protocol-v2 registry); not stored.
+    let mut record = subset(raw, &[5, 6, 7, 8, 9, 25, 26, 27, 31]);
     record.insert(1, RawValue::Map([(1, store::wire_device(device).write())].into()));
     for (key, fields) in [(10, &[1, 2, 3][..]), (12, &[1, 2, 3, 5, 6, 7, 8, 10, 11, 12][..])] {
         let RawValue::Array(items) = store::required(raw, key)? else {
@@ -329,6 +547,9 @@ fn historical_facts(record: &RawMap) -> Result<dto::DeviceFacts, StoreError> {
     raw.insert(2, 1u64.write());
     raw.insert(3, RawValue::Map([(1, 1u16.write()), (2, 0u16.write())].into()));
     raw.insert(4, RawValue::from(""));
+    raw.entry(25).or_insert_with(|| dto::DeviceKind::Desktop.write());
+    raw.entry(26).or_insert_with(|| v2::MAJOR.write());
+    raw.entry(27).or_insert_with(|| v2::MINOR.write());
     raw.insert(
         11,
         RawValue::Map(
@@ -454,6 +675,9 @@ mod tests {
                     ),
                 ),
                 (15, empty),
+                (25, dto::DeviceKind::Desktop.write()),
+                (26, v2::MAJOR.write()),
+                (27, v2::MINOR.write()),
                 (99, RawValue::Bytes(vec![7, 8, 9])),
             ]
             .into(),
@@ -485,6 +709,179 @@ mod tests {
         assert!(addresses.remember(peer, b).is_err());
         assert_eq!(addresses.raw, before);
         assert!(addresses.remember(peer, "[::1]:47470".parse().unwrap()).is_err());
+    }
+    #[test]
+    fn one_entry_per_ip_keeps_the_newest_port() {
+        let dir = tempfile::tempdir().unwrap();
+        let phone = DeviceId([3; 32]);
+        let other = DeviceId([4; 32]);
+        let pc: SocketAddr = "192.0.2.234:47470".parse().unwrap();
+        let mut addresses = AddressStore::load(dir.path()).unwrap();
+        addresses.remember(other, pc).unwrap();
+        for port in 50_000..50_012 {
+            assert!(
+                addresses
+                    .remember(phone, SocketAddr::from(([192, 168, 8, 232], port)))
+                    .unwrap()
+            );
+        }
+        let newest = SocketAddr::from(([192, 168, 8, 232], 50_011));
+        assert_eq!(addresses.candidates(phone), [newest]);
+        assert!(!addresses.remember(phone, newest).unwrap(), "already the newest entry");
+        let loaded = AddressStore::load(dir.path()).unwrap();
+        assert_eq!(loaded.candidates(phone), [newest]);
+        assert_eq!(loaded.candidates(other), [pc]);
+        assert_eq!(loaded.raw["entries"].as_array().unwrap().len(), 2);
+    }
+    #[test]
+    fn at_most_eight_ips_per_device_least_recently_used_dropped_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let peer = DeviceId([5; 32]);
+        let other = DeviceId([6; 32]);
+        let ip = |n: u8| SocketAddr::from(([10, 0, 0, n], 47470));
+        let mut addresses = AddressStore::load(dir.path()).unwrap();
+        for n in 1..=4 {
+            addresses.remember(other, ip(n)).unwrap();
+        }
+        for n in 1..=7 {
+            addresses.remember(peer, ip(n)).unwrap();
+        }
+        // .1 is used again: it becomes the most recent and survives.
+        addresses.remember(peer, ip(1)).unwrap();
+        for n in 8..=10 {
+            addresses.remember(peer, ip(n)).unwrap();
+        }
+        // Newest first; .2 and .3 were least recently used.
+        let expected: Vec<_> = [10, 9, 8, 1, 7, 6, 5, 4].into_iter().map(ip).collect();
+        assert_eq!(addresses.candidates(peer), expected);
+        assert_eq!(MAX_IPS_PER_DEVICE, 8);
+        // Other devices keep their own entries and order.
+        let others: Vec<_> = [4, 3, 2, 1].into_iter().map(ip).collect();
+        assert_eq!(addresses.candidates(other), others);
+        let loaded = AddressStore::load(dir.path()).unwrap();
+        assert_eq!(loaded.candidates(peer), expected);
+        assert_eq!(loaded.candidates(other), others);
+    }
+    #[test]
+    fn an_over_full_file_is_trimmed_on_load_and_written_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let peer = DeviceId([7; 32]);
+        let entry = |ip: &str, port: u16| serde_json::json!({"device":{"algorithm":"ed25519","public_key":peer.to_hex()},"ipv4":ip,"port":port});
+        // Newest first, as written by earlier builds: three ports on .232
+        // (the middle one pinned) and ten other IPs.
+        let mut entries = vec![
+            entry("192.0.2.232", 3),
+            entry("192.0.2.232", 2),
+            entry("192.0.2.232", 1),
+        ];
+        entries[1]["pinned"] = true.into();
+        entries[1]["future"] = true.into();
+        for n in 1..=10 {
+            entries.push(entry(&format!("10.0.0.{n}"), 47470));
+        }
+        std::fs::write(
+            dir.path().join(ADDRESSES_FILE),
+            serde_json::to_vec(&serde_json::json!({"schema":1,"entries":entries,"future":1})).unwrap(),
+        )
+        .unwrap();
+        let loaded = AddressStore::load(dir.path()).unwrap();
+        let mut expected = vec![SocketAddr::from(([192, 168, 8, 232], 3))];
+        expected.extend((1..=7).map(|n| SocketAddr::from(([10, 0, 0, n], 47470))));
+        assert_eq!(loaded.candidates(peer), expected);
+        // The pin follows its IP to the kept (newest) entry.
+        assert_eq!(
+            loaded.route_record(peer),
+            Some(oink_network::link::RouteRecord::Dial("192.0.2.232".parse().unwrap()))
+        );
+        assert_eq!(loaded.raw["future"], 1);
+        let on_disk: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.path().join(ADDRESSES_FILE)).unwrap()).unwrap();
+        assert_eq!(on_disk, loaded.raw);
+        assert_eq!(on_disk["schema"], 1);
+        assert_eq!(AddressStore::load(dir.path()).unwrap().candidates(peer), expected);
+    }
+    #[test]
+    fn route_probes_retain_a_remembered_nat_endpoint_outside_published_facts() {
+        use oink_network::link::RouteRecord;
+        let dir = tempfile::tempdir().unwrap();
+        let peer = DeviceId([1; 32]);
+        let published: SocketAddr = "192.0.2.2:47470".parse().unwrap();
+        let manual: SocketAddr = "198.51.100.2:47480".parse().unwrap();
+        let mut store = AddressStore::load(dir.path()).unwrap();
+        store.remember(peer, manual).unwrap();
+        assert_eq!(store.route_candidates(peer, vec![published]), [published]);
+        let std::net::IpAddr::V4(ip) = manual.ip() else {
+            unreachable!()
+        };
+        store
+            .set_route_record(peer, Some(RouteRecord::Dial(ip)), Some(manual))
+            .unwrap();
+        let loaded = AddressStore::load(dir.path()).unwrap();
+        assert_eq!(loaded.route_candidates(peer, vec![published]), [published, manual]);
+        assert_eq!(loaded.route_candidates(peer, vec![manual]), [manual]);
+        assert_eq!(loaded.route_candidates(peer, vec![]), [manual]);
+        store.set_route_record(peer, None, None).unwrap();
+        assert_eq!(store.route_candidates(peer, vec![published]), [published]);
+        assert_eq!(
+            store.candidates(peer),
+            [manual],
+            "automatic preserves ordinary dial hints"
+        );
+    }
+
+    #[test]
+    fn route_pins_persist_one_per_peer_and_survive_reload() {
+        use oink_network::link::RouteRecord;
+        let dir = tempfile::tempdir().unwrap();
+        let peer = DeviceId([1; 32]);
+        let other = DeviceId([2; 32]);
+        let wifi: SocketAddr = "192.168.1.2:47470".parse().unwrap();
+        let wired: SocketAddr = "10.77.0.2:47470".parse().unwrap();
+        let mut addresses = AddressStore::load(dir.path()).unwrap();
+        addresses.remember(peer, wifi).unwrap();
+        addresses.remember(other, wifi).unwrap();
+        assert_eq!(addresses.route_record(peer), None);
+        // Dial pins mark the dialed entry and move it first.
+        addresses
+            .set_route_record(peer, Some(RouteRecord::Dial(ip(wired))), Some(wired))
+            .unwrap();
+        assert_eq!(addresses.route_record(peer), Some(RouteRecord::Dial(ip(wired))));
+        assert_eq!(addresses.candidates(peer)[0], wired);
+        // A keep-incoming record replaces it: still one record per peer.
+        addresses
+            .set_route_record(peer, Some(RouteRecord::Incoming("10.77.0.1".parse().unwrap())), None)
+            .unwrap();
+        let loaded = AddressStore::load(dir.path()).unwrap();
+        assert_eq!(
+            loaded.route_record(peer),
+            Some(RouteRecord::Incoming("10.77.0.1".parse().unwrap()))
+        );
+        assert_eq!(loaded.route_record(other), None);
+        assert!(
+            loaded.raw["entries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|e| e.get("pinned").is_none())
+        );
+        assert_eq!(loaded.raw["schema"], 1);
+        // Automatic clears it; the address hints stay.
+        addresses.set_route_record(peer, None, None).unwrap();
+        let loaded = AddressStore::load(dir.path()).unwrap();
+        assert_eq!(loaded.route_record(peer), None);
+        assert_eq!(loaded.candidates(peer), [wired, wifi]);
+        // A dial pin needs the dialed socket of the same address.
+        assert!(
+            addresses
+                .set_route_record(peer, Some(RouteRecord::Dial(ip(wired))), Some(wifi))
+                .is_err()
+        );
+        fn ip(address: SocketAddr) -> std::net::Ipv4Addr {
+            let SocketAddr::V4(address) = address else {
+                unreachable!()
+            };
+            *address.ip()
+        }
     }
     #[test]
     fn cached_metadata_preserves_group_separation_and_failed_flush_retry() {
@@ -526,7 +923,7 @@ mod tests {
         ));
         assert_eq!(std::fs::read(&address).unwrap(), old);
         let path = dir.path().join(FACTS_FILE);
-        let future = v1::cbor::encode_map(&[(1, 2u8.write()), (2, RawValue::Array(vec![]))].into(), 1024).unwrap();
+        let future = v2::cbor::encode_map(&[(1, 2u8.write()), (2, RawValue::Array(vec![]))].into(), 1024).unwrap();
         std::fs::write(&path, &future).unwrap();
         assert!(matches!(
             FactsCache::load(dir.path()),
@@ -648,10 +1045,8 @@ mod tests {
             ),
         );
         let stamp = RawValue::Map([(1, 25u64.write()), (2, store::wire_device(DeviceId([1; 32])).write())].into());
-        let claim = RawValue::Map([(1, stamp.clone()), (2, true.write())].into());
-        for key in [20, 21, 24] {
-            raw.insert(key, claim.clone());
-        }
+        let route = RawValue::Map([(1, stamp.clone()), (2, store::wire_device(DeviceId([1; 32])).write())].into());
+        raw.insert(33, RawValue::Map([(1, route)].into()));
         raw.insert(
             17,
             RawValue::Map(
@@ -692,7 +1087,7 @@ mod tests {
         let entry = store::entries(&disk).unwrap()[0].as_map().unwrap();
         assert_eq!(
             entry.keys().copied().collect::<Vec<_>>(),
-            [1, 5, 6, 7, 8, 9, 10, 12, 18]
+            [1, 5, 6, 7, 8, 9, 10, 12, 18, 25, 26, 27]
         );
         assert!(
             !entry[&1].as_map().unwrap().contains_key(&2),
@@ -711,9 +1106,7 @@ mod tests {
         assert!(cached.resources().unwrap().is_none());
         assert!(cached.exit_volume().unwrap().is_none());
         assert!(cached.pause().unwrap().is_none());
-        assert!(cached.audio_exit_claim().unwrap().is_none());
-        assert!(cached.audio_claim_watermark().unwrap().is_none());
-        assert!(cached.microphone_claim_watermark().unwrap().is_none());
+        assert!(cached.audio_config().unwrap().is_none());
         assert!(cached.native_arrangement_token().unwrap().is_none());
         assert!(cached.accessibility_granted().unwrap().is_none());
         assert_eq!(
@@ -742,6 +1135,22 @@ mod tests {
             super::super::layout_wire::owner_preferences(&live.preferences().unwrap().unwrap().0)
         );
         assert!(preferences.iter().all(|p| !p.raw().contains_key(&99)));
+    }
+
+    #[test]
+    fn cache_keeps_the_mobile_form_factor_for_offline_badges() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut raw = rich_facts().raw().clone();
+        raw.insert(25, dto::DeviceKind::Mobile.write());
+        raw.insert(31, dto::FormFactor::Tablet.write());
+        let mut cache = FactsCache::load(dir.path()).unwrap();
+        cache.observe(dto::DeviceFacts::from_raw(raw).unwrap()).unwrap();
+        cache.flush().unwrap();
+        let cached = FactsCache::load(dir.path())
+            .unwrap()
+            .get(GroupId([3; 16]), DeviceId([1; 32]))
+            .unwrap();
+        assert!(matches!(cached.form_factor(), Ok(Some(dto::FormFactor::Tablet))));
     }
 
     #[test]

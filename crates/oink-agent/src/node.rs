@@ -56,6 +56,8 @@ pub(crate) struct Components {
     pub reports: bool,
     /// A missing identity may be created (never for the pre-login backend).
     pub create_identity: bool,
+    /// Text-input focus reports for the phones' keyboards (protocol §14.7).
+    pub text_focus: bool,
 }
 impl Profile {
     pub(crate) fn components(self) -> Components {
@@ -67,6 +69,7 @@ impl Profile {
                 pairing: true,
                 reports: true,
                 create_identity: true,
+                text_focus: true,
             },
             Self::Prelogin => Components {
                 content: false,
@@ -75,6 +78,7 @@ impl Profile {
                 pairing: false,
                 reports: false,
                 create_identity: false,
+                text_focus: false,
             },
         }
     }
@@ -220,6 +224,9 @@ pub(crate) struct Inner {
     tasks: Mutex<Vec<JoinHandle<()>>>,
     log_listener: Mutex<Option<u64>>,
     stop: tokio::sync::watch::Sender<bool>,
+    /// Set before `stop` when the network layer ended with a fatal error: the
+    /// host restarts the backend instead of exiting (`host::supervise`).
+    restart: Mutex<Option<oink_network::link::NetworkFatal>>,
 }
 
 #[derive(Clone)]
@@ -372,10 +379,12 @@ impl Node {
         config
             .update_owner(|owner| owner.clear_input_disables_on_start())
             .context("persist startup input state")?;
-        let unreadable =
-            crate::config_module::group_store::load(&data_dir.join(crate::config_module::group_store::STATE_FILE), me)
-                .err()
-                .map(|error| error.to_string());
+        // Undecodable content counts as unreadable too: the backend stays up
+        // IPC-only with the alert and its reset instead of failing to start.
+        let unreadable = crate::config_module::check_group_state(&data_dir, me).err();
+        if let Some(error) = &unreadable {
+            tracing::warn!(%error, "group state unreadable; sharing stays off until it is reset");
+        }
         let settings = config.settings.clone();
         if native_services {
             oink_clipboard::received::configure(settings.received_files_cleanup);
@@ -470,6 +479,7 @@ impl Node {
                 tasks: Mutex::new(Vec::new()),
                 log_listener: Mutex::new(None),
                 stop: tokio::sync::watch::channel(false).0,
+                restart: Mutex::new(None),
             }),
         };
         Ok(node)
@@ -575,6 +585,38 @@ impl Node {
         let _ = rx.wait_for(|stop| *stop).await;
     }
 
+    /// Why this backend stopped to be restarted: its network layer ended with
+    /// a fatal error. `None` for every other stop (quit, update, TERM).
+    pub fn restart_reason(&self) -> Option<oink_network::link::NetworkFatal> {
+        lock(&self.inner.restart).clone()
+    }
+
+    /// The network layer ended on its own (user 2026-11-12: fail fast, then a
+    /// supervised restart through the normal startup path). Records why in
+    /// the log, the diagnostics trace and an automatic bundle, and as a
+    /// Sentry error event; then stops this backend for its host to restart.
+    /// A Boot cannot rejoin with a new network layer, so the whole backend
+    /// (new Boot, new owners) starts again; nothing is rebuilt in place.
+    pub(crate) async fn network_failed(&self, fatal: oink_network::link::NetworkFatal) {
+        tracing::error!(reason = fatal.code(), error = %fatal,
+            "network layer ended with a fatal error; the backend restarts");
+        self.inner.reports.submit_fault(crate::telemetry::network_fault(&fatal));
+        if let Some(diagnostics) = self.inner.diagnostics.get() {
+            let recorder = diagnostics.recorder.clone();
+            recorder.network_failure(fatal.code());
+            if recorder.enabled() {
+                let saved =
+                    tokio::task::spawn_blocking(move || recorder.save(crate::diagnostics::Reason::NetworkFailure))
+                        .await;
+                if !matches!(saved, Ok(Ok(_))) {
+                    tracing::warn!("network-failure diagnostic save failed");
+                }
+            }
+        }
+        *lock(&self.inner.restart) = Some(fatal);
+        self.request_stop();
+    }
+
     pub async fn shutdown(&self) {
         self.shutdown_for_process_exit().await;
     }
@@ -605,6 +647,11 @@ impl Node {
         }
         if let Some(input) = self.inner.input.get().cloned() {
             let _ = tokio::task::spawn_blocking(move || input.stop()).await;
+        }
+        // Its drawing thread holds its own handle: end it, or a backend
+        // restarted in this process would leave the old overlay running.
+        if let Some(trail) = self.inner.cursor_trail.get() {
+            trail.shutdown();
         }
         self.drain_input_trace();
         if let Some(audio) = self.inner.audio.get() {

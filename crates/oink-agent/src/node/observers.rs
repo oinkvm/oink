@@ -401,8 +401,36 @@ impl Node {
 }
 
 impl Node {
+    /// Text-input focus → the input thread's router (protocol §14.7). The
+    /// watcher is an ordinary thread: it ends with the node and is joined at
+    /// shutdown like the platform observer.
+    fn start_text_focus_watcher(&self) {
+        let report_node = Arc::downgrade(&self.inner);
+        let running_node = Arc::downgrade(&self.inner);
+        let report: oink_input::text_focus::Report = Box::new(move |report| {
+            let Some(inner) = report_node.upgrade() else {
+                return;
+            };
+            if let Ok(input) = (Node { inner }).input_thread() {
+                input.send(InputCommand::TextFocus(oink_routing::control::TextFocusState {
+                    seq: report.seq,
+                    editable: report.editable,
+                    secure: report.secure,
+                }));
+            }
+        });
+        let running: oink_input::text_focus::Running =
+            Box::new(move || running_node.upgrade().is_some_and(|inner| !*inner.stop.borrow()));
+        if let Some(worker) = oink_input::text_focus::spawn(report, running) {
+            lock(&self.inner.ordinary_threads).push(worker);
+        }
+    }
+
     pub(super) fn start_observers(&self) -> anyhow::Result<()> {
         self.start_platform_observer()?;
+        if self.native_services_enabled() && self.inner.profile.components().text_focus {
+            self.start_text_focus_watcher();
+        }
         #[cfg(target_os = "macos")]
         if self.native_services_enabled() {
             lock(&self.inner.tasks).push(crate::file_provider::spawn(self));
@@ -418,6 +446,10 @@ impl Node {
             let mut sample = statistics_interval();
             let mut previous_input_sample = Instant::now();
             let mut previous_pause = node.pause_status();
+            // A whole-group pause (pause all) stops route probing (design 4.1).
+            if let Ok(links) = node.links() {
+                links.set_route_probing(!(previous_pause.paused && previous_pause.emergency));
+            }
             loop {
                 tokio::select! {
                     _ = stop.changed() => break,
@@ -469,6 +501,9 @@ impl Node {
                 node.reconcile_controls();
                 let pause = node.pause_status();
                 if pause != previous_pause {
+                    if let Ok(links) = node.links() {
+                        links.set_route_probing(!(pause.paused && pause.emergency));
+                    }
                     node.emit(ApiEvent::Pause(pause.clone()));
                     previous_pause = pause;
                 }

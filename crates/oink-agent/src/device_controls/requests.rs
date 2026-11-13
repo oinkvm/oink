@@ -2,7 +2,7 @@
 use crate::device_cards::{
     self, CardOptionEdit, DeviceControlFailure, GamePreference, SharingMode, TokenBinding, TokenOperation,
 };
-use oink_protocol::v1::{
+use oink_protocol::v2::{
     Message, RawMap, RawValue, dto,
     schema::{Ascii, Bytes, FixedBytes, Text, WireDto, WireValue},
 };
@@ -40,13 +40,9 @@ fn option_value(edit: &CardOptionEdit) -> RawValue {
             SharingMode::Disabled => 2u32,
         }
         .write(),
-        CardOptionEdit::ClipboardEnabled(v)
-        | CardOptionEdit::ForwardingEnabled(v)
-        | CardOptionEdit::KeyboardDisabled(v)
-        | CardOptionEdit::ScreenShared(v)
-        | CardOptionEdit::AudioExitClaim(v)
-        | CardOptionEdit::MicrophoneShareClaim(v)
-        | CardOptionEdit::MicrophoneReceiveMuted(v) => v.write(),
+        CardOptionEdit::ClipboardEnabled(v) | CardOptionEdit::KeyboardDisabled(v) | CardOptionEdit::ScreenShared(v) => {
+            v.write()
+        }
         CardOptionEdit::GameModePreference(v) => match v {
             GamePreference::Auto => 0u32,
             GamePreference::On => 1u32,
@@ -143,8 +139,8 @@ pub fn volume_request(
     let TokenOperation::ExitVolume {
         output_id,
         output_generation,
-        claim_counter,
-        claim_owner,
+        route_seq,
+        route_author,
     } = &binding.operation
     else {
         return Err(DeviceControlFailure::InvalidValue);
@@ -152,8 +148,8 @@ pub fn volume_request(
     if percent > 100 {
         return Err(DeviceControlFailure::InvalidValue);
     }
-    let claim = dto::ExitClaimStamp::from_raw(
-        [(1, claim_counter.write()), (2, wire_device(*claim_owner).write())]
+    let route = dto::AudioRouteVersion::from_raw(
+        [(1, route_seq.write()), (2, wire_device(*route_author).write())]
             .into_iter()
             .collect(),
     )
@@ -164,7 +160,7 @@ pub fn volume_request(
             (3, Text::<512>(output_id.clone()).write()),
             (4, output_generation.write()),
             (5, binding.owner.revision.write()),
-            (6, claim.write()),
+            (6, route.write()),
         ]
         .into_iter()
         .collect(),
@@ -227,38 +223,7 @@ mod tests {
         assert!(forwarding_request(&binding, ID, 100, false).is_err());
     }
     #[test]
-    fn microphone_actions_and_gain_use_registered_options() {
-        for (edit, option, value) in [
-            (
-                CardOptionEdit::MicrophoneShareClaim(true),
-                dto::LocalOption::MicrophoneShareClaim,
-                true,
-            ),
-            (
-                CardOptionEdit::MicrophoneShareClaim(false),
-                dto::LocalOption::MicrophoneShareClaim,
-                false,
-            ),
-            (
-                CardOptionEdit::MicrophoneReceiveMuted(false),
-                dto::LocalOption::MicrophoneReceiveMuted,
-                false,
-            ),
-            (
-                CardOptionEdit::MicrophoneReceiveMuted(true),
-                dto::LocalOption::MicrophoneReceiveMuted,
-                true,
-            ),
-        ] {
-            let Message::ConfigSetLocalOption(request) =
-                action_request(&binding(TokenOperation::Option { edit }), ID).unwrap()
-            else {
-                panic!()
-            };
-            assert_eq!(request.option().unwrap(), option);
-            assert_eq!(request.value().unwrap(), value.write());
-            assert_eq!(request.expected_revision().unwrap(), 9);
-        }
+    fn microphone_gain_uses_its_registered_option() {
         let Message::ConfigSetLocalOption(request) =
             forwarding_request(&binding(TokenOperation::MicrophoneControls), ID, 80, false).unwrap()
         else {

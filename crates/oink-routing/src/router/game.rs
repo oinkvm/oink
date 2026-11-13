@@ -303,6 +303,11 @@ impl Router {
                     cursor_hiding_cause_available: self.game.cursor_hiding_cause_available,
                 }),
             );
+            // The holder's text-input focus goes with its game state: a phone
+            // learns it when focus arrives here or it attaches (§14.7).
+            if let Some(record) = self.text_focus_record(peer) {
+                self.send(peer, record);
+            }
         }
     }
 

@@ -393,7 +393,7 @@ fn buffered(socket: TcpStream) -> std::io::Result<(BufStream<TcpStream>, std::ne
 }
 fn check_tls(stream: &io::Stream, peer: DeviceId) -> Result<(), String> {
     let (_, tls) = stream.get_ref();
-    if tls.alpn_protocol() != Some(oink_protocol::v1::LOW_ALPN)
+    if tls.alpn_protocol() != Some(oink_protocol::v2::LOW_ALPN)
         || tls.protocol_version() != Some(rustls::ProtocolVersion::TLSv1_3)
         || tls.negotiated_cipher_suite().map(|s| s.suite()) != Some(rustls::CipherSuite::TLS13_AES_128_GCM_SHA256)
         || tls
@@ -422,8 +422,8 @@ pub(super) async fn write_setup<W: tokio::io::AsyncWrite + Unpin>(
     stream.write_all(&bytes).await?;
     stream.flush().await
 }
-pub(super) fn control_header(bytes: &[u8], maximum: usize) -> std::io::Result<oink_protocol::v1::frame::FrameHeader> {
-    use oink_protocol::v1::{
+pub(super) fn control_header(bytes: &[u8], maximum: usize) -> std::io::Result<oink_protocol::v2::frame::FrameHeader> {
+    use oink_protocol::v2::{
         frame::FrameHeader,
         registry::{self, Transport},
     };

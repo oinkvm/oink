@@ -1,6 +1,6 @@
 use crate::{group_state::State, wire_identity as wire};
 use oink_foundation::DeviceId;
-use oink_protocol::v1::{
+use oink_protocol::v2::{
     self, RawValue, dto,
     schema::{WireDto, WireValue},
 };
@@ -11,12 +11,12 @@ pub const REGISTER_KIND: u32 = 0x1301;
 
 impl State {
     /// Only current membership incarnations appear; offline members retain slots.
-    pub fn pointer_slots(&self) -> v1::Result<BTreeMap<DeviceId, Option<u8>>> {
+    pub fn pointer_slots(&self) -> v2::Result<BTreeMap<DeviceId, Option<u8>>> {
         let Some(register) = self.register(REGISTER_KIND)? else {
             return Ok(BTreeMap::new());
         };
         if register.deleted()? {
-            return Err(v1::ErrorCode::StateConflict.into());
+            return Err(v2::ErrorCode::StateConflict.into());
         }
         let value = dto::PointerShortcutSlots::from_raw(register.value()?)?;
         let mut result = BTreeMap::new();
@@ -26,7 +26,7 @@ impl State {
             let device = wire::read_device(&entry.device()?)?;
             let slot = entry.slot()?;
             if slot.is_some_and(|s| s >= 10 || !used.insert(s)) || !devices.insert(device) {
-                return Err(v1::ErrorCode::StateConflict.into());
+                return Err(v2::ErrorCode::StateConflict.into());
             }
             if self
                 .roster()
@@ -41,7 +41,7 @@ impl State {
     /// Preserve assigned digits and OFF entries. Allocate only new incarnations,
     /// smallest free digit first; a removed device frees its digit immediately.
     /// Batch/legacy bootstrap joins tie-break by signed issued_ms then DeviceId.
-    pub fn reconcile_pointer_slots(&self, writer: DeviceId) -> v1::Result<Self> {
+    pub fn reconcile_pointer_slots(&self, writer: DeviceId) -> v2::Result<Self> {
         let mut slots = self.pointer_slots()?;
         let mut used = slots.values().flatten().copied().collect::<BTreeSet<_>>();
         let mut joining = self
@@ -81,7 +81,7 @@ impl State {
                 raw.insert(3, slot.write());
                 dto::PointerShortcutSlot::from_raw(raw).map(|e| e.write())
             })
-            .collect::<v1::Result<Vec<_>>>()?;
+            .collect::<v2::Result<Vec<_>>>()?;
         self.put_register(REGISTER_KIND, writer, [(1, RawValue::Array(entries))].into())
     }
 }
@@ -89,7 +89,7 @@ impl State {
 #[cfg(test)]
 mod tests {
     use crate::{group_state::State, identity::Identity};
-    use oink_protocol::v1::schema::WireDto;
+    use oink_protocol::v2::schema::WireDto;
 
     fn add(state: &State, owner: &Identity, seed: u8, time: u64) -> State {
         let device = Identity::from_seed([seed; 32]).id();

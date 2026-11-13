@@ -9,16 +9,18 @@ mod peer_bench;
 #[cfg(all(test, debug_assertions))]
 #[path = "collection_wire_tests.rs"]
 mod wire_tests;
+use super::mobile::{MobileDiagnosticEvent, MobileDiagnosticSegment};
 use super::*;
 use crate::{
     config_module::ConfigChange,
     node::Node,
     streams::{StreamModule, diagnostics::DiagnosticsStreams},
 };
+use oink_mobile_core::DiagnosticUpload;
 use oink_network::link::{LinkLayer, LinkState, LowStream, ModuleEvent, ModulePort};
 use oink_protocol::{
     frame::StreamKind,
-    v1::{
+    v2::{
         self, Message, RawValue, dto as w,
         schema::{WireDto, WireValue},
     },
@@ -29,14 +31,46 @@ const NONE: &str = "none";
 const DEFLATE: &str = "deflate-raw";
 const CHUNK: usize = 16 * 1024;
 const HEADER: u64 = 4096;
+const MOBILE_SEGMENT_BASE: u64 = 1 << 63;
 // Framing allowance is bounded separately from the shared 64 MiB payload budget.
 fn collection_options() -> oink_network::LowOptions {
-    let receive = v1::limits::DIAGNOSTIC_COLLECTION as u64 + 4 * 1024 * 1024;
+    let receive = v2::limits::DIAGNOSTIC_COLLECTION as u64 + 4 * 1024 * 1024;
     oink_network::LowOptions {
         send_max: HEADER,
         receive_max: receive,
         operation_max: HEADER + receive,
     }
+}
+
+fn hex_bytes(value: &str, expected: usize) -> Option<Vec<u8>> {
+    if value.len() != expected * 2 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    (0..expected)
+        .map(|index| u8::from_str_radix(&value[index * 2..index * 2 + 2], 16).ok())
+        .collect()
+}
+
+fn is_mobile_member(member: &crate::config_module::MemberInfo) -> bool {
+    matches!(member.os.as_str(), "android" | "ios")
+        || member.facts.as_ref().and_then(|facts| facts.device_kind().ok()) == Some(w::DeviceKind::Mobile)
+}
+
+fn mobile_device_wire(value: &str) -> Option<RawValue> {
+    let key = hex_bytes(value, 32)?.try_into().ok()?;
+    Some(oink_network::wire_identity::device(DeviceId(key)).write())
+}
+
+fn mobile_id_wire(value: &str) -> Option<RawValue> {
+    Some(w::Id16::read(&RawValue::Bytes(hex_bytes(value, 16)?)).ok()?.write())
+}
+
+fn mobile_device_text(value: &w::DeviceId) -> anyhow::Result<String> {
+    Ok(oink_network::wire_identity::read_device(value)?.to_hex())
+}
+
+fn mobile_id_text(value: &w::Id16) -> anyhow::Result<String> {
+    Ok(value.0.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 pub(super) const TIMEOUT: Duration = Duration::from_secs(30);
 async fn idle<T, E: Into<anyhow::Error>>(
@@ -85,7 +119,7 @@ impl CollectionTrace {
             .checked_add(bytes as u64)
             .ok_or_else(|| anyhow::anyhow!("member:size_limit"))?;
         anyhow::ensure!(
-            self.bytes <= oink_protocol::v1::limits::DIAGNOSTIC_COLLECTION as u64,
+            self.bytes <= oink_protocol::v2::limits::DIAGNOSTIC_COLLECTION as u64,
             "member:size_limit"
         );
         Ok(())
@@ -307,7 +341,7 @@ impl Context {
         snapshot.snapshot.layout = self.config.diagnostic_layout(&anon);
         let ready = self.links.links();
         let mut targets = Vec::new();
-        for member in members.iter().filter(|m| m.device != me) {
+        for member in members.iter().filter(|m| m.device != me && !is_mobile_member(m)) {
             let device = anon.device(member.device);
             snapshot.missing_members.insert(device.clone(), "offline".into());
             if let Some(link) = ready.by_peer(member.device).filter(|l| l.state == LinkState::Ready) {
@@ -349,6 +383,12 @@ impl Context {
                             .to_owned()
                         }
                     };
+                    // A holder sends its mobile segments last. A transfer that
+                    // failed before its DiagnosticsEnd, even after delivering
+                    // desktop segments, did not deliver its mobile part.
+                    if !store.network_ends.contains_key(&device) {
+                        store.mobile_unavailable_holders.insert(device.clone(), reason.clone());
+                    }
                     store.missing_members.insert(device, reason);
                 });
             }
@@ -366,11 +406,23 @@ impl Context {
             .sort_by_key(|meta| (meta.last_us, meta.seq));
         for member in members.iter().filter(|m| m.device != me) {
             let device = anon.device(member.device);
-            if !store.segments.iter().any(|m| m.device == device) {
-                store
+            if is_mobile_member(member) {
+                store.mobile_partial |= !member.online;
+                let source = mobile_device_text(&oink_network::wire_identity::device(member.device))?;
+                if !store.mobile_proxy.has_source_in_range(&source, start, end) {
+                    store
+                        .missing_members
+                        .insert(device, "no_mobile_diagnostics_in_range".into());
+                }
+            } else if !store.segments.iter().any(|m| m.device == device) {
+                let reason = store
                     .missing_members
-                    .entry(device)
-                    .or_insert_with(|| "no_recording_in_range".into());
+                    .entry(device.clone())
+                    .or_insert_with(|| "no_recording_in_range".into())
+                    .clone();
+                if reason != "no_recording_in_range" {
+                    store.mobile_unavailable_holders.insert(device, reason);
+                }
             }
         }
         let complete = store.missing_members.is_empty();
@@ -382,8 +434,7 @@ impl Context {
     }
     fn rich(&self, peer: DeviceId) -> bool {
         self.config
-            .peer_agreement(peer)
-            .is_some_and(|a| a.contains("oink.diagnostics.layout/1"))
+            .peer_opens(peer, oink_protocol::frame::StreamKind::Diagnostics)
     }
     fn check(&self, link: oink_network::link::LinkId, type_id: u16, valid: bool) -> anyhow::Result<()> {
         if !valid {
@@ -392,7 +443,7 @@ impl Context {
                 link,
                 StreamKind::Diagnostics,
                 type_id,
-                v1::ErrorCode::MalformedFrame,
+                v2::ErrorCode::MalformedFrame,
             );
             anyhow::bail!("invalid diagnostic operation");
         }
@@ -419,7 +470,7 @@ impl Context {
                             && error.scope()? == w::ErrorScope::LowOperation
                             && error.operation()?.is_some_and(|operation| operation.0 == request)
                         {
-                            if error.code()? == v1::ErrorCode::UnsupportedValue.number() as u16 {
+                            if error.code()? == v2::ErrorCode::UnsupportedValue.number() as u16 {
                                 anyhow::bail!("member:unsupported");
                             }
                             anyhow::bail!("member:protocol_error");
@@ -456,6 +507,8 @@ impl Context {
             ("request_id", request_id.write()),
             ("accepted_formats", strings(&[FORMAT])),
             ("accepted_compressions", strings(&[DEFLATE, NONE])),
+            ("export_id", request_id.write()),
+            ("include_mobile", true.wire()?),
         ])?;
         self.progress(stream.send(&Message::DiagnosticsRequest(request)))
             .await?;
@@ -509,6 +562,7 @@ impl Context {
         let mut payload = Vec::new();
         let mut environment = false;
         let mut segment_id = 0u64;
+        let mut mobile_meta = None;
         loop {
             let receiving = Instant::now();
             let message = self
@@ -546,12 +600,42 @@ impl Context {
                 }
                 Message::DiagnosticsChunk(c) => {
                     let bytes = c.bytes()?.0;
+                    let source_device = c.source_device()?.map(|value| mobile_device_text(&value)).transpose()?;
+                    let proxy_device = c.proxy_device()?.map(|value| mobile_device_text(&value)).transpose()?;
+                    let session_id = c.session_id()?.map(|value| mobile_id_text(&value)).transpose()?;
+                    let batch_id = c.batch_id()?.map(|value| mobile_id_text(&value)).transpose()?;
+                    let sequence = c.sequence()?;
+                    let is_mobile = source_device.is_some();
+                    if is_mobile {
+                        let expected_proxy = mobile_device_text(&oink_network::wire_identity::device(peer))?;
+                        anyhow::ensure!(
+                            proxy_device.as_deref() == Some(expected_proxy.as_str())
+                                && session_id.is_some()
+                                && batch_id.is_some()
+                                && sequence.is_some()
+                                && c.segment_id()? >= MOBILE_SEGMENT_BASE,
+                            "malformed mobile diagnostic metadata"
+                        );
+                        let current = (
+                            source_device.clone().unwrap(),
+                            proxy_device.clone().unwrap(),
+                            session_id.clone().unwrap(),
+                            batch_id.clone().unwrap(),
+                            sequence.unwrap(),
+                            c.segment_id()?,
+                        );
+                        if let Some(previous) = &mobile_meta {
+                            self.check(link, 0x0a04, previous == &current)?;
+                        } else {
+                            mobile_meta = Some(current);
+                        }
+                    }
                     self.check(
                         link,
                         0x0a04,
-                        environment
+                        (environment || is_mobile)
                             && c.request_id()? == request_id
-                            && c.segment_id()? == segment_id
+                            && (is_mobile || (mobile_meta.is_none() && c.segment_id()? == segment_id))
                             && c.offset()? as usize == payload.len()
                             && !bytes.is_empty()
                             && bytes.len() <= CHUNK,
@@ -563,16 +647,53 @@ impl Context {
                     payload.extend(bytes);
                 }
                 Message::DiagnosticsSegmentEnd(e) => {
+                    let source_device = e.source_device()?.map(|value| mobile_device_text(&value)).transpose()?;
+                    let proxy_device = e.proxy_device()?.map(|value| mobile_device_text(&value)).transpose()?;
+                    let session_id = e.session_id()?.map(|value| mobile_id_text(&value)).transpose()?;
+                    let batch_id = e.batch_id()?.map(|value| mobile_id_text(&value)).transpose()?;
+                    let sequence = e.sequence()?;
+                    let is_mobile = source_device.is_some();
                     self.check(
                         link,
                         0x0a05,
                         environment
                             && e.request_id()? == request_id
-                            && e.segment_id()? == segment_id
+                            && (is_mobile || (mobile_meta.is_none() && e.segment_id()? == segment_id))
                             && !payload.is_empty()
                             && e.compressed_length()? as usize == payload.len()
                             && e.raw_length()? as usize <= MAX_SEGMENT_RAW,
                     )?;
+                    if is_mobile {
+                        let (meta_source, meta_proxy, meta_session, meta_batch, meta_sequence, meta_segment) =
+                            mobile_meta
+                                .take()
+                                .ok_or_else(|| anyhow::anyhow!("missing mobile diagnostic metadata"))?;
+                        self.check(
+                            link,
+                            0x0a05,
+                            Some(meta_source) == source_device
+                                && Some(meta_proxy.clone()) == proxy_device
+                                && Some(meta_session) == session_id
+                                && Some(meta_batch) == batch_id
+                                && Some(meta_sequence) == sequence
+                                && meta_segment == e.segment_id()?
+                                && e.raw_length()? == e.compressed_length()?,
+                        )?;
+                        let raw = std::mem::take(&mut payload);
+                        let segment: MobileDiagnosticSegment = serde_json::from_slice(&raw)?;
+                        self.check(
+                            link,
+                            0x0a05,
+                            segment.source_device == source_device.clone().unwrap()
+                                && segment.proxy_device.as_deref() == Some(meta_proxy.as_str())
+                                && segment.session_id == session_id.clone().unwrap()
+                                && segment.batch_id == batch_id.clone().unwrap()
+                                && segment.sequence == meta_sequence,
+                        )?;
+                        lock(&snapshot).accept_mobile_remote(segment, meta_proxy)?;
+                        segment_id = segment_id.saturating_add(1);
+                        continue;
+                    }
                     budget.expanded(e.raw_length()? as usize)?;
                     lock(&snapshot).receive_expanded(e.raw_length()? as usize)?;
                     let bytes = std::mem::take(&mut payload);
@@ -612,7 +733,7 @@ impl Context {
                                 link,
                                 StreamKind::Diagnostics,
                                 0x0a05,
-                                v1::ErrorCode::MalformedFrame,
+                                v2::ErrorCode::MalformedFrame,
                             );
                             return Err(error);
                         }
@@ -667,7 +788,14 @@ impl Context {
                     {
                         let mut store = lock(&snapshot);
                         store.evicted_by_device.insert(device.into(), e.evicted_segments()?);
-                        store.network_ends.insert(device.into(), e);
+                        store.mobile_partial |= e.mobile_partial()?;
+                        store.mobile_evicted_bytes =
+                            store.mobile_evicted_bytes.saturating_add(e.mobile_evicted_bytes()?);
+                        let mut redacted = e.raw().clone();
+                        redacted.remove(&7);
+                        store
+                            .network_ends
+                            .insert(device.into(), w::DiagnosticsEnd::from_raw(redacted)?);
                     }
                     trace.work.end += ending.elapsed();
                     stream.finish();
@@ -718,6 +846,149 @@ impl Collector {
         })
         .await?
     }
+    async fn serve_mobile_upload(&self, mut stream: LowStream, first: w::DiagnosticsChunk) -> anyhow::Result<()> {
+        let peer = stream.peer();
+        let link = stream.link();
+        let receiver = self.recorder.inner.me;
+        anyhow::ensure!(
+            stream.path() == oink_network::link::LinkPath::Direct,
+            "mobile diagnostic proxy must be direct"
+        );
+        let admitted = move |config: &crate::config_module::ConfigModule| {
+            config
+                .members()
+                .members
+                .iter()
+                .any(|member| member.device == peer && member.online && is_mobile_member(member))
+        };
+        anyhow::ensure!(
+            admitted(&self.context.config),
+            "diagnostic upload source is not a ready mobile member"
+        );
+        let source_wire = oink_network::wire_identity::device(peer);
+        let proxy_wire = oink_network::wire_identity::device(receiver);
+        let session = first
+            .session_id()?
+            .ok_or_else(|| anyhow::anyhow!("missing mobile diagnostic session"))?;
+        let batch = first
+            .batch_id()?
+            .ok_or_else(|| anyhow::anyhow!("missing mobile diagnostic batch"))?;
+        let sequence = first
+            .sequence()?
+            .filter(|value| *value > 0)
+            .ok_or_else(|| anyhow::anyhow!("missing mobile diagnostic sequence"))?;
+        let mut next = Message::DiagnosticsChunk(first);
+        let mut raw = Vec::new();
+        loop {
+            match next {
+                Message::DiagnosticsChunk(chunk) => {
+                    let bytes = chunk.bytes()?.0;
+                    self.context.check(
+                        link,
+                        0x0a04,
+                        chunk.source_device()?.as_ref() == Some(&source_wire)
+                            && chunk.proxy_device()?.as_ref() == Some(&proxy_wire)
+                            && chunk.session_id()?.as_ref() == Some(&session)
+                            && chunk.batch_id()?.as_ref() == Some(&batch)
+                            && chunk.request_id()? == session
+                            && chunk.segment_id()? == sequence
+                            && chunk.sequence()? == Some(sequence)
+                            && chunk.offset()? as usize == raw.len()
+                            && !bytes.is_empty()
+                            && raw.len() + bytes.len() <= DiagnosticUpload::MAX_BYTES,
+                    )?;
+                    raw.extend(bytes);
+                }
+                Message::DiagnosticsSegmentEnd(end) => {
+                    self.context.check(
+                        link,
+                        0x0a05,
+                        end.source_device()?.as_ref() == Some(&source_wire)
+                            && end.proxy_device()?.as_ref() == Some(&proxy_wire)
+                            && end.session_id()?.as_ref() == Some(&session)
+                            && end.batch_id()?.as_ref() == Some(&batch)
+                            && end.request_id()? == session
+                            && end.segment_id()? == sequence
+                            && end.sequence()? == Some(sequence)
+                            && end.raw_length()? as usize == raw.len()
+                            && end.compressed_length()? as usize == raw.len()
+                            && !raw.is_empty(),
+                    )?;
+                    break;
+                }
+                other => self.context.check(link, other.type_id(), false)?,
+            }
+            next = self
+                .context
+                .progress(stream.recv())
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("mobile diagnostic segment ended before its footer"))?;
+        }
+        self.context
+            .check(link, 0x0a05, self.context.progress(stream.recv()).await?.is_none())?;
+        let valid = stream.effect_validity();
+        let recorder = self.recorder.clone();
+        let config = self.context.config.clone();
+        let request = session.clone();
+        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            let upload: DiagnosticUpload = serde_json::from_slice(&raw)?;
+            let mut first_at_us = i64::MAX;
+            let mut last_at_us = i64::MIN;
+            let mut events = Vec::with_capacity(upload.events.len() + upload.logs.len() + 1);
+            let mut span = |timestamp_ms: u64| {
+                let at = (timestamp_ms * 1_000) as i64;
+                first_at_us = first_at_us.min(at);
+                last_at_us = last_at_us.max(at);
+            };
+            for event in upload.events {
+                event.validate().map_err(anyhow::Error::msg)?;
+                span(event.timestamp_ms);
+                events.push(MobileDiagnosticEvent::Sample { event });
+            }
+            for log in upload.logs {
+                log.validate().map_err(anyhow::Error::msg)?;
+                span(log.timestamp_ms);
+                events.push(MobileDiagnosticEvent::Log { log });
+            }
+            anyhow::ensure!(!events.is_empty(), "empty mobile diagnostic upload");
+            if upload.dropped_events != 0 {
+                events.push(MobileDiagnosticEvent::DroppedEvents {
+                    count: upload.dropped_events,
+                });
+            }
+            let proxy_device = mobile_device_text(&proxy_wire)?;
+            let segment = MobileDiagnosticSegment {
+                source_device: mobile_device_text(&source_wire)?,
+                proxy_device: Some(proxy_device.clone()),
+                session_id: mobile_id_text(&session)?,
+                batch_id: mobile_id_text(&batch)?,
+                sequence,
+                offset: 0,
+                first_at_us,
+                last_at_us,
+                events,
+            };
+            let mut store = lock(&recorder.inner.store);
+            anyhow::ensure!(
+                (valid)() && admitted(&config) && recorder.enabled(),
+                "mobile diagnostic upload revoked or recording disabled"
+            );
+            store.mobile_proxy.accept(segment, &proxy_device)?;
+            Ok(())
+        })
+        .await??;
+        self.context
+            .progress(stream.send(&Message::DiagnosticsEnd(dto::<w::DiagnosticsEnd>([
+                ("request_id", request.write()),
+                ("coverage", RawValue::Array(Vec::new())),
+                ("partial", false.wire()?),
+                ("evicted_segments", 0u64.wire()?),
+            ])?)))
+            .await?;
+        stream.finish();
+        Ok(())
+    }
+
     async fn serve(&self, mut stream: LowStream, first: Message) -> anyhow::Result<()> {
         let mut trace = CollectionTrace::new("sender");
         let peer = stream.peer();
@@ -734,8 +1005,11 @@ impl Collector {
                 && self.context.config.members().members.iter().any(|m| m.device == peer),
             "requester not ready member"
         );
+        if let Message::DiagnosticsChunk(first) = first {
+            return self.serve_mobile_upload(stream, first).await;
+        }
         anyhow::ensure!(
-            v1::frame::encode(&first, v1::limits::RELIABLE_FRAME)?.len() <= HEADER as usize,
+            v2::frame::encode(&first, v2::limits::RELIABLE_FRAME)?.len() <= HEADER as usize,
             "invalid diagnostic header"
         );
         let Message::DiagnosticsRequest(request) = first else {
@@ -753,7 +1027,7 @@ impl Collector {
         };
         if !formats.iter().any(|f| f.0 == FORMAT) || !compressions.iter().any(|c| c.0 == compression) {
             let error = dto::<w::ProtocolError>([
-                ("code", (v1::ErrorCode::UnsupportedValue.number() as u16).wire()?),
+                ("code", (v2::ErrorCode::UnsupportedValue.number() as u16).wire()?),
                 ("scope", w::ErrorScope::LowOperation.write()),
                 ("offending_type", 0x0a02u16.wire()?),
                 ("operation", RawValue::Bytes(request_id.0.to_vec())),
@@ -818,6 +1092,10 @@ impl Collector {
         source.restrict_range(start, end)?;
         trace.work.snapshot = staging.elapsed();
         let rich = self.context.rich(peer);
+        // The response needs only the index. Each phone's logs are read just
+        // before its segments are sent, outside the recorder lock.
+        let mobile_store = source.mobile_proxy.clone();
+        let mobile_summary = mobile_store.overview(start, end);
         self.context
             .progress(
                 stream.send(&Message::DiagnosticsResponse(dto::<w::DiagnosticsResponse>([
@@ -828,6 +1106,12 @@ impl Collector {
                     ("request_id", request_id.write()),
                     ("format", RawValue::from(FORMAT)),
                     ("compression", RawValue::from(compression)),
+                    (
+                        "proxy_device",
+                        oink_network::wire_identity::device(self.recorder.inner.me).write(),
+                    ),
+                    ("store_bytes", mobile_summary.store_bytes.wire()?),
+                    ("partial", mobile_summary.partial.wire()?),
                 ])?)),
             )
             .await?;
@@ -840,7 +1124,7 @@ impl Collector {
                     ("start_us", start.wire()?),
                     ("end_us", end.wire()?),
                     ("complete", false.wire()?),
-                    ("failure", (v1::ErrorCode::LimitExceeded.number() as u16).wire()?),
+                    ("failure", (v2::ErrorCode::LimitExceeded.number() as u16).wire()?),
                 ])?;
                 self.context
                     .progress(stream.send(&Message::DiagnosticsEnd(dto::<w::DiagnosticsEnd>([
@@ -870,6 +1154,8 @@ impl Collector {
         trace.work.messages = 2;
         let mut coverage = Vec::new();
         let mut partial = false;
+        let mut mobile_partial = mobile_summary.partial;
+        let mut mobile_evicted_bytes = 0u64;
         #[cfg(all(test, debug_assertions))]
         let width = if self.context.legacy_sender { 0 } else { ENCODERS };
         #[cfg(not(all(test, debug_assertions)))]
@@ -904,8 +1190,8 @@ impl Collector {
             trace.work.compression += work.compression;
             trace.work.source_bytes += work.source_bytes;
             if segment_id >= 4096
-                || trace.bytes + bytes.len() as u64 > v1::limits::DIAGNOSTIC_COLLECTION as u64
-                || raw_total + raw_len as u64 > v1::limits::DIAGNOSTIC_COLLECTION as u64
+                || trace.bytes + bytes.len() as u64 > v2::limits::DIAGNOSTIC_COLLECTION as u64
+                || raw_total + raw_len as u64 > v2::limits::DIAGNOSTIC_COLLECTION as u64
             {
                 partial = true;
                 break;
@@ -952,24 +1238,102 @@ impl Collector {
                 .write(),
             );
         }
+        if request.include_mobile()? {
+            let mut mobile_segment_id = MOBILE_SEGMENT_BASE;
+            'mobile: for name in &mobile_summary.sources {
+                let store = mobile_store.clone();
+                let name = name.clone();
+                let export = tokio::task::spawn_blocking(move || store.export_source(&name, start, end)).await?;
+                mobile_partial |= export.partial;
+                mobile_evicted_bytes = mobile_evicted_bytes.saturating_add(export.evicted_bytes);
+                for item in export.segments.iter().rev() {
+                    let segment = &item.segment;
+                    let Some(source_device) = mobile_device_wire(&segment.source_device) else {
+                        mobile_partial = true;
+                        continue;
+                    };
+                    let Some(proxy_device) = segment.proxy_device.as_deref().and_then(mobile_device_wire) else {
+                        mobile_partial = true;
+                        continue;
+                    };
+                    let Some(session_id) = mobile_id_wire(&segment.session_id) else {
+                        mobile_partial = true;
+                        continue;
+                    };
+                    let Some(batch_id) = mobile_id_wire(&segment.batch_id) else {
+                        mobile_partial = true;
+                        continue;
+                    };
+                    let raw = serde_json::to_vec(segment)?;
+                    if trace.bytes.saturating_add(raw.len() as u64) > v2::limits::DIAGNOSTIC_COLLECTION as u64 {
+                        mobile_partial = true;
+                        break 'mobile;
+                    }
+                    let segment_id = mobile_segment_id;
+                    mobile_segment_id = mobile_segment_id.saturating_add(1);
+                    for (offset, chunk) in raw.chunks(CHUNK).enumerate() {
+                        self.context
+                            .progress(stream.send(&Message::DiagnosticsChunk(dto::<w::DiagnosticsChunk>([
+                                ("bytes", RawValue::Bytes(chunk.to_vec())),
+                                ("request_id", request_id.write()),
+                                ("segment_id", segment_id.wire()?),
+                                ("offset", ((offset * CHUNK) as u32).wire()?),
+                                ("source_device", source_device.clone()),
+                                ("proxy_device", proxy_device.clone()),
+                                ("session_id", session_id.clone()),
+                                ("batch_id", batch_id.clone()),
+                                ("sequence", segment.sequence.wire()?),
+                            ])?)))
+                            .await?;
+                        trace.received(chunk.len())?;
+                        trace.work.messages += 1;
+                    }
+                    self.context
+                        .progress(
+                            stream.send(&Message::DiagnosticsSegmentEnd(dto::<w::DiagnosticsSegmentEnd>([
+                                ("request_id", request_id.write()),
+                                ("segment_id", segment_id.wire()?),
+                                ("compressed_length", (raw.len() as u32).wire()?),
+                                ("raw_length", (raw.len() as u32).wire()?),
+                                ("source_device", source_device),
+                                ("proxy_device", proxy_device),
+                                ("session_id", session_id),
+                                ("batch_id", batch_id),
+                                ("sequence", segment.sequence.wire()?),
+                            ])?)),
+                        )
+                        .await?;
+                    trace.work.messages += 1;
+                    trace.work.segments += 1;
+                }
+            }
+        }
         if partial {
             coverage.push(
                 dto::<w::Coverage>([
                     ("start_us", start.wire()?),
                     ("end_us", end.wire()?),
                     ("complete", false.wire()?),
-                    ("failure", (v1::ErrorCode::LimitExceeded.number() as u16).wire()?),
+                    ("failure", (v2::ErrorCode::LimitExceeded.number() as u16).wire()?),
                 ])?
                 .write(),
             );
         }
         let ending = Instant::now();
+        let mobile_sources = mobile_summary
+            .sources
+            .iter()
+            .filter_map(|source| mobile_device_wire(source))
+            .collect::<Vec<_>>();
         self.context
             .progress(stream.send(&Message::DiagnosticsEnd(dto::<w::DiagnosticsEnd>([
                 ("request_id", request_id.write()),
                 ("coverage", RawValue::Array(coverage)),
                 ("partial", partial.wire()?),
                 ("evicted_segments", encoding.source.evicted.wire()?),
+                ("mobile_partial", mobile_partial.wire()?),
+                ("mobile_evicted_bytes", mobile_evicted_bytes.wire()?),
+                ("mobile_sources", RawValue::Array(mobile_sources)),
             ])?)))
             .await?;
         trace.work.messages += 1;
@@ -982,7 +1346,7 @@ impl Collector {
     }
 }
 fn member_share(peers: usize) -> u64 {
-    v1::limits::DIAGNOSTIC_COLLECTION as u64 / peers.max(1) as u64
+    v2::limits::DIAGNOSTIC_COLLECTION as u64 / peers.max(1) as u64
 }
 struct MemberBudget {
     limit: u64,
@@ -1165,7 +1529,7 @@ fn validate_request(request: &w::DiagnosticsRequest) -> anyhow::Result<()> {
 fn strings(values: &[&str]) -> RawValue {
     RawValue::Array(values.iter().map(|v| RawValue::from(*v)).collect())
 }
-fn stamp(value: &w::ClockStamp) -> v1::Result<clock::Stamp> {
+fn stamp(value: &w::ClockStamp) -> v2::Result<clock::Stamp> {
     Ok(clock::Stamp {
         mono_us: value.mono_us()?,
         utc_us: value.utc_us()?,
@@ -1201,7 +1565,7 @@ fn expand(bytes: &[u8], compression: &str, raw_length: usize) -> anyhow::Result<
     anyhow::ensure!(raw.len() == raw_length, "invalid diagnostic expansion length");
     Ok(raw)
 }
-fn baseline(segment: &w::DiagnosticSegment) -> v1::Result<bool> {
+fn baseline(segment: &w::DiagnosticSegment) -> v2::Result<bool> {
     Ok(segment.snapshot()?.layout()?.is_none()
         && segment.rows()?.0.iter().all(|row| {
             row.event()
@@ -1263,6 +1627,20 @@ pub(crate) fn start_link_runtime(
         );
         let wake = owner.wake();
         let mut changes = group.subscribe();
+        // Off the async thread: the first call loads the proxy index.
+        let retain_mobile = |recorder: &Recorder, group: &crate::config_module::ConfigModule| {
+            let members = group
+                .members()
+                .members
+                .iter()
+                .map(|member| member.device.to_hex())
+                .collect::<std::collections::BTreeSet<_>>();
+            let recorder = recorder.clone();
+            drop(tokio::task::spawn_blocking(move || {
+                recorder.retain_mobile_sources(&members)
+            }));
+        };
+        retain_mobile(&recorder, &group);
         let mut stop = node.stop_receiver();
         let mut serving = tokio::task::JoinSet::new();
         let slots = Arc::new(tokio::sync::Semaphore::new(4));
@@ -1282,7 +1660,7 @@ pub(crate) fn start_link_runtime(
                 },
                 change = changes.next() => match change {
                     Some(ConfigChange::Facts {device, capabilities_changed}) => owner.facts_changed(device, capabilities_changed),
-                    Some(ConfigChange::State {..}) => { let _ = collector.group_changed(Some(group.applied().group)).await; recorder.configuration(&group); },
+                    Some(ConfigChange::State {..}) => { let _ = collector.group_changed(Some(group.applied().group)).await; recorder.configuration(&group); retain_mobile(&recorder, &group); },
                     Some(_) => {}, None => break,
                 },
                 _ = wake.notified() => {},
@@ -1499,8 +1877,8 @@ mod tests {
         }
         slow.wire(share as usize).unwrap();
         slow.expanded(share as usize).unwrap();
-        assert_eq!(fast.wire + slow.wire, v1::limits::DIAGNOSTIC_COLLECTION as u64);
-        assert_eq!(fast.expanded + slow.expanded, v1::limits::DIAGNOSTIC_COLLECTION as u64);
+        assert_eq!(fast.wire + slow.wire, v2::limits::DIAGNOSTIC_COLLECTION as u64);
+        assert_eq!(fast.expanded + slow.expanded, v2::limits::DIAGNOSTIC_COLLECTION as u64);
         assert!(slow.wire(1).is_err());
         assert!(slow.expanded(1).is_err());
     }
@@ -1849,7 +2227,14 @@ mod tests {
             let staging = std::fs::read_dir(dir.path())
                 .unwrap()
                 .map(|entry| entry.unwrap().path())
-                .find(|path| path.file_name().unwrap().to_string_lossy().starts_with("export-"))
+                // The collection staging, not the mobile proxy's
+                // `export-mobile-*` pin next to it: read_dir order is
+                // arbitrary, and waiting for the segment in the wrong one
+                // turns the "failed" case into a 30 s idle timeout.
+                .find(|path| {
+                    let name = path.file_name().unwrap().to_string_lossy();
+                    name.starts_with("export-") && !name.starts_with("export-mobile-")
+                })
                 .unwrap();
             let mut context = context(links, group);
             let (expire, expired) = tokio::sync::watch::channel(false);
@@ -2010,6 +2395,19 @@ mod tests {
             );
             assert_eq!(bundle.cutoff_complete, Some(false));
             assert_eq!(bundle.included_device_count, Some(if mode == "failed" { 2 } else { 1 }));
+            // The holder never reached its mobile part, even when ("failed")
+            // one desktop segment arrived first.
+            assert_eq!(manifest["mobile_diagnostics"]["partial"], true, "{mode}");
+            assert_eq!(
+                manifest["mobile_diagnostics"]["unavailable_holders"]
+                    .as_object()
+                    .unwrap()
+                    .values()
+                    .next()
+                    .unwrap(),
+                reason,
+                "{mode}"
+            );
             serving.abort();
             let _ = serving.await;
             recorder.shutdown();

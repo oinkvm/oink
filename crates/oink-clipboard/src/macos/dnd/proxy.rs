@@ -660,14 +660,8 @@ mod tests {
         let source = Local::new(vec![(NodeId(1), root)]).unwrap();
         let peer = oink_foundation::DeviceId([2; 32]);
         let grants = SourceGrants::load(&temp.path().join("grants"), [(peer, [1; 32])]).unwrap();
-        grants.set_peer_safe_symlinks(
-            peer,
-            crate::negotiation::CAPABILITIES.contains(&"oink.files.safe-symlinks/1"),
-        );
-        grants.set_peer_exec_bits(
-            peer,
-            crate::negotiation::CAPABILITIES.contains(&"oink.files.exec-bits/1"),
-        );
+        grants.set_peer_safe_symlinks(peer, crate::negotiation::CAPABILITIES.contains(&"oink.clipboard/2"));
+        grants.set_peer_exec_bits(peer, crate::negotiation::CAPABILITIES.contains(&"oink.clipboard/2"));
         let token = grants.issue(peer, source.as_ref(), &[NodeId(1)]).unwrap();
         let received = grants.open(peer, token).unwrap();
         let output = temp.path().join("finder");

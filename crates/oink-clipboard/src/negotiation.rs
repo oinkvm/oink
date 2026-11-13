@@ -1,5 +1,5 @@
 //! Reconstruction contracts supported by the native clipboard adapters.
-use oink_protocol::v1::{RawValue, dto, schema::WireDto};
+use oink_protocol::v2::{RawValue, dto, schema::WireDto};
 
 pub const PORTABLE_FORMATS: &[&str] = &[
     "mime:text/plain;charset=utf-8",
@@ -10,18 +10,7 @@ pub const PORTABLE_FORMATS: &[&str] = &[
     "oink:privacy-markers/1",
     dto::URL_FORMAT,
 ];
-pub const CAPABILITIES: &[&str] = &[
-    "oink.clipboard/1",
-    "oink.drag/1",
-    "oink.cache/1",
-    "oink.cloud-file-links/1",
-    // The registry only defines codecs. Production offers must also advertise
-    // these implemented Mac receive contracts, or every grant projects them out.
-    #[cfg(target_os = "macos")]
-    "oink.files.safe-symlinks/1",
-    #[cfg(target_os = "macos")]
-    "oink.files.exec-bits/1",
-];
+pub const CAPABILITIES: &[&str] = &["oink.clipboard/2", "oink.drag/1", "oink.clipboard.history/1"];
 
 /// Negotiation describes implemented reconstruction contracts. The per-device
 /// filters separately remove disabled representations from every actual offer.
@@ -86,7 +75,7 @@ pub fn selection(
         .iter()
         .find(|item| item.representations.iter().any(|rep| rep.id == representation))?;
     let representation = item.representations.iter().find(|rep| rep.id == representation)?;
-    let format = if inventory.platform == target {
+    let format = if inventory.platform == target && representation.format.platform() == target {
         native_format(&representation.format)
     } else {
         portable_format(representation.standard?).into()
@@ -116,11 +105,12 @@ pub fn negotiated_selection(
     inventory: &crate::model::Inventory,
     representation: oink_foundation::content::RepresentationId,
     target: oink_foundation::clipboard::ClipPlatform,
-) -> oink_protocol::v1::Result<(oink_foundation::content::ItemId, String)> {
-    use oink_protocol::v1::ErrorCode;
+) -> oink_protocol::v2::Result<(oink_foundation::content::ItemId, String)> {
+    use oink_protocol::v2::ErrorCode;
     let (item, format) = selection(inventory, representation, target).ok_or(ErrorCode::UnsupportedValue)?;
-    if inventory.platform == target {
-        let representation = crate::content::find(inventory, representation).ok_or(ErrorCode::UnsupportedValue)?;
+    let descriptor = crate::content::find(inventory, representation).ok_or(ErrorCode::UnsupportedValue)?;
+    if inventory.platform == target && descriptor.format.platform() == target {
+        let representation = descriptor;
         let namespace = format.split_once(':').ok_or(ErrorCode::UnsupportedValue)?.0;
         if !source.native_namespaces()?.0.iter().any(|name| name.0 == namespace)
             || !target_profile

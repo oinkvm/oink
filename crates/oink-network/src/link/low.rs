@@ -11,7 +11,7 @@
 //! stream it depends on closing). The network layer never judges that for a module.
 use super::types::LinkId;
 use oink_foundation::DeviceId;
-use oink_protocol::{frame::StreamKind, v1::Message};
+use oink_protocol::{frame::StreamKind, v2::Message};
 
 #[derive(Debug, thiserror::Error)]
 pub enum LowError {
@@ -27,6 +27,13 @@ pub enum LowError {
     Budget,
     #[error("message too large")]
     TooLarge,
+    /// The send gate refused: this link did not negotiate the Low kind, or the
+    /// message has no Low route on it (protocol-v2 1.1). Nothing was sent.
+    #[error("not negotiated on this link")]
+    Unnegotiated,
+    /// This device's sharing is paused and the message is `Suspend`.
+    #[error("sharing is paused")]
+    Paused,
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -38,14 +45,43 @@ pub struct LowStream {
     peer: DeviceId,
     kind: StreamKind,
     inner: super::tcp::bulk::BulkStream,
+    _open: OpenOperation,
+}
+
+/// Counts this operation as open on its link until the handle is dropped.
+struct OpenOperation {
+    hub: std::sync::Arc<super::tcp::Hub>,
+    link: LinkId,
+}
+impl std::fmt::Debug for OpenOperation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OpenOperation").field("link", &self.link).finish()
+    }
+}
+impl Drop for OpenOperation {
+    fn drop(&mut self) {
+        let mut ops = self.hub.low_ops.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(entry) = ops.get_mut(&self.link) {
+            entry.0 = entry.0.saturating_sub(1);
+            entry.1 = Some(std::time::Instant::now());
+        }
+    }
 }
 
 impl LowStream {
-    pub(super) fn new(inner: super::tcp::bulk::BulkStream) -> Self {
+    pub(super) fn new(inner: super::tcp::bulk::BulkStream, hub: &std::sync::Arc<super::tcp::Hub>) -> Self {
+        {
+            let mut ops = hub.low_ops.lock().unwrap_or_else(|e| e.into_inner());
+            ops.entry(inner.link).or_default().0 += 1;
+        }
         Self {
             link: inner.link,
             peer: inner.peer,
             kind: inner.kind,
+            _open: OpenOperation {
+                hub: hub.clone(),
+                link: inner.link,
+            },
             inner,
         }
     }
@@ -78,6 +114,11 @@ impl LowStream {
         self.inner.effect_validity()
     }
     pub async fn send(&mut self, message: &Message) -> Result<(), LowError> {
+        if self._open.hub.sharing_paused.load(std::sync::atomic::Ordering::Acquire)
+            && super::gate::suspended(message.type_id())
+        {
+            return Err(LowError::Paused);
+        }
         self.inner.send(message).await
     }
     /// `Ok(None)` at the peer's orderly end.

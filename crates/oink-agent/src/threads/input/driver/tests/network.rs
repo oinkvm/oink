@@ -70,7 +70,7 @@ fn outbound(h: &mut Harness, network: &LinkLayer, link: LinkId, peer: DeviceId, 
 }
 
 async fn stall_clipboard(a: &LinkLayer, b: &LinkLayer, link: LinkId) -> (SendStream, RecvStream, ModulePort) {
-    use oink_protocol::v1::{
+    use oink_protocol::v2::{
         dto,
         schema::{WireDto, WireValue},
     };
@@ -87,7 +87,7 @@ async fn stall_clipboard(a: &LinkLayer, b: &LinkLayer, link: LinkId) -> (SendStr
             None,
         )
         .unwrap();
-    let offer = oink_protocol::v1::Message::ClipboardOffer(
+    let offer = oink_protocol::v2::Message::ClipboardOffer(
         dto::ClipboardOffer::from_raw(
             [
                 (
@@ -101,7 +101,6 @@ async fn stall_clipboard(a: &LinkLayer, b: &LinkLayer, link: LinkId) -> (SendStr
                 (2, 0u64.write()),
                 (3, 1u64.write()),
                 (4, dto::Sensitivity::Normal.write()),
-                (5, oink_clipboard::wire::digest([0; 32]).write()),
                 (
                     6,
                     oink_clipboard::wire::inventory(&oink_clipboard::model::Inventory {
@@ -117,12 +116,17 @@ async fn stall_clipboard(a: &LinkLayer, b: &LinkLayer, link: LinkId) -> (SendStr
                     .write(),
                 ),
                 (7, 0u64.write()),
+                (8, oink_clipboard::wire::device(a.id()).write()),
+                (10, oink_protocol::v2::schema::FixedBytes([0; 16]).write()),
+                (11, oink_protocol::v2::schema::FixedBytes([1; 16]).write()),
+                (12, 0u32.write()),
+                (13, oink_protocol::v2::RawValue::Array(vec![])),
             ]
             .into(),
         )
         .unwrap(),
     );
-    let offer = oink_protocol::v1::frame::encode(&offer, oink_protocol::v1::limits::RELIABLE_FRAME).unwrap();
+    let offer = oink_protocol::v2::frame::encode(&offer, oink_protocol::v2::limits::RELIABLE_FRAME).unwrap();
     send.post(offer.as_slice()).unwrap();
     let (receive, _) = inbound(&mut port).await.accept(
         QueueSpec::reliable(StreamKind::Clipboard).1,
@@ -169,7 +173,7 @@ async fn quic_reader_resend_reopens_only_the_writer_and_reuses_the_retained_open
         .unwrap();
     let (ac, bc) = tokio::join!(connected(&mut acfg), connected(&mut bcfg));
     let agreement =
-        oink_protocol::v1::admission::Agreement::new(crate::node::Node::offer_profile().capabilities).unwrap();
+        oink_protocol::v2::admission::Agreement::new(crate::node::Node::offer_profile().capabilities).unwrap();
     a.set_agreement(ac.link, agreement.clone());
     b.set_agreement(bc.link, agreement.clone());
     a.set_ready(ac.link);

@@ -306,7 +306,11 @@ fn run_checked() -> anyhow::Result<()> {
             node.request_stop();
         })?;
     host.block_on(host.node().wait_for_stop());
-    tracing::info!("pre-login backend stopping");
+    // A network layer that ended on its own ends this process with an error;
+    // the OinkInput service's pre-login supervisor starts a new one (with a
+    // new Boot) after its restart delay.
+    let restart = host.node().restart_reason();
+    tracing::info!(restart = ?restart.as_ref().map(|fatal| fatal.code()), "pre-login backend stopping");
     // Drain routing/injection and leave the group before confirming the final
     // native release ACK. Release failure is diagnostic; the service waits for
     // this pinned process to exit before creating the user network identity.
@@ -315,7 +319,10 @@ fn run_checked() -> anyhow::Result<()> {
     if let Some(reason) = oink_winsvc::client::prelogin_shutdown_failure() {
         tracing::warn!(?reason, "pre-login final release unconfirmed; shutdown complete");
     }
-    Ok(())
+    match restart {
+        Some(fatal) => Err(anyhow::anyhow!("network layer failed: {fatal}")),
+        None => Ok(()),
+    }
 }
 
 #[cfg(test)]

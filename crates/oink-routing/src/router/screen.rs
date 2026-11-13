@@ -24,6 +24,11 @@ impl Router {
     }
     pub(super) fn enforce_screen_policy(&mut self) {
         let from = self.holder;
+        // A phone's local sentinel is "no target", not an active hidden screen.
+        // Importing a shared layout must not let it claim group focus on its own.
+        if self.cfg.screenless && from == self.me() && !self.screen_focus_active() {
+            return;
+        }
         if self
             .locked_device()
             .is_some_and(|target| self.layout.source_requires_target(target))

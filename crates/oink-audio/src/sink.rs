@@ -68,6 +68,7 @@ struct Status {
     dropout_counters: Arc<std::sync::OnceLock<Arc<DropoutCounters>>>,
     highest_accepted: AtomicU64,
     accepted_at_ns: AtomicU64,
+    latest_arrival_ns: AtomicU64,
     epoch: Instant,
     feedback_dropped: AtomicU64,
     rendered_dropped: AtomicU64,
@@ -190,6 +191,14 @@ impl Source {
         let at = self.status.epoch + Duration::from_nanos(self.status.accepted_at_ns.load(Ordering::Acquire));
         Some((self.status.highest_accepted.load(Ordering::Acquire), at))
     }
+    /// Latest network arrival accepted by this source's jitter/sequence window.
+    pub fn latest_arrival(&self) -> Option<Instant> {
+        self.status
+            .latest_arrival_ns
+            .load(Ordering::Acquire)
+            .checked_sub(1)
+            .and_then(|ns| self.status.epoch.checked_add(Duration::from_nanos(ns)))
+    }
     /// Optional local diagnostics counter, retained across port/burst resets by the owner.
     pub fn set_dropout_counters(&self, counter: Arc<DropoutCounters>) {
         let _ = self.status.dropout_counters.set(counter);
@@ -239,6 +248,7 @@ impl SourceState {
             dropout_counters: Default::default(),
             highest_accepted: AtomicU64::new(0),
             accepted_at_ns: AtomicU64::new(0),
+            latest_arrival_ns: AtomicU64::new(0),
             epoch: Instant::now(),
             feedback_dropped: AtomicU64::new(0),
             rendered_dropped: AtomicU64::new(0),
@@ -373,6 +383,15 @@ impl SourceState {
                     now.saturating_duration_since(self.status.epoch)
                         .as_nanos()
                         .min(u128::from(u64::MAX)) as u64,
+                    Ordering::Release,
+                );
+                self.status.latest_arrival_ns.fetch_max(
+                    packet
+                        .arrived
+                        .saturating_duration_since(self.status.epoch)
+                        .as_nanos()
+                        .min(u128::from(u64::MAX - 1)) as u64
+                        + 1,
                     Ordering::Release,
                 );
                 self.status.accepted.fetch_add(1, Ordering::Release);
@@ -734,6 +753,19 @@ impl Sink {
     pub fn source(&mut self, config: dsp::Config) -> Result<Source, String> {
         self.source_inner(config, false)
     }
+
+    /// Pair a capture worker with this sink's single native output RenderTap.
+    /// The returned owner is used by the PC microphone path; it never creates
+    /// a second native output tap or carries reference PCM on the wire.
+    pub fn echo_input(&self, enabled: bool) -> Result<crate::echo::CaseAInput, String> {
+        self.playback.echo_input(enabled)
+    }
+    pub fn echo_system_reference(&self) -> crate::echo::SystemReference {
+        self.playback.echo_system_reference()
+    }
+    pub fn echo_control(&self) -> Arc<crate::echo::Control> {
+        self.playback.echo_control()
+    }
     fn source_inner(&mut self, config: dsp::Config, observe: bool) -> Result<Source, String> {
         self.reap();
         let index = self
@@ -811,9 +843,112 @@ impl Drop for Sink {
     }
 }
 
+/// Native device-independent pull renderer. The callback retains source storage,
+/// so ordinary source removal cannot free a decoder still borrowed by render.
+pub struct NativePull {
+    render: crate::playback::Render,
+    sources: Arc<NativeSources>,
+}
+pub struct NativeSources {
+    registry: Arc<Registry>,
+    states: std::sync::Mutex<Vec<(usize, Box<SourceState>)>>,
+    rate: u32,
+}
+impl NativePull {
+    pub fn new(rate: u32) -> (Self, Arc<NativeSources>) {
+        let registry = Arc::new(Registry::new());
+        let sources = Arc::new(NativeSources {
+            registry: registry.clone(),
+            states: std::sync::Mutex::new(Vec::with_capacity(MAX_SOURCES)),
+            rate,
+        });
+        let render = crate::playback::Render::for_native_pull(Box::new(PullRender::new(registry)));
+        (
+            Self {
+                render,
+                sources: sources.clone(),
+            },
+            sources,
+        )
+    }
+    pub fn fill(&mut self, output: &mut [f32], channels: u16, at: Instant) {
+        if !(1..=2).contains(&channels) || !output.len().is_multiple_of(usize::from(channels)) {
+            output.fill(0.0);
+            return;
+        }
+        self.render.fill_native_pull(
+            output,
+            self.sources.rate,
+            channels,
+            (output.len() / usize::from(channels)) as u32,
+            at,
+        );
+    }
+}
+impl Drop for NativePull {
+    fn drop(&mut self) {
+        // Destruction is after native callback quiescence. Sources may outlive
+        // the native owner, but are now forbidden to publish new decoder slots.
+        self.sources.registry.stop.store(true, Ordering::Release);
+    }
+}
+impl NativeSources {
+    pub fn source(&self, config: dsp::Config) -> Result<Source, String> {
+        let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
+        if self.registry.stop.load(Ordering::Acquire) {
+            return Err("native output stopped".into());
+        }
+        states.retain(|(slot, _)| !self.registry.slots[*slot].load(Ordering::Acquire).is_null());
+        let index = self
+            .registry
+            .slots
+            .iter()
+            .position(|slot| slot.load(Ordering::Acquire).is_null())
+            .ok_or("source slots awaiting retirement")?;
+        let (source, mut state) = SourceState::prepare(config, false)?;
+        // Kernel construction happens here on control, never on first callback.
+        state.receiver.set_output_rate(self.rate);
+        let ptr = &mut *state as *mut SourceState;
+        states.push((index, state));
+        self.registry.slots[index].store(ptr, Ordering::Release);
+        Ok(source)
+    }
+}
+impl std::fmt::Debug for NativePull {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NativePull").finish_non_exhaustive()
+    }
+}
+impl std::fmt::Debug for NativeSources {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NativeSources")
+            .field("rate", &self.rate)
+            .finish_non_exhaustive()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn native_pull_renders_admitted_packets_without_allocating() {
+        let (mut render, sources) = NativePull::new(48_000);
+        let config = dsp::Config::low_latency_pcm();
+        let mut source = sources.source(config).unwrap();
+        let mut encoder = dsp::Encoder::new_with_config(config).unwrap();
+        let packet = encoder.encode(&[0.2; 240]).unwrap();
+        let arrived = Instant::now();
+        for sequence in 0..8 {
+            assert!(source.push(sequence, &packet, arrived, None, None));
+        }
+        let mut output = [0.0; 240];
+        crate::allocation_audit::assert_no_heap(|| {
+            render.fill(&mut output, 2, arrived + Duration::from_millis(50));
+        });
+        assert!(output.iter().any(|sample| *sample > 0.1));
+        assert_eq!(source.latest_arrival(), Some(arrived));
+    }
+
     #[test]
     fn dormant_source_drains_without_plc_or_quality_events_while_another_source_plays() {
         let config = dsp::Config::low_latency_pcm();

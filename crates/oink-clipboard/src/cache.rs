@@ -12,6 +12,7 @@ pub enum CacheCategory {
     DeliveredFiles,
     SourceSnapshots,
     PromiseExports,
+    TransferProxy,
     Other,
 }
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -188,7 +189,17 @@ pub fn tree_bytes(path: &Path) -> io::Result<u64> {
 // Shared source files can themselves reside in an Oink provider/cache root.
 // Source publications and each live serving task own these leases.
 static SOURCE_FILES: OnceLock<std::sync::Mutex<std::collections::HashMap<PathBuf, usize>>> = OnceLock::new();
-pub struct SourceLease(PathBuf, bool);
+// The subset of leases for work in progress right now: a live read, a file on
+// the current system clipboard, or an upload being staged. Long-lived owner
+// leases of published sources are not activity; a cache clear may remove them.
+static ACTIVE_FILES: OnceLock<std::sync::Mutex<std::collections::HashMap<PathBuf, usize>>> = OnceLock::new();
+fn active_guard() -> std::sync::MutexGuard<'static, std::collections::HashMap<PathBuf, usize>> {
+    ACTIVE_FILES
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+pub struct SourceLease(PathBuf, bool, bool);
 impl std::fmt::Debug for SourceLease {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("SourceLease")
@@ -196,11 +207,16 @@ impl std::fmt::Debug for SourceLease {
 }
 impl SourceLease {
     pub(crate) fn new(path: PathBuf) -> Self {
-        Self::acquire(path, true)
+        Self::acquire(path, true, false)
     }
     /// Scoped protection for a freshly read current system clipboard.
     pub fn current(path: PathBuf) -> Self {
-        Self::acquire(path, false)
+        Self::acquire(path, false, true)
+    }
+    /// Work in progress below `path` (for example an upload being staged):
+    /// [`remove_unless_active`] keeps it until this lease drops.
+    pub fn busy(path: PathBuf) -> Self {
+        Self::acquire(path, false, true)
     }
     pub(crate) fn create_owner(create: impl FnOnce() -> io::Result<PathBuf>) -> io::Result<Self> {
         let mut sources = source_guard();
@@ -208,26 +224,41 @@ impl SourceLease {
         *sources.entry(path.clone()).or_default() += 1;
         drop(sources);
         source_changed(&path);
-        Ok(Self(path, true))
+        Ok(Self(path, true, false))
     }
     pub(crate) fn path(&self) -> &Path {
         &self.0
     }
     pub(crate) fn reading(path: PathBuf) -> Self {
-        Self::acquire(path, true)
+        Self::acquire(path, true, true)
     }
-    fn acquire(path: PathBuf, publish: bool) -> Self {
+    fn acquire(path: PathBuf, publish: bool, active: bool) -> Self {
+        // Lock order: active before sources, as in remove_unless_active.
+        let mut activity = active.then(active_guard);
         let mut sources = source_guard();
         *sources.entry(path.clone()).or_default() += 1;
         drop(sources);
+        if let Some(activity) = activity.as_mut() {
+            *activity.entry(path.clone()).or_default() += 1;
+        }
+        drop(activity);
         if publish {
             source_changed(&path);
         }
-        Self(path, publish)
+        Self(path, publish, active)
     }
 }
 impl Drop for SourceLease {
     fn drop(&mut self) {
+        if self.2 {
+            let mut activity = active_guard();
+            if let Some(count) = activity.get_mut(&self.0) {
+                *count -= 1;
+                if *count == 0 {
+                    activity.remove(&self.0);
+                }
+            }
+        }
         let mut sources = SOURCE_FILES
             .get_or_init(Default::default)
             .lock()
@@ -243,6 +274,28 @@ impl Drop for SourceLease {
             source_changed(&self.0);
         }
     }
+}
+/// Remove one representation unless its proxy tree is being served.
+pub(crate) fn remove_file_unless_active(path: &Path) -> io::Result<bool> {
+    let activity = active_guard();
+    if activity.keys().any(|p| p.starts_with(path) || path.starts_with(p)) {
+        return Ok(false);
+    }
+    fs::remove_file(path)?;
+    drop(activity);
+    Ok(true)
+}
+/// Remove the tree at `path` unless a read, upload or current-clipboard lease
+/// is active inside it (or on an ancestor). Holding the activity lock across
+/// the removal stops a new read from starting in between. `Ok(false)` = kept.
+pub fn remove_unless_active(path: &Path) -> io::Result<bool> {
+    let activity = active_guard();
+    if activity.keys().any(|p| p.starts_with(path) || path.starts_with(p)) {
+        return Ok(false);
+    }
+    fs::remove_dir_all(path)?;
+    drop(activity);
+    Ok(true)
 }
 #[cfg(target_os = "macos")]
 pub(crate) fn source_paths() -> Vec<PathBuf> {

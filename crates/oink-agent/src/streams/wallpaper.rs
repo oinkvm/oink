@@ -7,7 +7,7 @@ use oink_foundation::{DeviceId, snapshot::Snapshot};
 use oink_network::link::{InboundLow, InboundStream, LinkId, LinkLayer, LinkLost, StreamClosed, StreamId};
 use oink_protocol::{
     frame::{StreamCode, StreamKind},
-    v1::{self, Message, dto::WallpaperSet},
+    v2::{self, Message, dto::WallpaperSet},
 };
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
@@ -53,7 +53,7 @@ async fn deliver(
     if config.applied().paused {
         return false;
     }
-    let max = v1::limits::LOW_FRAME as u64;
+    let max = v2::limits::LOW_FRAME as u64;
     let options = oink_network::LowOptions {
         send_max: max,
         receive_max: 0,
@@ -151,10 +151,7 @@ impl WallpaperStreams {
         if self.paused
             || self.config.applied().paused
             || self.local.load().is_none()
-            || !self
-                .config
-                .peer_agreement(peer)
-                .is_some_and(|agreement| agreement.contains("oink.wallpaper/1"))
+            || !self.config.peer_opens(peer, StreamKind::Wallpaper)
         {
             return;
         }
@@ -188,14 +185,14 @@ impl WallpaperStreams {
         self.received.get(&peer).map(Vec::as_slice)
     }
 
-    fn store(&mut self, peer: DeviceId, link: LinkId, message: WallpaperSet) -> v1::Result<()> {
+    fn store(&mut self, peer: DeviceId, link: LinkId, message: WallpaperSet) -> v2::Result<()> {
         let screens = model::decode(&message)?;
         let revision = message.revision()?;
         let state = self
             .peers
             .get_mut(&peer)
             .filter(|p| p.link == link)
-            .ok_or(v1::ErrorCode::NotReady)?;
+            .ok_or(v2::ErrorCode::NotReady)?;
         if state.revision.is_none_or(|old| revision > old) {
             state.revision = Some(revision);
             self.received.insert(peer, screens);
@@ -324,7 +321,7 @@ mod lifecycle {
             "applied_pause_before_wallpaper_notification",
             Some(4),
             async {
-                use oink_protocol::v1::{
+                use oink_protocol::v2::{
                     RawValue, dto,
                     schema::{WireDto, WireValue},
                 };

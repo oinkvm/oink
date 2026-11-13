@@ -510,6 +510,7 @@ mod tests {
             let offer = ordering
                 .capture(
                     crate::wire::inventory(&inventory).unwrap(),
+                    vec![],
                     count,
                     Sensitivity::Normal,
                     0,
@@ -544,17 +545,19 @@ mod tests {
         let mut source = Ordering::new(DeviceId([31; 32]), 0);
         let at = Instant::now();
         assert!(source.local_change(count, at), "ownership is not copy completion");
-        assert!(!source.capture_due(at + Duration::from_millis(74)));
+        let quiet = crate::sync::SOURCE_QUIET_PERIOD;
+        assert!(!source.capture_due(at + quiet - Duration::from_millis(1)));
         // The type is already declared, but its bytes are still absent when
-        // the shorter quiet window expires. Metadata capture must keep the
-        // promise rather than snapshotting only the first completed format.
-        assert!(source.capture_due(at + Duration::from_millis(75)));
+        // the quiet window expires. Metadata capture must keep the promise
+        // rather than snapshotting only the first completed format.
+        assert!(source.capture_due(at + quiet));
         let data = tempfile::tempdir().unwrap();
         let captured = super::super::content::capture(Some(&name), data.path()).unwrap();
         let provider = captured.content.unwrap();
         let offer = source
             .capture(
                 crate::wire::inventory(&provider.inventory()).unwrap(),
+                vec![],
                 count,
                 captured.snapshot.sensitivity,
                 0,

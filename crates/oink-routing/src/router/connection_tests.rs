@@ -372,7 +372,7 @@ fn retiring_forwarded_origin_emits_old_boot_release_and_drops_sync_route() {
 #[test]
 fn migration_focus_scope_remains_encodable_after_member_replacement() {
     use oink_foundation::session::Boot;
-    use oink_protocol::v1::{
+    use oink_protocol::v2::{
         RawMap, RawValue, dto,
         schema::{FixedBytes, List, WireDto, WireValue},
     };

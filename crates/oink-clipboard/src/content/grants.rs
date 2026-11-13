@@ -68,6 +68,10 @@ impl std::fmt::Debug for SourceRoot {
     }
 }
 impl SourceRoot {
+    pub(in crate::content) fn with_tracked(mut self, tracked: Option<crate::tracked_file::TrackedFile>) -> Self {
+        self.location.tracked = tracked;
+        self
+    }
     pub(in crate::content) fn id(&self) -> NodeId {
         self.entry.id
     }
@@ -1046,8 +1050,17 @@ fn resolve(grant: &Grant, id: NodeId) -> io::Result<(PathBuf, local::Fingerprint
         }
         return Ok((path, node.location.fingerprint.clone()));
     }
-    let path = node.location.resolve()?;
     let root = &grant.nodes[&node.root];
+    // A CF handoff may create new disk identities for an entire phone folder.
+    // Its stored holder reference is the authority for the new root; child
+    // locations remain bounded by their originally granted relative paths.
+    let path = if root.location.tracked.is_some() && id.0 != node.root {
+        root.location
+            .resolve()?
+            .join(node.location.relative_to(&root.location)?)
+    } else {
+        node.location.resolve()?
+    };
     let root_path = match node.location.followed.last() {
         Some(guard) => guard.target().to_path_buf(),
         None => root.location.resolve()?,

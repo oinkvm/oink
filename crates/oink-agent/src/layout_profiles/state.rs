@@ -9,7 +9,7 @@ use crate::{
     node::{Node, lock},
 };
 use oink_foundation::{Point, Size};
-use oink_protocol::v1::{
+use oink_protocol::v2::{
     dto,
     schema::{WireDto, WireValue},
 };
@@ -81,17 +81,17 @@ pub fn preference_token(facts: &dto::DeviceFacts) -> String {
     let p = preference(facts, dto::LocalOption::SyncSystemArrangement).map(|p| p.write());
     // Raw wire values aren't Serialize; canonical CBOR is the token input.
     let raw = [
-        (1, boot.unwrap_or(oink_protocol::v1::RawValue::Null)),
-        (2, p.unwrap_or(oink_protocol::v1::RawValue::Null)),
+        (1, boot.unwrap_or(oink_protocol::v2::RawValue::Null)),
+        (2, p.unwrap_or(oink_protocol::v2::RawValue::Null)),
         (
             3,
             preference(facts, dto::LocalOption::DisableHiddenDisplays)
                 .map(|p| p.write())
-                .unwrap_or(oink_protocol::v1::RawValue::Null),
+                .unwrap_or(oink_protocol::v2::RawValue::Null),
         ),
     ]
     .into();
-    model::hash(&oink_protocol::v1::cbor::encode_map(&raw, 4096).unwrap_or_default())
+    model::hash(&oink_protocol::v2::cbor::encode_map(&raw, 4096).unwrap_or_default())
 }
 impl Node {
     pub(super) fn observe_profiles(&self) -> Result<Observation> {
@@ -119,7 +119,11 @@ impl Node {
         let mut devices = Vec::new();
         let mut online_devices = Default::default();
         let mut connected_screens = BTreeMap::new();
-        for member in &table.members {
+        for member in table
+            .members
+            .iter()
+            .filter(|member| !member.is_mobile() || layout.device_transform(member.device).is_some())
+        {
             let device = DeviceKey(member.device);
             let facts = member.facts.as_ref();
             let connected = facts
@@ -129,15 +133,17 @@ impl Node {
             if member.online {
                 std::collections::BTreeSet::insert(&mut online_devices, device);
             }
-            let enabled = facts
-                .and_then(|f| preference(f, dto::LocalOption::SyncSystemArrangement))
-                .and_then(|p| p.value().ok())
-                .and_then(|v| bool::read(&v).ok())
-                .unwrap_or(true);
+            let enabled = !member.is_mobile()
+                && facts
+                    .and_then(|f| preference(f, dto::LocalOption::SyncSystemArrangement))
+                    .and_then(|p| p.value().ok())
+                    .and_then(|v| bool::read(&v).ok())
+                    .unwrap_or(true);
             let supported = member.is_self
-                || config
-                    .peer_agreement(member.device)
-                    .is_some_and(|a| a.contains("oink.layout.arrangement/1"));
+                || config.peer_permits(
+                    member.device,
+                    oink_protocol::v2::registry::type_id::LayoutArrangementRequest,
+                );
             let token = facts
                 .and_then(|f| f.native_arrangement_token().ok().flatten())
                 .map(|t| t.0);
@@ -233,8 +239,9 @@ impl Node {
             .into();
         let mut data = lock(&self.inner.profiles.data);
         if data.catalog.as_ref().is_none_or(|c| c.group != group) {
+            let merged = self.substitute_merge(group, &observation)?;
             let catalog = select_catalog(
-                store::load(&self.inner.data_dir, group)?,
+                merged.or(store::load(&self.inner.data_dir, group)?),
                 || super::join::awaiting_catalog(&self.inner.data_dir, group),
                 || {
                     let c = Catalog::initial(
@@ -329,7 +336,7 @@ impl Node {
         }
         let applied_version = self.link_config().map_err(unavailable)?.applied().version.clone();
         if data.pending_layout.as_ref().is_some_and(|v| {
-            oink_protocol::v1::retained::version_cmp(&applied_version, v).is_ok_and(|o| o != std::cmp::Ordering::Less)
+            oink_protocol::v2::retained::version_cmp(&applied_version, v).is_ok_and(|o| o != std::cmp::Ordering::Less)
         }) {
             data.pending_layout = None;
         }

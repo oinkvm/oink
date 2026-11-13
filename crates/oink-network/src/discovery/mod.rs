@@ -9,14 +9,16 @@ use std::time::Duration;
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, oneshot, watch};
 
+pub mod address_watch;
 mod builtin;
 #[cfg(target_os = "macos")]
 mod dnssd;
+pub mod native;
 
 mod advert;
 pub use advert::{Advert, ProtocolOffer};
-pub(crate) const SERVICE_TYPE: &str = oink_protocol::v1::DISCOVERY_SERVICE;
-use oink_protocol::v1::{
+pub(crate) const SERVICE_TYPE: &str = oink_protocol::v2::DISCOVERY_SERVICE;
+use oink_protocol::v2::{
     self, Message, RawValue, dto,
     schema::{WireDto, WireValue},
 };
@@ -44,7 +46,7 @@ pub(crate) enum Packet {
     Query([u8; 16]),
     Reply(Advert, Option<[u8; 16]>),
 }
-fn bounded_advert(a: &Advert) -> v1::Result<dto::Advert> {
+fn bounded_advert(a: &Advert) -> v2::Result<dto::Advert> {
     let mut a = a.clone();
     let mut end = a.name.len().min(200);
     while !a.name.is_char_boundary(end) {
@@ -53,21 +55,24 @@ fn bounded_advert(a: &Advert) -> v1::Result<dto::Advert> {
     a.name.truncate(end);
     a.to_wire()
 }
-pub(crate) fn encode_beacon(a: &Advert) -> v1::Result<Vec<u8>> {
-    v1::frame::encode_discovery(&Message::DiscoveryBeacon(bounded_advert(a)?))
+pub(crate) fn encode_beacon(a: &Advert) -> v2::Result<Vec<u8>> {
+    v2::frame::encode_discovery(&Message::DiscoveryBeacon(bounded_advert(a)?))
 }
 pub(crate) fn encode_query(nonce: &[u8; 16]) -> Vec<u8> {
     let query = dto::DiscoveryQuery::from_raw([(1, RawValue::Bytes(nonce.to_vec()))].into())
         .expect("fixed-size discovery nonce");
-    v1::frame::encode_discovery(&Message::DiscoveryQuery(query)).expect("bounded discovery query")
+    v2::frame::encode_discovery(&Message::DiscoveryQuery(query)).expect("bounded discovery query")
 }
-pub(crate) fn encode_reply(a: &Advert, nonce: &[u8; 16]) -> v1::Result<Vec<u8>> {
+pub(crate) fn encode_reply(a: &Advert, nonce: &[u8; 16]) -> v2::Result<Vec<u8>> {
     let reply =
         dto::DiscoveryReply::from_raw([(1, bounded_advert(a)?.write()), (2, RawValue::Bytes(nonce.to_vec()))].into())?;
-    v1::frame::encode_discovery(&Message::DiscoveryReply(reply))
+    v2::frame::encode_discovery(&Message::DiscoveryReply(reply))
 }
 pub(crate) fn decode(bytes: &[u8]) -> Option<Packet> {
-    match v1::frame::discovery(bytes).ok()? {
+    let Ok(message) = v2::frame::discovery(bytes) else {
+        return legacy_v1(bytes);
+    };
+    match message {
         Message::DiscoveryBeacon(a) => Some(Packet::Beacon(Advert::from_wire(&a).ok()?)),
         Message::DiscoveryQuery(query) => Some(Packet::Query(query.nonce().ok()?.0)),
         Message::DiscoveryReply(reply) => Some(Packet::Reply(
@@ -78,8 +83,56 @@ pub(crate) fn decode(bytes: &[u8]) -> Option<Packet> {
     }
 }
 
+/// 0.3.x (protocol v1) beacons and replies share the discovery header and
+/// Advert keys 1–9 but lack the v2 keys 10–13, so the v2 decoder rejects them.
+/// Parse them only to report an old device ("版本过低，请升级"); QUIC and Low
+/// still accept only the v2 ALPN. Every protocol offer must be major 1.
+fn legacy_v1(bytes: &[u8]) -> Option<Packet> {
+    if bytes.len() > v2::limits::DISCOVERY || bytes.get(..6)? != b"OINK\x01\x00" {
+        return None;
+    }
+    let frame = v2::frame::OpaqueFrame::parse_exact(&bytes[6..], v2::limits::DISCOVERY - 6).ok()?;
+    let type_id = frame.header.type_id;
+    let payload = frame.payload();
+    let mut raw = v2::cbor::decode_map(payload, payload.len()).ok()?;
+    let (mut advert, nonce) = match type_id {
+        0x901 => (raw, None),
+        0x903 => {
+            let nonce = match raw.remove(&2)? {
+                RawValue::Bytes(nonce) => <[u8; 16]>::try_from(nonce).ok()?,
+                _ => return None,
+            };
+            (raw.remove(&1)?.as_map().ok()?.clone(), Some(nonce))
+        }
+        _ => return None,
+    };
+    if (10..=13).any(|key| advert.contains_key(&key)) {
+        return None;
+    }
+    advert.insert(10, 1u16.write());
+    advert.insert(11, 0u16.write());
+    advert.insert(12, RawValue::from(""));
+    advert.insert(13, dto::DeviceKind::Desktop.write());
+    let advert = Advert::from_wire(&dto::Advert::from_raw(advert).ok()?).ok()?;
+    if advert.protocols.is_empty() || advert.protocols.iter().any(|p| p.major != 1) {
+        return None;
+    }
+    Some(match nonce {
+        None => Packet::Beacon(advert),
+        Some(nonce) => Packet::Reply(advert, Some(nonce)),
+    })
+}
+
 /// 本机所有 IPv4 地址（不含回环），以及每个地址所在网段的广播地址。
+///
+/// Enumerating interfaces can take milliseconds; never call this on the
+/// realtime network thread (its address list arrives by `set_local_addresses`).
 pub fn local_ipv4() -> Vec<(Ipv4Addr, Option<Ipv4Addr>)> {
+    debug_assert_ne!(
+        std::thread::current().name(),
+        Some("oink-network"),
+        "interface enumeration on the realtime network thread"
+    );
     let Ok(list) = if_addrs::get_if_addrs() else {
         return Vec::new();
     };
@@ -427,13 +480,23 @@ async fn handle_packet(
 }
 
 /// TXT 记录的键值（两种 mDNS 实现共用）。
-pub(crate) fn txt_pairs(a: &Advert) -> Vec<(String, String)> {
+pub fn txt_pairs(a: &Advert) -> Vec<(String, String)> {
     let bounded = bounded_advert(a).ok().and_then(|a| Advert::from_wire(&a).ok());
     let Some(a) = bounded else {
         return Vec::new();
     };
     vec![
-        ("wire".into(), "1".into()),
+        ("wire".into(), "2".into()),
+        ("v".into(), format!("{}.{}", v2::MAJOR, v2::MINOR)),
+        ("build".into(), a.build),
+        (
+            "kind".into(),
+            match a.device_kind {
+                dto::DeviceKind::Desktop => "desktop".into(),
+                dto::DeviceKind::Mobile => "mobile".into(),
+                _ => return Vec::new(),
+            },
+        ),
         ("id".into(), a.id.to_hex()),
         ("idscheme".into(), dto::ED25519.into()),
         ("gid".into(), a.group.to_hex()),
@@ -463,11 +526,29 @@ fn unhex<const N: usize>(s: &str) -> Option<[u8; N]> {
     Some(out)
 }
 
-/// 从 TXT 键值还原通告内容。
-pub(crate) fn advert_from_txt(get: impl Fn(&str) -> Option<String>) -> Option<Advert> {
-    if get("wire")?.as_str() != "1" || get("idscheme").is_some_and(|s| s != dto::ED25519) {
+/// Parse untrusted DNS-SD hints. Legacy TXT is sufficient to report an old
+/// device while QUIC and Low continue to accept only the v2 ALPN.
+pub fn advert_from_txt(get: impl Fn(&str) -> Option<String>) -> Option<Advert> {
+    if get("idscheme").is_some_and(|scheme| scheme != dto::ED25519) {
         return None;
     }
+    let (wire_major, minor, build, device_kind) = match get("wire")?.as_str() {
+        "1" => (1, 0, String::new(), dto::DeviceKind::Desktop),
+        "2" => {
+            let version = get("v")?;
+            let (major, minor) = version.split_once('.')?;
+            if major.parse::<u16>().ok()? != v2::MAJOR {
+                return None;
+            }
+            let device_kind = match get("kind")?.as_str() {
+                "desktop" => dto::DeviceKind::Desktop,
+                "mobile" => dto::DeviceKind::Mobile,
+                _ => return None,
+            };
+            (v2::MAJOR, minor.parse().ok()?, get("build")?, device_kind)
+        }
+        _ => return None,
+    };
     let majors = get("majors")?;
     if majors.len() > 47 {
         return None;
@@ -475,13 +556,14 @@ pub(crate) fn advert_from_txt(get: impl Fn(&str) -> Option<String>) -> Option<Ad
     let protocols = majors
         .split(',')
         .map(|major| {
+            let major = major.parse().ok()?;
             Some(ProtocolOffer {
-                major: major.parse().ok()?,
-                highest_minor: 0,
+                major,
+                highest_minor: if major == wire_major { minor } else { 0 },
             })
         })
         .collect::<Option<Vec<_>>>()?;
-    if protocols.is_empty() || protocols.len() > 8 {
+    if protocols.is_empty() || protocols.len() > 8 || (wire_major == 1 && protocols.iter().any(|p| p.major != 1)) {
         return None;
     }
     let a = Advert {
@@ -493,19 +575,89 @@ pub(crate) fn advert_from_txt(get: impl Fn(&str) -> Option<String>) -> Option<Ad
         protocols,
         identity_algorithms: vec![dto::ED25519.into()],
         os: get("os")?,
+        build,
+        device_kind,
     };
     a.to_wire().ok()?;
     Some(a)
 }
 
 /// mDNS 实例名：`设备名 (短指纹)`，不超过 63 字节。
-pub(crate) fn instance_name(a: &Advert) -> String {
+pub fn instance_name(a: &Advert) -> String {
     let suffix = format!(" ({})", a.id.short());
     let mut name = a.name.clone();
     while name.len() + suffix.len() > 63 {
         name.pop();
     }
     format!("{name}{suffix}")
+}
+
+/// What one mDNS result set changed for a device (identity hints only).
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum MdnsChange {
+    Discovered(DeviceId, Vec<SocketAddr>),
+    AddressChanged {
+        peer: DeviceId,
+        from: Vec<SocketAddr>,
+        to: Vec<SocketAddr>,
+    },
+    Lost(DeviceId),
+}
+
+/// INFO lines when an mDNS browser's live set gains a device, changes its
+/// addresses or loses it. Diagnostics only (2026-11-12: whether a device saw
+/// a peer's new address could only be inferred); the periodic re-emits that
+/// keep nearby entries fresh do not log. Device IDs and addresses only.
+#[derive(Debug, Default)]
+pub(crate) struct MdnsPeers(std::collections::BTreeMap<DeviceId, Vec<SocketAddr>>);
+impl MdnsPeers {
+    /// `live`: every sighting the browser currently holds, any number per device.
+    pub(crate) fn update<'a>(&mut self, live: impl IntoIterator<Item = &'a Sighting>) -> Vec<MdnsChange> {
+        let mut now = std::collections::BTreeMap::<DeviceId, Vec<SocketAddr>>::new();
+        for sighting in live {
+            now.entry(sighting.advert.id).or_default().extend(&sighting.addrs);
+        }
+        for addresses in now.values_mut() {
+            addresses.sort();
+            addresses.dedup();
+        }
+        let mut changes = Vec::new();
+        for (peer, addresses) in &now {
+            match self.0.get(peer) {
+                None => changes.push(MdnsChange::Discovered(*peer, addresses.clone())),
+                Some(from) if from != addresses => changes.push(MdnsChange::AddressChanged {
+                    peer: *peer,
+                    from: from.clone(),
+                    to: addresses.clone(),
+                }),
+                Some(_) => {}
+            }
+        }
+        changes.extend(
+            self.0
+                .keys()
+                .filter(|peer| !now.contains_key(peer))
+                .map(|peer| MdnsChange::Lost(*peer)),
+        );
+        for change in &changes {
+            match change {
+                MdnsChange::Discovered(peer, addresses) => {
+                    tracing::info!(peer_id = peer.to_hex().as_str(), ?addresses, "mDNS peer discovered");
+                }
+                MdnsChange::AddressChanged { peer, from, to } => {
+                    tracing::info!(
+                        peer_id = peer.to_hex().as_str(),
+                        ?from,
+                        ?to,
+                        "mDNS peer address changed"
+                    );
+                }
+                MdnsChange::Lost(peer) => tracing::info!(peer_id = peer.to_hex().as_str(), "mDNS peer lost"),
+            }
+        }
+        self.0 = now;
+        changes
+    }
 }
 
 #[cfg(test)]
@@ -524,6 +676,50 @@ mod tests {
     }
 
     #[test]
+    fn mdns_peers_report_discovery_address_change_and_loss_once() {
+        let sighting = |id: u8, address: &str| Sighting {
+            advert: Advert {
+                id: DeviceId([id; 32]),
+                ..advert()
+            },
+            addrs: vec![address.parse().unwrap()],
+            source: Source::Mdns,
+        };
+        let a = DeviceId([1; 32]);
+        let b = DeviceId([2; 32]);
+        let mut peers = MdnsPeers::default();
+        let first = [sighting(1, "192.0.2.1:47470"), sighting(2, "192.0.2.2:47470")];
+        assert_eq!(
+            peers.update(&first),
+            [
+                MdnsChange::Discovered(a, vec!["192.0.2.1:47470".parse().unwrap()]),
+                MdnsChange::Discovered(b, vec!["192.0.2.2:47470".parse().unwrap()]),
+            ]
+        );
+        // Re-emitted results and a second interface's copy of the same address are silent.
+        assert!(peers.update(first.iter().chain(&first[..1])).is_empty());
+        // DNS-SD resolves one address per interface: the device's set is their union.
+        let moved = [
+            sighting(1, "192.0.2.1:47470"),
+            sighting(1, "198.51.100.1:47470"),
+            sighting(2, "192.0.2.2:47470"),
+        ];
+        assert_eq!(
+            peers.update(&moved),
+            [MdnsChange::AddressChanged {
+                peer: a,
+                from: vec!["192.0.2.1:47470".parse().unwrap()],
+                to: vec![
+                    "192.0.2.1:47470".parse().unwrap(),
+                    "198.51.100.1:47470".parse().unwrap()
+                ],
+            }]
+        );
+        assert_eq!(peers.update(&moved[2..]), [MdnsChange::Lost(a)]);
+        assert!(peers.update(&moved[2..]).is_empty());
+    }
+
+    #[test]
     fn packet_roundtrip() {
         let a = advert();
         assert_eq!(decode(&encode_beacon(&a).unwrap()), Some(Packet::Beacon(a.clone())));
@@ -534,7 +730,7 @@ mod tests {
             Some(Packet::Reply(a.clone(), Some(n)))
         );
         assert!(matches!(
-            v1::frame::discovery(&encode_beacon(&a).unwrap()),
+            v2::frame::discovery(&encode_beacon(&a).unwrap()),
             Ok(Message::DiscoveryBeacon(_))
         ));
         let mut oversized = encode_beacon(&a).unwrap();
@@ -545,27 +741,24 @@ mod tests {
     }
 
     #[test]
-    fn frozen_v1_advert_and_dynamic_port_use_the_existing_field() {
-        let hex = include_str!("../../../oink-protocol/tests/fixtures/v1/0901.hex").trim();
+    fn frozen_v1_advert_is_reported_as_an_incompatible_device() {
+        let hex = include_str!("../../../oink-protocol/tests/fixtures/v2/0901.hex").trim();
         let mut bytes = b"OINK\x01\x00".to_vec();
         bytes.extend(
             (0..hex.len())
                 .step_by(2)
                 .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap()),
         );
-        let Some(Packet::Beacon(mut old)) = decode(&bytes) else {
-            panic!("frozen advert rejected")
+        // The v2 decoder alone rejects it; the legacy path reports it only as
+        // an old device, never as a v2 peer.
+        assert!(v2::frame::discovery(&bytes).is_err());
+        let Some(Packet::Beacon(advert)) = decode(&bytes) else {
+            panic!("v1 beacon must be visible as an incompatible device")
         };
-        assert_eq!(old.port, 1);
-        old.port = 54321;
-        let encoded = encode_beacon(&old).unwrap();
-        // Same frozen parser and mandatory port field; no extension, new message
-        // or capability is required to carry an OS-assigned destination.
-        assert_eq!(decode(&encoded), Some(Packet::Beacon(old.clone())));
-        let pairs = txt_pairs(&old);
-        let txt = advert_from_txt(|key| pairs.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone())).unwrap();
-        assert_eq!(txt.port, old.port);
-        assert_eq!(txt.id, old.id);
+        assert!(!advert.supports_current_protocol());
+        assert_eq!(advert.name, "synthetic");
+        // Truncated v1 frames are still ignored.
+        assert!(decode(&bytes[..bytes.len() - 1]).is_none());
     }
 
     #[test]
@@ -587,6 +780,23 @@ mod tests {
         }
         assert!(instance_name(&a).ends_with(&format!("({})", a.id.short())));
     }
+    #[test]
+    fn legacy_txt_identifies_an_incompatible_peer() {
+        let a = advert();
+        let mut pairs = txt_pairs(&a).into_iter().collect::<HashMap<_, _>>();
+        pairs.remove("v");
+        pairs.remove("build");
+        pairs.remove("kind");
+        pairs.insert("wire".into(), "1".into());
+        pairs.insert("majors".into(), "1".into());
+        let old = advert_from_txt(|key| pairs.get(key).cloned()).unwrap();
+        assert_eq!(old.id, a.id);
+        assert_eq!(old.group, a.group);
+        assert!(!old.supports_current_protocol());
+        pairs.insert("majors".into(), "2".into());
+        assert!(advert_from_txt(|key| pairs.get(key).cloned()).is_none());
+    }
+
     #[test]
     fn discovery_rejects_foreign_envelopes_and_invalid_hints() {
         let mut packet = encode_beacon(&advert()).unwrap();
@@ -615,9 +825,11 @@ mod tests {
             highest_minor: 0,
         }];
         let pairs = txt_pairs(&a);
-        assert!(!pairs.iter().any(|(k, _)| k == "gname" || k == "v"));
+        assert!(pairs.iter().any(|(k, _)| k == "v"));
+        assert!(pairs.iter().any(|(k, _)| k == "build"));
         let get = |key: &str| pairs.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone());
         assert_eq!(advert_from_txt(get), Some(a));
+        assert!(advert_from_txt(|key| if key == "v" { None } else { get(key) }).is_none());
         assert!(advert_from_txt(|key| if key == "wire" { None } else { get(key) }).is_none());
         assert!(
             advert_from_txt(|key| if key == "idscheme" {

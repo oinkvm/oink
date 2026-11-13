@@ -56,6 +56,17 @@ struct Observer {
     uid: String,
     _owner: Box<std::thread::Thread>,
 }
+// SAFETY: the native observer is not tied to its creating thread. Its flags are
+// atomics, mute writes and wake registration are serialized on its own dispatch
+// queue, and reads are plain HAL property queries. One owner at a time holds
+// this handle exclusively; it moves only when a capture rebuild hands the
+// forwarding session's mute lease to the replacement capture worker.
+unsafe impl Send for Observer {}
+extern "C" fn wake_owner(context: *mut c_void) {
+    // SAFETY: Observer retains the boxed thread until native close drains
+    // callbacks, and keeps a replaced box until re-registration has returned.
+    unsafe { &*context.cast::<std::thread::Thread>() }.unpark();
+}
 impl Observer {
     fn new(uid: &str) -> Result<Self, String> {
         let c_uid = CString::new(uid).map_err(|_| "source output UID contains NUL")?;
@@ -67,17 +78,23 @@ impl Observer {
             return Err(message(&error));
         }
         let mut owner = Box::new(std::thread::current());
-        extern "C" fn wake(context: *mut c_void) {
-            // SAFETY: Observer retains the boxed thread until native close drains callbacks.
-            unsafe { &*context.cast::<std::thread::Thread>() }.unpark();
-        }
         // SAFETY: stable boxed context outlives the native listener registration.
-        unsafe { oink_audio_endpoint_on_change(raw, wake, (&mut *owner as *mut std::thread::Thread).cast()) };
+        unsafe { oink_audio_endpoint_on_change(raw, wake_owner, (&mut *owner as *mut std::thread::Thread).cast()) };
         Ok(Self {
             raw,
             uid: uid.into(),
             _owner: owner,
         })
+    }
+    /// Endpoint notifications wake the calling thread from now on.
+    fn rebind_owner(&mut self) {
+        let mut owner = Box::new(std::thread::current());
+        // SAFETY: registration is serialized with callbacks on the observer's
+        // queue, so after it returns no callback can still use the old context.
+        unsafe {
+            oink_audio_endpoint_on_change(self.raw, wake_owner, (&mut *owner as *mut std::thread::Thread).cast())
+        };
+        self._owner = owner;
     }
     fn flags(&self) -> u32 {
         // SAFETY: live handle; only process-local atomics are read.
@@ -235,6 +252,19 @@ impl MuteLease {
     }
     pub(crate) fn default_changed(&self) -> bool {
         self.lease.backend.flags() & 4 != 0
+    }
+    pub(crate) fn uid(&self) -> &str {
+        &self.lease.backend.uid
+    }
+    /// A lease can continue into another capture of the same forwarding only
+    /// while it still owns the exact endpoint state it muted: no user control
+    /// change, no default-output switch and no audio-service restart.
+    pub(crate) fn transferable(&self) -> bool {
+        self.lease.backend.flags() & (1 | 2 | 4 | 8) == 0
+    }
+    /// Called by the capture worker that adopts this lease.
+    pub(crate) fn rebind_owner(&mut self) {
+        self.lease.backend.rebind_owner();
     }
     pub(crate) fn finish(&mut self) -> Result<(), String> {
         self.lease.finish()

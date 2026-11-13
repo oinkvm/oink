@@ -16,6 +16,7 @@ use std::{
     sync::{Arc, Mutex, Weak},
 };
 
+pub mod announced;
 pub(crate) mod clipboard;
 mod deferred;
 pub use deferred::Deferred;
@@ -34,7 +35,7 @@ mod transfer;
 pub(crate) mod url;
 pub use remote::Remote;
 pub use snapshot::Snapshot;
-pub use transfer::{FileRetention, Registry, SourceLease};
+pub use transfer::{FileRetention, Registry, SourceLease, ThumbnailOutcome};
 
 /// Converts a native representation's bytes. Sibling metadata uses the same
 /// guarded source provider. Same-platform readers do not invoke this interface.
@@ -70,7 +71,10 @@ pub(crate) fn guarded(reader: FileReader, check: ReaderGuard) -> io::Result<File
             Ok(size)
         }
     }
-    Ok(Box::new(Checked { reader, check }))
+    // A clipboard-generation guard may return semantic Interrupted after open.
+    // Every consumer (including cache io::copy/read_to_end) must see a terminal
+    // content error rather than retry it forever as a transient OS interrupt.
+    Ok(terminal_reader(Box::new(Checked { reader, check })))
 }
 
 /// Content cancellation and a changed selected version are terminal failures,
@@ -268,7 +272,7 @@ pub fn projected(provider: Arc<dyn Provider>, inventory: Inventory) -> io::Resul
 /// Serve an already announced offer from a newer, equivalent clipboard.
 ///
 /// A synchronizer that writes our own announced content back replaces the
-/// native slot the announced readers were bound to. That write is a duplicate
+/// native slot the announced readers were bound to. That write is an echo
 /// (`crate::dedupe`) and is not announced again, so peers keep reading the
 /// original offer. Each announced representation is served by the newer
 /// clipboard's representation with the same native format at the same item
@@ -400,6 +404,86 @@ pub fn find(inventory: &Inventory, id: RepresentationId) -> Option<&Representati
         .find(|r| r.id == id)
 }
 
+fn portable_representation(
+    inventory: &Inventory,
+    id: RepresentationId,
+) -> Option<(
+    oink_foundation::content::ItemId,
+    &Representation,
+    crate::model::StandardFormat,
+)> {
+    use crate::model::StandardFormat;
+    inventory.items.iter().find_map(|item| {
+        if item.file.is_some() && !item.virtual_files {
+            return None;
+        }
+        let rep = item.representations.iter().find(|rep| rep.id == id)?;
+        let format = rep.standard.filter(|format| *format != StandardFormat::Privacy)?;
+        matches!(
+            rep.data,
+            RepresentationData::Inline(_) | RepresentationData::Reader { .. }
+        )
+        .then_some((item.id, rep, format))
+    })
+}
+
+/// The representation a phone presents for `item`, by the phone's own rule
+/// (oink-mobile-core `v2_session::portable_format`): the first portable
+/// representation of the best kind, a bitmap before plain text, a URL, HTML
+/// and RTF. A phone presents an offer with file roots by its roots instead.
+pub(crate) fn phone_representation(item: &crate::model::ContentItem) -> Option<&Representation> {
+    use crate::model::StandardFormat;
+    let rank = |format: StandardFormat| match format {
+        StandardFormat::Png => Some(0u8),
+        StandardFormat::Text => Some(1),
+        StandardFormat::Url => Some(2),
+        StandardFormat::Html => Some(3),
+        StandardFormat::Rtf => Some(4),
+        StandardFormat::Privacy => None,
+    };
+    item.representations
+        .iter()
+        .filter(|rep| {
+            matches!(
+                rep.data,
+                RepresentationData::Inline(_) | RepresentationData::Reader { .. }
+            )
+        })
+        .filter_map(|rep| Some((rank(rep.standard?)?, rep)))
+        // The first of equally ranked representations, like the phone.
+        .min_by_key(|(rank, _)| *rank)
+        .map(|(_, rep)| rep)
+}
+
+/// Every representation a phone fetches for `item` (2026-11-12, phones keep
+/// rich text): the one it presents (`phone_representation`) and, when that is
+/// plain text, the item's rich text next to it, HTML before RTF (the first of
+/// each, like the phone's `rich_format`). Hosts write both to the phone
+/// clipboard and render the rich one in the conversation.
+pub(crate) fn phone_representations(item: &crate::model::ContentItem) -> Vec<&Representation> {
+    use crate::model::StandardFormat;
+    let Some(primary) = phone_representation(item) else {
+        return Vec::new();
+    };
+    let mut wanted = vec![primary];
+    if primary.standard == Some(StandardFormat::Text) {
+        let readable = |rep: &&Representation| {
+            matches!(
+                rep.data,
+                RepresentationData::Inline(_) | RepresentationData::Reader { .. }
+            )
+        };
+        let first = |format| {
+            item.representations
+                .iter()
+                .filter(readable)
+                .find(|rep| rep.standard == Some(format))
+        };
+        wanted.extend(first(StandardFormat::Html).or_else(|| first(StandardFormat::Rtf)));
+    }
+    wanted
+}
+
 /// Bound memory before any native HGLOBAL/NSData or conversion result is copied.
 /// Streaming readers use the same limit and check EOF, including exact limits.
 pub fn read_all(reader: &mut dyn Read) -> io::Result<Vec<u8>> {
@@ -413,14 +497,18 @@ pub fn read_all(reader: &mut dyn Read) -> io::Result<Vec<u8>> {
 
 /// Same-system bytes remain untouched. Foreign payloads contain exactly the
 /// declared portable format bytes, selected by the offered representation.
+/// Canonical portable bytes regardless of source operating system.
+pub fn open_portable(provider: &dyn Provider, id: RepresentationId) -> io::Result<FileReader> {
+    open_for_demand(provider, id, None, false)
+}
 pub fn open_for(provider: &dyn Provider, id: RepresentationId, target: ClipPlatform) -> io::Result<FileReader> {
-    open_for_demand(provider, id, target, false)
+    open_for_demand(provider, id, Some(target), false)
 }
 
 fn open_for_demand(
     provider: &dyn Provider,
     id: RepresentationId,
-    target: ClipPlatform,
+    target: Option<ClipPlatform>,
     hover: bool,
 ) -> io::Result<FileReader> {
     use crate::copy_diagnostics::{self as diagnostic, Channel, Stage};
@@ -483,18 +571,20 @@ fn open_for_inventory(
     provider: &dyn Provider,
     inventory: &Inventory,
     id: RepresentationId,
-    target: ClipPlatform,
+    target: Option<ClipPlatform>,
     hover: bool,
 ) -> io::Result<FileReader> {
-    let rep = inventory
-        .wanted(target)
-        .find(|r| r.id == id)
-        .ok_or_else(|| unavailable(Unavailable::Unsupported))?;
+    let rep = match target {
+        Some(target) => inventory.wanted(target).find(|rep| rep.id == id),
+        None => portable_representation(inventory, id).map(|(_, rep, _)| rep),
+    }
+    .ok_or_else(|| unavailable(Unavailable::Unsupported))?;
+    let same_platform = target == Some(inventory.platform);
     // A DIB/TIFF and an existing PNG on the same item describe the same image.
     // Prefer lossless native PNG only for the portable contract, retaining raw
     // same-platform order and identity guards. Invalid PNG can fall back; source
     // expiry or a timed-out native callback cannot restart through a sibling.
-    if target != inventory.platform
+    if !same_platform
         && rep.standard == Some(crate::model::StandardFormat::Png)
         && !native_png(&rep.format)
         && let Some(item) = inventory
@@ -535,7 +625,7 @@ fn open_for_inventory(
         _ => return Err(unavailable(Unavailable::NoSuchItem)),
     };
     reader = guarded(reader, guard.clone())?;
-    if target == inventory.platform {
+    if same_platform {
         return Ok(reader);
     }
     if rep.standard == Some(crate::model::StandardFormat::Url) {

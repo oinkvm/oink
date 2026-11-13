@@ -1,7 +1,7 @@
 //! Scoped numeric failures. Endpoint identities become collection-local aliases;
 //! no payload bytes, addresses or human error messages are retained.
 use super::*;
-use oink_protocol::v1::{admission::ProtocolViolation, schema::WireDto};
+use oink_protocol::v2::{admission::ProtocolViolation, schema::WireDto};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Issue {
@@ -21,10 +21,10 @@ pub struct Issue {
 impl Recorder {
     pub(crate) fn protocol_violation(&self, peer: DeviceId, violation: &ProtocolViolation) {
         let anon = self.anonymizer();
-        let projection = (|| -> oink_protocol::v1::Result<Issue> {
+        let projection = (|| -> oink_protocol::v2::Result<Issue> {
             Ok(Issue {
                 code: u16::try_from(violation.code.number())
-                    .map_err(|_| oink_protocol::v1::ErrorCode::UnsupportedValue)?,
+                    .map_err(|_| oink_protocol::v2::ErrorCode::UnsupportedValue)?,
                 scope: violation.scope.number(),
                 peer_alias: anon.device(peer),
                 boot_alias: anon.router_instance(&violation.boot.nonce()?.0),
@@ -54,7 +54,7 @@ impl Recorder {
 #[cfg(all(test, debug_assertions))]
 mod tests {
     use super::*;
-    use oink_protocol::v1::{self, dto, schema::WireDto};
+    use oink_protocol::v2::{self, dto, schema::WireDto};
     #[test]
     fn violations_and_volume_refusals_use_aliases_and_numeric_catalogues_only() {
         let dir = tempfile::tempdir().unwrap();
@@ -63,7 +63,7 @@ mod tests {
         let recorder = super::super::tests::isolated(dir.path().into(), me, Some(GroupId([9; 16])), true).unwrap();
         recorder.wait_recovery();
         let violation = ProtocolViolation {
-            code: v1::ErrorCode::MalformedFrame,
+            code: v2::ErrorCode::MalformedFrame,
             scope: dto::ErrorScope::LowOperation,
             peer: oink_network::wire_identity::device(peer),
             boot: oink_network::wire_identity::boot(oink_foundation::session::Boot {
@@ -89,7 +89,7 @@ mod tests {
         );
         let before = recorder.inner.dropped.load(Ordering::Relaxed);
         let mut wide = violation;
-        wide.code = v1::ErrorCode::Unknown(65536);
+        wide.code = v2::ErrorCode::Unknown(65536);
         recorder.protocol_violation(peer, &wide);
         assert_eq!(recorder.inner.dropped.load(Ordering::Relaxed), before + 1);
         let mut store = lock(&recorder.inner.store);

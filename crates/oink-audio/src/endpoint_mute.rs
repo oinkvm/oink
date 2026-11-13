@@ -1,10 +1,13 @@
 //! Source-device lease policy. The platform observer and process lock outlive
 //! this lease. Storage/ownership rules are shared with Windows' recovery journal.
-use crate::recovery::{EndpointBackend, EndpointState, Journal, RecoveryOutcome};
+use crate::recovery::{EndpointBackend, EndpointState, Journal};
 
 pub(crate) struct Lease<B: EndpointBackend> {
     pub(crate) backend: B,
     journal: Journal,
+    /// Forwarding only began once the mute (or the user's own mute) was
+    /// confirmed; a failed setup is no forwarding end and never pauses media.
+    acquired: bool,
     finished: bool,
 }
 impl<B: EndpointBackend> Lease<B> {
@@ -14,6 +17,7 @@ impl<B: EndpointBackend> Lease<B> {
         let lease = Self {
             backend,
             journal,
+            acquired: false,
             finished: false,
         };
         lease.acquire(before)
@@ -41,6 +45,7 @@ impl<B: EndpointBackend> Lease<B> {
             // or retain our original mute for a reconnect during acquisition.
             return Err("source output disappeared while muting".into());
         }
+        self.acquired = true;
         Ok(self)
     }
 
@@ -61,16 +66,17 @@ impl<B: EndpointBackend> Lease<B> {
             // Platform readback may latch ownership loss; it never writes.
             let _ = self.backend.read(uid)?;
         }
-        if self.backend.ownership_lost() {
-            // Match Windows: a level-only change releases our mute without
-            // writing the user's new level; a mute override is never undone.
-            self.journal.release_after_volume_change(&self.backend)?;
-        }
-        let report = self.journal.recover_or_defer(&self.backend, false)?;
-        if report.outcome == RecoveryOutcome::UserOverride {
-            // Also cover ownership discovered by recover's final readback.
-            self.journal.release_after_volume_change(&self.backend)?;
-        }
+        let report = if self.acquired {
+            // A real forwarding end: pause (also for a pre-muted output or
+            // after a user takeover), then restore only what Oink changed.
+            self.journal.end_forwarding(&self.backend)?
+        } else {
+            // Failed setup: resolve the write-ahead entry without a pause.
+            if self.backend.ownership_lost() {
+                self.journal.release_after_volume_change(&self.backend)?;
+            }
+            self.journal.recover_or_defer(&self.backend, false)?
+        };
         self.finished = true;
         tracing::info!(?report, "source output mute lease finished");
         Ok(())
@@ -87,6 +93,7 @@ impl<B: EndpointBackend> Drop for Lease<B> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::recovery::RecoveryOutcome;
     use std::{
         cell::{Cell, RefCell},
         rc::Rc,
@@ -98,6 +105,7 @@ mod tests {
         removed: Cell<bool>,
         changed: Cell<bool>,
         mute_changed: Cell<bool>,
+        events: RefCell<Vec<&'static str>>,
         journal: std::path::PathBuf,
     }
     use crate::recovery::RestorePermit;
@@ -126,7 +134,11 @@ mod tests {
         fn mute_ownership_lost(&self) -> bool {
             self.mute_changed.get()
         }
+        fn pause_before_restore(&self) {
+            self.events.borrow_mut().push("pause");
+        }
         fn restore_mute(&self, _: &str, release_only: bool, _: &RestorePermit) -> Result<(), String> {
+            self.events.borrow_mut().push("restore");
             assert!(!self.mute_changed.get());
             assert!(release_only || !self.changed.get());
             self.state.borrow_mut().as_mut().unwrap().muted = false;
@@ -147,6 +159,7 @@ mod tests {
             removed: Cell::new(false),
             changed: Cell::new(false),
             mute_changed: Cell::new(false),
+            events: RefCell::new(Vec::new()),
             journal: dir.path().join("audio-mute-recovery.json"),
         });
         (dir, backend)
@@ -169,6 +182,45 @@ mod tests {
             assert!(!b.state.borrow().as_ref().unwrap().muted);
             assert_eq!(b.writes.get(), 2);
         }
+    }
+    // Field case (a Windows test machine, 0.4.0): the output was muted by the user before
+    // forwarding started, so Oink owned no mute and the end of forwarding
+    // restored nothing and paused nothing; the playing app kept playing.
+    #[test]
+    fn forwarding_end_pauses_even_when_the_output_was_already_muted() {
+        let (dir, b) = setup(true);
+        drop(start(dir.path(), &b));
+        assert_eq!(*b.events.borrow(), ["pause"]);
+        assert!(b.state.borrow().as_ref().unwrap().muted, "the user's mute stays");
+        assert_eq!(b.writes.get(), 0);
+    }
+    #[test]
+    fn forwarding_end_pauses_once_before_restoring_our_mute() {
+        let (dir, b) = setup(false);
+        drop(start(dir.path(), &b));
+        assert_eq!(*b.events.borrow(), ["pause", "restore"]);
+    }
+    #[test]
+    fn user_control_change_during_forwarding_still_pauses_at_the_end() {
+        for mute_toggled in [false, true] {
+            let (dir, b) = setup(false);
+            let mut lease = start(dir.path(), &b);
+            b.state.borrow_mut().as_mut().unwrap().volume = 0.75;
+            b.changed.set(true);
+            b.mute_changed.set(mute_toggled);
+            assert!(lease.check_ownership().unwrap());
+            drop(lease);
+            let restored: &[&str] = if mute_toggled { &[] } else { &["restore"] };
+            let expected: Vec<_> = ["pause"].iter().chain(restored).copied().collect();
+            assert_eq!(*b.events.borrow(), expected, "mute toggled {mute_toggled}");
+        }
+    }
+    #[test]
+    fn failed_mute_setup_is_not_a_forwarding_end_and_never_pauses() {
+        let (dir, b) = setup(false);
+        b.disappear_on_mute.set(true);
+        assert!(Lease::start(Journal::open(dir.path()).unwrap(), b.clone(), "test-output").is_err());
+        assert!(b.events.borrow().is_empty());
     }
     #[test]
     fn already_muted_is_never_written_or_unmuted() {

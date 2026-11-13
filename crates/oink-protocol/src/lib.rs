@@ -1,8 +1,4 @@
-//! Typed v1 wire contract, canonical CBOR profile, framing and admission rules.
-//!
-//! Business owners convert their local domain values to the retained DTOs in
-//! [`v1`]. All LAN messages use that codec. [`frame`] provides local stream
-//! metadata and delegates its wire header representation to the same v1 codec.
+//! Oink 0.4.0 wire protocol, canonical CBOR framing and admission rules.
 
 pub mod frame;
-pub mod v1;
+pub mod v2;

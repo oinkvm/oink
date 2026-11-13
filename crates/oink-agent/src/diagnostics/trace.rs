@@ -29,6 +29,108 @@ struct Scalars(
     Vec<(String, DeviceId)>,
     &'static str, // tracing target, distinct from the source module in .2
 );
+// Echo cancellation lines (`oink_audio::echo` log, desktop owner): counts,
+// levels in dBFS, AEC3 estimates and process-local epochs only. No PCM, no
+// device text (`detail` is a local-log-only Debug field and never matches).
+fn echo_numeric_field(name: &str) -> bool {
+    matches!(
+        name,
+        "engaged"
+            | "window_ms"
+            | "blocks"
+            | "processed_blocks"
+            | "bypass_blocks"
+            | "capture_rms_dbfs"
+            | "capture_peak_dbfs"
+            | "render_rms_dbfs"
+            | "render_peak_dbfs"
+            | "output_rms_dbfs"
+            | "output_peak_dbfs"
+            | "render_active_blocks"
+            | "attenuation_db"
+            | "aec3_erle_db"
+            | "aec3_erl_db"
+            | "aec3_delay_ms"
+            | "erle_db"
+            | "clipped_samples"
+            | "capture_gaps"
+            | "diverged_blocks"
+            | "resets"
+            | "engines_built"
+            | "epoch"
+            | "output_epoch"
+            | "reference_read_delay_us"
+            | "reference_read_delay_steps"
+            | "reference_late_max_us"
+            | "reference_late_blocks"
+            | "reference_silence_frames"
+            | "reference_valid_frames"
+            | "reference_invalid_frames"
+            | "reference_dropped_frames"
+            | "alignment_error_us"
+            | "render_ppm"
+            | "capture_ppm"
+            | "asrc_ratio"
+            | "cpu_us"
+            | "block_cpu_max_us"
+            | "block_work_max_us"
+            | "block_work_p99_us"
+            | "deadline_misses"
+            | "wait_max_us"
+            | "system_cpu_us"
+            | "nonfinite_samples"
+            | "transitions_dropped"
+            | "at_ms"
+            | "suppressed"
+            | "echo_cancellation"
+            | "local_exit"
+            | "previous_echo_cancellation"
+            | "previous_local_exit"
+    )
+}
+fn echo_label(name: &str, value: &str) -> bool {
+    match name {
+        "event" => matches!(
+            value,
+            "aec" | "aec_timing" | "aec_transition" | "aec_reference" | "aec_capture_rebuilt"
+        ),
+        "state" => matches!(value, "off" | "armed" | "converging" | "active" | "degraded"),
+        "reason" | "reset_reason" => matches!(
+            value,
+            "none"
+                | "switch-off"
+                | "no-local-route"
+                | "reference-missing"
+                | "timestamp-unknown"
+                | "clock-unstable"
+                | "reference-gap"
+                | "capture-gap"
+                | "deadline"
+                | "overload"
+                | "rebuilding"
+                | "output-changed"
+                | "nonfinite"
+                | "scheduling"
+                | "reference-late"
+                | "reference-idle"
+        ),
+        "reference_source" => matches!(value, "none" | "oink" | "system"),
+        "system_status" => matches!(
+            value,
+            "not-requested"
+                | "starting"
+                | "running"
+                | "unsupported"
+                | "permission-denied"
+                | "start-failed"
+                | "capture-failed"
+                | "output-changed"
+        ),
+        "capture_quality" | "reference_quality" => matches!(value, "hardware_boundary" | "estimated" | "unknown"),
+        "cause" => matches!(value, "policy" | "control"),
+        _ => false,
+    }
+}
 // Process-local numeric identities and typed discriminants only. Keep these
 // scoped to the provider target; names, paths, tokens and Debug/string values
 // never qualify as a generation or a reason.
@@ -426,6 +528,8 @@ impl Scalars {
             )
         } else if self.4 == "oink_microphone_routing" {
             f.name() == "to_device_key" && (0.0..281_474_976_710_656.0).contains(&v)
+        } else if self.4 == oink_audio::echo::LOG_TARGET {
+            echo_numeric_field(f.name())
         } else if self.2 == "oink_touchpad_diagnostics" {
             matches!(
                 f.name(),
@@ -527,6 +631,7 @@ impl Scalars {
                     | "dropped"
                     | "os_error"
                     | "os_error_known"
+                    | "previous_repeats"
                     | "duration_ms"
                     | "choice_counter"
                     | "choice_watermark"
@@ -683,6 +788,12 @@ impl Visit for Scalars {
         }
     }
     fn record_str(&mut self, field: &Field, value: &str) {
+        if self.4 == oink_audio::echo::LOG_TARGET {
+            if echo_label(field.name(), value) && self.1.len() < 8 {
+                self.1.push((field.name().into(), value.into()));
+            }
+            return;
+        }
         if self.4 == "oink_arrangement" {
             let permitted = match field.name() {
                 "call_site" => matches!(value, "startup" | "observer"),
@@ -810,6 +921,7 @@ impl Visit for Scalars {
                     "path_transition"
                         | "link_lost"
                         | "udp_send"
+                        | "udp_recv"
                         | "candidate_dial"
                         | "connection_step"
                         | "admission_timeout"
@@ -888,6 +1000,8 @@ impl Visit for Scalars {
                     value,
                     "none"
                         | "host_unreachable"
+                        | "network_unreachable"
+                        | "host_down"
                         | "wrong_route"
                         | "connection_mismatch"
                         | "boot_mismatch"
@@ -1987,6 +2101,9 @@ mod tests {
             tracing::warn!(target: "oink_link_diagnostics", kind = "udp_send", stage = "kernel",
                 result = "dropped", reason = "host_unreachable", os_error = 65i32, os_error_known = true,
                 destination = "203.0.113.7:47470", src_ip = "203.0.113.8", error = "PRIVATE ERROR /PRIVATE/PATH");
+            tracing::warn!(target: "oink_link_diagnostics", kind = "udp_recv", stage = "kernel",
+                result = "dropped", reason = "host_unreachable", os_error = 65i32, os_error_known = true,
+                previous_repeats = 3u64, error = "PRIVATE ERROR /PRIVATE/PATH");
             tracing::info!(target: "oink_link_diagnostics", stage = "/PRIVATE/PATH", reason = "PRIVATE ERROR", operation = "203.0.113.7:47470", network_path = "/PRIVATE/PATH");
         });
         let mut rows = Vec::new();
@@ -2017,6 +2134,19 @@ mod tests {
         for field in ["kernel", "dropped", "host_unreachable", "os_error", "65"] {
             assert!(text.contains(field), "missing {field}");
         }
+        let recv = rows.iter().find(|row| matches!(&row.event, Event::Log {labels,..} if labels.contains(&("kind".into(),"udp_recv".into())))).expect("UDP receive error survives projection");
+        let text = serde_json::to_string(recv).unwrap();
+        for field in [
+            "kernel",
+            "dropped",
+            "host_unreachable",
+            "os_error",
+            "65",
+            "previous_repeats",
+        ] {
+            assert!(text.contains(field), "missing {field}");
+        }
+        assert!(!text.contains("PRIVATE"));
         assert!(
             rows.iter().any(|row| matches!(&row.event, Event::Log { labels, .. }
             if labels.contains(&("kind".into(), "input_wait".into()))

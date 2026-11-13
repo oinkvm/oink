@@ -1,14 +1,15 @@
 //! The input owner's v1 boundary. Transport admission precedes every DTO projection.
-mod control;
-mod input;
 use oink_foundation::session::Boot;
-use oink_protocol::v1::{
+use oink_protocol::v2::{
     self,
     admission::{Agreement, Context, Phase},
     frame::OpaqueFrame,
-    registry::Transport,
+    registry::{Transport, type_id},
 };
-use oink_routing::{Packet, control::ControlMsg, input::InputMsg};
+use oink_routing::Packet;
+use oink_routing::wire::{control, input};
+#[cfg(test)]
+use oink_routing::{control::ControlMsg, input::InputMsg};
 use std::sync::Arc;
 
 #[derive(Clone, Debug)]
@@ -19,13 +20,13 @@ pub struct PeerAdmission {
 }
 impl PeerAdmission {
     pub fn relative(&self) -> bool {
-        self.agreement.contains("oink.input.relative/1")
+        self.agreement.permits(type_id::InputRelativeMotion)
     }
     pub fn drag(&self) -> bool {
-        self.agreement.contains("oink.drag/1")
+        self.agreement.permits(type_id::DndNotice)
     }
     pub fn contacts(&self) -> bool {
-        self.agreement.contains("oink.input.contacts/1")
+        self.agreement.permits(type_id::InputTouchpadContacts)
     }
     pub fn opening_len(&self) -> usize {
         3 + usize::from(self.relative()) + usize::from(self.drag())
@@ -56,10 +57,10 @@ impl PeerAdmission {
             old_member_lane: false,
         }
     }
-    pub fn violation(&self, type_id: Option<u16>, code: v1::ErrorCode, datagram: bool) -> v1::admission::Violation {
+    pub fn violation(&self, type_id: Option<u16>, code: v2::ErrorCode, datagram: bool) -> v2::admission::Violation {
         let context = self.context(datagram);
         if let Some(type_id) = type_id
-            && let Err(violation) = context.admit(v1::frame::FrameHeader {
+            && let Err(violation) = context.admit(v2::frame::FrameHeader {
                 type_id,
                 payload_length: 1,
             })
@@ -72,7 +73,7 @@ impl PeerAdmission {
     }
     pub fn admits(&self, type_id: u16, datagram: bool) -> bool {
         self.context(datagram)
-            .admit(v1::frame::FrameHeader {
+            .admit(v2::frame::FrameHeader {
                 type_id,
                 payload_length: 1,
             })
@@ -82,47 +83,46 @@ impl PeerAdmission {
 // Keep ordinary input decoding allocation-free; deferred records are the rare path.
 #[allow(clippy::large_enum_variant)]
 pub(crate) enum Decoded {
-    Retired,
     Packet(Packet),
     /// Drag inventories and attachment declarations stay retained until their ordinary owner consumes them.
-    Deferred(v1::Message),
+    Deferred(v2::Message),
 }
 
-pub(crate) fn decode(bytes: &[u8], peer: &PeerAdmission, datagram: bool) -> v1::Result<Decoded> {
+pub(crate) fn decode(bytes: &[u8], peer: &PeerAdmission, datagram: bool) -> v2::Result<Decoded> {
     let maximum = if datagram {
-        v1::limits::DATAGRAM
+        v2::limits::DATAGRAM
     } else {
-        v1::limits::RELIABLE_FRAME
+        v2::limits::RELIABLE_FRAME
     };
     let frame = OpaqueFrame::parse_exact(bytes, maximum)?;
-    if v1::registry::retired_input_frame(frame)? {
-        return Ok(Decoded::Retired);
-    }
     peer.context(datagram)
         .admit_frame(frame)
-        .map_err(|violation| v1::Error::from(violation.code))?;
+        .map_err(|violation| v2::Error::from(violation.code))?;
+    if frame.header.type_id == 0x020d {
+        return input::decode_text(frame.decode()?).map(Decoded::Packet);
+    }
     if (0x0201..=0x02ff).contains(&frame.header.type_id) {
         return input::decode(frame).map(Decoded::Packet);
     }
     let message = frame.decode()?;
     match message {
-        v1::Message::DndNotice(_) => Ok(Decoded::Deferred(message)),
-        v1::Message::AttachmentHead(ref head) => {
-            if head.header()?.variant()? != v1::schema::Open::Known(v1::dto::AttachmentKind::Drag) {
-                return Err(v1::ErrorCode::InvalidChannel.into());
+        v2::Message::DndNotice(_) => Ok(Decoded::Deferred(message)),
+        v2::Message::AttachmentHead(ref head) => {
+            if head.header()?.variant()? != v2::schema::Open::Known(v2::dto::AttachmentKind::Drag) {
+                return Err(v2::ErrorCode::InvalidChannel.into());
             }
             Ok(Decoded::Deferred(message))
         }
-        v1::Message::AttachmentResult(ref result) => {
-            if result.kind()? != v1::dto::AttachmentKind::Drag {
-                return Err(v1::ErrorCode::InvalidChannel.into());
+        v2::Message::AttachmentResult(ref result) => {
+            if result.kind()? != v2::dto::AttachmentKind::Drag {
+                return Err(v2::ErrorCode::InvalidChannel.into());
             }
             Ok(Decoded::Deferred(message))
         }
         _ if (0x0100..=0x010f).contains(&frame.header.type_id)
             || matches!(
                 frame.header.type_id,
-                0x1300 | 0x1301 | 0x1302 | 0x1303 | 0x1304 | 0x1305 | 0x0111
+                0x1300 | 0x1301 | 0x1302 | 0x1303 | 0x1304 | 0x1305 | 0x0111 | 0x0112 | 0x0113 | 0x0114
             ) =>
         {
             control::decode(message).map(|value| Decoded::Packet(Packet::Control(value)))
@@ -130,7 +130,7 @@ pub(crate) fn decode(bytes: &[u8], peer: &PeerAdmission, datagram: bool) -> v1::
         _ => crate::dnd::wire::decode(message).map(|value| Decoded::Packet(Packet::Dnd(value))),
     }
 }
-pub(crate) fn encode(message: &Packet, out: &mut [u8]) -> v1::Result<usize> {
+pub(crate) fn encode(message: &Packet, out: &mut [u8]) -> v2::Result<usize> {
     match message {
         Packet::Input(input) => input::encode(input, None, out),
         Packet::TimedInput { time, input } => input::encode(input, Some(*time), out),
@@ -138,43 +138,26 @@ pub(crate) fn encode(message: &Packet, out: &mut [u8]) -> v1::Result<usize> {
         Packet::Dnd(value) => encode_wire(&crate::dnd::wire::encode(value)?, out),
     }
 }
-pub(crate) fn encode_wire(message: &v1::Message, out: &mut [u8]) -> v1::Result<usize> {
-    let bytes = v1::frame::encode(message, out.len())?;
+pub(crate) fn encode_wire(message: &v2::Message, out: &mut [u8]) -> v2::Result<usize> {
+    let bytes = v2::frame::encode(message, out.len())?;
     out[..bytes.len()].copy_from_slice(&bytes);
     Ok(bytes.len())
 }
+/// Whether the peer's agreement carries `message`: the registry rule the
+/// send gate applies (protocol §1.1), never a capability named here.
 pub(crate) fn supported(message: &Packet, peer: &PeerAdmission) -> bool {
-    let capability = match message {
-        Packet::Input(input) | Packet::TimedInput { input, .. } => return input_supported(input, peer),
-        Packet::Control(ControlMsg::GameMode { .. } | ControlMsg::SetGameMode { .. }) => "oink.input.relative/1",
-        Packet::Control(ControlMsg::CursorTrail { .. } | ControlMsg::CursorTrailHandoff { .. }) => "oink.input.trail/1",
-        Packet::Dnd(_) => "oink.drag/1",
-        Packet::Control(ControlMsg::UnlockQuery { .. } | ControlMsg::UnlockReply { .. }) => "oink.auto-unlock/1",
-        Packet::Control(ControlMsg::SyncUnlock { .. }) => "oink.auto-unlock.sync/1",
-        Packet::Control(ControlMsg::LocalClick { .. }) => "oink.focus.local-click/1",
-        Packet::Control(ControlMsg::MovePointer { .. }) => "oink.pointer.move/1",
-        Packet::Control(ControlMsg::MovePointerEnter { .. }) => "oink.pointer.move-hidden/1",
-        Packet::Control(ControlMsg::EntryProtection { .. }) => "oink.pointer.entry-protection/1",
-        Packet::Control(ControlMsg::LockRemoteWindows(_)) => oink_routing::control::WINDOWS_LOCK_CAPABILITY,
-        Packet::Control(ControlMsg::LockEscape { .. }) => "oink.pointer.lock-escape/1",
-        _ => "oink.input/1",
+    let type_id = match message {
+        Packet::Input(input) | Packet::TimedInput { input, .. } => input::type_id(input),
+        Packet::Control(value) => match control::encode(value) {
+            Ok(message) => message.type_id(),
+            Err(_) => return false,
+        },
+        Packet::Dnd(value) => match crate::dnd::wire::encode(value) {
+            Ok(message) => message.type_id(),
+            Err(_) => return false,
+        },
     };
-    peer.agreement.contains(capability)
-}
-fn input_supported(input: &InputMsg, peer: &PeerAdmission) -> bool {
-    let capability = match input {
-        InputMsg::Forwarded { msg, .. } => return input_supported(msg, peer),
-        InputMsg::RelativeMotion { .. } => "oink.input.relative/1",
-        InputMsg::Gesture { .. } => "oink.input.gestures/1",
-        InputMsg::TouchpadContacts(_) => "oink.input.contacts/1",
-        InputMsg::Scroll {
-            unit: oink_routing::input::ScrollAmount::Pixels,
-            ..
-        } => "oink.input.scroll-pixels/1",
-        InputMsg::Volume { .. } => "oink.audio.exit-volume/1",
-        _ => "oink.input/1",
-    };
-    peer.agreement.contains(capability)
+    peer.agreement.permits(type_id)
 }
 
 #[cfg(test)]
@@ -188,9 +171,9 @@ mod scroll_pixel_tests {
             nonce: [1; 16],
         };
         for capable in [false, true] {
-            let mut caps = vec!["oink.core/1".to_owned(), "oink.input/1".to_owned()];
+            let mut caps = vec!["oink.core/2".to_owned()];
             if capable {
-                caps.push("oink.input.scroll-pixels/1".to_owned());
+                caps.push("oink.input/2".to_owned());
             }
             let peer = PeerAdmission {
                 boot,
@@ -209,7 +192,7 @@ mod scroll_pixel_tests {
                     phase: oink_foundation::input::ScrollPhase::Began,
                     wheel_steps: None,
                 };
-                let allowed = capable || unit == oink_routing::input::ScrollAmount::Reference;
+                let allowed = capable;
                 assert_eq!(supported(&Packet::Input(input.clone()), &peer), allowed);
                 assert_eq!(
                     supported(
@@ -234,9 +217,9 @@ mod lock_escape_tests {
     #[test]
     fn escape_snapshot_roundtrips_only_with_negotiated_support() {
         for capable in [false, true] {
-            let mut caps = vec!["oink.core/1".to_owned(), "oink.input/1".to_owned()];
+            let mut caps = vec!["oink.core/2".to_owned()];
             if capable {
-                caps.push("oink.pointer.lock-escape/1".to_owned());
+                caps.push("oink.input/2".to_owned());
             }
             let peer = PeerAdmission {
                 boot: Boot {
@@ -268,9 +251,9 @@ mod entry_protection_tests {
     #[test]
     fn entry_protection_roundtrips_only_with_negotiated_support() {
         for capable in [false, true] {
-            let mut caps = vec!["oink.core/1".to_owned(), "oink.input/1".to_owned()];
+            let mut caps = vec!["oink.core/2".to_owned()];
             if capable {
-                caps.push("oink.pointer.entry-protection/1".to_owned());
+                caps.push("oink.input/2".to_owned());
             }
             let peer = PeerAdmission {
                 boot: Boot {
@@ -322,9 +305,9 @@ mod windows_lock_tests {
             },
         ));
         for capable in [false, true] {
-            let mut caps = vec!["oink.core/1".to_owned(), "oink.input/1".to_owned()];
+            let mut caps = vec!["oink.core/2".to_owned()];
             if capable {
-                caps.push(oink_routing::control::WINDOWS_LOCK_CAPABILITY.into());
+                caps.push("oink.input/2".into());
             }
             let peer = PeerAdmission {
                 boot: source,
@@ -339,14 +322,19 @@ mod windows_lock_tests {
             } else {
                 assert!(decode(&bytes[..n], &peer, false).is_err());
             }
-            // Existing input is still admitted; capability absence is not a link failure.
+            // With the merged input domain, an older agreement has no input
+            // stream at all, so ordinary input is rejected with the new type.
             let key = Packet::Input(InputMsg::Key {
                 code: oink_foundation::input::KeyCode::keyboard(4),
                 pressed: true,
             });
-            assert!(supported(&key, &peer));
+            assert_eq!(supported(&key, &peer), capable);
             let n = encode(&key, &mut bytes).unwrap();
-            assert!(matches!(decode(&bytes[..n],&peer,false).unwrap(),Decoded::Packet(p) if p==key));
+            if capable {
+                assert!(matches!(decode(&bytes[..n],&peer,false).unwrap(),Decoded::Packet(p) if p==key));
+            } else {
+                assert!(decode(&bytes[..n], &peer, false).is_err());
+            }
         }
     }
 }
@@ -362,27 +350,18 @@ mod retirement_tests {
                 nonce: [1; 16],
             },
             link: oink_network::link::LinkId(1),
-            agreement: Arc::new(Agreement::new(v1::registry::BASELINE.iter().map(|s| s.to_string())).unwrap()),
+            agreement: Arc::new(
+                Agreement::new(
+                    v2::registry::BASELINE
+                        .iter()
+                        .copied()
+                        .chain(["oink.input/2"])
+                        .map(str::to_owned),
+                )
+                .unwrap(),
+            ),
         };
         assert!(Agreement::new(["oink.input.application-focus/1".into()]).is_err());
-        for (id, fields) in [
-            (0x010d, vec![]),
-            (0x0202, vec![103]),
-            (0x0207, vec![103]),
-            (0x0205, vec![103]),
-            (0x0205, vec![104]),
-        ] {
-            let fields: v1::RawMap = fields.into_iter().map(|key| (key, v1::RawValue::Bool(true))).collect();
-            let payload = v1::cbor::encode_map(&fields, 1024).unwrap();
-            let mut bytes = v1::frame::FrameHeader {
-                type_id: id,
-                payload_length: payload.len() as u32,
-            }
-            .bytes()
-            .to_vec();
-            bytes.extend_from_slice(&payload);
-            assert!(matches!(decode(&bytes, &peer, false).unwrap(), Decoded::Retired));
-        }
         let key = Packet::Input(InputMsg::Key {
             code: oink_foundation::input::KeyCode::CAPS_LOCK,
             pressed: true,
@@ -424,6 +403,7 @@ mod dispatch_tests {
             ControlMsg::UnlockReply {
                 epoch: 1,
                 unlocked: true,
+                paused: true,
             },
             ControlMsg::LocalClick {
                 epoch: 1,
@@ -435,6 +415,23 @@ mod dispatch_tests {
                 state: EntryProtection::default(),
             },
             ControlMsg::LockEscape { held: true },
+            ControlMsg::TextRefused {
+                seq: 3,
+                reason: oink_routing::control::TextRefusal::Paused,
+            },
+            ControlMsg::TextFocus {
+                epoch: 1,
+                seq: 2,
+                editable: true,
+                secure: false,
+                revision: 3,
+            },
+            ControlMsg::EdgeReport {
+                epoch: 1,
+                state: oink_routing::control::EdgeState::Blocked,
+                edge: oink_routing::control::EdgeSide::Left,
+                target: Some(device),
+            },
             ControlMsg::MovePointer {
                 epoch: 1,
                 target: device,
@@ -525,14 +522,14 @@ mod dispatch_tests {
                 nonce: [1; 16],
             },
             link: oink_network::link::LinkId(1),
-            agreement: Arc::new(Agreement::new(v1::registry::CAPABILITIES.iter().map(|s| s.to_string())).unwrap()),
+            agreement: Arc::new(Agreement::new(v2::registry::CAPABILITIES.iter().map(|s| s.to_string())).unwrap()),
         };
         let mut covered = BTreeSet::new();
         for sample in samples() {
             let packet = Packet::Control(sample);
             let mut out = [0u8; 4096];
             let n = encode(&packet, &mut out).unwrap();
-            let type_id = OpaqueFrame::parse_exact(&out[..n], v1::limits::RELIABLE_FRAME)
+            let type_id = OpaqueFrame::parse_exact(&out[..n], v2::limits::RELIABLE_FRAME)
                 .unwrap()
                 .header
                 .type_id;
@@ -548,7 +545,7 @@ mod dispatch_tests {
             );
         }
         // Every control type the registry routes on the input stream has a sample.
-        let registered: BTreeSet<u16> = v1::registry::MESSAGES
+        let registered: BTreeSet<u16> = v2::registry::MESSAGES
             .iter()
             .filter(|m| m.routes.iter().any(|r| r.kind == 3))
             .filter(|m| !(0x0201..=0x02ff).contains(&m.id))
@@ -568,20 +565,16 @@ mod dispatch_tests {
             link: oink_network::link::LinkId(1),
             agreement: Arc::new(Agreement::new(capabilities.iter().map(|s| s.to_string())).unwrap()),
         };
-        let base = [
-            "oink.core/1",
-            "oink.group/1",
-            "oink.input/1",
-            "oink.clipboard/1",
-            "oink.low/1",
-            "oink.auto-unlock/1",
-        ];
+        // v2: sync unlock is part of the device domain, like its challenge
+        // pair; a peer without oink.device/2 (an input-only phone) gets none.
+        let base = ["oink.core/2", "oink.group/2", "oink.input/2", "oink.low/1"];
         let old = admission(&base);
-        let new = admission(&[&base[..], &["oink.auto-unlock.sync/1"]].concat());
+        let new = admission(&[&base[..], &["oink.device/2"]].concat());
         let sync = Packet::Control(ControlMsg::SyncUnlock { epoch: 1 });
         assert!(!supported(&sync, &old));
         assert!(supported(&sync, &new));
-        // The challenge pair keeps its own, older capability.
-        assert!(supported(&Packet::Control(ControlMsg::UnlockQuery { epoch: 1 }), &old));
+        let query = Packet::Control(ControlMsg::UnlockQuery { epoch: 1 });
+        assert_eq!(supported(&query, &old), supported(&sync, &old));
+        assert_eq!(supported(&query, &new), supported(&sync, &new));
     }
 }

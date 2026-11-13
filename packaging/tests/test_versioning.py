@@ -27,6 +27,47 @@ BUILD = encode_build(INHOUSE, 17)
 DISPLAY = f"{INHOUSE}-inhouse.17"
 
 
+class PhoneVersions(unittest.TestCase):
+    """Android/iOS in-house packages take their fields from the PC rule (build-support/mobile_version.py)."""
+
+    def setUp(self):
+        spec = importlib.util.spec_from_file_location('mobile_version', ROOT / 'build-support/mobile_version.py')
+        self.mobile = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.mobile)
+
+    def test_first_040_phone_build(self):
+        with patch.dict(versioning.IDENTITY, inhouse_version='0.4.0'):
+            self.assertEqual(self.mobile.mobile_version(self.mobile.parse_build('000400001')),
+                             {'build': 400001, 'version_name': '0.4.0-inhouse.1', 'marketing_version': '0.4.0'})
+            self.assertEqual(self.mobile.mobile_version(400017)['version_name'], '0.4.0-inhouse.17')
+
+    def test_a_build_of_another_version_is_rejected(self):
+        with patch.dict(versioning.IDENTITY, inhouse_version='0.4.0'):
+            for build in (306002, 115, 400000, 401001, 2**31):
+                with self.subTest(build=build), self.assertRaises(ValueError):
+                    self.mobile.mobile_version(build)
+        for text in ('', '-400001', '400001.0', ' 400001', '4e5'):
+            with self.subTest(text=text), self.assertRaises(ValueError):
+                self.mobile.parse_build(text)
+
+    def test_command_line_for_gradle_and_xcodebuild(self):
+        build = encode_build(INHOUSE, 3)
+        script = str(ROOT / 'build-support/mobile_version.py')
+        gradle = subprocess.run([sys.executable, script, str(build)], capture_output=True, text=True, check=True)
+        self.assertEqual(json.loads(gradle.stdout),
+                         {'build': build, 'version_name': f'{INHOUSE}-inhouse.3', 'marketing_version': INHOUSE})
+        xcode = subprocess.run([sys.executable, script, '--xcode', str(build)], capture_output=True, text=True, check=True)
+        self.assertEqual(xcode.stdout.split(), [f'MARKETING_VERSION={INHOUSE}', f'CURRENT_PROJECT_VERSION={build}'])
+        refused = subprocess.run([sys.executable, script, '306002' if INHOUSE != '0.3.6' else '400001'],
+                                 capture_output=True, text=True)
+        self.assertEqual(refused.returncode, 1)
+        self.assertIn('encodes', refused.stderr)
+
+    def test_android_build_reads_the_helper(self):
+        gradle = (ROOT / 'apps/mobile/android/app/build.gradle.kts').read_text()
+        self.assertIn('build-support/mobile_version.py', gradle)
+
+
 class BuildNumbers(unittest.TestCase):
     def test_build_encodes_version_and_sequence(self):
         self.assertEqual(encode_build('0.3.6', 2), 306002)

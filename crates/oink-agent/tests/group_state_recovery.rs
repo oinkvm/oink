@@ -127,6 +127,119 @@ fn unreadable_group_keeps_ipc_and_reset_starts_sharing_in_same_node() {
     UdpSocket::bind(("127.0.0.1", port + 1)).unwrap();
 }
 
+/// A group state file that loads but holds a register value of another shape
+/// (here a PointerBase-shaped value at the DeviceOrder kind 0x1302, as an
+/// unreleased 0.4.0 build wrote it) is the same case as a damaged file: the
+/// backend stays up IPC-only with the alert, and reset starts sharing.
+#[test]
+fn undecodable_group_register_keeps_ipc_and_reset_starts_sharing() {
+    use oink_network::{group_state::State, identity::Identity, wire_identity};
+    use oink_protocol::v2::{
+        RawValue, dto,
+        schema::{WireDto, WireValue},
+    };
+    let _scenario = test_watchdog::Scenario::new(
+        module_path!(),
+        "undecodable_group_register_keeps_ipc_and_reset_starts_sharing",
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let identity = Identity::load_or_create(dir.path()).unwrap();
+    let state = State::create(&identity, "recovery", "test", 1).unwrap();
+    let kind = oink_network::device_order::REGISTER_KIND;
+    let version =
+        dto::ConfigVersion::from_raw([(1, 1u64.write()), (3, wire_identity::device(identity.id()).write())].into())
+            .unwrap();
+    let foreign = dto::Register::from_raw(
+        [
+            (1, kind.write()),
+            (3, version.write()),
+            (
+                4,
+                RawValue::Map([(1, wire_identity::device(identity.id()).write())].into()),
+            ),
+        ]
+        .into(),
+    )
+    .unwrap();
+    let mut registers: Vec<dto::Register> = state
+        .wire()
+        .registers()
+        .unwrap()
+        .0
+        .into_iter()
+        .filter(|r| r.kind() != Ok(kind))
+        .collect();
+    registers.push(foreign);
+    registers.sort_by_key(|r| r.kind().unwrap());
+    let mut raw = state.wire().raw().clone();
+    raw.insert(2, RawValue::Array(registers.iter().map(WireValue::write).collect()));
+    let stored = group_store::StoredGroupState::new(identity.id(), dto::GroupState::from_raw(raw).unwrap()).unwrap();
+    let path = dir.path().join(STATE_FILE);
+    group_store::save(&path, &stored).unwrap();
+    // The file itself loads; only its content does not decode.
+    assert!(group_store::load(&path, identity.id()).unwrap().is_some());
+    let error = oink_agent::config_module::check_group_state(dir.path(), identity.id()).unwrap_err();
+    assert!(error.contains("register 0x1302 DeviceOrder"), "{error}");
+    let bad = std::fs::read(&path).unwrap();
+
+    let input = Arc::new(FakeInput::new());
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let config = oink_test_support::network_config(dir.path().into(), "recovery", 0);
+    let node = rt
+        .block_on(Node::start_with_fake_platform(NodeOptions {
+            net: config,
+            input: input.clone(),
+            displays: vec![],
+            display_backend: None,
+            clipboard: None,
+            mode_switch_in_callback: true,
+            capture_reports_key_repeat: true,
+            cursor_trail: false,
+        }))
+        .unwrap();
+    assert_eq!(node.id(), identity.id());
+    assert!(node.links().is_err());
+    assert!(node.input_thread().is_err());
+    let server = rt.block_on(Server::start(node.clone())).unwrap();
+    let api = RemoteApi::new(dir.path());
+    let overview = api.overview().unwrap();
+    assert!(overview.group.is_none());
+    assert_eq!(overview.service, ServiceState::Degraded);
+    assert!(
+        overview
+            .alerts
+            .iter()
+            .any(|a| a.kind == AlertKind::GroupStateUnreadable)
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), bad);
+    api.reset_group_state().unwrap();
+    assert!(node.links().is_ok());
+    let group = api.group().unwrap();
+    assert!(group.id.is_some());
+    assert_eq!(group.members.len(), 1);
+    assert!(
+        !api.overview()
+            .unwrap()
+            .alerts
+            .iter()
+            .any(|a| a.kind == AlertKind::GroupStateUnreadable)
+    );
+    let backups: Vec<_> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|f| f.unwrap().path())
+        .filter(|p| {
+            p.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("group-state-unreadable-")
+        })
+        .collect();
+    assert_eq!(backups.len(), 1);
+    assert_eq!(std::fs::read(&backups[0]).unwrap(), bad);
+    rt.block_on(server.close());
+    rt.block_on(node.shutdown());
+}
+
 #[path = "common/watchdog.rs"]
 mod test_watchdog;
 

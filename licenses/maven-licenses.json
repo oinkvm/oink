@@ -1,0 +1,41 @@
+{
+  "schemaVersion": 1,
+  "comment": "Reviewed mapping from Maven POM <license><name> to SPDX for licenses/android-runtime.json. An unknown name, several POM licenses without a review below, or a license outside deny.toml's allow list fails `npm run licenses`.",
+  "names": {
+    "Apache 2.0": "Apache-2.0",
+    "Apache License 2.0": "Apache-2.0",
+    "Apache License, Version 2.0": "Apache-2.0",
+    "Apache-2.0": "Apache-2.0",
+    "The Apache License, Version 2.0": "Apache-2.0",
+    "The Apache Software License, Version 2.0": "Apache-2.0",
+    "MIT": "MIT",
+    "MIT License": "MIT",
+    "The MIT License": "MIT"
+  },
+  "texts": {
+    "Apache-2.0": {
+      "path": "licenses/maven/Apache-2.0.txt",
+      "sha256": "809fa1ed21450f59827d1e9aec720bbc4b687434fa22283c6cb5dd82a47ab9c0",
+      "source": "androidx.core:core:1.16.0 META-INF/androidx/core/core/LICENSE.txt (the Apache License 2.0 text AndroidX ships)"
+    }
+  },
+  "reviews": [
+    {
+      "group": "net.java.dev.jna",
+      "name": "jna",
+      "version": "5.17.0",
+      "pomLicenses": [
+        {
+          "name": "LGPL-2.1-or-later",
+          "url": "https://www.gnu.org/licenses/old-licenses/lgpl-2.1"
+        },
+        {
+          "name": "Apache-2.0",
+          "url": "https://www.apache.org/licenses/LICENSE-2.0.txt"
+        }
+      ],
+      "licenseExpression": "LGPL-2.1-or-later OR Apache-2.0",
+      "reason": "The POM comments and the jar's META-INF/LICENSE (SPDX-License-Identifier: Apache-2.0 OR LGPL-2.1-or-later) state a free choice between the two; Oink takes Apache-2.0."
+    }
+  ]
+}

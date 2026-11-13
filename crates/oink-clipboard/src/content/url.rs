@@ -74,6 +74,11 @@ fn native(format: &NativeFormat, bytes: &[u8]) -> io::Result<Link> {
     if bytes.len() > MAX_SOURCE_BYTES {
         return Err(unavailable(Unavailable::LimitExceeded));
     }
+    if let NativeFormat::Unknown(name) = format
+        && name == oink_protocol::v2::dto::URL_FORMAT
+    {
+        return Link::decode(bytes);
+    }
     let (url, name) = match format {
         NativeFormat::Mac(name) if name == "public.url" => (utf8(bytes)?, name.as_str()),
         NativeFormat::WindowsRegistered(name)

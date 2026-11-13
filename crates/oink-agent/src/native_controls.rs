@@ -293,7 +293,7 @@ pub fn dispatch(api: &dyn crate::api::AgentApi, id: &str) -> crate::api::ApiResu
     let unavailable = || ApiError::Unavailable {
         message: "native control is unavailable".into(),
     };
-    let mut view = api.device_cards()?;
+    let view = api.device_cards()?;
     let menu = model(&view, UiLanguage::English);
     if !menu
         .tasks
@@ -311,25 +311,6 @@ pub fn dispatch(api: &dyn crate::api::AgentApi, id: &str) -> crate::api::ApiResu
     if id == "unlock" {
         api.set_focus_locked(false)?;
         return Ok(None);
-    }
-    if id == "audio-local"
-        && view
-            .cards
-            .iter()
-            .find(|c| c.is_self)
-            .and_then(|c| c.status.as_ref())
-            .is_some_and(|s| s.speaker.resource.configured_mode == Some(SpeakerMode::Receiver))
-    {
-        // Relinquishing the exit alone preserves the old source preference.
-        // Clear it first so choosing Local cannot start forwarding to a peer
-        // when that peer becomes the next exit.
-        api.set_audio_settings(
-            serde_json::from_value(serde_json::json!({
-                "forwarding_enabled": false
-            }))
-            .expect("static audio preference patch"),
-        )?;
-        view = api.device_cards()?;
     }
     let card = view.cards.iter().find(|c| c.is_self).ok_or_else(unavailable)?;
     let status = card.status.as_ref();
@@ -350,6 +331,7 @@ pub fn dispatch(api: &dyn crate::api::AgentApi, id: &str) -> crate::api::ApiResu
         "microphone-shared" => status.map(|s| &s.microphone.share_action),
         "audio-exit" => status.map(|s| &s.speaker.make_exit_action),
         "audio-forward" => status.map(|s| &s.actions.forwarding_enabled),
+        // From the exit too this is one write: Clear(self) with forward off.
         "audio-local" => status.map(|s| {
             if s.speaker.resource.configured_mode == Some(SpeakerMode::Receiver) {
                 &s.speaker.resource.action
@@ -364,6 +346,11 @@ pub fn dispatch(api: &dyn crate::api::AgentApi, id: &str) -> crate::api::ApiResu
     };
     let request_id = crate::device_controls::runtime::fresh_request_id();
     let reply = if matches!(id, "pause" | "resume") {
+        tracing::info!(
+            paused = id == "pause",
+            source = "native_menu",
+            "device card pause requested"
+        );
         api.set_device_paused(request_id, token.clone(), id == "pause")?
     } else {
         api.invoke_device_card_action(request_id, token.clone())?
@@ -428,11 +415,8 @@ mod tests {
             }],
             screen_shared: vec![],
             focus: FocusObservation::default(),
-            exit_baseline: false,
+            audio: Default::default(),
             microphone_resolution: Default::default(),
-            local_exit_selection_ready: false,
-            selected_exit: None,
-            exit_claim: None,
             emergency_delivery: None,
         };
         (*projector.update(&inputs, 0).unwrap()).clone()
@@ -559,13 +543,6 @@ mod dispatch_tests {
         let home = tempfile::tempdir().unwrap();
         let net = oink_test_support::network_config(home.path().into(), "synthetic", 0);
         let node = start_with_clip(&net, &Displays::new("screen"), None).await;
-        let n = node.clone();
-        tokio::task::spawn_blocking(move || {
-            n.set_audio_settings(serde_json::from_value(serde_json::json!({"forwarding_enabled": true})).unwrap())
-        })
-        .await
-        .unwrap()
-        .unwrap();
         until("exit action ready", || {
             model(&node.device_cards().unwrap(), UiLanguage::English)
                 .groups
@@ -602,9 +579,14 @@ mod dispatch_tests {
             .await
             .unwrap()
             .unwrap();
-        assert!(!node.audio_status().unwrap().settings.forwarding_enabled);
+        // One write: no longer the exit and forward off (global audio configuration).
+        let local = node.audio_status().unwrap().overview;
+        assert_eq!(
+            local.mode(node.id(), oink_audio::route::Role::Speaker),
+            Some(oink_audio::route::Mode::Local)
+        );
         until("failed exit released", || {
-            node.audio_status().unwrap().resolution.owner().is_none()
+            node.audio_status().unwrap().resolution.target().is_none()
         })
         .await;
         node.shutdown().await;

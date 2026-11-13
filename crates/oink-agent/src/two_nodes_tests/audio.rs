@@ -1,9 +1,6 @@
 use super::*;
-use oink_audio::claims::Resolution;
-use oink_protocol::v1::{
-    dto,
-    schema::{WireDto, WireValue},
-};
+use oink_audio::route::{Mode, Resolution, Role};
+use oink_protocol::v2::dto;
 
 #[test]
 fn concurrent_exit_selections_converge_after_directional_group_merge() {
@@ -55,21 +52,23 @@ fn concurrent_exit_selections_converge_after_directional_group_merge() {
             }
             common::active(&nodes).await;
             assert!(nodes.iter().all(|node| node.group_id() == Some(target_group)));
-            wait_for_audio("one selected exit survives group merge", &nodes, |resolutions| {
-                let winner = resolutions[0];
-                winner.available()
-                    && matches!(winner.owner(),Some(owner) if owner==a.node.id() || owner==b.node.id())
-                    && resolutions.iter().all(|resolution| *resolution == winner)
-            })
+            // The joining group restarts its audio configuration and merges
+            // with the target group: the target group's exit stays and the
+            // joining exit falls back to forward (F6, user 2026-11-11 B).
+            wait_for_audio(
+                "the target group's exit survives the group merge",
+                &nodes,
+                |resolutions| {
+                    let winner = resolutions[0];
+                    winner.available()
+                        && winner.target() == Some(a.node.id())
+                        && resolutions.iter().all(|resolution| *resolution == winner)
+                },
+            )
             .await;
-            assert!(
-                crate::node::lock(&b.node.inner.config)
-                    .owner()
-                    .claims(source_group)
-                    .records
-                    .iter()
-                    .any(|record| record.owner == b.node.id() && record.claim.is_some())
-            );
+            assert_ne!(source_group, target_group);
+            let b_own = b.node.audio_status().unwrap().overview;
+            assert_eq!(b_own.mode(b.node.id(), Role::Speaker), Some(Mode::Shared));
             tokio::join!(select_exit(&ap.node), select_exit(&bp.node));
             wait_for_audio(
                 "concurrent exit selections converge across merged members",
@@ -77,13 +76,12 @@ fn concurrent_exit_selections_converge_after_directional_group_merge() {
                 |resolutions| {
                     let resolution = resolutions[0];
                     resolution.available()
-                        && matches!(resolution.owner(), Some(owner) if owner == ap.node.id() || owner == bp.node.id())
+                        && matches!(resolution.target(), Some(owner) if owner == ap.node.id() || owner == bp.node.id())
                         && resolutions.iter().all(|current| *current == resolution)
                 },
             )
             .await;
             for node in nodes {
-                assert!(!node.audio_status().unwrap().settings.forwarding_enabled);
                 node.shutdown().await;
             }
         },
@@ -150,14 +148,10 @@ fn dump_audio_convergence(what: &str, nodes: &[&Node]) {
     for (index, node) in nodes.iter().enumerate() {
         let group = node.inner.group.get().unwrap();
         let applied = group.applied();
-        let (active_group, claims, local) = {
+        let (active_group, own) = {
             let config = crate::node::lock(&node.inner.config);
             let owner = config.owner();
-            (
-                owner.active_group(),
-                owner.claims(applied.group),
-                owner.item(dto::LocalOption::AudioExitClaim),
-            )
+            (owner.active_group(), owner.audio(node.id()))
         };
         eprintln!(
             "node[{index}] id={:?} boot={:?} group={:?} active_group={active_group:?} paused={} members={:?} audio={:?}",
@@ -169,7 +163,10 @@ fn dump_audio_convergence(what: &str, nodes: &[&Node]) {
             node.audio_status()
                 .map(|status| (status.resolution, status.phase, status.problem))
         );
-        eprintln!("node[{index}] local_option20={local:?} retained={claims:?}");
+        eprintln!(
+            "node[{index}] own_audio={own:?} overview={:?}",
+            node.audio_status().map(|status| status.overview)
+        );
         let links = node.links().unwrap().links();
         for (peer_index, peer) in nodes.iter().enumerate() {
             let link = links
@@ -185,19 +182,11 @@ fn dump_audio_convergence(what: &str, nodes: &[&Node]) {
                 }
             );
             eprintln!(
-                "node[{index}]->node[{peer_index}] facts_boot={:?} facts_group={:?} fact_sequence={:?} preference20={:?} claim20={:?} watermark21={:?} observed={:?} pause={:?}",
+                "node[{index}]->node[{peer_index}] facts_boot={:?} facts_group={:?} fact_sequence={:?} audio_config={:?} observed={:?} pause={:?}",
                 facts.as_ref().map(|facts| facts.boot()),
                 facts.as_ref().map(|facts| facts.group()),
                 facts.as_ref().map(|facts| facts.fact_sequence()),
-                facts
-                    .as_ref()
-                    .map(|facts| facts.preferences().map(|items| items.map(|items| items
-                        .0
-                        .into_iter()
-                        .filter(|item| item.option() == Ok(dto::LocalOption::AudioExitClaim))
-                        .collect::<Vec<_>>()))),
-                facts.as_ref().map(|facts| facts.audio_exit_claim()),
-                facts.as_ref().map(|facts| facts.audio_claim_watermark()),
+                facts.as_ref().map(|facts| facts.audio_config()),
                 facts.as_ref().map(|facts| facts.observed()),
                 facts.as_ref().map(|facts| facts.pause())
             );
@@ -206,10 +195,10 @@ fn dump_audio_convergence(what: &str, nodes: &[&Node]) {
 }
 
 #[test]
-fn reinstalled_member_can_replace_the_removed_audio_exit() {
+fn removed_exit_drops_out_and_a_new_member_replaces_it_from_its_card() {
     crate::test_watchdog::run(
         module_path!(),
-        "reinstalled_member_can_replace_the_removed_audio_exit",
+        "removed_exit_drops_out_and_a_new_member_replaces_it_from_its_card",
         Some(4),
         async {
             let old = start("exit-old", 0).await;
@@ -218,213 +207,83 @@ fn reinstalled_member_can_replace_the_removed_audio_exit() {
             common::pair(&a.node, &old.node).await;
             common::pair(&a.node, &b.node).await;
             common::active(&[&old.node, &a.node, &b.node]).await;
-            wait_for("all audio owner baselines", 5., || {
-                [&old.node, &a.node, &b.node]
-                    .iter()
-                    .all(|node| node.audio_status().unwrap().resolution != oink_audio::claims::Resolution::Unknown)
-            })
+            // Peer a chooses old as the exit; old executes a's decision.
+            choose_exit(&a.node, Some(old.node.id())).await;
+            let chosen = a.node.audio_status().unwrap().resolution;
+            assert_eq!(chosen.target(), Some(old.node.id()));
+            wait_for_audio(
+                "a's choice reaches every member",
+                &[&old.node, &a.node, &b.node],
+                |all| all.iter().all(|resolution| *resolution == chosen),
+            )
             .await;
-            // A counter above one makes the lost-history case independent of
-            // the random identities' byte ordering.
-            select_exit(&old.node).await;
-            let first_exit = old.node.audio_status().unwrap().resolution;
-            wait_for("first selection reaches both peers", 5., || {
-                [&a.node, &b.node]
-                    .iter()
-                    .all(|node| node.audio_status().unwrap().resolution == first_exit)
-            })
-            .await;
-            // Delay both ordinary owners after the first selection. A later
-            // selection has the same owner ID but must not reuse that readiness.
-            let gates = [a.node.inner.owner_gate.clone(), b.node.inner.owner_gate.clone()];
-            let (held, holding) = tokio::sync::oneshot::channel();
-            let (resume, resumed) = std::sync::mpsc::channel();
-            let delayed = tokio::task::spawn_blocking(move || {
-                let _guards = gates.iter().map(|gate| gate.lock().unwrap()).collect::<Vec<_>>();
-                let _ = held.send(());
-                let _ = resumed.recv();
-            });
-            holding.await.unwrap();
-            let revision = crate::node::lock(&old.node.inner.config)
-                .owner()
-                .revision(dto::LocalOption::AudioExitClaim)
-                .unwrap();
-            let cleared = old
-                .node
-                .inner
-                .audio
-                .get()
-                .unwrap()
-                .set_claim(
-                    oink_network::wire_identity::boot(old.node.boot()),
-                    old.node.group_id().unwrap(),
-                    false,
-                    revision,
-                )
-                .await
-                .unwrap();
-            assert_eq!(cleared.outcome, dto::ControlOutcome::Applied);
-            assert!(cleared.persisted);
-            assert!(cleared.fact_sequence.is_some());
-            select_exit(&old.node).await;
-            let selected_exit = old.node.audio_status().unwrap().resolution;
-            assert!(selected_exit.stamp().unwrap().counter >= 3);
-            // Both consumers must apply this exact selection before its author
-            // goes offline; the earlier selection cannot establish its history.
-            let applied = wait_for("final exit selection reaches both peers", 5., || {
-                [&a.node, &b.node]
-                    .iter()
-                    .all(|node| node.audio_status().unwrap().resolution == selected_exit)
-            });
-            tokio::pin!(applied);
-            let readiness = std::future::poll_fn(|context| {
-                std::task::Poll::Ready(std::future::Future::poll(applied.as_mut(), context))
-            })
-            .await;
-            assert!(
-                readiness.is_pending(),
-                "an older selection must not satisfy the final selection barrier"
-            );
-            resume.send(()).unwrap();
-            delayed.await.unwrap();
-            applied.await;
             old.node.shutdown().await;
             let removed = old.node.id();
             api(&a.node, move |node| node.remove_member(removed.into()))
                 .await
                 .unwrap();
-            wait_for("removed exit leaves both rosters", 5., || {
-                [&a.node, &b.node].iter().all(|node| {
-                    !node
-                        .group()
-                        .unwrap()
-                        .members
-                        .iter()
-                        .any(|member| member.device.id.0 == removed)
-                })
+            // An offline exit drops out of the overview: no exit at all, and
+            // sources play locally again (no "selected but unavailable").
+            wait_for_audio("removed exit drops out", &[&a.node, &b.node], |all| {
+                all.iter().all(|resolution| *resolution == Resolution::None)
             })
             .await;
-            // Force the legal observation order: the new member receives the
-            // historical watermark and its own withdrawal before the last
-            // current member's AudioExitClaim baseline. A missing baseline does
-            // not block an explicit selection (oinkvm/oink#32).
-            let gate = b.node.inner.owner_gate.clone();
-            let (held, holding) = tokio::sync::oneshot::channel();
-            let (resume_baseline, resumed) = std::sync::mpsc::channel::<()>();
-            let baseline_worker = tokio::task::spawn_blocking(move || {
-                let _guard = gate.lock().unwrap();
-                let _ = held.send(());
-                let _ = resumed.recv();
-            });
-            holding.await.unwrap();
-            api(&b.node, |node| {
-                let mut preferences = crate::node::lock(&node.inner.config).owner().preferences();
-                preferences.retain(|item| item.option() != Ok(dto::LocalOption::AudioExitClaim));
-                let group = node.inner.group.get().unwrap();
-                let pause = group.local_facts().pause().unwrap().unwrap();
-                group.publish_local_owner(preferences, pause).unwrap();
-            })
-            .await;
+            // A newly joined member merges with the group (it holds no role).
             let fresh = start("exit-new", 0).await;
-            let group = a.node.group_id().unwrap();
             common::pair(&fresh.node, &a.node).await;
-            assert_eq!(fresh.node.group_id(), Some(group));
             common::active(&[&a.node, &b.node, &fresh.node]).await;
-            // Only the witness names the removed owner's selection. It is the
-            // selected exit, unavailable, not an unknown route.
-            let removed_exit = Resolution::Exit {
-                stamp: selected_exit.stamp().unwrap(),
-                available: false,
-            };
-            wait_for("historical ordering witness reaches new member", 5., || {
-                fresh.node.audio_status().unwrap().resolution == removed_exit
-                    && crate::node::lock(&fresh.node.inner.config)
-                        .owner()
-                        .claims(group)
-                        .seen_counter
-                        >= 3
+            wait_for("new member merges with the group", 5., || {
+                let status = fresh.node.audio_status().unwrap();
+                status.overview.joined && status.resolution == Resolution::None
             })
             .await;
-            // Recreate the already-installed app's durable colliding claim. The
-            // new owner must fence this old selection, then let the user select
-            // again above history that exists only on the surviving peers.
-            {
-                let mut config = crate::node::lock(&fresh.node.inner.config);
-                config
-                    .update_owner(|owner| {
-                        let mut records = owner.claims(group);
-                        let local = records.records.iter_mut().find(|r| r.owner == fresh.node.id()).unwrap();
-                        local.revision += 1;
-                        local.claim = Some(
-                            dto::AudioExitClaim::from_raw(
-                                [
-                                    (
-                                        1,
-                                        oink_audio::claims::Stamp {
-                                            counter: 1,
-                                            owner: fresh.node.id(),
-                                        }
-                                        .to_wire()
-                                        .write(),
-                                    ),
-                                    (2, true.write()),
-                                ]
-                                .into(),
-                            )
-                            .unwrap(),
-                        );
-                        owner.commit_claims(group, fresh.node.id(), records)
-                    })
-                    .unwrap();
-            }
-            let audio = fresh.node.inner.audio.get().unwrap().clone();
-            let settings = audio.status().settings;
-            tokio::task::spawn_blocking(move || audio.configure(settings.into()))
-                .await
-                .unwrap()
-                .unwrap();
-            assert_eq!(fresh.node.audio_status().unwrap().resolution, removed_exit);
-            wait_for("obsolete installed selection yields before user action", 5., || {
-                fresh
-                    .node
-                    .device_facts(fresh.node.id())
-                    .and_then(|facts| facts.audio_exit_claim().ok().flatten())
-                    .is_some_and(|claim| claim.claimed() == Ok(false))
-            })
-            .await;
-            // The last current member's baseline is still missing; that no
-            // longer blocks the explicit selection.
             assert_eq!(
                 make_exit_via_card(&fresh.node).await,
                 crate::device_cards::DeviceControlResult::Applied
             );
-            resume_baseline.send(()).unwrap();
-            baseline_worker.await.unwrap();
-            wait_for("new exit claim converges after reinstall and join", 5., || {
-                [&a.node, &b.node, &fresh.node]
-                    .iter()
-                    .all(|node| node.audio_status().unwrap().resolution.owner() == Some(fresh.node.id()))
+            wait_for_audio("new exit converges", &[&a.node, &b.node, &fresh.node], |all| {
+                all.iter()
+                    .all(|resolution| resolution.target() == Some(fresh.node.id()) && resolution.available())
             })
             .await;
             for node in [&a.node, &b.node, &fresh.node] {
-                assert!(!node.audio_status().unwrap().settings.forwarding_enabled);
-                assert!(node.audio_status().unwrap().resolution.stamp().unwrap().counter > 3);
+                let version = node.audio_status().unwrap().resolution.version().unwrap();
+                // Chosen after seeing the old choice: a newer HLC stamp.
+                assert!(version > chosen.version().unwrap());
+                assert_eq!(version.author, fresh.node.id());
                 node.shutdown().await;
             }
         },
     );
 }
 
-/// Select `node` as the audio exit through its own device card, as the UI does.
-async fn make_exit_via_card(node: &Node) -> crate::device_cards::DeviceControlResult {
-    let revision = crate::node::lock(&node.inner.config)
-        .owner()
-        .revision(dto::LocalOption::AudioExitClaim)
+/// The user on `node` chooses `exit` for the group, or turns the current
+/// exit back to forward (a PC that leaves the exit forwards).
+async fn choose_exit(node: &Node, exit: Option<oink_foundation::DeviceId>) {
+    let audio = node.inner.audio.get().unwrap().clone();
+    let (device, mode) = match exit {
+        Some(exit) => (exit, Mode::Holder),
+        None => (
+            audio.status().resolution.target().expect("an exit to clear"),
+            Mode::Shared,
+        ),
+    };
+    let result = tokio::task::spawn_blocking(move || audio.set_audio_mode(device, Role::Speaker, mode))
+        .await
         .unwrap();
-    // Facts and device cards are separate asynchronous observations. Selecting
-    // an older cached token correctly refuses StaleRevision instead of applying.
+    eprintln!(
+        "AUDIO_EXIT_SELECTION author={:?} group={:?} device={device:?} mode={mode:?} result={result:?}",
+        node.id(),
+        node.group_id()
+    );
+    assert_eq!(result, Ok(dto::ControlOutcome::Applied));
+}
+
+/// Select `node` as the audio exit through its own device card, as the UI does.
+/// The choice completes on this device; no other member is asked.
+async fn make_exit_via_card(node: &Node) -> crate::device_cards::DeviceControlResult {
     let mut token = None;
-    wait_for("make-exit action at the current claim revision", 5., || {
+    wait_for("make-exit action on this device's card", 5., || {
         node.refresh_device_cards();
         let cards = node.device_cards().unwrap();
         let card = cards.cards.iter().find(|card| card.is_self).unwrap();
@@ -432,47 +291,26 @@ async fn make_exit_via_card(node: &Node) -> crate::device_cards::DeviceControlRe
         let crate::device_cards::CardAction::Invoke { token: current, .. } = &status.speaker.make_exit_action else {
             return false;
         };
-        let binding = crate::node::lock(&node.inner.cards).tokens().read(current).unwrap();
-        if binding.owner.revision != revision {
-            return false;
-        }
         token = Some(current.clone());
         true
     })
     .await;
     let token = token.unwrap();
     let request = crate::device_controls::runtime::fresh_request_id();
-    let expected = request.clone();
-    let (send, mut receive) = tokio::sync::mpsc::unbounded_channel();
-    let subscription = node.subscribe(Arc::new(move |event| {
-        if let crate::api::ApiEvent::DeviceControlCompleted(result) = event
-            && result.request_id == expected
-        {
-            let _ = send.send(result.clone());
-        }
-    }));
     let reply = api(node, move |node| node.invoke_device_card_action(request, token))
         .await
         .unwrap();
-    let completed = match reply {
-        crate::device_cards::DeviceControlReply::Completed(completed) => completed,
-        crate::device_cards::DeviceControlReply::Accepted(_) => {
-            tokio::time::timeout(Duration::from_secs(5), receive.recv())
-                .await
-                .expect("exit command completion")
-                .unwrap()
-        }
+    let crate::device_cards::DeviceControlReply::Completed(completed) = reply else {
+        panic!("a route choice completes on the choosing device: {reply:?}")
     };
-    node.unsubscribe(subscription);
-    eprintln!(
-        "AUDIO_EXIT_CARD_SELECTION owner={:?} expected_revision={revision} result={completed:?}",
-        node.id()
-    );
     completed.result
 }
 
-/// oinkvm/oink#32: two Macs and a Windows PC; one Mac is offline and the
-/// device the user clicks never received its audio record.
+/// oinkvm/oink#32 (main 0.3.5) in the global audio configuration: a member
+/// that is offline and that the clicking device never met blocks nothing; it
+/// dropped out of the overview, so its old exit is no exit. When it restarts
+/// holding the exit in its own configuration, it yields to the group's
+/// online exit (F5, user 2026-11-11 A).
 #[test]
 fn offline_member_without_audio_record_does_not_block_exit_selection() {
     crate::test_watchdog::run(
@@ -494,31 +332,19 @@ fn offline_member_without_audio_record_does_not_block_exit_selection() {
             let port = d.node.network_info().unwrap().port;
             let Dev { node, _dir: dir, .. } = d;
             node.shutdown().await;
-            // The clicking device joins while that member is offline, so it has
-            // no record of it; only the other member's witness.
+            // The clicking device joins while that member is offline.
             let w = start("issue32-w", 0).await;
             common::pair(&w.node, &a.node).await;
             let group = a.node.group_id().unwrap();
             assert_eq!(w.node.group_id(), Some(group));
             assert!(w.node.group().unwrap().members.iter().any(|m| m.device.id.0 == offline));
-            assert!(
-                !crate::node::lock(&w.node.inner.config)
-                    .owner()
-                    .claims(group)
-                    .records
-                    .iter()
-                    .any(|record| record.owner == offline)
-            );
-            // Both online devices show the real state: the selected exit is
-            // unavailable. Neither waits on the offline member's record.
-            let unavailable = Resolution::Exit {
-                stamp: old_exit.stamp().unwrap(),
-                available: false,
-            };
-            wait_for("both online devices see the selected exit as unavailable", 5., || {
-                [&a.node, &w.node]
-                    .iter()
-                    .all(|node| node.audio_status().unwrap().resolution == unavailable)
+            // Both online devices show the real state: no exit (the offline
+            // one dropped out). Neither waits on the offline member.
+            wait_for("both online devices have no exit", 5., || {
+                [&a.node, &w.node].iter().all(|node| {
+                    let status = node.audio_status().unwrap();
+                    status.overview.joined && status.resolution == Resolution::None
+                })
             })
             .await;
             assert_eq!(
@@ -526,8 +352,8 @@ fn offline_member_without_audio_record_does_not_block_exit_selection() {
                 crate::device_cards::DeviceControlResult::Applied
             );
             let selected = w.node.audio_status().unwrap().resolution;
-            assert_eq!(selected.owner(), Some(w.node.id()));
-            assert!(selected.stamp().unwrap() > old_exit.stamp().unwrap());
+            assert_eq!(selected.target(), Some(w.node.id()));
+            assert!(selected.version().unwrap() > old_exit.version().unwrap());
             wait_for("both online devices agree on the new exit", 5., || {
                 [&a.node, &w.node].iter().all(|node| {
                     let resolution = node.audio_status().unwrap().resolution;
@@ -535,9 +361,8 @@ fn offline_member_without_audio_record_does_not_block_exit_selection() {
                 })
             })
             .await;
-            // The offline member comes back with its old durable claim. The
-            // group's current selection overrides it: it yields, nobody falls
-            // back to it.
+            // The offline member restarts with its persisted exit and yields
+            // to the group's online exit (it falls back to forward).
             let d = start_in(dir, "issue32-d", port).await;
             let nodes = [&a.node, &w.node, &d.node];
             wait_for("returning member learns the current roster", 5., || {
@@ -549,8 +374,7 @@ fn offline_member_without_audio_record_does_not_block_exit_selection() {
                     .any(|m| m.device.id.0 == w.node.id())
             })
             .await;
-            // Discovery is disabled in these fixtures; supply endpoint hints so
-            // the returning member also links to the member it never met.
+            // Discovery is disabled in these fixtures; supply endpoint hints.
             for node in nodes {
                 let endpoints = nodes
                     .iter()
@@ -569,7 +393,7 @@ fn offline_member_without_audio_record_does_not_block_exit_selection() {
             }
             common::active(&nodes).await;
             wait_for_audio(
-                "returning member is overridden by the group's selection",
+                "returning member yields to the group's selection",
                 &nodes,
                 |resolutions| {
                     resolutions
@@ -578,14 +402,8 @@ fn offline_member_without_audio_record_does_not_block_exit_selection() {
                 },
             )
             .await;
-            wait_for("returning member withdrew its old claim", 5., || {
-                nodes.iter().all(|node| {
-                    node.device_facts(offline)
-                        .and_then(|facts| facts.audio_exit_claim().ok().flatten())
-                        .is_some_and(|claim| claim.claimed() == Ok(false))
-                })
-            })
-            .await;
+            let returned = d.node.audio_status().unwrap().overview;
+            assert_eq!(returned.mode(d.node.id(), Role::Speaker), Some(Mode::Shared));
             for node in nodes {
                 node.shutdown().await;
             }
@@ -593,44 +411,59 @@ fn offline_member_without_audio_record_does_not_block_exit_selection() {
     );
 }
 
-async fn select_exit(node: &Node) {
-    wait_for("complete audio baseline before selecting exit", 5., || {
-        let records = crate::node::lock(&node.inner.config)
-            .owner()
-            .claims(node.group_id().unwrap())
-            .records;
-        node.group()
-            .unwrap()
-            .members
-            .iter()
-            .all(|member| records.iter().any(|record| record.owner == member.device.id.0))
-    })
-    .await;
-    let revision = crate::node::lock(&node.inner.config)
-        .owner()
-        .revision(dto::LocalOption::AudioExitClaim)
-        .unwrap();
-    let result = node
-        .inner
-        .audio
-        .get()
-        .unwrap()
-        .set_claim(
-            oink_network::wire_identity::boot(node.boot()),
-            node.group_id().unwrap(),
-            true,
-            revision,
-        )
-        .await;
-    eprintln!(
-        "AUDIO_EXIT_SELECTION owner={:?} group={:?} expected_revision={revision} result={result:?}",
-        node.id(),
-        node.group_id()
+/// Q1 / F7: the setter decides every mode. When the exit moves to another PC
+/// the previous one forwards (its own configuration says so, no option 4);
+/// a setter turning another PC's forward off is adopted and persisted there.
+#[test]
+fn a_pc_that_loses_the_exit_forwards_and_a_setter_changes_its_forward() {
+    crate::test_watchdog::run(
+        module_path!(),
+        "a_pc_that_loses_the_exit_forwards_and_a_setter_changes_its_forward",
+        Some(4),
+        async {
+            let a = start("q1-a", 0).await;
+            let b = start("q1-b", 0).await;
+            common::pair(&a.node, &b.node).await;
+            common::active(&[&a.node, &b.node]).await;
+            let mode = |node: &Node, device| node.audio_status().unwrap().overview.mode(device, Role::Speaker);
+            choose_exit(&a.node, Some(b.node.id())).await;
+            wait_for("b is the exit everywhere", 5., || {
+                [&a.node, &b.node]
+                    .iter()
+                    .all(|node| mode(node, b.node.id()) == Some(Mode::Holder))
+            })
+            .await;
+            // a picks itself: b falls back to forward, seen the same everywhere.
+            choose_exit(&a.node, Some(a.node.id())).await;
+            wait_for("b forwards to the new exit", 5., || {
+                [&a.node, &b.node].iter().all(|node| {
+                    mode(node, b.node.id()) == Some(Mode::Shared) && mode(node, a.node.id()) == Some(Mode::Holder)
+                })
+            })
+            .await;
+            // a turns b's forward off; b adopts it and persists it.
+            let audio = a.node.inner.audio.get().unwrap().clone();
+            let device = b.node.id();
+            let result = tokio::task::spawn_blocking(move || audio.set_audio_mode(device, Role::Speaker, Mode::Local))
+                .await
+                .unwrap();
+            assert_eq!(result, Ok(dto::ControlOutcome::Applied));
+            wait_for("b adopts local", 5., || {
+                [&a.node, &b.node]
+                    .iter()
+                    .all(|node| mode(node, b.node.id()) == Some(Mode::Local))
+            })
+            .await;
+            let (own, _) = crate::node::lock(&b.node.inner.config).owner().audio(b.node.id());
+            assert!(!own.forward.on && !own.speaker_exit, "persisted on b");
+            a.node.shutdown().await;
+            b.node.shutdown().await;
+        },
     );
-    let applied = result.unwrap();
-    assert_eq!(applied.outcome, dto::ControlOutcome::Applied);
-    assert!(applied.persisted);
-    assert!(applied.fact_sequence.is_some());
+}
+
+async fn select_exit(node: &Node) {
+    choose_exit(node, Some(node.id())).await;
 }
 
 #[test]
@@ -855,36 +688,15 @@ async fn lifecycle_changes_reach_both_uis_without_periodic_report_scenario() {
     );
 }
 
-pub(super) async fn withdraw_exit(node: &Node) -> dto::AudioExitClaim {
-    let audio = node.inner.audio.get().unwrap();
-    let revision = crate::node::lock(&node.inner.config)
-        .owner()
-        .revision(dto::LocalOption::AudioExitClaim)
-        .unwrap();
-    let acquired = audio
-        .set_claim(
-            oink_network::wire_identity::boot(node.boot()),
-            node.group_id().unwrap(),
-            true,
-            revision,
-        )
-        .await
-        .unwrap();
-    assert_eq!(acquired.outcome, dto::ControlOutcome::Applied);
-    let revision = acquired.current.revision().unwrap();
-    let applied = audio
-        .set_claim(
-            oink_network::wire_identity::boot(node.boot()),
-            node.group_id().unwrap(),
-            false,
-            revision,
-        )
-        .await
-        .unwrap();
-    assert_eq!(applied.outcome, dto::ControlOutcome::Applied);
-    assert!(applied.persisted);
-    assert!(applied.fact_sequence.is_some());
-    dto::AudioExitClaim::read(&applied.current.value().unwrap()).unwrap()
+/// Choose this node as the exit and clear it again; returns the speaker
+/// register it then broadcasts.
+pub(super) async fn withdraw_exit(node: &Node) -> dto::AudioRoute {
+    select_exit(node).await;
+    choose_exit(node, None).await;
+    node.device_facts(node.id())
+        .and_then(|facts| facts.audio_config().ok().flatten())
+        .and_then(|config| config.speaker_exit().ok().flatten())
+        .expect("broadcast speaker register")
 }
 
 #[test]
@@ -899,15 +711,6 @@ fn audio_settings_api_updates_owner_and_ui_before_reply() {
             let a = start("aud-a", 0).await;
             let b = start("aud-b", 0).await;
             common::pair(&a.node, &b.node).await;
-            // This scenario exercises disabling then re-enabling an opted-in
-            // source; fresh installations now start with forwarding disabled.
-            api(&a.node, |node| {
-                node.set_audio_settings(
-                    serde_json::from_value(serde_json::json!({"forwarding_enabled": true})).unwrap(),
-                )
-                .unwrap();
-            })
-            .await;
             let events = Arc::new(Mutex::new(Vec::new()));
             let sink = events.clone();
             let subscription = a.node.subscribe_views(
@@ -920,28 +723,37 @@ fn audio_settings_api_updates_owner_and_ui_before_reply() {
             );
             let peer_local = b.node.audio_status().unwrap().settings;
             let mut settings = a.node.audio_status().unwrap().settings;
-            let claim = a.node.device_facts(a.node.id()).unwrap().audio_exit_claim().unwrap();
-            for edit in 0..8 {
+            // The forward switch is not a local setting (global audio
+            // configuration): settings edits never change key 33. Pairing
+            // returns before the groups merge and each side lists the other's
+            // switches (one hop), so compare only against the converged
+            // configuration, where both nodes list the same two devices.
+            let devices = |node: &Node| {
+                node.device_facts(node.id())
+                    .and_then(|facts| facts.audio_config().ok().flatten())
+                    .and_then(|config| config.devices().ok())
+                    .map(|devices| devices.0)
+                    .unwrap_or_default()
+            };
+            wait_for("both nodes publish the merged audio configuration", 5., || {
+                let (mine, peer) = (devices(&a.node), devices(&b.node));
+                mine.len() == 2 && peer.len() == 2 && mine.iter().all(|entry| peer.contains(entry))
+            })
+            .await;
+            let audio_config = a.node.device_facts(a.node.id()).unwrap().audio_config().unwrap();
+            for edit in 0..7 {
                 match edit {
                     0 => settings.receive_output = Some("synthetic-output".into()),
                     1 => settings.keep_local_playback = true,
-                    2 => settings.forwarding_enabled = false,
-                    3 => settings.forwarding_volume_percent = 135,
-                    4 => settings.capture_scope = oink_audio::CaptureScope::Global,
-                    5 => settings.quality = oink_audio::negotiation::Quality::Lossless,
-                    6 => settings.forwarding_muted = true,
-                    7 => {
-                        settings.forwarding_enabled = true;
-                        // Enabling forwarding atomically clears its previous mute.
-                        settings.forwarding_muted = false;
-                    }
+                    2 => settings.forwarding_volume_percent = 135,
+                    3 => settings.capture_scope = oink_audio::CaptureScope::Global,
+                    4 => settings.quality = oink_audio::negotiation::Quality::Lossless,
+                    5 => settings.forwarding_muted = true,
+                    6 => settings.forwarding_muted = false,
                     _ => unreachable!(),
                 }
                 events.lock().unwrap().clear();
-                let mut requested = settings.clone();
-                if edit == 7 {
-                    requested.forwarding_muted = true;
-                }
+                let requested = settings.clone();
                 api(&a.node, move |node| {
                     crate::api::dispatch(
                         node,
@@ -957,7 +769,7 @@ fn audio_settings_api_updates_owner_and_ui_before_reply() {
                 let saved = crate::config::AgentConfig::load_from(a.node.data_dir()).unwrap();
                 assert_eq!(saved.settings.audio, settings);
                 let local = a.node.device_facts(a.node.id()).unwrap();
-                assert_eq!(local.audio_exit_claim().unwrap(), claim);
+                assert_eq!(local.audio_config().unwrap(), audio_config);
                 let preferences = local.preferences().unwrap();
                 wait_for("peer receives owner audio preferences", 5., || {
                     b.node

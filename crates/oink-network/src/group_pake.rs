@@ -1,7 +1,7 @@
 //! SPAKE2 binds the UI roles, exact greeting frames, full tagged identities and
 //! each submitted attempt. Confirmation keys never become a group secret.
 use hmac::{Hmac, Mac};
-use oink_protocol::v1::{
+use oink_protocol::v2::{
     self, RawValue, dto,
     frame::OpaqueFrame,
     schema::{WireDto, WireValue},
@@ -20,8 +20,8 @@ pub enum PakeError {
     #[error("incorrect pairing code")]
     WrongCode,
 }
-impl From<v1::Error> for PakeError {
-    fn from(_: v1::Error) -> Self {
+impl From<v2::Error> for PakeError {
+    fn from(_: v2::Error) -> Self {
         Self::Protocol
     }
 }
@@ -55,7 +55,7 @@ impl Transcript {
             return Err(PakeError::Protocol);
         }
         for (bytes, id) in [(hello, 0xd00), (info, 0xd01)] {
-            if OpaqueFrame::parse_exact(bytes, v1::limits::CONFIG_FRAME)?
+            if OpaqueFrame::parse_exact(bytes, v2::limits::CONFIG_FRAME)?
                 .header
                 .type_id
                 != id
@@ -66,8 +66,8 @@ impl Transcript {
         context.initiator()?.device_id()?.require_supported()?;
         context.responder()?.device_id()?.require_supported()?;
         let mut hash = Sha256::new();
-        hash.update(v1::labels::PAIR_TRANSCRIPT);
-        lp(&mut hash, &context.encode(v1::limits::CONFIG_FRAME)?)?;
+        hash.update(v2::labels::PAIR_TRANSCRIPT);
+        lp(&mut hash, &context.encode(v2::limits::CONFIG_FRAME)?)?;
         hash.update([attempt]);
         lp(&mut hash, hello)?;
         lp(&mut hash, info)?;
@@ -79,7 +79,7 @@ impl Transcript {
         let transcript: [u8; 32] = self.0.finalize().into();
         let mut bytes = Zeroizing::new([0u8; 64]);
         hkdf::Hkdf::<Sha256>::new(Some(&transcript), key)
-            .expand(v1::labels::PAIR_CONFIRMATION, bytes.as_mut())
+            .expand(v2::labels::PAIR_CONFIRMATION, bytes.as_mut())
             .map_err(|_| PakeError::Protocol)?;
         let mut keys = Keys {
             receiver: [0; 32],

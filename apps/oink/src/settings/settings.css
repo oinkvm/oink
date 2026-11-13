@@ -100,6 +100,7 @@ mark.setp__hit { background: var(--ok-accent-tint); color: inherit; border-radiu
 
 
 .kmap { display: grid; gap: 12px; justify-items: start; min-width: 0; }
+.kmap__selectors { display: flex; flex-wrap: wrap; gap: 8px; width: 100%; min-width: 0; }
 .kmap__board {
   --key-u: 84px; --key-h: 58px; --key-gap: 6px;   
   position: relative; display: grid; gap: var(--key-gap); justify-self: stretch;

@@ -797,7 +797,7 @@ fn profiles_merge_and_sync_over_low_without_applying_native() {
 #[test]
 fn native_owner_fences_mode_changes_and_status_queries_never_repeat_a_write() {
     crate::test_watchdog::run(module_path!(), "native dedup fences", Some(4), async {
-        use oink_protocol::v1::RawValue;
+        use oink_protocol::v2::RawValue;
         let dir = tempfile::tempdir().unwrap();
         let displays = Displays::new();
         let node = start(dir.path(), displays.clone()).await;
@@ -1239,7 +1239,7 @@ fn redo_020_manual_commit_autosaves_without_saving_automatic_geometry() {
                         screen.rect.x += 300.0;
                     }
                 }),
-                oink_protocol::v1::dto::LayoutSource::Default,
+                oink_protocol::v2::dto::LayoutSource::Default,
             )
         })
         .await
@@ -1371,7 +1371,7 @@ fn redo_020_crash_after_manual_layout_recovers_autosave_once() {
                 Box::new(move |l| {
                     l.place_device(p.device.0, p.origin, p.scale, true);
                 }),
-                oink_protocol::v1::dto::LayoutSource::Manual,
+                oink_protocol::v2::dto::LayoutSource::Manual,
             )
         })
         .await
@@ -1418,7 +1418,7 @@ fn legacy_manual_commit_preserves_intervening_automatic_layout_fields() {
                             origin.y += 0.5;
                             live.place_device(device, origin, scale, false);
                         }),
-                        oink_protocol::v1::dto::LayoutSource::Default,
+                        oink_protocol::v2::dto::LayoutSource::Default,
                     )
                     .unwrap();
                 let (mut origin, scale) = target.device_transform(device).unwrap();
@@ -1911,10 +1911,12 @@ async fn pairing_visibility_matrix(source_count: usize, target_count: usize) {
                     .screens
                     .iter()
                     .find(|candidate| candidate.key == before.key)
-                    .is_some_and(|candidate| candidate.hidden);
+                    .map(|candidate| candidate.hidden)
+                    .unwrap_or(before.hidden);
                 assert_eq!(
                     screen.hidden, expected_hidden,
-                    "pairing did not apply the global visibility winner"
+                    "pairing did not apply the global visibility winner: selection={selection} source_count={source_count} target_count={target_count} screen={:?} actual={} expected={}",
+                    before.key, screen.hidden, expected_hidden,
                 );
                 assert_eq!(screen.device_disabled, before.device_disabled);
                 assert!(screen.online);
@@ -2122,7 +2124,7 @@ async fn offline_acceptor_scenario(recover_projection: bool) {
         // Freeze the durable membership decision before the profile handoff
         // and group projection acknowledgements. Startup must prepare the
         // exact list while no live configuration handle exists yet.
-        use oink_protocol::v1::{RawValue as V, cbor, schema::WireValue};
+        use oink_protocol::v2::{RawValue as V, cbor, schema::WireValue};
         for (dir, node) in dirs.iter().zip([&a, &b]) {
             let path = dir.path().join(oink_network::pair_journal::FILE);
             let journal = oink_network::pair_journal::Journal::load(&path, node.id()).unwrap();
@@ -2777,7 +2779,7 @@ fn remote_unplug_with_catalog_ahead_of_manual_layout_preserves_the_manual_placem
 
 fn remote_hotplug_profile_return(delay_manual_layout: bool) {
     use crate::api::AgentApi;
-    use oink_protocol::v1::schema::WireDto;
+    use oink_protocol::v2::schema::WireDto;
     crate::test_watchdog::run(module_path!(), "remote hotplug profile return", Some(6), async {
         let dirs = [
             tempfile::tempdir().unwrap(),
@@ -2875,7 +2877,7 @@ fn remote_hotplug_profile_return(delay_manual_layout: bool) {
         .unwrap()
         .unwrap();
         let value =
-            oink_protocol::v1::dto::LayoutValue::from_raw(stored.layout_register().unwrap().value().unwrap()).unwrap();
+            oink_protocol::v2::dto::LayoutValue::from_raw(stored.layout_register().unwrap().value().unwrap()).unwrap();
         let retained = crate::config_module::layout_wire::from_wire(&value).unwrap();
         assert!(retained.screens.iter().any(|s| s.id.device == c.id()));
         assert!(!a.layout().0.screens.iter().any(|s| s.id.device == c.id()));
@@ -2928,7 +2930,7 @@ fn remote_hotplug_profile_return(delay_manual_layout: bool) {
             assert_eq!(lock(&node.inner.profiles.data).catalog.as_ref(), Some(&saved));
             assert_eq!(
                 node.link_config().unwrap().applied().layout_source,
-                oink_protocol::v1::dto::LayoutSource::Default
+                oink_protocol::v2::dto::LayoutSource::Default
             );
         }
         lock(&db.state).displays.pop();
@@ -3061,7 +3063,7 @@ fn remote_hotplug_profile_return(delay_manual_layout: bool) {
                 assert_eq!(lock(&node.inner.profiles.data).catalog.as_ref(), Some(&saved_plugged));
                 assert_eq!(
                     node.link_config().unwrap().applied().layout_source,
-                    oink_protocol::v1::dto::LayoutSource::Default
+                    oink_protocol::v2::dto::LayoutSource::Default
                 );
             }
         }
@@ -3701,6 +3703,50 @@ fn retained_disabled_catalog_never_replaces_active_input_geometry() {
             assert_eq!(result, Disposition::Pass);
         }
         assert_eq!(node.layout().0.screens.len(), 2, "retained target remains editable");
+        node.shutdown().await;
+    });
+}
+
+#[test]
+fn retained_android_screen_is_in_arrangement_api_and_always_rigid() {
+    crate::test_watchdog::run(module_path!(), "retained Android arrangement", Some(2), async {
+        let dir = tempfile::tempdir().unwrap();
+        let displays = Displays::new();
+        {
+            let mut native = lock(&displays.state);
+            native.displays.truncate(1);
+            native.displays[0].key = oink_foundation::display::ANDROID_INPUT_DISPLAY.into();
+            native.displays[0].bounds = Rect::new(0., 0., 400., 800.);
+        }
+        let mut net = oink_test_support::network_config(dir.path().into(), "phone-arrangement-fixture", 0);
+        net.os = "android".into();
+        // This is the production API projection over a retained phone record,
+        // with fake OS backends; it does not certify an Android helper/device.
+        let node = Node::start(NodeOptions {
+            net,
+            input: Arc::new(oink_test_support::input::FakeInput::new()),
+            displays: displays.displays().unwrap(),
+            display_backend: Some(displays),
+            clipboard: None,
+            mode_switch_in_callback: true,
+            capture_reports_key_repeat: false,
+            cursor_trail: false,
+        })
+        .await
+        .unwrap();
+        let state = query(&node).await;
+        let phone = crate::api::DeviceKey(node.id());
+        let snapshot = state.snapshot.unwrap();
+        assert!(snapshot.placements.iter().any(|p| p.device == phone));
+        assert!(snapshot.native.iter().any(|n| {
+            n.device == phone
+                && n.screens
+                    .iter()
+                    .any(|s| s.screen.display == oink_foundation::display::ANDROID_INPUT_DISPLAY)
+        }));
+        let device = state.devices.iter().find(|d| d.device == phone).unwrap();
+        assert!(!device.sync_system_arrangement);
+        assert!(!device.can_edit_screens);
         node.shutdown().await;
     });
 }

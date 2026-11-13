@@ -1,0 +1,60 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>zh_CN</string>
+	<key>CFBundleDisplayName</key>
+	<string>Oink</string>
+	<key>CFBundleExecutable</key>
+	<string>$(EXECUTABLE_NAME)</string>
+	<key>CFBundleIdentifier</key>
+	<string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>$(PRODUCT_NAME)</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>$(MARKETING_VERSION)</string>
+	<key>CFBundleVersion</key>
+	<string>$(CURRENT_PROJECT_VERSION)</string>
+	<key>LSRequiresIPhoneOS</key>
+	<true/>
+	<key>NSCameraUsageDescription</key>
+	<string>Oink 只在你选择「拍摄」时使用相机，拍下的照片会发送到你的其它设备。</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>开启麦克风共享后，Oink 会持续采集麦克风，仅在已配对电脑使用时发送声音；暂停共享会停止录音。</string>
+	<key>NSSupportsLiveActivities</key>
+	<true/>
+	<key>NSPhotoLibraryAddUsageDescription</key>
+	<string>Oink 只在你点击保存时将已下载的图片保存到相册。</string>
+	<key>UIBackgroundModes</key>
+	<array><string>audio</string></array>
+	<key>NSBonjourServices</key>
+	<array>
+		<string>_oink._udp</string>
+	</array>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>Oink 使用局域网发现并连接你的电脑，分享剪贴板、文件与音频。</string>
+	<key>OinkAppGroup</key>
+	<string>$(OINK_APP_GROUP)</string>
+	<key>OinkKeychainGroup</key>
+	<string>$(OINK_KEYCHAIN_GROUP)</string>
+	<key>UIApplicationSceneManifest</key>
+	<dict>
+		<key>UIApplicationSupportsMultipleScenes</key>
+		<false/>
+	</dict>
+	<key>UILaunchScreen</key>
+	<dict/>
+	<key>UISupportedInterfaceOrientations</key>
+	<array>
+		<string>UIInterfaceOrientationPortrait</string>
+		<string>UIInterfaceOrientationLandscapeLeft</string>
+		<string>UIInterfaceOrientationLandscapeRight</string>
+		<string>UIInterfaceOrientationPortraitUpsideDown</string>
+	</array>
+</dict>
+</plist>

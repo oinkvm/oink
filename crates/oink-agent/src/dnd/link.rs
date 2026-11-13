@@ -9,7 +9,7 @@ use crate::{
 use oink_network::link::{ModuleEvent, ModulePort, StreamDir, StreamId};
 use oink_protocol::{
     frame::StreamKind,
-    v1::{
+    v2::{
         self, Message, dto,
         schema::{Open, WireDto},
     },
@@ -269,10 +269,10 @@ fn send_control(input: &InputThread, peer: DeviceId, message: Message) {
         input.send(InputCommand::SendMessage { peer, stream, message });
     }
 }
-fn head_notice(head: &dto::AttachmentHead) -> v1::Result<oink_routing::dnd::DragNotice> {
+fn head_notice(head: &dto::AttachmentHead) -> v2::Result<oink_routing::dnd::DragNotice> {
     let header = head.header()?;
     if header.variant() != Ok(Open::Known(dto::AttachmentKind::Drag)) {
-        return Err(v1::ErrorCode::InvalidChannel.into());
+        return Err(v2::ErrorCode::InvalidChannel.into());
     }
     wire::local_notice(&dto::DragAttachment::from_raw(header.body()?)?.notice()?)
 }

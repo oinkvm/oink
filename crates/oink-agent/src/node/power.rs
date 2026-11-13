@@ -2,12 +2,13 @@
 use super::*;
 use oink_foundation::{GroupId, session::Boot};
 use oink_input::power::State;
-use oink_protocol::v1::{
+use oink_protocol::v2::{
     Message, dto,
     schema::{WireDto, WireValue},
 };
 use std::collections::HashMap;
-const CAPABILITY: &str = "oink.power/1";
+#[cfg(test)]
+const CAPABILITY: &str = "oink.device/2";
 const HEARTBEAT: Duration = Duration::from_secs(5);
 const LEASE: Duration = Duration::from_secs(15);
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -98,9 +99,6 @@ impl Node {
             || applied.paused
             || !applied.members.contains(&boot.device_id)
             || group.peer_boot(boot.device_id) != Some(boot)
-            || !group
-                .peer_agreement(boot.device_id)
-                .is_some_and(|a| a.contains(CAPABILITY))
             || self.inner.input_environment.load().system_sleeping
         {
             return;
@@ -196,7 +194,9 @@ impl Node {
                 .sent
                 .retain(|peer, _| applied.members.contains(peer) && group.peer_boot(*peer).is_some());
             for peer in &applied.members {
-                if *peer == self.id() || !group.peer_supports(*peer, CAPABILITY) {
+                if *peer == self.id()
+                    || !group.peer_permits(*peer, oink_protocol::v2::registry::type_id::ControlPowerState)
+                {
                     continue;
                 }
                 let Some(boot) = group.peer_boot(*peer) else { continue };
@@ -426,12 +426,14 @@ mod network_tests {
         until("power agreement", || {
             a.link_config()
                 .unwrap()
-                .peer_agreement(b.id())
-                .is_some_and(|a| a.contains(CAPABILITY))
+                .peer_permits(b.id(), oink_protocol::v2::registry::type_id::ControlPowerState)
         })
         .await;
-        assert!(a.link_config().unwrap().peer_supports(b.id(), CAPABILITY));
-        assert!(!a.link_config().unwrap().peer_supports(b.id(), "unsupported/1"));
+        assert!(
+            a.link_config()
+                .unwrap()
+                .peer_permits(b.id(), oink_protocol::v2::registry::type_id::ControlPowerState)
+        );
         let system = State {
             system: true,
             ..State::default()
@@ -522,7 +524,11 @@ mod network_tests {
             a.link_config().unwrap().peer_agreement(b.id()).is_some()
         })
         .await;
-        assert!(!a.link_config().unwrap().peer_supports(b.id(), CAPABILITY));
+        assert!(
+            !a.link_config()
+                .unwrap()
+                .peer_permits(b.id(), oink_protocol::v2::registry::type_id::ControlPowerState)
+        );
         source(
             &a,
             State {

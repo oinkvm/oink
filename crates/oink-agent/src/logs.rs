@@ -186,14 +186,31 @@ impl DiagnosticBudget {
     }
 }
 
-// Only lifecycle decisions bypass the verbose bootstrap budget. Inspect the
-// typed kind field, never the formatted message or peer-controlled error text.
+// Only lifecycle decisions bypass the verbose bootstrap budget, and the one
+// line naming the candidate a local dial completed on (2026-11-12: a restart's
+// first 2 s of bootstrap steps used the whole budget, so two successful dials
+// left no record of their address). Inspect the typed kind and result fields,
+// never the formatted message or peer-controlled error text.
 #[derive(Default)]
-struct CriticalLinkEvent(bool);
+struct CriticalLinkEvent {
+    lifecycle: bool,
+    candidate_dial: bool,
+    completed: bool,
+}
+impl CriticalLinkEvent {
+    fn critical(&self) -> bool {
+        self.lifecycle || self.candidate_dial && self.completed
+    }
+}
 impl Visit for CriticalLinkEvent {
     fn record_str(&mut self, field: &Field, value: &str) {
-        if field.name() == "kind" {
-            self.0 = matches!(value, "link_lost" | "path_transition" | "connection_step");
+        match field.name() {
+            "kind" => {
+                self.lifecycle = matches!(value, "link_lost" | "path_transition" | "connection_step");
+                self.candidate_dial = value == "candidate_dial";
+            }
+            "result" => self.completed = value == "completed",
+            _ => {}
         }
     }
     fn record_debug(&mut self, _: &Field, _: &dyn std::fmt::Debug) {}
@@ -213,7 +230,7 @@ impl<S: Subscriber> tracing_subscriber::layer::Filter<S> for LocalLogFilter {
             if metadata.target() == "oink_link_diagnostics" {
                 event.record(&mut critical);
             }
-            if critical.0 {
+            if critical.critical() {
                 return true;
             }
             return self.0.lock().unwrap_or_else(|e| e.into_inner()).admit(Instant::now());
@@ -436,18 +453,25 @@ mod tests {
             tracing::info!(target: "oink_link_diagnostics", kind = "path_transition", "path survives");
             tracing::info!(target: "oink_link_diagnostics", kind = "connection_step", "connection survives");
             tracing::warn!(target: "oink_link_diagnostics", kind = "udp_send", "error context survives");
+            tracing::info!(target: "oink_link_diagnostics", kind = "candidate_dial", candidate = "192.0.2.1:47470",
+                result = "completed", reason = "authenticated", "winning candidate survives");
+            tracing::info!(target: "oink_link_diagnostics", kind = "candidate_dial", result = "entered", "dial start bounded");
+            tracing::info!(target: "oink_link_diagnostics", kind = "candidate_dial", result = "failed", "dial failure bounded");
             tracing::info!(target: "oink_dnd_read", kind = "connection_step", "unrelated target remains bounded");
         });
         let text = String::from_utf8(output.lock().unwrap().clone()).unwrap();
-        assert_eq!(text.lines().count(), 132);
+        assert_eq!(text.lines().count(), 133);
         for expected in [
             "decision survives",
             "path survives",
             "connection survives",
             "error context survives",
+            "winning candidate survives",
         ] {
             assert!(text.contains(expected), "missing {expected}");
         }
+        assert!(!text.contains("dial start bounded"));
+        assert!(!text.contains("dial failure bounded"));
         assert!(!text.contains("budget exhausted"));
         assert!(!text.contains("unrelated target remains bounded"));
     }

@@ -653,7 +653,7 @@ fn release_and_held_sync_follow_original_exit_after_audio_stops() {
 
 #[test]
 fn volume_repeat_and_release_keep_initial_claim_context_after_rebinding() {
-    use oink_protocol::v1::schema::{WireDto, WireValue};
+    use oink_protocol::v2::schema::{WireDto, WireValue};
     let mut source = router(A, A, Some(E));
     source.local_key(UP, true, 1);
     let first = messages(&mut source).pop().unwrap().1;
@@ -668,7 +668,7 @@ fn volume_repeat_and_release_keep_initial_claim_context_after_rebinding() {
     let mut replacement = volume_route(A, E).session.raw().clone();
     replacement.insert(2, 2u64.write());
     let replacement = crate::input::VolumeRoute::from_session(Arc::new(
-        oink_protocol::v1::dto::AudioSessionContext::from_raw(replacement).unwrap(),
+        oink_protocol::v2::dto::AudioSessionContext::from_raw(replacement).unwrap(),
     ))
     .unwrap();
     source.set_volume_exit_probe(Arc::new(move || Some(replacement.clone())));

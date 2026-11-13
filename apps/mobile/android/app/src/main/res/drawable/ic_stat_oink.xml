@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Status-bar icon of Oink notifications: the Oink mark in one colour (AndroidNotice.jsx OinkMark). -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp" android:height="24dp" android:viewportWidth="64" android:viewportHeight="64">
+    <group android:translateX="32" android:translateY="32">
+        <group android:scaleX="1.1" android:scaleY="1.1">
+            <group android:translateX="-30.2" android:translateY="-29.6">
+                <path android:pathData="M21,35C21,47 31,53 43,53A8.5,8.5 0,1 0,35 41.6" android:fillColor="#00000000"
+                    android:strokeColor="#FFFFFFFF" android:strokeWidth="6" android:strokeLineCap="round" />
+                <path android:pathData="M8,5V43L18,34.5L35,32.5Z" android:fillColor="#FFFFFFFF"
+                    android:strokeColor="#FFFFFFFF" android:strokeWidth="4" android:strokeLineJoin="round" />
+            </group>
+        </group>
+    </group>
+</vector>

@@ -10,7 +10,7 @@ use oink_foundation::{
     input::{InputMode, KeyCode},
     input_transform as input,
 };
-use oink_protocol::v1::{
+use oink_protocol::v2::{
     RawMap, RawValue,
     dto::{self, LocalOption},
     schema::WireValue,
@@ -47,7 +47,6 @@ pub(super) fn values(settings: &Settings) -> Vec<(LocalOption, RawValue)> {
             .write(),
         ),
         (ClipboardEnabled, settings.clipboard_enabled.write()),
-        (ForwardingEnabled, a.forwarding_enabled.write()),
         (ScreenShared, settings.screen_shared.write()),
         (
             ScreenPreferences,
@@ -127,8 +126,6 @@ pub(super) fn values(settings: &Settings) -> Vec<(LocalOption, RawValue)> {
         (NativeMultifinger, r.native_multifinger.write()),
         (MacScrollFeel, r.mac_scroll_feel.write()),
         (AudioQuality, a.quality.number().write()),
-        (AudioExitClaim, RawValue::Null),
-        (MicrophoneShareClaim, RawValue::Null),
         (
             MicrophoneControls,
             map([
@@ -136,14 +133,13 @@ pub(super) fn values(settings: &Settings) -> Vec<(LocalOption, RawValue)> {
                 (2, settings.microphone.muted.write()),
             ]),
         ),
-        (MicrophoneReceiveMuted, settings.microphone.receive_muted.write()),
         (
             MicrophoneInput,
             settings
                 .microphone
                 .input
                 .as_ref()
-                .map(|v| oink_protocol::v1::schema::Text::<512>(v.clone()))
+                .map(|v| oink_protocol::v2::schema::Text::<512>(v.clone()))
                 .write(),
         ),
         (SyncSystemArrangement, settings.sync_system_arrangement.write()),
@@ -202,7 +198,7 @@ fn target(value: &input::TargetTransform) -> RawValue {
     map([(1, value.reverse_wheel.write()), (2, keyboard(&value.keyboard))])
 }
 pub(crate) fn transform(value: &input::InputTransform) -> RawValue {
-    map([
+    let mut raw: RawMap = [
         (1, target(&value.macos)),
         (2, target(&value.windows)),
         (
@@ -218,7 +214,12 @@ pub(crate) fn transform(value: &input::InputTransform) -> RawValue {
                 RawValue::Map(raw)
             })),
         ),
-    ])
+    ]
+    .into();
+    if let Some(android) = &value.android {
+        raw.insert(4, target(android));
+    }
+    RawValue::Map(raw)
 }
 fn read_keyboard(value: dto::KeyboardMapping) -> Result<input::KeyboardMapping, StoreError> {
     Ok(input::KeyboardMapping {
@@ -283,6 +284,7 @@ pub(crate) fn read_transform(value: dto::InputTransformValue) -> Result<input::I
     Ok(input::InputTransform {
         macos: read_target(value.macos()?)?,
         windows: read_target(value.windows()?)?,
+        android: value.android()?.map(read_target).transpose()?,
         overrides: value
             .overrides()?
             .0
@@ -318,7 +320,6 @@ pub(super) fn apply(owner: &OwnerStore, settings: &mut Settings) -> Result<(), S
                 }
             }
             ClipboardEnabled => settings.clipboard_enabled = bool::read(&value)?,
-            ForwardingEnabled => settings.audio.forwarding_enabled = bool::read(&value)?,
             ScreenShared => settings.screen_shared = bool::read(&value)?,
             ScreenPreferences => {
                 let value = dto::ScreenPreferencesValue::read(&value)?;
@@ -367,7 +368,7 @@ pub(super) fn apply(owner: &OwnerStore, settings: &mut Settings) -> Result<(), S
             }
             AudioQuality => {
                 settings.audio.quality = oink_audio::negotiation::Quality::from_number(u32::read(&value)?)
-                    .ok_or_else(|| oink_protocol::v1::Error::from(oink_protocol::v1::ErrorCode::UnsupportedValue))?;
+                    .ok_or_else(|| oink_protocol::v2::Error::from(oink_protocol::v2::ErrorCode::UnsupportedValue))?;
             }
             ForwardingControls => {
                 let value = dto::ForwardingControlsValue::read(&value)?;
@@ -398,11 +399,9 @@ pub(super) fn apply(owner: &OwnerStore, settings: &mut Settings) -> Result<(), S
                 settings.microphone.volume_percent = value.volume_percent()?;
                 settings.microphone.muted = value.muted()?;
             }
-            MicrophoneReceiveMuted => settings.microphone.receive_muted = bool::read(&value)?,
             MicrophoneInput => {
-                settings.microphone.input = Option::<oink_protocol::v1::schema::Text<512>>::read(&value)?.map(|v| v.0)
+                settings.microphone.input = Option::<oink_protocol::v2::schema::Text<512>>::read(&value)?.map(|v| v.0)
             }
-            AudioExitClaim | MicrophoneShareClaim => {}
             _ => return Err(StoreError::Invalid),
         }
     }
@@ -456,4 +455,41 @@ pub(super) fn local(settings: &Settings) -> serde_json::Value {
         audio.remove(field);
     }
     value
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn android_input_transform_extends_the_existing_preference() {
+        let mut transform = input::InputTransform::initial("macos");
+        transform.android = None;
+        let old = super::transform(&transform);
+        assert!(!old.as_map().unwrap().contains_key(&4));
+
+        transform.android = Some(input::TargetTransform {
+            keyboard: input::KeyboardMapping::preset(input::KeyPreset::MacFeel, "macos", "android"),
+            ..Default::default()
+        });
+        let next = super::transform(&transform);
+        let option = LocalOption::InputTransform;
+        let mut owner = super::super::owner::OwnerStore::new([(option, old.clone())]).unwrap();
+        let patch = super::super::owner::typed_patch(option, &old, &next);
+        owner.edit(option, 1, patch).unwrap();
+        let stored = owner.value(option).unwrap();
+        assert_eq!(stored, next);
+        let decoded = read_transform(dto::InputTransformValue::read(&stored).unwrap()).unwrap();
+        assert_eq!(decoded, transform);
+        assert_eq!(
+            decoded
+                .resolve(oink_foundation::DeviceId([1; 32]), "android")
+                .keyboard
+                .map(KeyCode::LEFT_GUI),
+            KeyCode::LEFT_CTRL
+        );
+        for key in [1, 2, 3] {
+            assert_eq!(old.as_map().unwrap().get(&key), next.as_map().unwrap().get(&key));
+        }
+    }
 }

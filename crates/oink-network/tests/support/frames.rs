@@ -1,5 +1,5 @@
 use super::oink_network_profile;
-use oink_protocol::v1::{
+use oink_protocol::v2::{
     self, Message, RawValue, dto,
     schema::{WireDto, WireValue},
 };
@@ -7,14 +7,9 @@ use oink_protocol::v1::{
 pub fn profile() -> oink_network_profile::OfferProfile {
     let mut profile = oink_network_profile::OfferProfile::default();
     profile.capabilities.extend(
-        [
-            "oink.diagnostics.collect/1",
-            "oink.input.relative/1",
-            "oink.input.contacts/1",
-            "oink.input.gestures/1",
-        ]
-        .into_iter()
-        .map(str::to_owned),
+        ["oink.diagnostics/2", "oink.input/2", "oink.low/1"]
+            .into_iter()
+            .map(str::to_owned),
     );
     profile
 }
@@ -47,5 +42,5 @@ pub fn low(byte: u8, size: usize) -> Message {
     )
 }
 pub fn encode(message: &Message) -> Vec<u8> {
-    v1::frame::encode(message, v1::limits::CONFIG_FRAME).unwrap()
+    v2::frame::encode(message, v2::limits::CONFIG_FRAME).unwrap()
 }

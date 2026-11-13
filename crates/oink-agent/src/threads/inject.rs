@@ -831,11 +831,11 @@ pub(crate) fn start_with_trace(
                 if current.active()
                     && current != safety
                     && native_faults.snapshot().screen
-                        == Some(oink_protocol::v1::dto::ResourceFaultCode::PermissionDenied)
+                        == Some(oink_protocol::v2::dto::ResourceFaultCode::PermissionDenied)
                 {
                     // The old admission fault must not prevent the new session from
                     // starting; otherwise no fresh injection can ever clear it.
-                    native_faults.screen(oink_protocol::v1::dto::ResourceFaultCode::None);
+                    native_faults.screen(oink_protocol::v2::dto::ResourceFaultCode::None);
                     if let Some(wake) = input_wake.get() {
                         wake();
                     }
@@ -1059,7 +1059,7 @@ pub(crate) fn start_with_trace(
                         }
                         // A successful move cannot clear a failed key/button cleanup.
                         let cleanup_pending = native_faults.snapshot().screen
-                            == Some(oink_protocol::v1::dto::ResourceFaultCode::CleanupFailed)
+                            == Some(oink_protocol::v2::dto::ResourceFaultCode::CleanupFailed)
                             && !held.0.is_empty();
                         if !cleanup_pending
                             && native_faults.screen(super::input::faults::native_result(&result))
@@ -1173,7 +1173,7 @@ pub(crate) fn start_with_trace(
                     } => {
                         let cleanup_pending = expect_released && !held.0.is_empty();
                         if cleanup_pending {
-                            native_faults.screen(oink_protocol::v1::dto::ResourceFaultCode::CleanupFailed);
+                            native_faults.screen(oink_protocol::v2::dto::ResourceFaultCode::CleanupFailed);
                         }
                         let result = if cleanup_pending {
                             3

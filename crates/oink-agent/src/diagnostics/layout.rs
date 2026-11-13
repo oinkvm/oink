@@ -4,7 +4,7 @@ use super::*;
 use oink_display::layout::{EffectiveSettings, SizeSource};
 use oink_display::layout::{Layout, OwnerLayoutPreferences};
 use oink_foundation::{Point, Rect, Size};
-use oink_protocol::v1::{self, dto as wire};
+use oink_protocol::v2::{self, dto as wire};
 use std::collections::BTreeMap;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -228,32 +228,32 @@ pub(crate) struct RouterCompilation {
     pub source_layout: Arc<Layout>,
     pub input_online: Option<std::collections::BTreeSet<DeviceId>>,
 }
-fn version(value: &wire::ConfigVersion, anon: &Anonymizer) -> v1::Result<Version> {
+fn version(value: &wire::ConfigVersion, anon: &Anonymizer) -> v2::Result<Version> {
     let writer = value.writer()?;
     if writer.algorithm()?.0 != wire::ED25519 {
-        return Err(v1::ErrorCode::UnsupportedValue.into());
+        return Err(v2::ErrorCode::UnsupportedValue.into());
     }
     let key: [u8; 32] = writer
         .public_key()?
         .0
         .try_into()
-        .map_err(|_| v1::ErrorCode::UnsupportedValue)?;
+        .map_err(|_| v2::ErrorCode::UnsupportedValue)?;
     Ok(Version {
         counter: value.counter()?,
         writer_alias: anon.device(DeviceId(key)),
     })
 }
-fn rect(value: wire::Rect) -> v1::Result<Rect> {
+fn rect(value: wire::Rect) -> v2::Result<Rect> {
     Ok(Rect::new(value.x()?, value.y()?, value.w()?, value.h()?))
 }
-fn size(value: wire::Size) -> v1::Result<Size> {
+fn size(value: wire::Size) -> v2::Result<Size> {
     Ok(Size::new(value.w()?, value.h()?))
 }
 impl DeviceInputs {
-    fn project(&self, anon: &Anonymizer) -> v1::Result<Device> {
+    fn project(&self, anon: &Anonymizer) -> v2::Result<Device> {
         let facts = self.facts.as_deref();
         let input_capable = facts
-            .map(|f| Ok::<_, v1::Error>(f.capabilities()?.supported()?.0.iter().any(|c| c.0 == "oink.input/1")))
+            .map(|f| Ok::<_, v2::Error>(f.capabilities()?.supported()?.0.iter().any(|c| c.0 == "oink.input/2")))
             .transpose()?;
         let displays = facts
             .map(|f| f.displays())
@@ -275,7 +275,7 @@ impl DeviceInputs {
                     virtual_display: d.is_virtual()?,
                 })
             })
-            .collect::<v1::Result<Vec<_>>>()?;
+            .collect::<v2::Result<Vec<_>>>()?;
         Ok(Device {
             device: anon.device(self.device),
             saved_member: self.saved_member,
@@ -288,7 +288,7 @@ impl DeviceInputs {
     }
 }
 impl Inputs {
-    pub fn project(&self, anon: &Anonymizer) -> v1::Result<CompleteLayout> {
+    pub fn project(&self, anon: &Anonymizer) -> v2::Result<CompleteLayout> {
         let layout = &self.saved;
         let mut owner_preferences = Vec::new();
         for (device, preferences) in &self.owner_preferences {
@@ -333,7 +333,7 @@ impl Inputs {
                 .devices
                 .iter()
                 .map(|d| d.project(anon))
-                .collect::<v1::Result<_>>()?,
+                .collect::<v2::Result<_>>()?,
             compiled,
             owner_preferences,
             local_pause: LocalPause {
@@ -348,7 +348,7 @@ impl RouterCompilation {
     pub fn source_devices(&self) -> std::collections::BTreeSet<DeviceId> {
         self.source_layout.screens.iter().map(|s| s.id.device).collect()
     }
-    pub fn project(&self, anon: &Anonymizer) -> v1::Result<Compiled> {
+    pub fn project(&self, anon: &Anonymizer) -> v2::Result<Compiled> {
         let topology = self.topology.topology();
         Ok(Compiled {
             current_group: true,
@@ -538,9 +538,9 @@ fn owner_preference(
     device: DeviceId,
     preference: &wire::DevicePreference,
     anon: &Anonymizer,
-) -> v1::Result<OwnerPreference> {
-    use v1::RawValue;
-    use v1::schema::WireDto;
+) -> v2::Result<OwnerPreference> {
+    use v2::RawValue;
+    use v2::schema::WireDto;
     let option = preference.option()?.number();
     let mut effective = OwnerValue {
         scalars: BTreeMap::new(),

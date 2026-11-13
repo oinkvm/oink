@@ -119,6 +119,7 @@ fn only_the_sync_challenge_reply_confirms_and_never_starts_a_pointer_attempt() {
         Message::Control(ControlMsg::UnlockReply {
             epoch: focus,
             unlocked: true,
+            paused: false,
         }),
     );
     assert!(answer.try_recv().is_err());
@@ -128,6 +129,7 @@ fn only_the_sync_challenge_reply_confirms_and_never_starts_a_pointer_attempt() {
             Message::Control(ControlMsg::UnlockReply {
                 epoch: sent[0],
                 unlocked: true,
+                paused: false,
             }),
         );
     }
@@ -144,6 +146,7 @@ fn only_the_sync_challenge_reply_confirms_and_never_starts_a_pointer_attempt() {
         Message::Control(ControlMsg::UnlockReply {
             epoch: query,
             unlocked: false,
+            paused: false,
         }),
     );
     assert_eq!(answer.try_recv(), Ok(SourceAnswer::Locked));
@@ -202,7 +205,7 @@ fn sync_password_transaction_ignores_focus_but_needs_its_attached_source() {
         _writer,
     } = attached();
     // The pointer is on the peer: this device is not the focus holder.
-    h.driver.command(InputCommand::MovePointerTo(peer()));
+    h.driver.command(InputCommand::MovePointerTo(peer(), None));
     h.driver.command(InputCommand::SessionLocked(Some(true)));
     let focus = h.driver.adapter.router().focus();
     assert_ne!(focus.holder, h.driver.local);

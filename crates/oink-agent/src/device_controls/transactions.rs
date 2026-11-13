@@ -1,6 +1,6 @@
 //! Bounded owner/requester bookkeeping shared by option, pause and volume edits.
 use crate::api::DeviceKey;
-use oink_protocol::v1::dto::ControlFailure;
+use oink_protocol::v2::dto::ControlFailure;
 use std::{
     collections::{BTreeMap, VecDeque},
     time::{Duration, Instant},

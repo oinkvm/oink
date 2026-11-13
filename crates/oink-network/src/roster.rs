@@ -2,13 +2,13 @@
 //! self-signed roots never establish authority for an existing group.
 use crate::{identity::Identity, wire_identity as wire};
 use oink_foundation::{DeviceId, GroupId};
-use oink_protocol::v1::{
+use oink_protocol::v2::{
     self, RawMap, RawValue, dto, retained,
     schema::{WireDto, WireValue},
 };
 use std::collections::{BTreeMap, BTreeSet};
 
-type Result<T> = v1::Result<T>;
+type Result<T> = v2::Result<T>;
 pub const MAX_MEMBERS: usize = 16;
 pub const MAX_RECORDS: usize = 256;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -53,11 +53,10 @@ impl Roster {
             Some(os),
             now_ms,
         )?;
-        let root = retained::record_id(&record)?.0;
+        let root = record_id(&record)?;
         let roster = dto::Roster::from_raw(
             [
                 (1, RawValue::Bytes(group.0.to_vec())),
-                (2, RawValue::Bytes(root.to_vec())),
                 (3, RawValue::Array(vec![record.write()])),
             ]
             .into(),
@@ -67,42 +66,32 @@ impl Roster {
     /// Checks structure against a locally trusted anchor, not authenticity.
     /// Callers must authenticate network senders before accepting their content.
     pub fn verify(roster: dto::Roster, anchor: Anchor) -> Result<Self> {
-        if roster.group()?.0 != anchor.group.0 || roster.root_id()?.0 != anchor.root {
-            return Err(v1::ErrorCode::AuthenticationFailed.into());
+        if roster.group()?.0 != anchor.group.0 {
+            return Err(v2::ErrorCode::AuthenticationFailed.into());
         }
-        roster.encode(v1::limits::CONFIG_STATE)?;
+        roster.encode(v2::limits::CONFIG_STATE)?;
         let mut records = BTreeMap::new();
-        let mut previous = None;
-        for record in roster.records()?.0 {
-            let record_id = retained::record_id(&record)?.0;
-            if previous.is_some_and(|previous| previous > record_id) {
-                return Err(v1::ErrorCode::MalformedFrame.into());
-            }
-            previous = Some(record_id);
+        for stored_record in roster.records()?.0 {
+            // 0.3.x persisted the record signature and issuer digest in fields
+            // that v2 retired.  They remain opaque in group-state.json, while
+            // the v2 record identity and network projection use only the v2
+            // body.  This keeps an old roster's anchor stable after upgrade.
+            let record = project_record(&stored_record)?;
+            let record_id = record_id(&record)?;
             let body = dto::RecordBody::from_raw(record.body()?)?;
             if body.group()?.0 != anchor.group.0 {
-                return Err(v1::ErrorCode::AuthenticationFailed.into());
+                return Err(v2::ErrorCode::AuthenticationFailed.into());
             }
             let subject = wire::read_device(&body.subject()?)?;
             let issuer = wire::read_device(&body.issuer()?)?;
-            let signature = record.signature()?;
-            // TLS/member admission or PAKE authenticates the sender; persisted
-            // and in-group content is trusted. Keep the v1 signature schema.
-            if signature.algorithm()?.0 != dto::ED25519 {
-                return Err(v1::ErrorCode::AuthenticationFailed.into());
-            }
             match body.kind()? {
                 dto::RecordKind::Create => {
-                    if record_id != anchor.root
-                        || subject != issuer
-                        || body.epoch()? != 0
-                        || body.issuer_ref()?.is_some()
-                    {
-                        return Err(v1::ErrorCode::AuthenticationFailed.into());
+                    if record_id != anchor.root || subject != issuer || body.epoch()? != 0 {
+                        return Err(v2::ErrorCode::AuthenticationFailed.into());
                     }
                 }
                 dto::RecordKind::Remove if body.name()?.is_some() || body.os()?.is_some() => {
-                    return Err(v1::ErrorCode::MalformedFrame.into());
+                    return Err(v2::ErrorCode::MalformedFrame.into());
                 }
                 _ => {}
             }
@@ -116,14 +105,11 @@ impl Roster {
                 },
             );
         }
-        let root = records.get(&anchor.root).ok_or(v1::ErrorCode::AuthenticationFailed)?;
+        let root = records.get(&anchor.root).ok_or(v2::ErrorCode::AuthenticationFailed)?;
         if root.body.kind()? != dto::RecordKind::Create {
-            return Err(v1::ErrorCode::AuthenticationFailed.into());
+            return Err(v2::ErrorCode::AuthenticationFailed.into());
         }
-        let mut verified = BTreeSet::new();
-        for record in records.keys() {
-            verify_chain(*record, anchor.root, &records, &mut verified, &mut BTreeSet::new())?;
-        }
+        verify_authorities(root.subject, &records)?;
         let mut adds = BTreeMap::<DeviceId, (u64, [u8; 32])>::new();
         let mut removes = BTreeMap::<DeviceId, u64>::new();
         for (&id, record) in &records {
@@ -161,9 +147,10 @@ impl Roster {
             );
         }
         if members.len() > MAX_MEMBERS || records.len() > MAX_RECORDS {
-            return Err(v1::ErrorCode::LimitExceeded.into());
+            return Err(v2::ErrorCode::LimitExceeded.into());
         }
         let mut raw = roster.into_raw();
+        raw.remove(&2); // 0.3.x roster digest is retained only on disk.
         raw.insert(3, RawValue::Array(records.values().map(|r| r.wire.write()).collect()));
         Ok(Self {
             wire: dto::Roster::from_raw(raw)?,
@@ -179,7 +166,9 @@ impl Roster {
         &self.wire
     }
     pub fn digest(&self) -> Result<[u8; 32]> {
-        Ok(retained::sha256(&self.wire.encode(v1::limits::CONFIG_STATE)?).0)
+        Ok(crate::wire_identity::object_digest(
+            &self.wire.encode(v2::limits::CONFIG_STATE)?,
+        ))
     }
     pub fn members(&self) -> impl Iterator<Item = &Member> {
         self.members.values()
@@ -214,7 +203,7 @@ impl Roster {
         if let Some(expected) = expected_add
             && self.member(subject).map(|m| m.add) != Some(expected)
         {
-            return Err(v1::ErrorCode::StateConflict.into());
+            return Err(v2::ErrorCode::StateConflict.into());
         }
         self.edit(signer, dto::RecordKind::Remove, subject, None, None, now_ms)
     }
@@ -233,7 +222,7 @@ impl Roster {
             .into_iter()
             .max()
             .map_or(Ok(1), |epoch| {
-                epoch.checked_add(1).ok_or(v1::ErrorCode::LimitExceeded.into())
+                epoch.checked_add(1).ok_or(v2::ErrorCode::LimitExceeded.into())
             })
     }
     pub fn propose_add(
@@ -244,7 +233,7 @@ impl Roster {
         os: Option<&str>,
         now: u64,
     ) -> Result<dto::RecordBody> {
-        let reference = self.member(issuer).ok_or(v1::ErrorCode::AuthenticationFailed)?.add;
+        let reference = self.member(issuer).ok_or(v2::ErrorCode::AuthenticationFailed)?.add;
         body(
             dto::RecordKind::Add,
             self.anchor.group,
@@ -269,7 +258,7 @@ impl Roster {
                 proposal.issued_ms()?,
             )?;
             if result.contains(subject) || (1..=9).any(|key| proposal.raw().get(&key) != expected.raw().get(&key)) {
-                return Err(v1::ErrorCode::StateConflict.into());
+                return Err(v2::ErrorCode::StateConflict.into());
             }
             result = result.insert(sign_body(identity, proposal.clone())?)?;
         }
@@ -302,7 +291,7 @@ impl Roster {
         os: Option<&str>,
         now_ms: u64,
     ) -> Result<Self> {
-        let authority = self.member(signer.id()).ok_or(v1::ErrorCode::AuthenticationFailed)?;
+        let authority = self.member(signer.id()).ok_or(v2::ErrorCode::AuthenticationFailed)?;
         let epoch = self.next_epoch(subject)?;
         let record = sign(
             signer,
@@ -323,38 +312,34 @@ impl Roster {
             .iter()
             .map(|(id, record)| (*id, record.wire.clone()))
             .collect::<BTreeMap<_, _>>();
-        records.insert(retained::record_id(&record)?.0, record);
+        records.insert(record_id(&record)?, record);
         let mut raw = self.wire.raw().clone();
         raw.insert(3, RawValue::Array(records.values().map(WireValue::write).collect()));
         Self::verify(dto::Roster::from_raw(raw)?, self.anchor)
     }
 }
-fn verify_chain(
-    id: [u8; 32],
-    root: [u8; 32],
-    records: &BTreeMap<[u8; 32], Record>,
-    verified: &mut BTreeSet<[u8; 32]>,
-    visiting: &mut BTreeSet<[u8; 32]>,
-) -> Result<()> {
-    if verified.contains(&id) {
-        return Ok(());
-    }
-    if !visiting.insert(id) {
-        return Err(v1::ErrorCode::AuthenticationFailed.into());
-    }
-    let record = records.get(&id).ok_or(v1::ErrorCode::AuthenticationFailed)?;
-    if id != root {
-        let parent = record.body.issuer_ref()?.ok_or(v1::ErrorCode::AuthenticationFailed)?.0;
-        let authority = records.get(&parent).ok_or(v1::ErrorCode::AuthenticationFailed)?;
-        if authority.subject != record.issuer
-            || !matches!(authority.body.kind()?, dto::RecordKind::Create | dto::RecordKind::Add)
-        {
-            return Err(v1::ErrorCode::AuthenticationFailed.into());
+fn verify_authorities(root: DeviceId, records: &BTreeMap<[u8; 32], Record>) -> Result<()> {
+    // v2 has no issuer-record hash. Follow all anchored historical grants:
+    // removing and re-adding a device can produce cycles among issuers even
+    // though each member has a valid path back to the original Create record.
+    let mut grants = BTreeMap::<DeviceId, Vec<DeviceId>>::new();
+    for record in records.values() {
+        if record.body.kind()? == dto::RecordKind::Add {
+            grants.entry(record.issuer).or_default().push(record.subject);
         }
-        verify_chain(parent, root, records, verified, visiting)?;
     }
-    visiting.remove(&id);
-    verified.insert(id);
+    let mut authorized = BTreeSet::from([root]);
+    let mut pending = vec![root];
+    while let Some(issuer) = pending.pop() {
+        for &subject in grants.get(&issuer).into_iter().flatten() {
+            if authorized.insert(subject) {
+                pending.push(subject);
+            }
+        }
+    }
+    if records.values().any(|record| !authorized.contains(&record.issuer)) {
+        return Err(v2::ErrorCode::AuthenticationFailed.into());
+    }
     Ok(())
 }
 #[allow(clippy::too_many_arguments)]
@@ -364,14 +349,24 @@ fn sign(
     group: GroupId,
     subject: DeviceId,
     epoch: u64,
-    issuer_ref: Option<[u8; 32]>,
+    _issuer_ref: Option<[u8; 32]>,
     name: Option<&str>,
     os: Option<&str>,
     now_ms: u64,
 ) -> Result<dto::SignedRecord> {
     sign_body(
         identity,
-        body(kind, group, subject, epoch, identity.id(), issuer_ref, name, os, now_ms)?,
+        body(
+            kind,
+            group,
+            subject,
+            epoch,
+            identity.id(),
+            _issuer_ref,
+            name,
+            os,
+            now_ms,
+        )?,
     )
 }
 #[allow(clippy::too_many_arguments)]
@@ -381,7 +376,7 @@ fn body(
     subject: DeviceId,
     epoch: u64,
     issuer: DeviceId,
-    issuer_ref: Option<[u8; 32]>,
+    _issuer_ref: Option<[u8; 32]>,
     name: Option<&str>,
     os: Option<&str>,
     now: u64,
@@ -395,9 +390,6 @@ fn body(
         (9, now.write()),
     ]
     .into();
-    if let Some(reference) = issuer_ref {
-        raw.insert(6, RawValue::Bytes(reference.to_vec()));
-    }
     if let Some(name) = name {
         raw.insert(7, RawValue::from(name));
     }
@@ -406,22 +398,42 @@ fn body(
     }
     dto::RecordBody::from_raw(raw)
 }
-fn sign_body(identity: &Identity, body: dto::RecordBody) -> Result<dto::SignedRecord> {
-    let signature =
-        dto::Signature::from_raw([(1, RawValue::from(dto::ED25519)), (2, RawValue::Bytes(vec![0; 64]))].into())?;
-    let mut record = dto::SignedRecord::from_raw([(1, body.write()), (2, signature.write())].into())?;
-    let input = retained::record_signature_input(&record)?;
-    let signature = dto::Signature::from_raw(
-        [
-            (1, RawValue::from(dto::ED25519)),
-            (2, RawValue::Bytes(identity.sign(&input).to_vec())),
-        ]
-        .into(),
-    )?;
-    let mut raw = record.into_raw();
-    raw.insert(2, signature.write());
-    record = dto::SignedRecord::from_raw(raw)?;
-    Ok(record)
+fn sign_body(_identity: &Identity, body: dto::RecordBody) -> Result<dto::SignedRecord> {
+    dto::SignedRecord::from_raw([(1, body.write())].into())
+}
+
+fn record_id(record: &dto::SignedRecord) -> Result<[u8; 32]> {
+    let record = project_record(record)?;
+    Ok(crate::wire_identity::object_digest(
+        &record.encode(v2::limits::CONFIG_STATE)?,
+    ))
+}
+
+/// Remove fields retired from the v2 roster wire projection.  The caller's
+/// durable GroupState retains those fields; this projection is used only for
+/// v2 identity, ordering, and network state.
+fn project_record(record: &dto::SignedRecord) -> Result<dto::SignedRecord> {
+    let mut raw = record.raw().clone();
+    raw.remove(&2); // 0.3.x signed-record signature
+    let mut body = record.body()?;
+    body.remove(&6); // 0.3.x issuer/reference digest
+    raw.insert(1, RawValue::Map(body));
+    dto::SignedRecord::from_raw(raw)
+}
+
+/// Returns the stable identity of the roster's Create record. This is local
+/// group anchoring metadata; it is not a wire digest proof or a member
+/// signature.
+pub fn root_id(roster: &dto::Roster) -> Result<[u8; 32]> {
+    let mut root = None;
+    for record in roster.records()?.0 {
+        if dto::RecordBody::from_raw(record.body()?)?.kind()? == dto::RecordKind::Create
+            && root.replace(record_id(&record)?).is_some()
+        {
+            return Err(v2::ErrorCode::StateConflict.into());
+        }
+    }
+    root.ok_or(v2::ErrorCode::AuthenticationFailed.into())
 }
 
 #[cfg(test)]
@@ -443,6 +455,20 @@ mod tests {
         let rejoined = removed.add(&a, b.id(), "b", "test", 4).unwrap();
         assert!(rejoined.contains(b.id()));
     }
+    #[test]
+    fn rejoining_founder_keeps_anchored_legacy_members() {
+        let a = Identity::from_seed([1; 32]);
+        let b = Identity::from_seed([2; 32]);
+        let group = GroupId([1; 16]);
+        let root = Roster::create(&a, group, "a", "test", 0).unwrap();
+        let joined = root.add(&a, b.id(), "b", "test", 1).unwrap();
+        let removed = joined.remove(&b, a.id(), None, 2).unwrap();
+        let rejoined = removed.add(&b, a.id(), "a", "test", 3).unwrap();
+        assert!(rejoined.contains(a.id()));
+        assert!(rejoined.contains(b.id()));
+        assert_eq!(rejoined.anchor(), root.anchor());
+    }
+
     #[test]
     fn foreign_roots_changed_root_digests_and_unanchored_adds_are_rejected() {
         let a = Identity::from_seed([1; 32]);
@@ -477,7 +503,7 @@ mod tests {
         assert!(root.insert(unanchored).is_err());
     }
     #[test]
-    fn full_trust_roster_keeps_signature_format_and_record_digests_without_verifying_signatures() {
+    fn full_trust_roster_keeps_record_identity_without_verifying_signatures() {
         let a = Identity::from_seed([1; 32]);
         let b = Identity::from_seed([2; 32]);
         let root = Roster::create(&a, GroupId([1; 16]), "a", "test", 0).unwrap();
@@ -492,17 +518,8 @@ mod tests {
         crate::identity::STRICT_VERIFICATIONS.with(|count| count.set(0));
         let accepted = root.insert(record.clone()).unwrap();
         assert!(accepted.contains(b.id()));
-        assert_eq!(
-            accepted.member(b.id()).unwrap().add,
-            retained::record_id(&record).unwrap().0
-        );
+        assert_eq!(accepted.member(b.id()).unwrap().add, record_id(&record).unwrap());
         crate::identity::STRICT_VERIFICATIONS.with(|count| assert_eq!(count.get(), 0));
-        let mut raw = record.into_raw();
-        raw.insert(
-            2,
-            RawValue::Map([(1, RawValue::from(dto::ED25519)), (2, RawValue::Bytes(vec![0; 63]))].into()),
-        );
-        assert!(dto::SignedRecord::from_raw(raw).is_err());
     }
     #[test]
     fn equal_epoch_removal_wins_and_signed_unknown_data_is_retained() {
@@ -536,7 +553,7 @@ mod tests {
             3,
         )
         .unwrap();
-        let unknown_id = retained::record_id(&unknown).unwrap().0;
+        let unknown_id = record_id(&unknown).unwrap();
         let kept = removed.insert(unknown.clone()).unwrap();
         assert!(!kept.contains(b.id()));
         assert_eq!(kept.records[&unknown_id].wire, unknown);

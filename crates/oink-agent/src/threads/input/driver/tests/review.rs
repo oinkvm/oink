@@ -70,8 +70,10 @@ fn failed_post_to_one_peer_does_not_drop_output_for_another_peer() {
         }
         // The link to `closed` is lost: the network thread closes the queue.
         drop(ends.remove(&closed));
-        let mut feel = oink_foundation::input::FeelProfile::default();
-        feel.key_repeat_delay_ms += 125;
+        let feel = oink_foundation::input::FeelProfile {
+            wheel_lines_per_notch: Some(5.5),
+            ..Default::default()
+        };
         // One router batch for both attached peers (the changed local feel is broadcast).
         h.driver.command(InputCommand::LocalFeel(feel.clone()));
         assert!(!h.driver.adapter.attached(id(closed)), "the broken peer is detached");

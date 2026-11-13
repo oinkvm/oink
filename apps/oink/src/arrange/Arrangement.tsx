@@ -1,3 +1,4 @@
+import { OsLogo } from '../devices/icons';
 import {
     membersOf,
     sameComputer,
@@ -689,7 +690,7 @@ export function Arrangement({ screens, platform = 'mac', geometryScreens = scree
                 <path d="M3 3 17 17"/>
               </Icon>}
               <span className="scr__label">
-                <span className="scr__name">{s.name}</span>
+                <span className="scr__name">{s.android && <OsLogo os="android" privileged={s.privileged}/>}{s.name}</span>
                 <span className="scr__res">{resW} × {resH}</span>
               </span>
               </span>

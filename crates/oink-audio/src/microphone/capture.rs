@@ -102,6 +102,18 @@ impl std::fmt::Debug for Capture {
 }
 impl Capture {
     pub fn start(id: &str, permit: StartPermit, encoder: crate::source::Encoder) -> Result<Self, String> {
+        Self::start_with_echo(id, permit, encoder, None)
+    }
+
+    /// Start the capture owner with the optional Case A processor paired with
+    /// the existing local playback RenderTap. This does not create a second
+    /// native tap; it only transforms PCM before the existing encoder.
+    pub fn start_with_echo(
+        id: &str,
+        permit: StartPermit,
+        encoder: crate::source::Encoder,
+        echo_input: Option<crate::echo::CaseAInput>,
+    ) -> Result<Self, String> {
         permit.check()?;
         match permission() {
             Permission::Granted | Permission::SystemControlled => (),
@@ -155,10 +167,38 @@ impl Capture {
         let error = Arc::new(Mutex::new(None));
         let health = Arc::new(Health::default());
         let stream = match config.sample_format() {
-            cpal::SampleFormat::F32 => build::<f32>(&device, &config.into(), encoder, error.clone(), health.clone()),
-            cpal::SampleFormat::I16 => build::<i16>(&device, &config.into(), encoder, error.clone(), health.clone()),
-            cpal::SampleFormat::I32 => build::<i32>(&device, &config.into(), encoder, error.clone(), health.clone()),
-            cpal::SampleFormat::U16 => build::<u16>(&device, &config.into(), encoder, error.clone(), health.clone()),
+            cpal::SampleFormat::F32 => build::<f32>(
+                &device,
+                &config.into(),
+                encoder,
+                error.clone(),
+                health.clone(),
+                echo_input,
+            ),
+            cpal::SampleFormat::I16 => build::<i16>(
+                &device,
+                &config.into(),
+                encoder,
+                error.clone(),
+                health.clone(),
+                echo_input,
+            ),
+            cpal::SampleFormat::I32 => build::<i32>(
+                &device,
+                &config.into(),
+                encoder,
+                error.clone(),
+                health.clone(),
+                echo_input,
+            ),
+            cpal::SampleFormat::U16 => build::<u16>(
+                &device,
+                &config.into(),
+                encoder,
+                error.clone(),
+                health.clone(),
+                echo_input,
+            ),
             format => return Err(format!("unsupported microphone sample format: {format}")),
         }?;
         let capture = Self {
@@ -213,21 +253,117 @@ impl Drop for Capture {
     }
 }
 
+/// Turns native capture callbacks into the shared encoder's 48 kHz blocks,
+/// through Case A when it is armed. Runs in the native capture callback with
+/// fixed storage only; separated from the CPAL closure so the product path can
+/// be driven without a device.
+pub(crate) struct CaptureBlocks {
+    rate: u32,
+    resampler: super::resample::Resampler,
+    block: [f32; FRAMES_PER_BLOCK * 2],
+    filled: usize,
+    echo_block: [f32; crate::echo::BLOCK],
+    echo_filled: usize,
+    echo_input: Option<crate::echo::CaseAInput>,
+}
+
+impl CaptureBlocks {
+    pub(crate) fn new(rate: u32, echo_input: Option<crate::echo::CaseAInput>) -> Self {
+        Self {
+            rate,
+            resampler: super::resample::Resampler::new(rate),
+            block: [0.0; FRAMES_PER_BLOCK * 2],
+            filled: 0,
+            echo_block: [0.0; crate::echo::BLOCK],
+            echo_filled: 0,
+            echo_input,
+        }
+    }
+
+    /// One native callback of `frames` mono samples that arrived at
+    /// `callback_at`. Emits finished blocks with their source stamps.
+    pub(crate) fn callback(
+        &mut self,
+        frames: usize,
+        mono: impl Iterator<Item = f32>,
+        callback_at: std::time::Instant,
+        emit: &mut impl FnMut(&[f32], crate::source::Stamp),
+    ) {
+        let stamp = crate::source::Stamp {
+            first_sample_at: None,
+            callback_at: Some(callback_at),
+            delivered_at: callback_at,
+            // CPAL does not expose the native frame position here. A count of
+            // delivered blocks cannot detect capture loss and must not certify
+            // continuity.
+            source_frame_position: None,
+            discontinuity: false,
+        };
+        // CPAL drops the native capture time here. Case A stamps a block by
+        // its position inside this callback, taking the callback arrival as
+        // the time of the callback's last sample. The stamp lags the true ADC
+        // time by the input latency, which only adds delay between reference
+        // and echo (AEC3 estimates it) and never makes the echo precede its
+        // reference; the reference for the stamped span is already rendered.
+        let callback_ns = crate::echo::estimated_host_ns(callback_at) as f64;
+        let resampled = frames as f64 * 48_000.0 / f64::from(self.rate);
+        let mut produced = 0usize;
+        let Self {
+            resampler,
+            block,
+            filled,
+            echo_block,
+            echo_filled,
+            echo_input,
+            ..
+        } = self;
+        for sample in mono {
+            resampler.push(sample, |sample| {
+                produced += 1;
+                if let Some(echo_input) = echo_input.as_mut() {
+                    echo_block[*echo_filled] = sample;
+                    *echo_filled += 1;
+                    if *echo_filled == echo_block.len() {
+                        let remaining = (resampled - produced as f64).max(0.0) + (crate::echo::BLOCK - 1) as f64;
+                        let host_ns = (callback_ns - remaining * 1e9 / 48_000.0).max(1.0) as u64;
+                        let processed = echo_input.process_block(echo_block, host_ns, callback_at, false);
+                        let mut output = [0.0; crate::echo::BLOCK * 2];
+                        for (frame, value) in output.as_chunks_mut::<2>().0.iter_mut().zip(processed) {
+                            frame.fill(value);
+                        }
+                        emit(&output, stamp);
+                        *echo_filled = 0;
+                    }
+                } else {
+                    block[*filled] = sample;
+                    block[*filled + 1] = sample;
+                    *filled += 2;
+                    if *filled == block.len() {
+                        // Encode/post on the native callback with fixed storage, just
+                        // like speaker capture; no allocating PCM channel to an actor.
+                        emit(block, stamp);
+                        *filled = 0;
+                    }
+                }
+            });
+        }
+    }
+}
+
 fn build<T>(
     device: &cpal::Device,
     config: &cpal::StreamConfig,
     encoder: crate::source::Encoder,
     error: Arc<Mutex<Option<String>>>,
     health: Arc<Health>,
+    echo_input: Option<crate::echo::CaseAInput>,
 ) -> Result<cpal::Stream, String>
 where
     T: cpal::SizedSample,
     f32: cpal::FromSample<T>,
 {
     let channels = usize::from(config.channels);
-    let mut resampler = super::resample::Resampler::new(config.sample_rate);
-    let mut block = [0.0; FRAMES_PER_BLOCK * 2];
-    let mut filled = 0;
+    let mut blocks = CaptureBlocks::new(config.sample_rate, echo_input);
     let mut encoder = encoder;
     let error_health = health.clone();
     device
@@ -238,32 +374,12 @@ where
                     return;
                 }
                 let callback_at = std::time::Instant::now();
-                for frame in samples.chunks_exact(channels) {
-                    let mono = frame.iter().map(|value| value.to_sample::<f32>()).sum::<f32>() / channels as f32;
-                    resampler.push(mono, |sample| {
-                        block[filled] = sample;
-                        block[filled + 1] = sample;
-                        filled += 2;
-                        if filled == block.len() {
-                            // Encode/post on the native callback with fixed storage, just
-                            // like speaker capture; no allocating PCM channel to an actor.
-                            encoder.supply(
-                                &block,
-                                crate::source::Stamp {
-                                    first_sample_at: None,
-                                    callback_at: Some(callback_at),
-                                    delivered_at: callback_at,
-                                    // CPAL does not expose the native frame position
-                                    // here. A count of delivered blocks cannot detect
-                                    // capture loss and must not certify continuity.
-                                    source_frame_position: None,
-                                    discontinuity: false,
-                                },
-                            );
-                            filled = 0;
-                        }
-                    });
-                }
+                let mono = samples
+                    .chunks_exact(channels)
+                    .map(|frame| frame.iter().map(|value| value.to_sample::<f32>()).sum::<f32>() / channels as f32);
+                blocks.callback(samples.len() / channels, mono, callback_at, &mut |pcm, stamp| {
+                    encoder.supply(pcm, stamp)
+                });
             },
             move |failure| {
                 if error_health.closing.load(Ordering::Acquire) {

@@ -153,8 +153,8 @@ export const SECTIONS: SectionMeta[] = [
         icon: <KeyboardIcon />,
         items: [
             {
-                id: 'keymap', label: (p) => (p === 'mac' ? tr('Windows 按键映射') : tr('macOS 按键映射')),
-                desc: (p) => (p === 'mac' ? tr('用这台 Mac 的键盘控制 Windows 设备时，修饰键怎么对应') : tr('用这台电脑的键盘控制 Mac 时，修饰键怎么对应')),
+                id: 'keymap', label: () => tr('按键映射'),
+                desc: () => tr('用本机键盘控制其它设备时，修饰键怎么对应'),
                 get keywords() { return tr('键盘 修饰键 快捷键 command option control ctrl alt win caps lock 大写 中英 输入法 映射'); },
             },
             { id: 'takeForegroundOnLeave', only: 'win', get label() { return tr('指针离开时接管前台'); }, get desc() { return tr('指针离开本机时，接管前台应用，避免本机运行读取物理按键的应用时，按键同时在两边生效。若部分应用在指针离开后行为异常，可关闭此开关。'); }, get keywords() { return tr('前台 窗口 游戏 捕获 点击 按键 全屏'); } },
@@ -222,6 +222,7 @@ export const SECTIONS: SectionMeta[] = [
                 }, get desc() {
                     return tr('音频发送到其他设备时，本机扬声器/耳机保持播放');
                 }, get keywords() { return tr('转发 声音 本机'); } },
+            { id: 'echoCancellation', get label() { return tr('回声消除'); }, get desc() { return tr('消除麦克风录制的本机播放的音频'); }, get keywords() { return tr('回声 消除 AEC 麦克风 音频'); } },
             { id: 'virtualMicrophone', get label() { return tr('虚拟麦克风'); }, get keywords() { return tr('麦克风'); } },
             { id: 'microphoneInput', get label() { return tr('共享的麦克风'); }, get desc() { return tr('选择本机共享到其他设备的麦克风'); }, get keywords() { return tr('麦克风 输入 录音 来源 系统默认'); } },
         ],

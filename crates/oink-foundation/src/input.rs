@@ -354,6 +354,36 @@ pub enum InjectEvent {
         code: KeyCode,
         pressed: bool,
     },
+    /// Committed text from a remote input method, inserted as Unicode
+    /// characters instead of key codes: the target's layout, input method and
+    /// held modifiers must not change it. Local injection item; the wire form
+    /// is `InputText` on C0. Never printed: diagnostics keep only its length.
+    Text(InjectedText),
+}
+
+/// Text to insert; `Debug` shows only the UTF-16 length, never the characters.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InjectedText(pub String);
+
+impl InjectedText {
+    pub fn utf16_len(&self) -> usize {
+        self.0.encode_utf16().count()
+    }
+}
+
+impl std::fmt::Debug for InjectedText {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "InjectedText(utf16_len={})", self.utf16_len())
+    }
+}
+
+/// A platform that cannot take a long committed text at once: insert at most
+/// `units` UTF-16 code units per [`InjectEvent::Text`], then wait `pause`
+/// before the next slice (the native backend says why).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TextPacing {
+    pub units: usize,
+    pub pause: std::time::Duration,
 }
 
 /// Existing scroll delivery, retained alongside precision touchpad metadata.

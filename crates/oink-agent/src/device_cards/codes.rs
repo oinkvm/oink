@@ -1,6 +1,6 @@
 //! Preserve unknown numeric wire codes without classifying them as healthy.
 use super::*;
-use oink_protocol::v1::{self, dto};
+use oink_protocol::v2::{self, dto};
 
 macro_rules! map_code {
     ($value:expr, $source:ident, $target:ident, [$($variant:ident),*]) => {
@@ -12,7 +12,7 @@ macro_rules! map_code {
 }
 
 impl TryFrom<&dto::UserFacingProblem> for UserFacingProblem {
-    type Error = v1::Error;
+    type Error = v2::Error;
     fn try_from(value: &dto::UserFacingProblem) -> Result<Self, Self::Error> {
         let (code, unknown_code) = map_code!(
             value.code()?,
@@ -46,7 +46,7 @@ impl TryFrom<&dto::UserFacingProblem> for UserFacingProblem {
     }
 }
 impl TryFrom<&dto::ResourceFault> for ResourceFault {
-    type Error = v1::Error;
+    type Error = v2::Error;
     fn try_from(value: &dto::ResourceFault) -> Result<Self, Self::Error> {
         let (code, unknown_code) = map_code!(
             value.code()?,
@@ -119,7 +119,7 @@ impl DeviceControlResult {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use oink_protocol::v1::{RawMap, RawValue, schema::WireDto};
+    use oink_protocol::v2::{RawMap, RawValue, schema::WireDto};
 
     #[test]
     fn explicit_healthy_unknown_and_missing_faults_stay_distinct() {

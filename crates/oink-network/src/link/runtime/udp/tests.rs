@@ -89,7 +89,10 @@ async fn recovers(failure_kind: u8) {
     .unwrap();
     let identity = inbound.stable_id();
     failure.store(failure_kind, Ordering::Relaxed);
-    if failure_kind == 1 {
+    if failure_kind == 0 {
+        // Host request after the OS moved the process to another network.
+        socket.request_rebind();
+    } else if failure_kind == 1 {
         inbound
             .send_datagram(bytes::Bytes::from_static(b"trigger send"))
             .unwrap();
@@ -98,11 +101,13 @@ async fn recovers(failure_kind: u8) {
             .send_datagram(bytes::Bytes::from_static(b"trigger recv"))
             .unwrap();
     }
-    wake.notified().await;
+    if failure_kind != 0 {
+        wake.notified().await;
+    }
     let replacement = socket
         .rebind(&recovering)
         .unwrap()
-        .expect("EPIPE must rebind the endpoint");
+        .expect("EPIPE or a host request must rebind the endpoint");
     assert_eq!(replacement.local_addr().unwrap(), address);
     assert_eq!(recovering.local_addr().unwrap(), address);
     assert_eq!(inbound.stable_id(), identity);
@@ -140,6 +145,16 @@ async fn defunct_receive_rebinds_same_port_and_preserves_connections() {
     tokio::time::timeout(Duration::from_secs(3), recovers(2))
         .await
         .expect("receive EPIPE recovery");
+}
+
+/// Review H17: Android keeps the process bound to the network it had when the
+/// socket was created. A requested rebind gives a healthy socket a new fd on
+/// the same port and keeps live connections.
+#[tokio::test]
+async fn requested_rebind_replaces_a_healthy_socket_and_preserves_connections() {
+    tokio::time::timeout(Duration::from_secs(3), recovers(0))
+        .await
+        .expect("requested rebind");
 }
 
 #[tokio::test]

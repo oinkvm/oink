@@ -128,11 +128,8 @@ mod tests {
             }],
             screen_shared: vec![],
             focus: FocusObservation::default(),
-            exit_baseline: false,
+            audio: Default::default(),
             microphone_resolution: Default::default(),
-            local_exit_selection_ready: false,
-            selected_exit: None,
-            exit_claim: None,
             emergency_delivery: None,
         };
         (*projector.update(&inputs, 0).unwrap()).clone()

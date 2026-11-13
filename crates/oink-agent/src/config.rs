@@ -197,24 +197,24 @@ impl AgentConfig {
             (serde_json::json!({"schema":1,"local":{}}), settings, owner)
         };
         let mut extended = owner.ensure_option(
-            oink_protocol::v1::dto::LocalOption::SyncSystemArrangement,
-            oink_protocol::v1::RawValue::Bool(true),
+            oink_protocol::v2::dto::LocalOption::SyncSystemArrangement,
+            oink_protocol::v2::RawValue::Bool(true),
         )?;
         extended |= owner.ensure_option(
-            oink_protocol::v1::dto::LocalOption::DisableHiddenDisplays,
-            oink_protocol::v1::RawValue::Bool(false),
+            oink_protocol::v2::dto::LocalOption::DisableHiddenDisplays,
+            oink_protocol::v2::RawValue::Bool(false),
         )?;
         extended |= owner.ensure_option(
-            oink_protocol::v1::dto::LocalOption::AudioQuality,
-            oink_protocol::v1::RawValue::Uint(u64::from(oink_audio::negotiation::Quality::default().number())),
+            oink_protocol::v2::dto::LocalOption::AudioQuality,
+            oink_protocol::v2::RawValue::Uint(u64::from(oink_audio::negotiation::Quality::default().number())),
         )?;
         // Upgrade the old receiver choice without changing its behavior: an
         // old OFF becomes parent ON + mapped gestures + the existing scroll feel.
         // Keep LocalOption 19's released meaning for sources without the new capability.
         let legacy = owner
-            .value(oink_protocol::v1::dto::LocalOption::AcceptContacts)
+            .value(oink_protocol::v2::dto::LocalOption::AcceptContacts)
             .and_then(|value| {
-                if let oink_protocol::v1::RawValue::Bool(v) = value {
+                if let oink_protocol::v2::RawValue::Bool(v) = value {
                     Some(v)
                 } else {
                     None
@@ -222,16 +222,16 @@ impl AgentConfig {
             })
             .unwrap_or(true);
         for (option, value) in [
-            (oink_protocol::v1::dto::LocalOption::TouchpadInjection, true),
-            (oink_protocol::v1::dto::LocalOption::NativeMultifinger, legacy),
+            (oink_protocol::v2::dto::LocalOption::TouchpadInjection, true),
+            (oink_protocol::v2::dto::LocalOption::NativeMultifinger, legacy),
             (
-                oink_protocol::v1::dto::LocalOption::MacScrollFeel,
+                oink_protocol::v2::dto::LocalOption::MacScrollFeel,
                 // The old scroll checkbox had no effect while raw contacts
                 // were OFF: synthetic scrolling always preserved the Mac curve.
                 !legacy || settings.routing.mac_scroll_feel,
             ),
         ] {
-            extended |= owner.ensure_option(option, oink_protocol::v1::RawValue::Bool(value))?;
+            extended |= owner.ensure_option(option, oink_protocol::v2::RawValue::Bool(value))?;
         }
         if let Some(local) = envelope
             .get_mut("local")
@@ -247,10 +247,8 @@ impl AgentConfig {
             .filter(|(option, _)| {
                 matches!(
                     option,
-                    oink_protocol::v1::dto::LocalOption::MicrophoneShareClaim
-                        | oink_protocol::v1::dto::LocalOption::MicrophoneControls
-                        | oink_protocol::v1::dto::LocalOption::MicrophoneReceiveMuted
-                        | oink_protocol::v1::dto::LocalOption::MicrophoneInput
+                    oink_protocol::v2::dto::LocalOption::MicrophoneControls
+                        | oink_protocol::v2::dto::LocalOption::MicrophoneInput
                 )
             })
         {
@@ -308,7 +306,7 @@ impl AgentConfig {
     pub fn preview_preferences(
         &self,
         settings: &Settings,
-    ) -> anyhow::Result<Vec<oink_protocol::v1::dto::DevicePreference>> {
+    ) -> anyhow::Result<Vec<oink_protocol::v2::dto::DevicePreference>> {
         Ok(self.projected_candidate(settings)?.owner.preferences())
     }
     fn projected_candidate(&self, settings: &Settings) -> anyhow::Result<Self> {
@@ -377,11 +375,11 @@ impl AgentConfig {
     }
     pub fn edit_owner(
         &mut self,
-        option: oink_protocol::v1::dto::LocalOption,
+        option: oink_protocol::v2::dto::LocalOption,
         expected: u64,
-        patch: oink_protocol::v1::RawValue,
-    ) -> Result<oink_protocol::v1::dto::DevicePreference, oink_protocol::v1::dto::ControlFailure> {
-        use oink_protocol::v1::dto::ControlFailure;
+        patch: oink_protocol::v2::RawValue,
+    ) -> Result<oink_protocol::v2::dto::DevicePreference, oink_protocol::v2::dto::ControlFailure> {
+        use oink_protocol::v2::dto::ControlFailure;
         let mut candidate = self.clone();
         let item = candidate.owner.edit(option, expected, patch)?;
         projection::apply(&candidate.owner, &mut candidate.settings).map_err(|_| ControlFailure::InvalidValue)?;
@@ -457,14 +455,13 @@ fn command_output(cmd: &str, args: &[&str]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use oink_protocol::v1::{
+    use oink_protocol::v2::{
         RawValue,
         dto::{ControlFailure, LocalOption},
-        schema::WireDto,
     };
     #[test]
     fn saved_custom_keymap_survives_owner_projection_and_restart_under_a_preset() {
-        use oink_protocol::v1::{dto, schema::WireValue};
+        use oink_protocol::v2::{dto, schema::WireValue};
         let home = tempfile::tempdir().unwrap();
         let mut config = AgentConfig::load_from_with_device_name(home.path(), "source".into()).unwrap();
         let mut raw = write_transform(&oink_foundation::input_transform::InputTransform::initial("macos"));
@@ -667,7 +664,7 @@ mod tests {
     #[test]
     fn audio_quality_is_source_owned_persistent_and_revision_checked() {
         use oink_audio::negotiation::Quality;
-        use oink_protocol::v1::{dto::LocalOption, schema::WireValue};
+        use oink_protocol::v2::{dto::LocalOption, schema::WireValue};
         let dir = tempfile::tempdir().unwrap();
         let mut config = AgentConfig::load_from(dir.path()).unwrap();
         let option = LocalOption::AudioQuality;
@@ -687,32 +684,40 @@ mod tests {
     }
 
     #[test]
-    fn fresh_audio_defaults_and_explicit_owner_choices_survive_unrelated_edits() {
-        use oink_protocol::v1::{dto::LocalOption, schema::WireValue};
+    fn the_own_audio_configuration_survives_unrelated_edits_and_restarts() {
+        use oink_audio::route::{Flag, OwnConfig, Version};
+        use oink_foundation::DeviceId;
         let dir = tempfile::tempdir().unwrap();
+        let me = DeviceId([1; 32]);
         let mut config = AgentConfig::load_from(dir.path()).unwrap();
-        assert!(!config.settings.audio.forwarding_enabled);
         assert_eq!(
-            config.owner().value(LocalOption::ForwardingEnabled),
-            Some(false.write())
+            config.owner().audio(me),
+            (OwnConfig::local(me), 0),
+            "a fresh install is all local"
         );
         assert!(!config.settings_path().exists());
-        for enabled in [true, false] {
-            config.update(|s| s.audio.forwarding_enabled = enabled).unwrap();
-            config.update(|s| s.onboarding_done = true).unwrap();
-            config = AgentConfig::load_from(dir.path()).unwrap();
-            assert_eq!(config.settings.audio.forwarding_enabled, enabled);
-            assert_eq!(
-                config.owner().value(LocalOption::ForwardingEnabled),
-                Some(enabled.write())
-            );
-            assert!(stored(dir.path())["local"].get("audio").is_none());
-        }
+        let own = OwnConfig {
+            speaker_exit: false,
+            microphone_send: true,
+            forward: Flag {
+                on: true,
+                version: Version {
+                    stamp: 5 << 16,
+                    author: me,
+                },
+            },
+            receive: OwnConfig::local(me).receive,
+        };
+        config.update_owner(|owner| owner.commit_audio(own, 6 << 16)).unwrap();
+        config.update(|s| s.onboarding_done = true).unwrap();
+        let config = AgentConfig::load_from(dir.path()).unwrap();
+        assert_eq!(config.owner().audio(me), (own, 6 << 16));
+        assert!(stored(dir.path())["local"].get("audio").is_none());
     }
 
     #[test]
     fn touchpad_owner_options_default_on_persist_independently_and_project_legacy() {
-        use oink_protocol::v1::{dto::LocalOption as O, schema::WireValue};
+        use oink_protocol::v2::{dto::LocalOption as O, schema::WireValue};
         let dir = tempfile::tempdir().unwrap();
         let mut config = AgentConfig::load_from(dir.path()).unwrap();
         for option in [O::TouchpadInjection, O::NativeMultifinger, O::MacScrollFeel] {
@@ -751,13 +756,13 @@ mod tests {
     #[test]
     fn touchpad_upgrade_preserves_old_off_and_legacy_scroll_choice() {
         use base64::Engine;
-        use oink_protocol::v1::{RawValue, dto::LocalOption as O, schema::WireValue};
+        use oink_protocol::v2::{RawValue, dto::LocalOption as O, schema::WireValue};
         for (legacy, mac) in [(false, false), (false, true), (true, false), (true, true)] {
             let dir = tempfile::tempdir().unwrap();
             let mut config = AgentConfig::load_from(dir.path()).unwrap();
             config.save().unwrap();
             let mut raw = stored(dir.path());
-            let mut owner = oink_protocol::v1::cbor::decode(&config.owner().encode().unwrap(), 4 * 1024 * 1024)
+            let mut owner = oink_protocol::v2::cbor::decode(&config.owner().encode().unwrap(), 4 * 1024 * 1024)
                 .unwrap()
                 .as_map()
                 .unwrap()
@@ -1262,70 +1267,39 @@ mod tests {
         assert_eq!(reloaded.device_name(), "first");
     }
     #[test]
-    fn group_claim_projection_recovers_as_one_commit_and_retries_failed_switch() {
+    fn own_audio_configuration_recovers_as_one_commit_and_retries_failed_switch() {
+        use oink_audio::route::OwnConfig;
         use oink_foundation::{DeviceId, GroupId};
-        use oink_protocol::v1::{dto, schema::WireValue};
         let home = tempfile::tempdir().unwrap();
         let me = DeviceId([1; 32]);
         let source = GroupId([2; 16]);
         let target = GroupId([3; 16]);
         let mut config = AgentConfig::load_from(home.path()).unwrap();
-        let claim = dto::AudioExitClaim::from_raw(
-            [
-                (
-                    1,
-                    RawValue::Map([(1, 7u64.write()), (2, store::wire_device(me).write())].into()),
-                ),
-                (2, true.write()),
-            ]
-            .into(),
-        )
-        .unwrap();
+        let own = OwnConfig {
+            speaker_exit: true,
+            ..OwnConfig::local(me)
+        };
         config
             .update_owner(|owner| {
-                owner.switch_group(source, me)?;
-                owner.commit_claims(
-                    source,
-                    me,
-                    owner::GroupClaims {
-                        watermark: None,
-                        seen_counter: 7,
-                        records: vec![owner::ClaimRecord {
-                            owner: me,
-                            revision: 3,
-                            claim: Some(claim.clone()),
-                        }],
-                    },
-                )
+                owner.switch_group(source)?;
+                owner.commit_audio(own, 7 << 16)
             })
             .unwrap();
         let before = std::fs::read(config.settings_path()).unwrap();
         let saved_owner = config.owner().clone();
         std::fs::remove_file(config.settings_path()).unwrap();
         std::fs::create_dir(config.settings_path()).unwrap();
-        assert!(config.update_owner(|owner| owner.switch_group(target, me)).is_err());
+        assert!(config.update_owner(|owner| owner.switch_group(target)).is_err());
         assert_eq!(config.owner(), &saved_owner);
         std::fs::remove_dir(config.settings_path()).unwrap();
         std::fs::write(config.settings_path(), before).unwrap();
         let mut restarted = AgentConfig::load_from(home.path()).unwrap();
         assert_eq!(restarted.owner(), &saved_owner);
-        restarted.update_owner(|owner| owner.switch_group(target, me)).unwrap();
-        let mut restarted = AgentConfig::load_from(home.path()).unwrap();
+        restarted.update_owner(|owner| owner.switch_group(target)).unwrap();
+        let restarted = AgentConfig::load_from(home.path()).unwrap();
         assert_eq!(restarted.owner().active_group(), Some(target));
-        assert_eq!(
-            restarted.owner().value(LocalOption::AudioExitClaim),
-            Some(RawValue::Null)
-        );
-        assert_eq!(restarted.owner().claims(source), saved_owner.claims(source));
-        restarted.update_owner(|owner| owner.switch_group(source, me)).unwrap();
-        let recovered = AgentConfig::load_from(home.path()).unwrap();
-        assert_eq!(recovered.owner().active_group(), Some(source));
-        assert_eq!(
-            recovered.owner().value(LocalOption::AudioExitClaim),
-            Some(claim.write())
-        );
-        assert_eq!(recovered.owner().revision(LocalOption::AudioExitClaim), Some(5));
-        assert_eq!(recovered.owner().claims(source).seen_counter, 7);
+        // Device-level: the switch keeps this device's own configuration.
+        assert_eq!(restarted.owner().audio(me), (own, 7 << 16));
     }
     #[test]
     fn new_screen_defaults_preserve_user_choices_and_unplugged_preferences() {
@@ -1505,7 +1479,7 @@ mod tests {
 mod display_policy_defaults_tests {
     use super::*;
     use base64::Engine;
-    use oink_protocol::v1::{RawValue, dto::LocalOption};
+    use oink_protocol::v2::{RawValue, dto::LocalOption};
 
     #[test]
     fn arrangement_defaults_on_but_explicit_off_is_preserved_without_migration() {

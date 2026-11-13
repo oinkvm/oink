@@ -136,7 +136,7 @@ const WINDOWS_VERBS: &[(&str, &str, bool)] = &[
     ("*", "%1", true),
 ];
 
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 fn paste_menu_icon_value(dll: &Path, dark: bool) -> String {
     // The state DLL contains both VI-approved marks. Explorer does not
     // re-evaluate an Icon registry value when the theme changes. The caller
@@ -429,5 +429,18 @@ mod tests {
         assert_eq!(shell_destination(root.path()).unwrap(), root.path());
         assert_eq!(shell_destination(&file).unwrap(), root.path());
         assert!(shell_destination(&root.path().join("missing")).is_err());
+    }
+
+    #[test]
+    fn shell_icon_uses_the_embedded_light_or_dark_mark() {
+        let dll = Path::new(r"C:\Program Files\Oink\OinkPasteMenu.dll");
+        assert_eq!(
+            paste_menu_icon_value(dll, false),
+            r#""C:\Program Files\Oink\OinkPasteMenu.dll",-101"#
+        );
+        assert_eq!(
+            paste_menu_icon_value(dll, true),
+            r#""C:\Program Files\Oink\OinkPasteMenu.dll",-102"#
+        );
     }
 }

@@ -1,6 +1,6 @@
 [package]
 name = "oink-protocol"
-description = "Typed v1 wire protocol, canonical CBOR framing and admission"
+description = "Typed v2 wire protocol, canonical CBOR framing and admission"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -18,8 +18,9 @@ minicbor = { version = "2.3", default-features = false }
 sha2 = "0.10"
 
 [dev-dependencies]
-oink-test-support = { path = "../../tests/support", default-features = false, features = ["protocol"] }
+# The registry snapshot (tests/registry.rs).
 serde_json.workspace = true
+
 
 [lints]
 workspace = true

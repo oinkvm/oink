@@ -182,3 +182,16 @@ describe('screen tile resolution', () => {
         expect(labels(renderLayout(layout([retina({ w: 3024, h: 0 })]), {}))).toEqual([[1512, 982]]);
     });
 });
+
+it('keeps an Android phone transform and scale across orientation updates and offline editing', () => {
+    const portrait = {...screen('android:built-in', {x:0,y:0,w:400,h:800}), os:'android' as const};
+    const landscape = {...portrait, display:{...portrait.display, bounds:{x:0,y:0,w:800,h:400}, pixel_width:800,pixel_height:400,rotation_deg:90}};
+    const first = renderLayout(layout([portrait]), {}, [placement]);
+    const rotated = renderLayout(layout([landscape]), {}, [placement]);
+    expect(first[0].android).toBe(true);
+    expect([rotated[0].w,rotated[0].h]).toEqual([first[0].h,first[0].w]);
+    expect(layoutPlacements(layout([landscape]),rotated)).toEqual([placement]);
+    const offline = presentScreens(rotated,[{id:'computer',name:'Phone',group:'offline',privileged:true}]);
+    expect(offline[0]).toMatchObject({name:'Phone',offline:true,android:true,privileged:true});
+    expect(layoutPlacements(layout([landscape]),offline)).toEqual([placement]);
+});

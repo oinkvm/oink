@@ -377,6 +377,18 @@ impl Store {
             }
             self.enqueue(report, collected_at, now)?;
             self.state.admissions.push(fingerprint);
+        } else if let Report::RuntimeFault(fault) = &report {
+            // A fault that keeps recurring (a restart loop) queues once until
+            // that report has been sent; error budgets bound the rest.
+            if self
+                .state
+                .queue
+                .iter()
+                .any(|q| matches!(&q.report.report, Report::RuntimeFault(queued) if queued == fault))
+            {
+                return Err(Error::Limit);
+            }
+            self.enqueue(report, collected_at, now)?;
         } else {
             let context = report.context().ok_or(Error::Invalid)?;
             let distribution = matches!(report, Report::PerformanceDistribution(_));
@@ -867,6 +879,45 @@ mod tests {
         drop(s);
         std::fs::write(dir.path().join("checkpoint.json"), b"corrupt").unwrap();
         assert_eq!(Store::open(dir.path(), consent(), DAY).unwrap_err(), Error::Invalid);
+    }
+    #[test]
+    fn a_runtime_fault_is_an_error_event_queued_once_until_sent() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = Store::open(dir.path(), consent(), DAY).unwrap();
+        let fault = Report::RuntimeFault(RuntimeFault {
+            build: build(),
+            component: Component::Agent,
+            fault: FaultKind::NetworkEndpointStopped,
+        });
+        s.observe(1, fault.clone(), DAY, DAY).unwrap();
+        // A restart loop reports the same fault again: still one queued.
+        assert_eq!(s.observe(1, fault.clone(), DAY, DAY), Err(Error::Limit));
+        assert_eq!(s.status().crashes, 1);
+        let submission = s.prepare(1, DAY).unwrap().unwrap();
+        assert_eq!(s.state.budget.crash_requests, 1, "charged to the error budget");
+        let lines: Vec<serde_json::Value> = submission
+            .bytes
+            .split(|b| *b == b'\n')
+            .filter(|line| !line.is_empty())
+            .map(|line| serde_json::from_slice(line).unwrap())
+            .collect();
+        assert_eq!(lines[1]["type"], "event");
+        assert_eq!(lines[2]["level"], "error");
+        assert_eq!(lines[2]["tags"]["fault"], "network_endpoint_stopped");
+        assert_eq!(lines[2]["tags"]["component"], "agent");
+        assert_eq!(lines[2]["exception"]["values"][0]["type"], "network_endpoint_stopped");
+        assert_eq!(lines[2]["exception"]["values"][0]["mechanism"]["handled"], true);
+        assert!(lines[2].get("message").is_none());
+        s.complete(&submission, Delivery::Accepted).unwrap();
+        // Once sent, a later occurrence is admitted again.
+        s.observe(1, fault, DAY + 1, DAY + 1).unwrap();
+        // Only the backend agent reports this fault.
+        let other = Report::RuntimeFault(RuntimeFault {
+            build: build(),
+            component: Component::UiRust,
+            fault: FaultKind::NetworkEndpointStopped,
+        });
+        assert_eq!(s.observe(1, other, DAY + 1, DAY + 1), Err(Error::Invalid));
     }
     #[test]
     fn retries_keep_ids_charge_before_network_and_stop_at_three() {

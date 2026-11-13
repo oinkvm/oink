@@ -1,7 +1,7 @@
 //! Poll-driven QUIC framing. Each visit does at most one message's work.
 use super::*;
 use oink_foundation::handoff_timing::{self, Event, Stage, Token};
-use oink_protocol::{frame::StreamHeader, v1::frame};
+use oink_protocol::{frame::StreamHeader, v2::frame};
 use std::{
     collections::VecDeque,
     future::Future,
@@ -73,7 +73,10 @@ impl PoolSource {
             self.prefer_info = false;
             (info.grant, info.message.clone(), None)
         };
-        if !self.port.low_current(grant) {
+        // Info describes this authenticated physical N1 hop, not the logical
+        // route which happened to publish it. Migration can retire that route
+        // while Info is queued; the new path's Open still needs these facts.
+        if !matches!(message, super::control::LowMsg::Info { .. }) && !self.port.low_current(grant) {
             if let Some(reply) = reply {
                 let _ = reply.send(Err(crate::NetError::Closed));
             }
@@ -121,6 +124,20 @@ pub(super) struct Writer {
     offset: usize,
     pub finished: bool,
     config_drain: usize,
+    /// Outgoing I0 frames taken since the owner last drained them, for the route
+    /// arbiter's idle test: type id, plus the bytes of held-state frames.
+    pub observed: Vec<(u16, Option<Vec<u8>>)>,
+}
+/// Input frames whose bytes the idle test needs (key, button, held set).
+pub(super) fn held_frame(type_id: u16) -> bool {
+    matches!(type_id, 0x0202 | 0x0203 | 0x0205)
+}
+fn observe(observed: &mut Vec<(u16, Option<Vec<u8>>)>, bytes: &[u8]) {
+    if bytes.len() < frame::FRAME_HEADER || observed.len() >= 64 {
+        return;
+    }
+    let type_id = u16::from_le_bytes([bytes[0], bytes[1]]);
+    observed.push((type_id, held_frame(type_id).then(|| bytes.to_vec())));
 }
 impl Writer {
     pub fn new(
@@ -147,6 +164,7 @@ impl Writer {
             offset: 0,
             finished: false,
             config_drain: 0,
+            observed: Vec::new(),
         }
     }
     /// Prepare periodic records before polling either this stream or N0. Do not
@@ -166,6 +184,9 @@ impl Writer {
         }
         for message in messages.messages.iter() {
             self.pending.extend_from_slice(message);
+            if self.header.tag.kind == StreamKind::Input {
+                observe(&mut self.observed, message);
+            }
         }
         self.pending_age = queue.age.track(std::time::Instant::now());
         if let Some(observer) = &messages.observer {
@@ -273,6 +294,9 @@ impl Writer {
             self.timing_record(Stage::NetworkDequeue, conn);
             if self.stream.is_none() {
                 self.header.encode(&mut self.pending);
+            }
+            if self.header.tag.kind == StreamKind::Input {
+                observe(&mut self.observed, &next.bytes);
             }
             self.pending.extend_from_slice(&next.bytes);
         }

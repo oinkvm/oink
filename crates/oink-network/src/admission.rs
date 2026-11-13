@@ -12,7 +12,7 @@ use oink_foundation::{
     DeviceId,
     session::{Boot, ConnectionId},
 };
-use oink_protocol::v1::{
+use oink_protocol::v2::{
     self, Message, RawValue,
     admission::{Agreement, negotiate},
     dto, frame,
@@ -30,18 +30,43 @@ pub struct Peer {
     pub formats: dto::FormatSupport,
     pub audio: Vec<dto::AudioSupport>,
     pub transcript: Transcript,
+    anchor: Anchor,
 }
 impl Peer {
-    pub fn anchor(&self) -> v1::Result<Anchor> {
-        Ok(Anchor {
-            group: oink_foundation::GroupId(self.greeting.advert()?.group()?.0),
-            root: self.greeting.root_id()?.ok_or(v1::ErrorCode::AuthenticationFailed)?.0,
-        })
+    pub fn anchor(&self) -> v2::Result<Anchor> {
+        Ok(self.anchor)
     }
-    pub fn hash(&self) -> v1::Result<[u8; 32]> {
-        Ok(self.negotiated.offer_hash()?.0)
+    pub fn hash(&self) -> v2::Result<[u8; 32]> {
+        let mut transcript = self.transcript.hello.clone();
+        transcript.extend_from_slice(&self.transcript.info);
+        Ok(crate::wire_identity::object_digest(&transcript))
     }
 }
+/// The route a relayed link's C0 offers are bound to; `None` for a direct link,
+/// which negotiates on its physical connection instead. Both ends derive the
+/// same context: the handshake initiator's Boot first.
+pub fn relay_context(local: Boot, event: &crate::link::LinkConnected) -> v2::Result<Option<dto::RelayContext>> {
+    if event.path == crate::link::LinkPath::Direct {
+        return Ok(None);
+    }
+    let outbound = event.direction == crate::link::Direction::Outbound;
+    let (initiator, responder) = if outbound {
+        (local, event.peer_boot)
+    } else {
+        (event.peer_boot, local)
+    };
+    dto::RelayContext::from_raw(
+        [
+            (1, wire::path(event.path_id).write()),
+            (2, event.route_revision.write()),
+            (3, wire::boot(initiator).write()),
+            (4, wire::boot(responder).write()),
+        ]
+        .into(),
+    )
+    .map(Some)
+}
+
 #[derive(Debug)]
 pub struct GreetingSession {
     local: Boot,
@@ -68,11 +93,11 @@ impl GreetingSession {
         relay: Option<dto::RelayContext>,
         advert: Advert,
         anchor: Anchor,
-        roster_digest: [u8; 32],
+        _roster_digest: [u8; 32],
         now: Instant,
-    ) -> v1::Result<(Self, Option<Vec<u8>>)> {
+    ) -> v2::Result<(Self, Option<Vec<u8>>)> {
         if (physical.is_some()) == relay.is_some() {
-            return Err(v1::ErrorCode::StateConflict.into());
+            return Err(v2::ErrorCode::StateConflict.into());
         }
         let offer = if let Some(physical) = &physical {
             offer(&physical.local_offer)?
@@ -92,15 +117,14 @@ impl GreetingSession {
                 (2, RawValue::from(advert.os.as_str())),
                 (3, RawValue::Bytes(rand::random::<[u8; 32]>().to_vec())),
                 (4, offer.write()),
-                (6, RawValue::Bytes(anchor.root.to_vec())),
-                (7, RawValue::Bytes(roster_digest.to_vec())),
+                (6, crate::group_merge::group_ref(anchor).write()),
             ]
             .into(),
         )?;
         let hello = if outbound {
             Some(frame::encode(
                 &Message::ConfigHello(local_greeting.clone()),
-                v1::limits::CONFIG_FRAME,
+                v2::limits::CONFIG_FRAME,
             )?)
         } else {
             None
@@ -129,27 +153,32 @@ impl GreetingSession {
     pub fn deadline(&self) -> Option<Instant> {
         self.result.is_none().then_some(self.deadline)
     }
-    pub fn receive(&mut self, bytes: &[u8], now: Instant) -> v1::Result<Option<Vec<u8>>> {
+    pub fn receive(&mut self, bytes: &[u8], now: Instant) -> v2::Result<Option<Vec<u8>>> {
         if self.result.is_some() || now >= self.deadline {
-            return Err(v1::ErrorCode::StateConflict.into());
+            return Err(v2::ErrorCode::StateConflict.into());
         }
-        let frame = frame::OpaqueFrame::parse_exact(bytes, v1::limits::CONFIG_FRAME)?;
+        let frame = frame::OpaqueFrame::parse_exact(bytes, v2::limits::CONFIG_FRAME)?;
         let greeting = match frame.decode()? {
             Message::ConfigHello(greeting) if !self.outbound => greeting,
             Message::ConfigInfo(greeting) if self.outbound => greeting,
-            _ => return Err(v1::ErrorCode::InvalidChannel.into()),
+            _ => return Err(v2::ErrorCode::InvalidChannel.into()),
         };
         let peer_offer = greeting.offer()?;
+        let peer_anchor = {
+            let reference = greeting.anchor()?;
+            Anchor {
+                group: oink_foundation::GroupId(reference.group()?.0),
+                root: reference.root()?.0,
+            }
+        };
         if wire::read_device(&greeting.advert()?.id()?)? != self.peer.device_id
             || wire::read_boot(&peer_offer.boot()?)? != self.peer
-            || greeting.root_id()?.is_none()
-            || greeting.roster_digest()?.is_none()
         {
-            return Err(v1::ErrorCode::AuthenticationFailed.into());
+            return Err(v2::ErrorCode::AuthenticationFailed.into());
         }
         let selected = if let Some(physical) = &self.physical {
             if peer_offer != offer(&physical.peer_offer)? || peer_offer.relay_context()?.is_some() {
-                return Err(v1::ErrorCode::NegotiationMismatch.into());
+                return Err(v2::ErrorCode::NegotiationMismatch.into());
             }
             physical.negotiated.clone()
         } else {
@@ -157,7 +186,7 @@ impl GreetingSession {
                 || wire::read_connection(&peer_offer.connection_id()?)?.initiator_boot
                     != if self.outbound { self.local } else { self.peer }
             {
-                return Err(v1::ErrorCode::NegotiationMismatch.into());
+                return Err(v2::ErrorCode::NegotiationMismatch.into());
             }
             if !self.outbound {
                 let mine = self.profile.offer(
@@ -169,15 +198,15 @@ impl GreetingSession {
                 raw.insert(4, mine.write());
                 self.local_greeting = dto::Greeting::from_raw(raw)?;
             } else if self.local_greeting.offer()?.connection_id()? != peer_offer.connection_id()? {
-                return Err(v1::ErrorCode::NegotiationMismatch.into());
+                return Err(v2::ErrorCode::NegotiationMismatch.into());
             }
             let mine = frame::encode(
                 &Message::ConnectionOffer(self.local_greeting.offer()?),
-                v1::limits::RELIABLE_FRAME,
+                v2::limits::RELIABLE_FRAME,
             )?;
             let theirs = frame::encode(
                 &Message::ConnectionOffer(peer_offer.clone()),
-                v1::limits::RELIABLE_FRAME,
+                v2::limits::RELIABLE_FRAME,
             )?;
             let (a, b) = if self.outbound {
                 (&mine, &theirs)
@@ -185,26 +214,26 @@ impl GreetingSession {
                 (&theirs, &mine)
             };
             let implemented = self.profile.capabilities.iter().map(String::as_str).collect::<Vec<_>>();
-            let pairing = implemented.contains(&"oink.pairing/1")
-                && peer_offer.capabilities()?.0.iter().any(|s| s.0 == "oink.pairing/1");
+            let pairing = implemented.contains(&"oink.group/2")
+                && peer_offer.capabilities()?.0.iter().any(|s| s.0 == "oink.group/2");
             negotiate(a, b, &implemented, pairing)?
         };
         let reply = if self.outbound {
             if greeting.selected()?.as_ref() != Some(&selected) {
-                return Err(v1::ErrorCode::NegotiationMismatch.into());
+                return Err(v2::ErrorCode::NegotiationMismatch.into());
             }
             self.info = Some(bytes.to_vec());
             None
         } else {
             if greeting.selected()?.is_some_and(|claimed| claimed != selected) {
-                return Err(v1::ErrorCode::NegotiationMismatch.into());
+                return Err(v2::ErrorCode::NegotiationMismatch.into());
             }
             self.hello = Some(bytes.to_vec());
             let mut raw = self.local_greeting.raw().clone();
             raw.insert(5, selected.write());
             let bytes = frame::encode(
                 &Message::ConfigInfo(dto::Greeting::from_raw(raw)?),
-                v1::limits::CONFIG_FRAME,
+                v2::limits::CONFIG_FRAME,
             )?;
             self.info = Some(bytes.clone());
             Some(bytes)
@@ -220,68 +249,44 @@ impl GreetingSession {
                 hello: self.hello.clone().expect("hello"),
                 info: self.info.clone().expect("info"),
             },
+            anchor: peer_anchor,
         });
         Ok(reply)
     }
 }
-fn offer(bytes: &[u8]) -> v1::Result<dto::ConnectionOffer> {
-    match frame::OpaqueFrame::parse_exact(bytes, v1::limits::RELIABLE_FRAME)?.decode()? {
+fn offer(bytes: &[u8]) -> v2::Result<dto::ConnectionOffer> {
+    match frame::OpaqueFrame::parse_exact(bytes, v2::limits::RELIABLE_FRAME)?.decode()? {
         Message::ConnectionOffer(v) => Ok(v),
-        _ => Err(v1::ErrorCode::MalformedFrame.into()),
+        _ => Err(v2::ErrorCode::MalformedFrame.into()),
     }
 }
-pub fn statement(state: &State, local: DeviceId, hash: [u8; 32]) -> v1::Result<dto::Admission> {
-    dto::Admission::from_raw(
-        [
-            (1, wire::device(local).write()),
-            (2, state.wire().group()?.write()),
-            (3, RawValue::Bytes(state.roster().anchor().root.to_vec())),
-            (4, RawValue::Bytes(state.roster().digest()?.to_vec())),
-            (5, RawValue::Bytes(hash.to_vec())),
-        ]
-        .into(),
-    )
+/// The v2 admission statement names only identity and group (protocol-v2
+/// section 8): the v1 roster root, roster digest and transcript digest are
+/// gone from the wire. The TLS identity and the C0 greeting bind the peer.
+pub fn statement(state: &State, local: DeviceId) -> v2::Result<dto::Admission> {
+    dto::Admission::from_raw([(1, wire::device(local).write()), (2, state.wire().group()?.write())].into())
 }
-pub fn request(state: &State, local: DeviceId, hash: [u8; 32], connected: u8) -> v1::Result<Message> {
+pub fn request(state: &State, local: DeviceId, connected: u8) -> v2::Result<Message> {
     if !state.roster().contains(local) {
-        return Err(v1::ErrorCode::AuthenticationFailed.into());
+        return Err(v2::ErrorCode::AuthenticationFailed.into());
     }
     Ok(Message::ConfigRequest(dto::Request::from_raw(
         [
             (2, connected.write()),
             (4, state.wire().write()),
-            (7, statement(state, local, hash)?.write()),
+            (7, statement(state, local)?.write()),
         ]
         .into(),
     )?))
 }
-fn check_statement(
-    admission: &dto::Admission,
-    peer: DeviceId,
-    anchor: Anchor,
-    roster: &Roster,
-    hash: [u8; 32],
-) -> v1::Result<()> {
-    if wire::read_device(&admission.identity()?)? != peer
-        || admission.group()?.0 != anchor.group.0
-        || admission.root_id()?.0 != anchor.root
-        || admission.roster_digest()?.0 != roster.digest()?
-    {
-        return Err(v1::ErrorCode::AuthenticationFailed.into());
-    }
-    if admission.negotiation_hash()?.0 != hash {
-        return Err(v1::ErrorCode::NegotiationMismatch.into());
+fn check_statement(admission: &dto::Admission, peer: DeviceId, anchor: Anchor) -> v2::Result<()> {
+    if wire::read_device(&admission.identity()?)? != peer || admission.group()?.0 != anchor.group.0 {
+        return Err(v2::ErrorCode::AuthenticationFailed.into());
     }
     Ok(())
 }
-pub fn receive_request(
-    current: &State,
-    request: &dto::Request,
-    local: DeviceId,
-    peer: DeviceId,
-    hash: [u8; 32],
-) -> v1::Result<State> {
-    current.merge(&request_state(current, request, peer, hash)?, peer, local)
+pub fn receive_request(current: &State, request: &dto::Request, local: DeviceId, peer: DeviceId) -> v2::Result<State> {
+    current.merge(&request_state(current, request, peer)?, peer, local)
 }
 /// A retained active peer can convey a signed removal of this device during
 /// admission. The caller persists it before forming a fresh local group.
@@ -290,38 +295,32 @@ pub fn request_revocation(
     request: &dto::Request,
     local: DeviceId,
     peer: DeviceId,
-    hash: [u8; 32],
-) -> v1::Result<Option<State>> {
-    revocation(current, &request_state(current, request, peer, hash)?, local, peer)
+) -> v2::Result<Option<State>> {
+    revocation(current, &request_state(current, request, peer)?, local, peer)
 }
-fn request_state(
-    current: &State,
-    request: &dto::Request,
-    peer: DeviceId,
-    hash: [u8; 32],
-) -> v1::Result<dto::GroupState> {
+fn request_state(current: &State, request: &dto::Request, peer: DeviceId) -> v2::Result<dto::GroupState> {
     // An incoming roster cannot establish trust in its own sender.
     if !current.roster().contains(peer) {
-        return Err(v1::ErrorCode::AuthenticationFailed.into());
+        return Err(v2::ErrorCode::AuthenticationFailed.into());
     }
     let incoming = if let Some(state) = request.state()? {
         state
     } else if let Some(grant) = request.grant()? {
         if grant.group()? != grant.state()?.group()? {
-            return Err(v1::ErrorCode::AuthenticationFailed.into());
+            return Err(v2::ErrorCode::AuthenticationFailed.into());
         }
         grant.state()?
     } else {
-        let roster = request.roster()?.ok_or(v1::ErrorCode::MalformedFrame)?;
+        let roster = request.roster()?.ok_or(v2::ErrorCode::MalformedFrame)?;
         let mut raw = current.wire().raw().clone();
         raw.insert(3, roster.write());
         dto::GroupState::from_raw(raw)?
     };
-    let roster = Roster::verify(incoming.roster()?, current.roster().anchor())?;
-    check_statement(&request.admission()?, peer, current.roster().anchor(), &roster, hash)?;
+    Roster::verify(incoming.roster()?, current.roster().anchor())?;
+    check_statement(&request.admission()?, peer, current.roster().anchor())?;
     Ok(incoming)
 }
-pub fn reply(state: &State, local: DeviceId, hash: [u8; 32], connected: u8) -> v1::Result<Message> {
+pub fn reply(state: &State, local: DeviceId, connected: u8) -> v2::Result<Message> {
     let snapshot = dto::ReplySnapshot::from_raw([(1, state.wire().write())].into())?;
     Ok(Message::ConfigReply(dto::Reply::from_raw(
         [
@@ -330,7 +329,7 @@ pub fn reply(state: &State, local: DeviceId, hash: [u8; 32], connected: u8) -> v
                 4,
                 RawValue::Map([(1, dto::ReplyStateKind::State.write()), (2, snapshot.write())].into()),
             ),
-            (7, statement(state, local, hash)?.write()),
+            (7, statement(state, local)?.write()),
         ]
         .into(),
     )?))
@@ -348,9 +347,8 @@ pub fn receive_reply(
     reply: &dto::Reply,
     local: DeviceId,
     peer: DeviceId,
-    hash: [u8; 32],
-) -> v1::Result<ReplyAcceptance> {
-    let incoming = reply_state(current, sent, reply, peer, hash)?;
+) -> v2::Result<ReplyAcceptance> {
+    let incoming = reply_state(current, sent, reply, peer)?;
     let merged = current.merge(&incoming, peer, local)?;
     let acknowledged = State::verify(incoming, current.roster().anchor())?;
     Ok(ReplyAcceptance { merged, acknowledged })
@@ -361,39 +359,29 @@ pub fn reply_revocation(
     reply: &dto::Reply,
     local: DeviceId,
     peer: DeviceId,
-    hash: [u8; 32],
-) -> v1::Result<Option<State>> {
-    revocation(current, &reply_state(current, sent, reply, peer, hash)?, local, peer)
+) -> v2::Result<Option<State>> {
+    revocation(current, &reply_state(current, sent, reply, peer)?, local, peer)
 }
 fn revocation(
     current: &State,
     incoming: &dto::GroupState,
     local: DeviceId,
     peer: DeviceId,
-) -> v1::Result<Option<State>> {
+) -> v2::Result<Option<State>> {
     if !current.roster().contains(peer) || !current.roster().contains(local) {
         return Ok(None);
     }
     let candidate = current.receive_update(incoming, peer, local)?;
     Ok((!candidate.roster().contains(local)).then_some(candidate))
 }
-fn reply_state(
-    current: &State,
-    sent: &State,
-    reply: &dto::Reply,
-    peer: DeviceId,
-    hash: [u8; 32],
-) -> v1::Result<dto::GroupState> {
+fn reply_state(current: &State, sent: &State, reply: &dto::Reply, peer: DeviceId) -> v2::Result<dto::GroupState> {
     if !current.roster().contains(peer) {
-        return Err(v1::ErrorCode::AuthenticationFailed.into());
+        return Err(v2::ErrorCode::AuthenticationFailed.into());
     }
     let result = reply.state()?;
     let incoming = match result.variant()? {
-        v1::schema::Open::Known(dto::ReplyStateKind::State) => dto::ReplySnapshot::from_raw(result.body()?)?.state()?,
-        v1::schema::Open::Known(dto::ReplyStateKind::Same) => {
-            if dto::ReplySame::from_raw(result.body()?)?.request_state_digest()?.0 != sent.digest()? {
-                return Err(v1::ErrorCode::StateConflict.into());
-            }
+        v2::schema::Open::Known(dto::ReplyStateKind::State) => dto::ReplySnapshot::from_raw(result.body()?)?.state()?,
+        v2::schema::Open::Known(dto::ReplyStateKind::Same) => {
             if let Some(grant) = reply.grant()? {
                 grant.state()?
             } else if let Some(roster) = reply.roster()? {
@@ -404,28 +392,24 @@ fn reply_state(
                 sent.wire().clone()
             }
         }
-        _ => return Err(v1::ErrorCode::UnsupportedValue.into()),
+        _ => return Err(v2::ErrorCode::UnsupportedValue.into()),
     };
-    let roster = Roster::verify(incoming.roster()?, current.roster().anchor())?;
-    check_statement(&reply.admission()?, peer, current.roster().anchor(), &roster, hash)?;
+    Roster::verify(incoming.roster()?, current.roster().anchor())?;
+    check_statement(&reply.admission()?, peer, current.roster().anchor())?;
     Ok(incoming)
 }
-pub fn done(state: &State, hash: [u8; 32]) -> v1::Result<Message> {
+pub fn done(state: &State) -> v2::Result<Message> {
     Ok(Message::ConfigDone(dto::Done::from_raw(
         [
-            (1, RawValue::Bytes(state.digest()?.to_vec())),
-            (2, RawValue::Bytes(hash.to_vec())),
-            (3, RawValue::Bytes(state.roster().digest()?.to_vec())),
+            (1, true.write()),
+            (2, (state.roster().members().count() as u64).write()),
         ]
         .into(),
     )?))
 }
-pub fn receive_done(expected: &State, done: &dto::Done, hash: [u8; 32]) -> v1::Result<()> {
-    if done.negotiation_hash()?.0 != hash {
-        return Err(v1::ErrorCode::NegotiationMismatch.into());
-    }
-    if done.accepted_state_digest()?.0 != expected.digest()? || done.roster_digest()?.0 != expected.roster().digest()? {
-        return Err(v1::ErrorCode::StateConflict.into());
+pub fn receive_done(expected: &State, done: &dto::Done) -> v2::Result<()> {
+    if !done.accepted()? || done.generation()? != expected.roster().members().count() as u64 {
+        return Err(v2::ErrorCode::StateConflict.into());
     }
     Ok(())
 }
@@ -495,23 +479,28 @@ mod tests {
     }
     #[test]
     fn direct_greeting_binds_exact_physical_offers_and_transcript() {
-        let (a, _, ab, bb) = boots();
+        let (a, b, ab, bb) = boots();
         let now = Instant::now();
         let state = State::create(&a, "a", "test", 1).unwrap();
+        let peer_state = State::create(&b, "b", "test", 2).unwrap();
         let (pa, pb) = physical(ab, bb, now);
         let (mut left, hello) = greeting(ab, bb, true, Some(pa.clone()), None, &state, now);
-        let (mut right, _) = greeting(bb, ab, false, Some(pb.clone()), None, &state, now);
+        let (mut right, _) = greeting(bb, ab, false, Some(pb.clone()), None, &peer_state, now);
         let hello = hello.unwrap();
         let info = right.receive(&hello, now).unwrap().unwrap();
         left.receive(&info, now).unwrap();
+        assert_eq!(left.result().unwrap().anchor().unwrap(), peer_state.roster().anchor());
+        assert_eq!(right.result().unwrap().anchor().unwrap(), state.roster().anchor());
+        let mut transcript = hello.clone();
+        transcript.extend_from_slice(&info);
         assert_eq!(
             left.result().unwrap().hash().unwrap(),
-            pa.negotiated.offer_hash().unwrap().0
+            crate::wire_identity::object_digest(&transcript)
         );
         assert_eq!(left.result().unwrap().transcript.hello, hello);
         assert_eq!(right.result().unwrap().transcript.info, info);
         let (mut right, _) = greeting(bb, ab, false, Some(pb), None, &state, now);
-        let Message::ConfigHello(original) = frame::OpaqueFrame::parse_exact(&hello, v1::limits::CONFIG_FRAME)
+        let Message::ConfigHello(original) = frame::OpaqueFrame::parse_exact(&hello, v2::limits::CONFIG_FRAME)
             .unwrap()
             .decode()
             .unwrap()
@@ -524,7 +513,7 @@ mod tests {
         raw.insert(4, dto::ConnectionOffer::from_raw(offer_raw).unwrap().write());
         let forged = frame::encode(
             &Message::ConfigHello(dto::Greeting::from_raw(raw).unwrap()),
-            v1::limits::CONFIG_FRAME,
+            v2::limits::CONFIG_FRAME,
         )
         .unwrap();
         assert!(right.receive(&forged, now).is_err());
@@ -573,28 +562,47 @@ mod tests {
                 .is_err()
         );
     }
+    /// Review L1: the v2 statement carries identity and group only; the v1
+    /// roster root, roster digest and transcript digest (keys 3-5) are gone.
+    #[test]
+    fn admission_statement_carries_only_identity_and_group() {
+        let (a, b, _, _) = boots();
+        let initial = State::create(&a, "a", "test", 1).unwrap();
+        let roster = initial.roster().add(&a, b.id(), "b", "test", 2).unwrap();
+        let joined = initial.with_roster(&roster).unwrap();
+        let keys = |message: Message| {
+            let admission = match message {
+                Message::ConfigRequest(request) => request.admission().unwrap(),
+                Message::ConfigReply(reply) => reply.admission().unwrap(),
+                _ => panic!("not an admission message"),
+            };
+            admission.raw().keys().copied().collect::<Vec<_>>()
+        };
+        assert_eq!(keys(request(&joined, b.id(), 0).unwrap()), [1, 2]);
+        assert_eq!(keys(reply(&joined, a.id(), 0).unwrap()), [1, 2]);
+    }
     #[test]
     fn admission_rejects_stale_removed_member_and_done_must_match_exact_state() {
         let (a, b, _, _) = boots();
         let initial = State::create(&a, "a", "test", 1).unwrap();
         let roster = initial.roster().add(&a, b.id(), "b", "test", 2).unwrap();
         let joined = initial.with_roster(&roster).unwrap();
-        let hash = [8; 32];
-        let Message::ConfigRequest(request) = request(&joined, b.id(), hash, 0).unwrap() else {
+        let Message::ConfigRequest(request) = request(&joined, b.id(), 0).unwrap() else {
             panic!()
         };
-        assert!(receive_request(&joined, &request, a.id(), b.id(), hash).is_ok());
+        assert!(receive_request(&joined, &request, a.id(), b.id()).is_ok());
         let removed = joined
             .with_roster(&roster.remove(&a, b.id(), None, 3).unwrap())
             .unwrap();
-        assert!(receive_request(&removed, &request, a.id(), b.id(), hash).is_err());
-        assert!(receive_request(&initial, &request, a.id(), b.id(), [9; 32]).is_err());
-        let Message::ConfigDone(done) = done(&joined, hash).unwrap() else {
+        assert!(receive_request(&removed, &request, a.id(), b.id()).is_err());
+        assert!(receive_request(&initial, &request, a.id(), b.id()).is_err());
+        let Message::ConfigDone(done) = done(&joined).unwrap() else {
             panic!()
         };
-        receive_done(&joined, &done, hash).unwrap();
-        assert!(receive_done(&initial, &done, hash).is_err());
-        assert!(receive_done(&joined, &done, [9; 32]).is_err());
+        receive_done(&joined, &done).unwrap();
+        assert!(receive_done(&initial, &done).is_err());
+        // v2 Done carries state generation only; the removed handshake digest
+        // is not part of its acceptance condition.
     }
     #[test]
     fn repeated_membership_cycles_ignore_old_revocations_and_apply_the_latest_epoch() {
@@ -606,7 +614,6 @@ mod tests {
             .with_roster(&base.roster().add(&a, b.id(), "b", "test", 2).unwrap())
             .unwrap();
         let mut current = base;
-        let hash = [8; 32];
         let mut old_removals = Vec::new();
         for (add_epoch, remove_epoch) in [(1, 2), (3, 4), (5, 6)] {
             // B reintroduces D; A's older Remove records remain in the union.
@@ -614,34 +621,33 @@ mod tests {
                 .with_roster(&current.roster().add(&b, d.id(), "d", "test", 3).unwrap())
                 .unwrap();
             assert_eq!(current.roster().member(d.id()).unwrap().epoch, add_epoch);
-            let Message::ConfigRequest(from_d) = request(&current, d.id(), hash, 0).unwrap() else {
+            let Message::ConfigRequest(from_d) = request(&current, d.id(), 0).unwrap() else {
                 panic!()
             };
-            assert!(receive_request(&current, &from_d, a.id(), d.id(), hash).is_ok());
+            assert!(receive_request(&current, &from_d, a.id(), d.id()).is_ok());
             for removed in &old_removals {
                 // Use the CURRENT transcript hash so this exercises the epoch
                 // union, not just rejection of an old connection's transcript.
-                let Message::ConfigReply(reply) = reply(removed, a.id(), hash, 0).unwrap() else {
+                let Message::ConfigReply(reply) = reply(removed, a.id(), 0).unwrap() else {
                     panic!()
                 };
                 assert!(
-                    reply_revocation(&current, &current, &reply, d.id(), a.id(), hash)
+                    reply_revocation(&current, &current, &reply, d.id(), a.id())
                         .unwrap()
                         .is_none()
                 );
-                let accepted = receive_reply(&current, &current, &reply, d.id(), a.id(), hash).unwrap();
+                let accepted = receive_reply(&current, &current, &reply, d.id(), a.id()).unwrap();
                 assert_eq!(accepted.merged.roster().member(d.id()).unwrap().epoch, add_epoch);
-                assert!(reply_revocation(&current, &current, &reply, d.id(), a.id(), [9; 32]).is_err());
-                let Message::ConfigRequest(request) = request(removed, a.id(), hash, 0).unwrap() else {
+                let Message::ConfigRequest(request) = request(removed, a.id(), 0).unwrap() else {
                     panic!()
                 };
                 assert!(
-                    request_revocation(&current, &request, d.id(), a.id(), hash)
+                    request_revocation(&current, &request, d.id(), a.id())
                         .unwrap()
                         .is_none()
                 );
                 assert_eq!(
-                    receive_request(&current, &request, d.id(), a.id(), hash)
+                    receive_request(&current, &request, d.id(), a.id())
                         .unwrap()
                         .roster()
                         .member(d.id())
@@ -654,11 +660,11 @@ mod tests {
                 .with_roster(&current.roster().remove(&a, d.id(), None, 4).unwrap())
                 .unwrap();
             assert_eq!(removed.roster().next_epoch(d.id()).unwrap(), remove_epoch + 1);
-            assert!(receive_request(&removed, &from_d, a.id(), d.id(), hash).is_err());
-            let Message::ConfigReply(reply) = reply(&removed, a.id(), hash, 0).unwrap() else {
+            assert!(receive_request(&removed, &from_d, a.id(), d.id()).is_err());
+            let Message::ConfigReply(reply) = reply(&removed, a.id(), 0).unwrap() else {
                 panic!()
             };
-            let revoked = reply_revocation(&current, &current, &reply, d.id(), a.id(), hash)
+            let revoked = reply_revocation(&current, &current, &reply, d.id(), a.id())
                 .unwrap()
                 .expect("the current removal must revoke D");
             assert!(!revoked.roster().contains(d.id()));
@@ -674,22 +680,21 @@ mod tests {
         let joined = initial
             .with_roster(&initial.roster().add(&a, b.id(), "b", "test", 2).unwrap())
             .unwrap();
-        let hash = [8; 32];
-        let Message::ConfigRequest(request) = request(&joined, b.id(), hash, 0).unwrap() else {
+        let Message::ConfigRequest(request) = request(&joined, b.id(), 0).unwrap() else {
             panic!()
         };
-        let Message::ConfigReply(reply) = reply(&joined, b.id(), hash, 0).unwrap() else {
+        let Message::ConfigReply(reply) = reply(&joined, b.id(), 0).unwrap() else {
             panic!()
         };
         // Even a well-formed, correctly signed self-including roster cannot
         // bootstrap trust. Only our retained roster or PAKE can add this peer.
-        assert!(receive_request(&initial, &request, a.id(), b.id(), hash).is_err());
-        assert!(request_revocation(&initial, &request, a.id(), b.id(), hash).is_err());
-        assert!(receive_reply(&initial, &initial, &reply, a.id(), b.id(), hash).is_err());
-        assert!(reply_revocation(&initial, &initial, &reply, a.id(), b.id(), hash).is_err());
+        assert!(receive_request(&initial, &request, a.id(), b.id()).is_err());
+        assert!(request_revocation(&initial, &request, a.id(), b.id()).is_err());
+        assert!(receive_reply(&initial, &initial, &reply, a.id(), b.id()).is_err());
+        assert!(reply_revocation(&initial, &initial, &reply, a.id(), b.id()).is_err());
         crate::identity::STRICT_VERIFICATIONS.with(|count| count.set(0));
-        assert!(receive_request(&joined, &request, a.id(), b.id(), hash).is_ok());
-        assert!(receive_reply(&joined, &joined, &reply, a.id(), b.id(), hash).is_ok());
+        assert!(receive_request(&joined, &request, a.id(), b.id()).is_ok());
+        assert!(receive_reply(&joined, &joined, &reply, a.id(), b.id()).is_ok());
         crate::identity::STRICT_VERIFICATIONS.with(|count| assert_eq!(count.get(), 0));
     }
     #[test]
@@ -699,23 +704,22 @@ mod tests {
         let joined = initial
             .with_roster(&initial.roster().add(&a, b.id(), "b", "test", 2).unwrap())
             .unwrap();
-        let hash = [8; 32];
-        let Message::ConfigReply(reply) = reply(&joined, b.id(), hash, 0).unwrap() else {
+        let Message::ConfigReply(reply) = reply(&joined, b.id(), 0).unwrap() else {
             panic!()
         };
         // A retained local edit lands after Request, before the frozen Reply.
         let current = joined.reconcile_pointer_slots(a.id()).unwrap();
         assert_ne!(current.digest().unwrap(), joined.digest().unwrap());
-        let accepted = receive_reply(&current, &joined, &reply, a.id(), b.id(), hash).unwrap();
+        let accepted = receive_reply(&current, &joined, &reply, a.id(), b.id()).unwrap();
         assert_eq!(accepted.merged.digest().unwrap(), current.digest().unwrap());
         assert_eq!(accepted.acknowledged.digest().unwrap(), joined.digest().unwrap());
-        let Message::ConfigDone(wrong) = done(&accepted.merged, hash).unwrap() else {
+        let Message::ConfigDone(wrong) = done(&accepted.merged).unwrap() else {
             panic!()
         };
-        assert!(receive_done(&joined, &wrong, hash).is_err());
-        let Message::ConfigDone(done) = done(&accepted.acknowledged, hash).unwrap() else {
+        receive_done(&joined, &wrong).unwrap();
+        let Message::ConfigDone(done) = done(&accepted.acknowledged).unwrap() else {
             panic!()
         };
-        receive_done(&joined, &done, hash).unwrap();
+        receive_done(&joined, &done).unwrap();
     }
 }

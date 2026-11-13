@@ -491,28 +491,33 @@ pub(crate) fn request_quit() {
         return;
     }
     std::thread::spawn(|| {
-        if let Ok(node) = crate::backend::node() {
-            match node.prepare_for_update() {
-                Ok(token) => {
-                    #[cfg(windows)]
-                    let saved = windows::user_quit();
-                    #[cfg(not(windows))]
-                    let saved = {
-                        let mut state = lock(&node.inner.update);
-                        state.policy.next_quit = false;
-                        state.save(node.data_dir()).is_ok()
-                    };
-                    if saved {
-                        let _ = token.shutdown_with_ui(true);
-                    }
-                }
-                Err(blockers) => {
+        let Ok(node) = crate::backend::node() else {
+            // No backend runs: a restart after a network-layer failure is
+            // waiting out its back-off. Quit instead of starting it again.
+            crate::host::cancel_restart();
+            QUITTING.store(false, Ordering::Release);
+            return;
+        };
+        match node.prepare_for_update() {
+            Ok(token) => {
+                #[cfg(windows)]
+                let saved = windows::user_quit();
+                #[cfg(not(windows))]
+                let saved = {
                     let mut state = lock(&node.inner.update);
-                    state.status.blockers = blockers;
-                    let status = state.status.clone();
-                    drop(state);
-                    node.emit(ApiEvent::UpdateStatusChanged(status));
+                    state.policy.next_quit = false;
+                    state.save(node.data_dir()).is_ok()
+                };
+                if saved {
+                    let _ = token.shutdown_with_ui(true);
                 }
+            }
+            Err(blockers) => {
+                let mut state = lock(&node.inner.update);
+                state.status.blockers = blockers;
+                let status = state.status.clone();
+                drop(state);
+                node.emit(ApiEvent::UpdateStatusChanged(status));
             }
         }
         QUITTING.store(false, Ordering::Release);

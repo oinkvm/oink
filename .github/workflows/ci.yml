@@ -2,7 +2,7 @@ name: Build and test
 on:
   pull_request:
   push:
-    branches: [main]
+    branches: [main, '0.4']
   workflow_dispatch:
 permissions:
   contents: read
@@ -10,6 +10,8 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 env:
+  # Branch builds compile products without invoking the full test/policy suite.
+  BUILD_ONLY: ${{ github.ref == 'refs/heads/0.4' || github.base_ref == '0.4' }}
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: '0'
   PYTHONUTF8: '1'
@@ -76,7 +78,7 @@ jobs:
           if [[ "$RUNNER_OS" == Windows ]]; then test "$PROCESSOR_ARCHITECTURE" = AMD64; fi
           npm install --global npm@11.11.0
       - name: Select OpenSSL 3 for macOS feed tests
-        if: runner.os == 'macOS'
+        if: runner.os == 'macOS' && env.BUILD_ONLY != 'true'
         shell: bash
         run: |
           # Apple's LibreSSL cannot perform the Ed25519 pkeyutl -rawin calls.
@@ -93,29 +95,91 @@ jobs:
         run: |
           npm ci
           npm run -w apps/oink typecheck
-          npm run -w apps/oink test
+          if [[ "$BUILD_ONLY" != true ]]; then npm run -w apps/oink test; fi
           npm run -w apps/oink build
+          if [[ "$BUILD_ONLY" == true ]]; then exit 0; fi
           if ! cargo about --version 2>/dev/null | grep -q '0.9.2$'; then cargo install cargo-about --version 0.9.2 --locked --features cli; fi
           npm run licenses:check -- --release-sources
       - name: File Provider compile and pure tests
         if: runner.os == 'macOS'
-        run: python packaging/macos/check.py --test
-      - name: Rust formatting, all targets, integration and release parser tests
         shell: bash
         run: |
-          cargo fmt --all --check
+          args=()
+          if [[ "$BUILD_ONLY" != true ]]; then args+=(--test); fi
+          python packaging/macos/check.py "${args[@]}"
+      - name: Rust formatting
+        run: cargo fmt --all --check
+      - name: Desktop Rust build
+        if: env.BUILD_ONLY == 'true'
+        run: cargo build --locked --workspace
+      - name: All targets, integration and release parser tests
+        if: env.BUILD_ONLY != 'true'
+        shell: bash
+        run: |
           python build-support/ci.py
       - name: Packaging pure tests
+        if: env.BUILD_ONLY != 'true'
         shell: bash
         run: |
           if [[ "$RUNNER_OS" == Windows ]]; then export PATH="/c/Program Files/Git/usr/bin:$PATH"; fi
           openssl version
           python -m unittest discover -s packaging/tests -v
       - name: Compile and inspect Windows MSI without installation
-        if: runner.os == 'Windows'
+        if: runner.os == 'Windows' && env.BUILD_ONLY != 'true'
         run: python build-support/package.py --public-version --platform windows --sequence 1 --output-root "${{ runner.temp }}/package-check"
       - name: Dependency policy
+        if: env.BUILD_ONLY != 'true'
         shell: bash
         run: |
           if ! cargo deny --version 2>/dev/null | grep -q '0.20.2$'; then cargo install cargo-deny --version 0.20.2 --locked; fi
           cargo deny check
+
+  android:
+    if: github.ref == 'refs/heads/0.4' || github.base_ref == '0.4'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - abi: arm64-v8a
+            target: aarch64-linux-android
+            blocking: false
+          - abi: x86_64
+            target: x86_64-linux-android
+            blocking: false
+    runs-on: ubuntu-24.04
+    continue-on-error: ${{ !matrix.blocking }}
+    timeout-minutes: 90
+    env:
+      MOBILE_PROFILE: debug
+      MOBILE_ANDROID_ABIS: ${{ matrix.abi }}
+      CARGO_BUILD_JOBS: '2'
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f
+        with:
+          toolchain: '1.99.0'
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          key: android-${{ matrix.target }}
+          workspaces: |
+            . -> target
+            build-support/mobile/uniffi-bindgen -> target/uniffi-bindgen
+      - name: Select JDK and install the app's pinned Android SDK
+        shell: bash
+        run: |
+          echo "JAVA_HOME=$JAVA_HOME_21_X64" >> "$GITHUB_ENV"
+          echo "$JAVA_HOME_21_X64/bin" >> "$GITHUB_PATH"
+          sdkmanager 'platforms;android-36' 'build-tools;37.0.0' 'ndk;30.0.16248370'
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/30.0.16248370" >> "$GITHUB_ENV"
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk --version 4.1.2 --locked
+      - name: Build Rust core and Kotlin bindings
+        run: bash build-support/mobile/build-android.sh
+      - name: Assemble debug APK (no release signing credentials)
+        run: bash apps/mobile/android/gradlew -p apps/mobile/android --no-daemon :app:assembleDebug -PoinkBuild=400008 -PoinkAbis=${{ matrix.abi }}
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: android-debug-${{ matrix.abi }}
+          path: apps/mobile/android/app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error

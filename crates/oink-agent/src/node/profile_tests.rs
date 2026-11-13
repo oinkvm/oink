@@ -17,7 +17,15 @@ fn options(data_dir: &std::path::Path) -> NodeOptions {
 #[test]
 fn user_profile_installs_everything_and_prelogin_only_network_routing_display_input() {
     let user = Profile::User.components();
-    assert!(user.content && user.audio && user.companions && user.pairing && user.reports && user.create_identity);
+    assert!(
+        user.content
+            && user.audio
+            && user.companions
+            && user.pairing
+            && user.reports
+            && user.create_identity
+            && user.text_focus
+    );
     let prelogin = Profile::Prelogin.components();
     assert_eq!(
         prelogin,
@@ -28,35 +36,35 @@ fn user_profile_installs_everything_and_prelogin_only_network_routing_display_in
             pairing: false,
             reports: false,
             create_identity: false,
+            text_focus: false,
         }
     );
 }
 
+/// Review M4: merged v2 capabilities name protocol domains. The pre-login
+/// backend serves device resources/options, the system arrangement and its
+/// diagnostics recorder as 0.3.x pre-login did, so it keeps announcing
+/// device/2, layout/2 and diagnostics/2; content and audio stay out.
 #[test]
-fn prelogin_offer_keeps_the_v1_baseline_and_drops_components_it_does_not_install() {
+fn prelogin_offer_keeps_device_layout_and_diagnostics_and_drops_content_and_audio() {
     let user = Node::offer_profile_for(Profile::User);
     assert_eq!(user.capabilities, Node::offer_profile().capabilities);
     let offer = Node::offer_profile_for(Profile::Prelogin);
-    for required in oink_protocol::v1::registry::BASELINE.iter().chain(&[
+    for required in oink_protocol::v2::registry::BASELINE.iter().chain(&[
         "oink.relay/1",
-        "oink.input.relative/1",
-        "oink.pointer.move-hidden/1",
-        "oink.layout.arrangement/1",
+        "oink.relay.transit/1",
+        "oink.input/2",
+        "oink.device/2",
+        "oink.layout/2",
+        "oink.diagnostics/2",
     ]) {
         assert!(offer.capabilities.iter().any(|c| c == required), "{required}");
     }
     for absent in oink_clipboard::negotiation::CAPABILITIES
         .iter()
-        .filter(|c| **c != "oink.clipboard/1")
+        .filter(|c| **c != "oink.clipboard/2")
         .chain(oink_audio::negotiation::CAPABILITIES)
-        .chain(&[
-            "oink.pairing/1",
-            "oink.wallpaper/1",
-            "oink.layout.projection/1",
-            "oink.layout.profiles/3",
-            "oink.notify/1",
-            "oink.input.trail/1",
-        ])
+        .chain(&["oink.clipboard/2"])
     {
         assert!(!offer.capabilities.iter().any(|c| c == absent), "{absent}");
     }

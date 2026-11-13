@@ -53,6 +53,13 @@ pub fn fatal_boundary<T>(run: impl FnOnce() -> T) -> T {
     })
 }
 pub use oink_telemetry::realtime::Stamp;
+
+/// The report kind of a network layer that ended on its own.
+pub(crate) fn network_fault(fatal: &oink_network::link::NetworkFatal) -> FaultKind {
+    match fatal {
+        oink_network::link::NetworkFatal::EndpointDriverStopped { .. } => FaultKind::NetworkEndpointStopped,
+    }
+}
 #[derive(Debug)]
 struct Observation {
     generation: u64,
@@ -168,6 +175,10 @@ pub struct Owner {
     cancel: tokio::sync::watch::Sender<u64>,
     task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     lifecycle: Mutex<()>,
+    /// `shutdown` ran. The ingress may already belong to this owner's
+    /// successor in the same process, so a second shutdown (the final drop
+    /// of a retired backend) must not disarm it.
+    closed: std::sync::atomic::AtomicBool,
     capture: Mutex<Option<Arc<oink_crash::capsule::Capture>>>,
     #[cfg(target_os = "macos")]
     inbox: Arc<Mutex<Option<inbox::Inbox>>>,
@@ -223,20 +234,27 @@ impl Owner {
             app_version: expected,
             os_version_class: projections::os_class(),
         };
-        let ingress = Arc::new(Ingress {
-            generation: AtomicU64::new(0),
-            queue: ArrayQueue::new(512),
-            wake: tokio::sync::Notify::new(),
-            build,
-            epoch: Instant::now(),
-            enabled_us: AtomicU64::new(0),
-            busy_until_us: AtomicU64::new(0),
-            realtime: oink_telemetry::realtime::Ring::new(
-                512,
-                Instant::now(),
-                oink_telemetry::sampling::random_below(100).unwrap_or(0) as u8,
-            ),
-        });
+        // One ingress per process: producers keep the `&'static` handle from
+        // `producer()`. A backend restarted inside this process after a
+        // network-layer failure (`host::supervise`) adopts it; a new one
+        // would leave every producer feeding the retired owner's queue.
+        let ingress = match PRODUCER.get() {
+            Some(existing) if endpoint.is_some() => existing.clone(),
+            _ => Arc::new(Ingress {
+                generation: AtomicU64::new(0),
+                queue: ArrayQueue::new(512),
+                wake: tokio::sync::Notify::new(),
+                build,
+                epoch: Instant::now(),
+                enabled_us: AtomicU64::new(0),
+                busy_until_us: AtomicU64::new(0),
+                realtime: oink_telemetry::realtime::Ring::new(
+                    512,
+                    Instant::now(),
+                    oink_telemetry::sampling::random_below(100).unwrap_or(0) as u8,
+                ),
+            }),
+        };
         let dir = data_dir.join("reports");
         let store = if online && (endpoint.is_some() || dir.exists()) {
             Store::open(&dir, consent, now()).ok()
@@ -254,6 +272,7 @@ impl Owner {
             cancel,
             task: Mutex::new(None),
             lifecycle: Mutex::new(()),
+            closed: std::sync::atomic::AtomicBool::new(false),
             capture: Mutex::new(None),
             #[cfg(target_os = "macos")]
             inbox: Arc::new(Mutex::new(None)),
@@ -347,6 +366,32 @@ impl Owner {
         )?;
         self.ingress.wake.notify_one();
         Ok(())
+    }
+    /// A handled runtime failure (Sentry error event, e.g. the network layer
+    /// ended and the backend restarts). Admitted durably like a recovered
+    /// crash, only with granted consent; the current or the next owner of
+    /// this store sends it.
+    pub(crate) fn submit_fault(&self, fault: FaultKind) {
+        let report = Report::RuntimeFault(RuntimeFault {
+            build: self.ingress.build,
+            component: Component::Agent,
+            fault,
+        });
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if !state.consent.granted() {
+            return;
+        }
+        let generation = state.consent.generation;
+        let Some(store) = state.store.as_mut() else {
+            return;
+        };
+        match store.observe(generation, report, now(), now()) {
+            Ok(()) => {
+                drop(state);
+                self.ingress.wake.notify_one();
+            }
+            Err(error) => tracing::info!(?error, ?fault, "runtime fault not queued for reporting"),
+        }
     }
     pub fn status(&self) -> ReportStatus {
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -622,6 +667,9 @@ impl Owner {
     }
     pub fn shutdown(&self) {
         let _lifecycle = self.lifecycle.lock().unwrap_or_else(|e| e.into_inner());
+        if self.closed.swap(true, Ordering::AcqRel) {
+            return;
+        }
         self.ingress.generation.store(0, Ordering::Release);
         self.ingress.realtime.disarm();
         self.ingress.realtime.clear();

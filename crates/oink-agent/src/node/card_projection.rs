@@ -35,11 +35,8 @@ impl Node {
                 }],
                 screen_shared: vec![],
                 focus,
-                exit_baseline: false,
+                audio: Default::default(),
                 microphone_resolution: Default::default(),
-                local_exit_selection_ready: false,
-                selected_exit: None,
-                exit_claim: None,
                 emergency_delivery,
             };
         };
@@ -53,10 +50,9 @@ impl Node {
                 .entry(screen.id.device.into())
                 .or_insert(!screen.device_hidden);
         }
-        // The audio command orders a selection above everything this owner has
-        // seen; other members' records are not prerequisites (oinkvm/oink#32).
-        // It needs only the owner's own record for the applied group.
-        let local_exit_selection_ready = lock(&self.inner.config).owner().active_group() == Some(state.group);
+        // The global audio overview the audio owner executes: modes of every
+        // online device and the registers that fence this device's tokens.
+        let audio_status = self.inner.audio.get().map(|audio| audio.status());
         let links = self.links().ok().map(|links| links.links());
         let members = config
             .members()
@@ -113,31 +109,18 @@ impl Node {
                 }
             })
             .collect();
-        let resolution = self.inner.audio.get().map(|audio| audio.status().resolution);
-        let (exit_baseline, selected_exit, exit_claim) = match resolution {
-            Some(oink_audio::claims::Resolution::None { .. }) => (true, None, None),
-            Some(oink_audio::claims::Resolution::Exit { stamp, .. }) => (
-                true,
-                Some(stamp.owner.into()),
-                Some((stamp.counter, stamp.owner.into())),
-            ),
-            _ => (false, None, None),
-        };
         CardInputs {
             group: Some(state.group.into()),
             members,
             screen_shared: screen_shared.into_iter().collect(),
             focus,
-            exit_baseline,
-            microphone_resolution: self
-                .inner
-                .audio
-                .get()
-                .map(|audio| audio.status().microphone_resolution)
+            audio: audio_status
+                .as_ref()
+                .map(|status| status.overview.clone())
                 .unwrap_or_default(),
-            local_exit_selection_ready,
-            selected_exit,
-            exit_claim,
+            microphone_resolution: audio_status
+                .map(|status| status.microphone_resolution)
+                .unwrap_or_default(),
             emergency_delivery,
         }
     }

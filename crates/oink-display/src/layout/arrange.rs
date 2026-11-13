@@ -115,7 +115,12 @@ impl Layout {
             .collect::<Vec<_>>();
         let (mut origin, scale) = placement.unwrap_or_else(|| {
             let group = bbox(fresh.iter().map(|s| s.rect));
-            let existing = bbox(self.screens.iter().filter(|s| s.id.device != device).map(|s| s.rect));
+            let existing = bbox(
+                self.screens
+                    .iter()
+                    .filter(|s| s.id.device != device && s.participates_in_geometry())
+                    .map(|s| s.rect),
+            );
             let offset = match (existing, group) {
                 (Some(e), Some(g)) => Point::new(e.right() - g.x, e.center().y - g.center().y),
                 (_, Some(g)) => Point::new(-g.x, -g.y),

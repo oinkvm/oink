@@ -40,6 +40,9 @@ const PROBLEMS: Record<string, MessageKey> = {
   stale_revision: '设备状态已变化，请重试',
   offline: '设备已离线',
   busy: '操作进行中',
+  helper_unavailable: '手机的特权模式未就绪',
+  request_expired: '手机上没有确认，请求已过期',
+  request_declined: '已在手机上拒绝',
   emergency_stop: '已收到暂停设备组共享指令',
   persistence_failed: '无法保存设置',
 };

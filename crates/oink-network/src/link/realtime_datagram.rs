@@ -9,7 +9,7 @@ use std::{
 
 #[derive(Clone, Copy)]
 struct Packet {
-    bytes: [u8; oink_protocol::v1::limits::DATAGRAM],
+    bytes: [u8; oink_protocol::v2::limits::DATAGRAM],
     len: usize,
     arrived: Instant,
 }
@@ -48,7 +48,7 @@ impl Lane {
             slots: (0..=capacity)
                 .map(|_| Slot {
                     packet: UnsafeCell::new(Packet {
-                        bytes: [0; oink_protocol::v1::limits::DATAGRAM],
+                        bytes: [0; oink_protocol::v2::limits::DATAGRAM],
                         len: 0,
                         arrived: epoch,
                     }),
@@ -141,7 +141,7 @@ impl Partitions {
         }
     }
     pub(super) fn post(&self, bytes: &[u8], at: Instant) -> bool {
-        let Ok(frame) = oink_protocol::v1::frame::OpaqueFrame::parse_exact(bytes, oink_protocol::v1::limits::DATAGRAM)
+        let Ok(frame) = oink_protocol::v2::frame::OpaqueFrame::parse_exact(bytes, oink_protocol::v2::limits::DATAGRAM)
         else {
             return false;
         };

@@ -1,6 +1,6 @@
 use super::*;
 use crate::streams::lifecycle_tests::Fixture;
-use oink_protocol::v1::schema::{FixedBytes, WireValue};
+use oink_protocol::v2::schema::{FixedBytes, WireValue};
 
 #[derive(Default)]
 struct State {
@@ -8,7 +8,6 @@ struct State {
     capture_rate: Option<u32>,
     capture_rate_error: Option<String>,
     encoder: Option<oink_audio::source::Encoder>,
-    omitted_silent_frames: u64,
     volume: Option<oink_audio::volume::Reading>,
     volume_writes: usize,
     volume_revision: u64,
@@ -101,16 +100,40 @@ impl RestoreProbe {
     }
 }
 
-impl CaptureStream for Capture {
-    fn omitted_silent_frames(&self) -> u64 {
-        lock(&self.0).omitted_silent_frames
+// Mirrors the platform handover: the journal-backed mute moves to the next
+// capture untouched; dropping it is the real pause-and-restore.
+struct HeldProbe(Option<RestoreProbe>);
+impl Drop for HeldProbe {
+    fn drop(&mut self) {
+        if let Some(probe) = &mut self.0 {
+            probe.journal.end_forwarding(&probe.backend).unwrap();
+        }
     }
+}
+impl HeldMute for HeldProbe {
+    fn finish(self: Box<Self>) -> Option<String> {
+        None
+    }
+    fn into_any(self: Box<Self>) -> Box<dyn std::any::Any + Send> {
+        self
+    }
+}
+
+impl CaptureStream for Capture {
     fn finish(&mut self) -> Option<String> {
         let hook = lock(&self.0).capture_finish_hook.take();
         if let Some(hook) = hook {
             hook();
         }
         lock(&self.0).cleanup_error.clone()
+    }
+    fn finish_keep_mute(&mut self) -> (Option<String>, Option<Box<dyn HeldMute>>) {
+        let cleanup = self.finish();
+        let held = self
+            .1
+            .take()
+            .map(|probe| Box::new(HeldProbe(Some(probe))) as Box<dyn HeldMute>);
+        (cleanup, held)
     }
     fn default_output_changed(&self) -> bool {
         lock(&self.0).default_output_changed
@@ -139,7 +162,7 @@ impl CaptureStream for Capture {
 impl Drop for Capture {
     fn drop(&mut self) {
         if let Some(probe) = &mut self.1 {
-            probe.journal.recover(&probe.backend, false).unwrap();
+            probe.journal.end_forwarding(&probe.backend).unwrap();
         }
         let mut state = lock(&self.0);
         state.encoder = None;
@@ -166,7 +189,12 @@ impl AudioPlatform for Platform {
         encoder: oink_audio::source::Encoder,
         muted: bool,
         _: CaptureScope,
+        held: Option<Box<dyn HeldMute>>,
     ) -> Result<Box<dyn CaptureStream>, String> {
+        // An unmuted capture ends a held mute before it starts.
+        let held = held
+            .and_then(|held| held.into_any().downcast::<HeldProbe>().ok())
+            .filter(|_| muted);
         let mut state = lock(&self.0);
         state.muted.push(muted);
         if let Some(error) = &state.capture_init_error {
@@ -174,7 +202,11 @@ impl AudioPlatform for Platform {
         }
         state.encoder = Some(encoder);
         state.events.push("capture");
-        let probe = (state.restore_probe && muted).then(|| RestoreProbe::new(self.0.clone()));
+        let probe = match held {
+            // Adopt the probe; the emptied handle restores nothing on drop.
+            Some(mut held) => held.0.take(),
+            None => (state.restore_probe && muted).then(|| RestoreProbe::new(self.0.clone())),
+        };
         Ok(Box::new(Capture(self.0.clone(), probe)))
     }
 
@@ -316,8 +348,12 @@ struct Running {
 impl Running {
     async fn new() -> Self {
         let mut this = Self::before_reconciliation(true).await;
-        this.until(|r| r.owners.iter().all(|o| matches!(o.resolution, Resolution::None { .. })))
-            .await;
+        this.until(|r| {
+            r.owners
+                .iter()
+                .all(|o| o.audio.merged() && matches!(o.resolution, Resolution::None))
+        })
+        .await;
         this
     }
     async fn before_reconciliation(forwarding_enabled: bool) -> Self {
@@ -328,6 +364,9 @@ impl Running {
     }
     async fn with_members(forwarding_enabled: bool, omitted: Option<&str>, members: u8) -> Self {
         let fixture = Fixture::<AudioStreams>::start_profile(members, omitted).await;
+        Self::with_fixture(fixture, forwarding_enabled, members)
+    }
+    fn with_fixture(fixture: Fixture<AudioStreams>, forwarding_enabled: bool, members: u8) -> Self {
         let mut owners = Vec::new();
         let mut platforms = Vec::new();
         let mut directories = Vec::new();
@@ -338,8 +377,16 @@ impl Running {
                 let mut config = lock(&store);
                 config
                     .update(|settings| {
-                        settings.audio.forwarding_enabled = forwarding_enabled;
                         settings.audio.quality = oink_audio::negotiation::Quality::Lossless;
+                    })
+                    .unwrap();
+                // The forward switch is this device's own audio configuration.
+                let me = links.id();
+                config
+                    .update_owner(|owner| {
+                        let (mut own, last) = owner.audio(me);
+                        own.forward.on = forwarding_enabled;
+                        owner.commit_audio(own, last)
                     })
                     .unwrap();
                 (
@@ -381,7 +428,7 @@ impl Running {
     }
     async fn start(forward: bool) -> Self {
         let mut this = Self::new().await;
-        this.claim(1, true);
+        this.select_exit(1, true);
         this.until(Self::prepared_route_ready).await;
         if forward {
             this.supply(0, 0.1);
@@ -392,7 +439,7 @@ impl Running {
     async fn start_probed() -> Self {
         let mut this = Self::new().await;
         lock(&this.platforms[0].0).restore_probe = true;
-        this.claim(1, true);
+        this.select_exit(1, true);
         this.until(Self::prepared_route_ready).await;
         this
     }
@@ -410,19 +457,18 @@ impl Running {
                     .is_some_and(|session| session.ready() && session.prepared() == prepared)
             })
     }
-    fn claim(&mut self, index: usize, claimed: bool) {
-        let expected = lock(&self.owners[index].store)
-            .owner()
-            .revision(dto::LocalOption::AudioExitClaim)
-            .unwrap();
-        let requester = boot(self.owners[index].links.boot());
-        let group = self.owners[index].group.applied().group;
-        let applied = self.owners[index]
-            .set_claim(&requester, group, claimed, expected)
-            .unwrap();
-        assert_eq!(applied.outcome, dto::ControlOutcome::Applied);
-        assert!(applied.persisted);
-        assert!(applied.fact_sequence.is_some());
+    /// The user on device `index` makes that device the group exit, or clears it.
+    fn select_exit(&mut self, index: usize, select: bool) {
+        let exit = self.owners[index].links.id();
+        self.choose_exit(index, select.then_some(exit), exit);
+    }
+    /// The user on device `author` chooses `exit`, or turns the exit
+    /// `current` back to forward (a PC that leaves the exit forwards). The
+    /// author decides alone: no other member's record or consent is needed.
+    fn choose_exit(&mut self, author: usize, exit: Option<DeviceId>, current: DeviceId) {
+        let (device, mode) = exit.map_or((current, Mode::Shared), |exit| (exit, Mode::Holder));
+        let outcome = self.owners[author].set_mode(device, Role::Speaker, mode).unwrap();
+        assert_eq!(outcome, dto::ControlOutcome::Applied);
     }
     fn supply(&self, index: usize, level: f32) {
         let now = Instant::now();
@@ -535,13 +581,15 @@ async fn later_source_joins_shared_exit_without_retiring_either_capture() {
         lock(&running.platforms[source].0).restore_probe = true;
     }
     running
-        .until(|r| r.owners.iter().all(|o| matches!(o.resolution, Resolution::None { .. })))
+        .until(|r| {
+            r.owners
+                .iter()
+                .all(|o| o.audio.merged() && matches!(o.resolution, Resolution::None))
+        })
         .await;
-    running.claim(1, true);
+    running.select_exit(1, true);
     for index in [0, 2] {
-        let mut settings = running.owners[index].settings.clone();
-        settings.forwarding_enabled = true;
-        running.owners[index].install_settings(settings).unwrap();
+        running.owners[index].set_own_forwarding(true);
         running
             .until(|r| {
                 for source in [0, 2] {
@@ -575,43 +623,326 @@ async fn later_source_joins_shared_exit_without_retiring_either_capture() {
     running.stop().await;
 }
 
+// Field case (0.4.0-inhouse.110): a phone joined through the Mac exit, the
+// Windows source never reached it, and the Windows owner then kept the whole
+// group's exit unknown — no forwarding and an unknown speaker on the exit card.
 #[tokio::test]
-async fn exit_change_with_live_capture_does_not_pause_or_restore() {
-    let mut running = Running::with_members(true, None, 3).await;
-    lock(&running.platforms[0].0).restore_probe = true;
-    running.claim(1, true);
-    running.until(Running::prepared_route_ready).await;
-    running.supply(0, 0.1);
-    let captures = lock(&running.platforms[0].0).muted.len();
-    let next_exit = running.owners[2].links.id();
-    running.claim(2, true);
+async fn member_never_reached_does_not_keep_the_exit_unknown() {
+    let fixture = Fixture::<AudioStreams>::start_with_absent(2, 1).await;
+    let mut running = Running::with_fixture(fixture, true, 2);
+    assert!(
+        running.owners[0].group.members().members.len() == 3,
+        "the absent member is on the roster"
+    );
     running
         .until(|r| {
-            if r.owners[0].capture.is_some() {
-                r.supply(0, 0.1);
-            }
-            r.owners[0].resolution.owner() == Some(next_exit)
-                && r.owners[0].exit_switch_deadline.is_none()
-                && r.owners[2].receive_sessions.values().any(|s| s.ready())
+            r.owners
+                .iter()
+                .all(|o| o.audio.merged() && matches!(o.resolution, Resolution::None))
         })
         .await;
-    assert!(running.owners[0].capture.is_some());
-    {
-        let state = lock(&running.platforms[0].0);
-        assert_eq!(state.muted.len(), captures);
-        assert!(!state.events.contains(&"pause"));
-        assert!(!state.events.contains(&"restore"));
-    }
+    running.select_exit(1, true);
+    let exit = running.owners[1].links.id();
+    running
+        .until(|r| r.owners[0].resolution.target() == Some(exit) && r.owners[0].resolution.available())
+        .await;
+    running.until(Running::prepared_route_ready).await;
+    running.supply(0, 0.1);
+    assert!(running.owners[0].sent.load(Ordering::Relaxed) > 0);
+    running.stop().await;
+}
+
+// User decision 2026-11-09: the device where the exit is chosen decides and
+// broadcasts the whole setting; every member executes the newest version and
+// relays it. The first and last members here never link (like Windows and a
+// phone on another subnet), yet each executes the other's choice.
+#[tokio::test]
+async fn a_choice_reaches_members_that_never_link_to_its_author() {
+    let fixture = Fixture::<AudioStreams>::start_partitioned().await;
+    let mut running = Running::with_fixture(fixture, true, 3);
+    running
+        .until(|r| {
+            r.owners
+                .iter()
+                .all(|o| o.audio.merged() && matches!(o.resolution, Resolution::None))
+        })
+        .await;
+    let [first, middle, last] = [0, 1, 2].map(|index| running.owners[index].links.id());
+    assert!(
+        running.owners[0].current_boot(last).is_none(),
+        "first and last never link"
+    );
+    assert!(
+        running.owners[2].current_boot(first).is_none(),
+        "first and last never link"
+    );
+    // The last member chooses the middle one; the first hears it via the middle.
+    running.choose_exit(2, Some(middle), middle);
+    running
+        .until(|r| {
+            r.owners
+                .iter()
+                .all(|o| o.resolution.target() == Some(middle) && o.resolution.available())
+        })
+        .await;
+    assert_eq!(
+        running.owners[0].audio.route(Role::Speaker).unwrap().version.author,
+        last,
+        "authored by the last member, relayed by the middle one"
+    );
+    running.until(Running::prepared_route_ready).await;
+    running.supply(0, 0.1);
+    assert!(running.owners[0].sent.load(Ordering::Relaxed) > 0);
+    // The first member clears it without any record from the last one.
+    running.choose_exit(0, None, middle);
+    running
+        .until(|r| r.owners.iter().all(|o| o.resolution == Resolution::None))
+        .await;
+    let cleared = running.owners[2].audio.route(Role::Speaker).unwrap();
+    assert_eq!((cleared.target, cleared.version.author), (None, first));
+    assert!(running.owners[0].capture.is_none());
     running.stop().await;
 }
 
 #[tokio::test]
-async fn local_settings_off_restores_with_pause_once_and_in_order() {
+async fn a_relayed_member_executes_the_route_setting() {
+    let fixture = Fixture::<AudioStreams>::start_relayed().await;
+    let mut running = Running::with_fixture(fixture, false, 3);
+    running
+        .until(|r| {
+            r.owners
+                .iter()
+                .all(|o| o.audio.merged() && matches!(o.resolution, Resolution::None))
+        })
+        .await;
+    let exit = running.owners[1].links.id();
+    running.choose_exit(1, Some(exit), exit);
+    running
+        .until(|r| {
+            r.owners
+                .iter()
+                .all(|o| o.resolution.target() == Some(exit) && o.resolution.available())
+        })
+        .await;
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn simultaneous_choices_converge_on_one_exit_everywhere() {
+    let mut running = Running::with_members(false, None, 3).await;
+    running
+        .until(|r| {
+            r.owners
+                .iter()
+                .all(|o| o.audio.merged() && matches!(o.resolution, Resolution::None))
+        })
+        .await;
+    // Each chooses itself before hearing the other's choice.
+    for index in [0, 2] {
+        let me = running.owners[index].links.id();
+        running.choose_exit(index, Some(me), me);
+    }
+    running
+        .until(|r| {
+            let route = r.owners[0].audio.route(Role::Speaker);
+            r.owners.iter().all(|o| o.audio.route(Role::Speaker) == route)
+                && route.is_some_and(|route| route.target == Some(route.version.author))
+                && r.owners
+                    .iter()
+                    .all(|o| o.resolution.target() == route.and_then(|route| route.target))
+        })
+        .await;
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn exit_change_with_live_capture_does_not_pause_or_restore() {
+    // The source UI, old exit UI and new exit UI all author the same route.
+    for author in 0..3 {
+        let mut running = Running::with_members(true, None, 3).await;
+        lock(&running.platforms[0].0).restore_probe = true;
+        running.select_exit(1, true);
+        running.until(Running::prepared_route_ready).await;
+        running.supply(0, 0.1);
+        let captures = lock(&running.platforms[0].0).muted.len();
+        let next_exit = running.owners[2].links.id();
+        running.choose_exit(author, Some(next_exit), next_exit);
+        running
+            .until(|r| {
+                if r.owners[0].capture.is_some() {
+                    r.supply(0, 0.1);
+                }
+                r.owners[0].resolution.target() == Some(next_exit)
+                    && !r.owners[0].exit_switching
+                    && r.owners[2].receive_sessions.values().any(|s| s.ready())
+            })
+            .await;
+        assert!(running.owners[0].capture.is_some());
+        {
+            let state = lock(&running.platforms[0].0);
+            assert_eq!(state.muted.len(), captures);
+            assert!(!state.events.contains(&"pause"));
+            assert!(!state.events.contains(&"restore"));
+        }
+        running.owners[0].set_own_forwarding(false);
+        let events = lock(&running.platforms[0].0).events.clone();
+        let restores: Vec<_> = events
+            .into_iter()
+            .filter(|e| ["pause", "probe-restore"].contains(e))
+            .collect();
+        assert_eq!(restores, ["pause", "probe-restore"]);
+        running.stop().await;
+    }
+}
+
+// M0 refusal can overtake C0's new global exit facts: the old exit already
+// yielded, while this source still knows the previous route. That is a switch.
+#[tokio::test]
+async fn exit_change_refusal_before_facts_does_not_pause_or_restore() {
+    for reason in [
+        dto::ControlFailure::NotExit,
+        dto::ControlFailure::RouteChanged,
+        dto::ControlFailure::OutputChanged,
+    ] {
+        let mut running = Running::start_probed().await;
+        let peer = running.owners[1].links.id();
+        let offer = running.owners[0].source_session.offer().unwrap().clone();
+        let refusal =
+            dto::AudioPrepareRefused::from_raw([(1, offer.write()), (2, reason.write()), (3, RawValue::Null)].into())
+                .unwrap();
+        running.owners[0].message(peer, Message::AudioPrepareRefused(refusal));
+        running.owners[0].tick_source_at(Instant::now() + Duration::from_secs(60));
+        assert!(running.owners[0].capture.is_some(), "{reason:?}");
+        let events = lock(&running.platforms[0].0).events.clone();
+        assert!(!events.contains(&"pause"), "{reason:?}: {events:?}");
+        assert!(!events.contains(&"probe-restore"), "{reason:?}: {events:?}");
+        running.owners[0].set_own_forwarding(false);
+        let events = lock(&running.platforms[0].0).events.clone();
+        let restores: Vec<_> = events
+            .into_iter()
+            .filter(|e| ["pause", "probe-restore"].contains(e))
+            .collect();
+        assert_eq!(restores, ["pause", "probe-restore"]);
+        running.stop().await;
+    }
+}
+
+#[tokio::test]
+async fn exit_change_waits_for_preparation_without_ending_capture() {
+    let mut running = Running::start_probed().await;
+    let old = running.owners[0].resolution;
+    let Resolution::Exit {
+        mut version,
+        target,
+        available,
+    } = old
+    else {
+        panic!("exit")
+    };
+    version.stamp += 1;
+    running.owners[0].transition(Resolution::Exit {
+        version,
+        target,
+        available,
+    });
+    let captures = lock(&running.platforms[0].0).muted.len();
+    for seconds in [0, 2, 60] {
+        running.owners[0].tick_source_at(Instant::now() + Duration::from_secs(seconds));
+        assert!(running.owners[0].capture.is_some());
+        let state = lock(&running.platforms[0].0);
+        assert_eq!(state.muted.len(), captures);
+        assert!(!state.events.contains(&"pause"));
+        assert!(!state.events.contains(&"probe-restore"));
+    }
+    running.owners[0].set_own_forwarding(false);
+    let events = lock(&running.platforms[0].0).events.clone();
+    let restores: Vec<_> = events
+        .into_iter()
+        .filter(|e| ["pause", "probe-restore"].contains(e))
+        .collect();
+    assert_eq!(restores, ["pause", "probe-restore"]);
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn exit_change_during_capture_rebuild_keeps_the_held_mute() {
+    let mut running = Running::start_probed().await;
+    running.owners[0].release_capture();
+    assert!(running.owners[0].held_mute.is_some());
+    let Resolution::Exit {
+        mut version,
+        target,
+        available,
+    } = running.owners[0].resolution
+    else {
+        panic!("exit")
+    };
+    version.stamp += 1;
+    running.owners[0].transition(Resolution::Exit {
+        version,
+        target,
+        available,
+    });
+    assert!(running.owners[0].held_mute.is_some());
+    let events = lock(&running.platforms[0].0).events.clone();
+    assert!(!events.contains(&"pause"));
+    assert!(!events.contains(&"probe-restore"));
+    running.owners[0].set_own_forwarding(false);
+    let events = lock(&running.platforms[0].0).events.clone();
+    let restores: Vec<_> = events
+        .into_iter()
+        .filter(|e| ["pause", "probe-restore"].contains(e))
+        .collect();
+    assert_eq!(restores, ["pause", "probe-restore"]);
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn empty_media_table_does_not_pause_or_restore_live_capture() {
+    let mut running = Running::start_probed().await;
+    let peer = running.owners[1].links.id();
+    running.owners[0].streams.forget_preparation(peer);
+    running.owners[0].tick_source();
+    assert!(running.owners[0].capture.is_some());
+    let events = lock(&running.platforms[0].0).events.clone();
+    assert!(!events.contains(&"pause"));
+    assert!(!events.contains(&"probe-restore"));
+    running.stop().await;
+}
+
+// Field case (0.4.0, macOS 26): every internal capture rebuild released the
+// source mute lease, so media was paused and local output unmuted while the
+// forwarding switch stayed on. A rebuild is not a forwarding end.
+#[tokio::test]
+async fn capture_rebuild_during_forwarding_does_not_pause_or_restore() {
     let mut running = Running::start_probed().await;
     running.supply(0, 0.1);
-    let mut settings = running.owners[0].settings.clone();
-    settings.forwarding_enabled = false;
-    running.owners[0].install_settings(settings).unwrap();
+    let opens = lock(&running.platforms[0].0).muted.len();
+    lock(&running.platforms[0].0).capture_restart = Some("audio service restarted".into());
+    running.owners[0].tick_source();
+    assert!(
+        running.owners[0].capture.is_none(),
+        "the native restart retires capture"
+    );
+    running
+        .until(|r| r.owners[0].capture.is_some() && Running::prepared_route_ready(r))
+        .await;
+    let sent = running.owners[0].sent.load(Ordering::Relaxed);
+    running.supply(0, 0.1);
+    assert!(running.owners[0].sent.load(Ordering::Relaxed) > sent);
+    assert!(running.owners[0].forwarding());
+    {
+        let state = lock(&running.platforms[0].0);
+        assert_eq!(state.muted.len(), opens + 1, "the rebuild opened one muted replacement");
+        assert!(state.muted.iter().all(|muted| *muted));
+        assert!(!state.events.contains(&"pause"), "a rebuild must not pause media");
+        assert!(
+            !state.events.contains(&"probe-restore"),
+            "a rebuild must not restore local output"
+        );
+    }
+    // The real forwarding end still pauses once, immediately before restoring.
+    running.owners[0].set_own_forwarding(false);
     running.owners[0].stop_source();
     {
         let state = lock(&running.platforms[0].0);
@@ -627,31 +958,41 @@ async fn local_settings_off_restores_with_pause_once_and_in_order() {
 }
 
 #[tokio::test]
-async fn clear_offline_unknown_and_switch_timeout_release_capture() {
-    for outcome in 0..4 {
+async fn local_settings_off_restores_with_pause_once_and_in_order() {
+    let mut running = Running::start_probed().await;
+    running.supply(0, 0.1);
+    running.owners[0].set_own_forwarding(false);
+    running.owners[0].stop_source();
+    {
+        let state = lock(&running.platforms[0].0);
+        let events: Vec<_> = state
+            .events
+            .iter()
+            .copied()
+            .filter(|e| ["pause", "probe-restore"].contains(e))
+            .collect();
+        assert_eq!(events, ["pause", "probe-restore"]);
+    }
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn clear_offline_and_unknown_release_capture() {
+    for outcome in 0..3 {
         let mut running = Running::start_probed().await;
-        let old = running.owners[0].resolution.stamp().unwrap();
+        let old = running.owners[0].resolution.version().unwrap();
+        let target = running.owners[0].resolution.target().unwrap();
         let next = match outcome {
-            0 => Resolution::None { barrier: Some(old) },
+            0 => Resolution::None,
             1 => Resolution::Unknown,
             2 => Resolution::Exit {
-                stamp: old,
+                version: old,
+                target,
                 available: false,
             },
-            _ => Resolution::Exit {
-                stamp: Stamp {
-                    counter: old.counter + 1,
-                    owner: old.owner,
-                },
-                available: true,
-            },
+            _ => unreachable!(),
         };
         running.owners[0].transition(next);
-        if outcome == 3 {
-            assert!(running.owners[0].capture.is_some());
-            running.owners[0].exit_switch_deadline = Some(Instant::now());
-            running.owners[0].tick_source();
-        }
         assert!(running.owners[0].capture.is_none());
         running.owners[0].stop_source();
         let events = lock(&running.platforms[0].0).events.clone();
@@ -667,10 +1008,10 @@ async fn clear_offline_unknown_and_switch_timeout_release_capture() {
 #[tokio::test]
 async fn source_becoming_exit_releases_capture_without_capturing_own_mix() {
     let mut running = Running::start(true).await;
-    running.claim(0, true);
+    running.select_exit(0, true);
     let me = running.owners[0].links.id();
     running
-        .until(|r| r.owners.iter().all(|o| o.resolution.owner() == Some(me)))
+        .until(|r| r.owners.iter().all(|o| o.resolution.target() == Some(me)))
         .await;
     assert!(running.owners[0].capture.is_none());
     assert!(running.owners[0].exit_volume.state().is_some());
@@ -681,45 +1022,42 @@ async fn source_becoming_exit_releases_capture_without_capturing_own_mix() {
 async fn muted_forwarding_persists_and_reenable_resets_mute_before_reply() {
     let mut running = Running::start(true).await;
     let owner = &mut running.owners[0];
+    let me = owner.links.id();
     let mut settings = owner.settings.clone();
     settings.forwarding_muted = true;
     owner.install_settings(settings).unwrap();
-    let enabled = dto::LocalOption::ForwardingEnabled;
-    let revision = lock(&owner.store).owner().revision(enabled).unwrap();
-    owner
-        .set_option(
-            &boot(owner.links.boot()),
-            owner.group.applied().group,
-            enabled,
-            revision,
-            false.write(),
-        )
-        .unwrap();
-    let revision = lock(&owner.store).owner().revision(enabled).unwrap();
-    owner
-        .set_option(
-            &boot(owner.links.boot()),
-            owner.group.applied().group,
-            enabled,
-            revision,
-            true.write(),
-        )
-        .unwrap();
+    // Forward is this device's own audio configuration, set like any mode.
+    assert_eq!(
+        owner.set_mode(me, Role::Speaker, Mode::Local),
+        Ok(dto::ControlOutcome::Applied)
+    );
+    assert!(!owner.forwarding());
+    assert_eq!(
+        owner.set_mode(me, Role::Speaker, Mode::Shared),
+        Ok(dto::ControlOutcome::Applied)
+    );
+    assert!(owner.forwarding());
     assert!(!owner.settings.forwarding_muted);
+    assert_eq!(
+        owner.set_mode(me, Role::Speaker, Mode::Shared),
+        Ok(dto::ControlOutcome::NoChange)
+    );
+    // The retired option 4 is refused.
     assert_eq!(
         owner
             .set_option(
                 &boot(owner.links.boot()),
                 owner.group.applied().group,
-                enabled,
-                revision,
+                dto::LocalOption::from_number(4),
+                1,
                 false.write()
             )
             .unwrap_err(),
-        dto::ControlFailure::StaleRevision
+        dto::ControlFailure::UnsupportedOption
     );
     let saved = AgentConfig::load_from(running.directories[0].as_path()).unwrap();
     assert_eq!(saved.settings.audio, owner.settings);
+    assert!(saved.owner().audio(me).0.forward.on);
     assert!(!running.directories[0].as_path().join("audio/settings.json").exists());
     running.stop().await;
 }
@@ -797,13 +1135,11 @@ async fn volume_keys_follow_focus_forwarding_mode(local_keyboard: bool) {
 
     // The remote physical keyboard belongs to the exit. Its forwarding setting
     // must not decide what happens to keys delivered to the focus source.
-    let mut settings = running.owners[1].settings.clone();
-    settings.forwarding_enabled = false;
-    running.owners[1].install_settings(settings).unwrap();
+    running.owners[1].set_own_forwarding(false);
     for keep_local in [false, true] {
         for forwarding in [true, false, true] {
+            running.owners[0].set_own_forwarding(forwarding);
             let mut settings = running.owners[0].settings.clone();
-            settings.forwarding_enabled = forwarding;
             settings.keep_local_playback = keep_local;
             running.owners[0].install_settings(settings).unwrap();
             for code in [
@@ -896,11 +1232,9 @@ async fn volume_keys_follow_focus_forwarding_mode(local_keyboard: bool) {
 async fn live_volume_works_without_capture_and_publishes_fact_before_success() {
     let mut running = Running::new().await;
     for owner in &mut running.owners {
-        let mut settings = owner.settings.clone();
-        settings.forwarding_enabled = false;
-        owner.install_settings(settings).unwrap();
+        owner.set_own_forwarding(false);
     }
-    running.claim(1, true);
+    running.select_exit(1, true);
     running.until(|r| r.owners[0].resolved_volume().is_some()).await;
     assert!(running.owners.iter().all(|o| o.capture.is_none()));
     assert!(running.owners.iter().all(|o| o.volume.load().is_none()));
@@ -1018,7 +1352,7 @@ async fn external_endpoint_takeover_saves_disabled_reason_before_observation() {
         state.default_output_changed = true;
     }
     running.owners[0].tick();
-    assert!(!running.owners[0].settings.forwarding_enabled);
+    assert!(!running.owners[0].forwarding());
     assert_eq!(
         running.owners[0].settings.forwarding_off_reason,
         Some(oink_audio::ForwardingOffReason::LocalVolumeChanged)
@@ -1050,8 +1384,11 @@ fn repeated_no_frame_capture_probes_back_off_and_valid_frames_reset_the_deadline
     assert_eq!(watchdog.timeout, Duration::from_millis(500));
 }
 
+// Field case (macOS 26.6): while nothing plays the system tap delivers no
+// callbacks at all and resumes on the same tap at onset. Idle is not a stall:
+// the capture must neither be reopened nor release (pause/restore) the mute.
 #[tokio::test]
-async fn native_silent_frame_omission_keeps_capture_dormant_without_reopening() {
+async fn idle_capture_without_callbacks_stays_open_and_muted() {
     let mut running = Running::start_probed().await;
     running.supply(0, 0.0);
     let now = Instant::now();
@@ -1064,17 +1401,14 @@ async fn native_silent_frame_omission_keeps_capture_dormant_without_reopening() 
         .tick(now + oink_audio::source::SILENCE_TIMEOUT);
     assert!(running.owners[0].encoded.as_ref().unwrap().sleeping());
     let sent = running.owners[0].sent.load(Ordering::Relaxed);
-    // Match the native tap's optimisation: callbacks continue, but exact-zero
-    // frames after the five-second tail do not enter the PCM ring/encoder.
     for second in 5..=65 {
-        // Keep real QUIC/control queues moving while only the capture-health
-        // clock advances; otherwise a full control queue is a different fault.
+        // Keep real QUIC/control queues moving while only the owner clock
+        // advances; otherwise a full control queue is a different fault.
         running.pump().await;
-        lock(&running.platforms[0].0).omitted_silent_frames += 48_000;
         running.owners[0].tick_source_at(now + Duration::from_secs(second));
         assert!(
             running.owners[0].capture.is_some(),
-            "healthy silent tap was reopened at {second}s: {:?}",
+            "idle tap was reopened at {second}s: {:?}",
             running.owners[0].restart_reason
         );
         assert_eq!(running.owners[0].phase(), AudioPhase::SoundSleep);
@@ -1082,6 +1416,7 @@ async fn native_silent_frame_omission_keeps_capture_dormant_without_reopening() 
         let state = lock(&running.platforms[0].0);
         assert_eq!(state.muted.len(), opens);
         assert!(!state.events.contains(&"pause"));
+        assert!(!state.events.contains(&"probe-restore"));
         assert!(!state.events.contains(&"restore"));
     }
     // Onset bypasses the sleeping control owner; no reopen or owner tick is needed.
@@ -1098,44 +1433,9 @@ async fn native_silent_frame_omission_keeps_capture_dormant_without_reopening() 
     );
     assert!(running.owners[0].sent.load(Ordering::Relaxed) > sent);
     assert!(!running.owners[0].encoded.as_ref().unwrap().sleeping());
+    running.owners[0].tick_source_at(wake + Duration::from_secs(30));
+    assert!(running.owners[0].capture.is_some());
     assert_eq!(lock(&running.platforms[0].0).muted.len(), opens);
-    running.owners[0].tick_source_at(wake);
-    // Silence is not an exemption for a genuinely stalled native producer.
-    lock(&running.platforms[0].0)
-        .encoder
-        .as_mut()
-        .unwrap()
-        .tick(wake + oink_audio::source::SILENCE_TIMEOUT);
-    running.owners[0].tick_source_at(wake + oink_audio::source::SILENCE_TIMEOUT);
-    assert!(running.owners[0].capture.is_none());
-    running.until(Running::prepared_route_ready).await;
-    let sent = running.owners[0].sent.load(Ordering::Relaxed);
-    running.supply(0, 0.2);
-    assert!(running.owners[0].sent.load(Ordering::Relaxed) > sent);
-    running.stop().await;
-}
-
-#[tokio::test]
-async fn no_frames_capture_reopens_but_silent_frames_are_progress() {
-    let mut running = Running::start(true).await;
-    let now = Instant::now();
-    running.owners[0].tick_source_at(now);
-    for step in 1..=3 {
-        running.supply(0, 0.0);
-        running.owners[0].tick_source_at(now + Duration::from_millis(step * 400));
-        assert!(running.owners[0].capture.is_some(), "zero PCM is still frame progress");
-    }
-    running.owners[0].tick_source_at(now + Duration::from_millis(1800));
-    assert!(
-        running.owners[0].capture.is_none(),
-        "no frame progress must retire capture"
-    );
-    assert!(running.owners[0].settings.forwarding_enabled);
-    assert_ne!(running.owners[0].phase(), AudioPhase::Forwarding);
-    running.until(Running::prepared_route_ready).await;
-    let sent = running.owners[0].sent.load(Ordering::Relaxed);
-    running.supply(0, 0.1);
-    assert!(running.owners[0].sent.load(Ordering::Relaxed) > sent);
     running.stop().await;
 }
 
@@ -1237,14 +1537,12 @@ async fn default_change_during_capture_retirement_switches_to_local_before_reope
             // A control message can retire capture before the gated tick. The
             // final native flags must survive that handle's destruction too.
             running.owners[0].release_capture();
-            assert!(lock(&running.owners[0].store).settings.audio.forwarding_enabled);
+            let me = running.owners[0].links.id();
+            assert!(lock(&running.owners[0].store).owner().audio(me).0.forward.on);
         }
         running.owners[0].tick();
         let owner = &running.owners[0];
-        assert!(
-            !owner.settings.forwarding_enabled,
-            "late default change must turn forwarding off"
-        );
+        assert!(!owner.forwarding(), "late default change must turn forwarding off");
         assert_eq!(
             owner.settings.forwarding_off_reason,
             Some(oink_audio::ForwardingOffReason::DefaultOutputChanged)
@@ -1262,7 +1560,7 @@ async fn default_change_during_capture_retirement_switches_to_local_before_reope
         running
             .until(|r| {
                 r.owners.iter().all(|owner| {
-                    let card = speaker_card(&owner.group, source, nonce, true);
+                    let card = speaker_card(&owner.group, &owner.audio.overview(), source, nonce);
                     card.forwarding_enabled == Some(false)
                         && card.resource.configured_mode == Some(SpeakerMode::Unused)
                         && card.activity == SpeakerActivity::Idle
@@ -1281,9 +1579,7 @@ async fn default_change_during_capture_retirement_switches_to_local_before_reope
             state.default_output_changed = false;
             state.capture_restart = None;
         }
-        let mut settings = running.owners[0].settings.clone();
-        settings.forwarding_enabled = true;
-        running.owners[0].install_settings(settings).unwrap();
+        running.owners[0].set_own_forwarding(true);
         running.until(Running::prepared_route_ready).await;
         let sent = running.owners[0].sent.load(Ordering::Relaxed);
         running.supply(0, 0.1);
@@ -1436,7 +1732,7 @@ async fn keep_local_rebuilds_once_and_preserves_forwarding_claim() {
         state.capture_restart_hook = Some(Box::new(move || lock(&changed).default_output_changed = true));
     }
     running.until(Running::prepared_route_ready).await;
-    assert!(running.owners[0].settings.forwarding_enabled);
+    assert!(running.owners[0].forwarding());
     assert_eq!(running.owners[0].settings.forwarding_off_reason, None);
     assert_eq!(lock(&running.platforms[0].0).muted, [true, false, false]);
     let sent = running.owners[0].sent.load(Ordering::Relaxed);
@@ -1649,6 +1945,101 @@ async fn silence_closes_only_after_all_sources_and_wake_preserves_startup_backlo
     running.stop().await;
 }
 
+/// Root cause #2 of the 0.4.0 howling report (2026-11-12): the exit output
+/// closed after every 5 s of source silence, which dropped its echo control
+/// and rebuilt the shared microphone capture without AEC, then again with a
+/// fresh engine when sound returned. While the local capture runs AEC against
+/// this exit, source silence keeps the same output (and so the same control,
+/// engine and reference) open; once that capture ends the idle drain resumes.
+#[tokio::test]
+async fn a_local_echo_capture_keeps_the_exit_output_open_through_source_silence() {
+    use crate::streams::audio::ForwardFrom;
+    use crate::streams::audio::transport::testing::datagram_pair;
+    use oink_network::link::{LinkId, QueueSpec};
+    use oink_protocol::frame::{StreamKind, StreamTag};
+    let mut running = Running::start(false).await;
+    let table = running.owners[1].streams.forward_table();
+    let peer = DeviceId([40; 32]);
+    let (tx, rx) = datagram_pair(
+        LinkId(140),
+        StreamTag {
+            kind: StreamKind::Audio,
+            ordinal: 1,
+        },
+        QueueSpec::datagram(StreamKind::Audio),
+    );
+    table.publish(ForwardTable {
+        to: vec![],
+        from: vec![ForwardFrom {
+            admission: Default::default(),
+            peer,
+            stream_id: 7,
+            format: StreamFormat::Pcm16_2p5ms,
+            gain: 1.0,
+            playing: true,
+            packets: rx,
+        }],
+    });
+    running.owners[1].tick_exit();
+    // Establish a live output with a real onset packet; the fake sink has no
+    // RT reader, so perform its read/consume explicitly.
+    post_media(tx.as_ref(), 7, 1, 1, false, 100);
+    let receiver = running.owners[1].receivers.get_mut(&peer).unwrap();
+    let packet = receiver.reader.read().1.unwrap();
+    receiver.backlog.push_back(packet);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            running.owners[1].tick_exit();
+            if running.owners[1].playback.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("onset opens the output");
+    for receiver in running.owners[1].receivers.values_mut() {
+        receiver.backlog.clear();
+    }
+    let events = |running: &Running, name: &str| {
+        lock(&running.platforms[1].0)
+            .events
+            .iter()
+            .filter(|event| **event == name)
+            .count()
+    };
+    let opened = events(&running, "playback");
+    let closed = events(&running, "close-output");
+    // The local shared-microphone capture runs AEC against this exit.
+    running.owners[1].microphone.echo_holds_exit = true;
+    post_media(tx.as_ref(), 7, 1, 20, true, 0);
+    assert!(running.owners[1].receivers[&peer].reader.read().1.is_none());
+    for _ in 0..6 {
+        running.owners[1].tick_exit();
+    }
+    assert!(running.owners[1].receivers[&peer].reader.bursts.asleep(Instant::now()));
+    assert!(
+        running.owners[1].playback.is_some(),
+        "silence keeps the echo reference output"
+    );
+    assert!(!running.owners[1].draining);
+    assert!(!running.owners[1].playback_idle);
+    assert_eq!(
+        events(&running, "playback"),
+        opened,
+        "no second output (no new echo control)"
+    );
+    assert_eq!(events(&running, "close-output"), closed);
+    // The capture ended: the silent output drains and sleeps as before.
+    running.owners[1].microphone.echo_holds_exit = false;
+    running.owners[1].tick_exit();
+    assert!(running.owners[1].draining);
+    running.owners[1].tick_exit(); // fake device acknowledges its zero drain
+    assert!(running.owners[1].playback.is_none());
+    assert!(running.owners[1].playback_idle);
+    running.stop().await;
+}
+
 fn render_test_exit(running: &Running, at: Instant) -> [f32; 256] {
     let core = lock(&running.platforms[1].0).playback_core.clone().unwrap();
     let mut core = lock(&core);
@@ -1665,7 +2056,7 @@ async fn prepared_opus_remote_exit() -> Running {
         settings.quality = oink_audio::negotiation::Quality::Smooth;
         owner.install_settings(settings).unwrap();
     }
-    running.claim(1, true);
+    running.select_exit(1, true);
     running.until(Running::prepared_route_ready).await;
     running
 }
@@ -1893,7 +2284,7 @@ async fn slow_remote_exit_wake_preserves_backlog_larger_than_receiver_capacity()
 #[tokio::test]
 async fn failed_remote_exit_wake_recovers_without_a_new_user_claim() {
     let mut running = sleeping_opus_remote_exit().await;
-    let claim = running.owners[1].resolution.stamp();
+    let claim = running.owners[1].resolution.version();
     let old_session = running.owners[0].source_session.prepared().unwrap().session();
     lock(&running.platforms[1].0).playback_init_error = Some("synthetic transient wake failure".into());
     running.supply(0, 0.2);
@@ -1929,7 +2320,7 @@ async fn failed_remote_exit_wake_recovers_without_a_new_user_claim() {
     running
         .until(|r| !r.owners[1].playback_failed && r.prepared_route_ready())
         .await;
-    assert_eq!(running.owners[1].resolution.stamp(), claim);
+    assert_eq!(running.owners[1].resolution.version(), claim);
     assert_ne!(
         running.owners[0].source_session.prepared().unwrap().session(),
         old_session
@@ -2034,23 +2425,115 @@ async fn publication_failure_after_save_returns_actual_persisted_owner_result() 
     let owner = &mut running.owners[0];
     let requester = boot(owner.links.boot());
     let group = owner.group.applied().group;
-    let option = dto::LocalOption::ForwardingEnabled;
+    let option = dto::LocalOption::ForwardingControls;
     let revision = lock(&owner.store).owner().revision(option).unwrap();
+    let value = RawValue::Map([(1, 50u16.write()), (2, false.write())].into());
     let applied = owner
-        .set_option(&requester, group, option, revision, false.write())
+        .set_option(&requester, group, option, revision, value.clone())
         .unwrap();
     assert_eq!(applied.outcome, dto::ControlOutcome::Failed);
     assert_eq!(applied.reason, dto::ControlFailure::ApplyFailed);
     assert!(applied.persisted);
-    assert_eq!(applied.current.value().unwrap(), false.write());
+    assert_eq!(applied.current.value().unwrap(), value);
     assert_eq!(applied.fact_sequence, None);
-    assert!(
-        !AgentConfig::load_from(running.directories[0].as_path())
+    assert_eq!(
+        AgentConfig::load_from(running.directories[0].as_path())
             .unwrap()
             .settings
             .audio
-            .forwarding_enabled
+            .forwarding_volume_percent,
+        50
     );
+    running.stop().await;
+}
+
+/// Publish this device's sharing pause the way the pause control does.
+fn publish_pause(owner: &Owner, paused: bool) {
+    let facts = owner.group.local_facts();
+    let old = facts.pause().unwrap().unwrap();
+    let reason = if paused {
+        dto::PauseReason::LocalUser
+    } else {
+        dto::PauseReason::None
+    };
+    let state = dto::LocalPauseState::from_raw(
+        [
+            (1, paused.write()),
+            (2, reason.write()),
+            (3, (old.revision().unwrap() + 1).write()),
+        ]
+        .into(),
+    )
+    .unwrap();
+    owner
+        .group
+        .publish_local_owner(facts.preferences().unwrap().unwrap().0, state)
+        .unwrap();
+}
+
+/// The network gate holds back `Suspend` audio messages while this device is
+/// paused (protocol-v2 pause policy). That refusal is not a stream failure:
+/// pausing and resuming the source keeps the route setting and its version,
+/// and the source prepares the same exit again and forwards once resumed.
+#[tokio::test]
+async fn pausing_and_resuming_the_source_restores_forwarding_to_the_same_exit() {
+    let mut running = Running::start(true).await;
+    let exit = running.owners[1].links.id();
+    let version = running.owners[0].resolution.version();
+    assert_eq!(running.owners[0].resolution.target(), Some(exit));
+    let offer = running.owners[0].source_session.offer().unwrap().clone();
+
+    publish_pause(&running.owners[0], true);
+    crate::test_watchdog::until("pause is applied", || running.owners[0].group.applied().paused).await;
+    // The gate is closed before the owner learns of the pause: what it still
+    // sends in that window is refused as Paused, without failing anything.
+    assert_eq!(
+        running.owners[0]
+            .streams
+            .send(exit, &Message::AudioQualitySourceOffer(offer), Instant::now()),
+        Err(oink_network::link::PostError::Paused)
+    );
+    running.supply(0, 0.1);
+    running
+        .until(|r| r.owners[0].phase() == AudioPhase::Paused && r.owners[0].capture.is_none())
+        .await;
+    for owner in &running.owners {
+        assert!(!owner.source_failed && !owner.playback_failed, "{:?}", owner.error);
+        assert_eq!(owner.resolution.version(), version);
+        assert_eq!(owner.resolution.target(), Some(exit));
+    }
+
+    publish_pause(&running.owners[0], false);
+    crate::test_watchdog::until("resume is applied", || !running.owners[0].group.applied().paused).await;
+    running.until(Running::prepared_route_ready).await;
+    let before = running.owners[0].sent.load(Ordering::Relaxed);
+    running.supply(0, 0.1);
+    assert!(
+        running.owners[0].sent.load(Ordering::Relaxed) > before,
+        "forwarding resumes"
+    );
+    for owner in &running.owners {
+        assert_ne!(owner.phase(), AudioPhase::Paused);
+        assert_ne!(owner.phase(), AudioPhase::Failed, "{:?}", owner.error);
+        assert_eq!(owner.resolution.version(), version);
+        assert!(owner.resolution.available());
+    }
+    running.stop().await;
+}
+
+/// Pause audit 6: an exit whose output failed refuses a source's offer with
+/// OutputUnavailable, and the source shows that reason instead of waiting.
+#[tokio::test]
+async fn a_failed_exit_output_refuses_offers_with_a_reason() {
+    let mut running = Running::start(false).await;
+    let exit = running.owners[1].links.id();
+    // No retry during the test: the failure is the state under test.
+    running.owners[1].playback_retry_delay = Duration::from_secs(3600);
+    running.owners[1].fail_playback("synthetic output failure".into());
+    running.owners[0].source_session.retire();
+    running.owners[0].streams.forget_preparation(exit);
+    running.owners[0].prepare_peer(exit);
+    running.until(|r| r.owners[0].remote_problem.is_some()).await;
     running.stop().await;
 }
 
@@ -2058,40 +2541,50 @@ async fn publication_failure_after_save_returns_actual_persisted_owner_result() 
 async fn removing_the_selected_exit_retires_media_without_fallback() {
     let mut running = Running::start(true).await;
     let removed = running.owners[1].links.id();
-    let selected = running.owners[0].resolution.stamp().unwrap();
-    assert_eq!(selected.owner, removed);
+    let selected = running.owners[0].resolution.version().unwrap();
+    assert_eq!(running.owners[0].resolution.target(), Some(removed));
     running.owners[0].group.remove_member(removed).unwrap();
+    // Global audio configuration: a device that is no longer online (here no
+    // longer a member) drops out of the overview, so the register naming it
+    // executes as "no exit"; nobody becomes a fallback exit.
+    assert!(selected.author == running.owners[0].links.id() || selected.author == removed);
     running
         .until(|r| {
             !r.owners[0].members().contains(&removed)
-                && r.owners[0].resolution
-                    == Resolution::Exit {
-                        stamp: selected,
-                        available: false,
-                    }
+                && r.owners[0].resolution == Resolution::None
+                && r.owners[0]
+                    .audio
+                    .route(Role::Speaker)
+                    .is_some_and(|route| route.target == Some(removed))
                 && r.owners[0].capture.is_none()
         })
         .await;
     assert!(running.owners[0].volume.load().is_none());
     assert!(running.owners[0].source_session.prepared().is_none());
-    // A later explicit claim may take over; removal itself never elects a fallback.
-    running.claim(0, true);
+    // A later explicit choice may take over; removal itself never elects a fallback.
+    running.select_exit(0, true);
     let local = running.owners[0].links.id();
-    running.until(|r| r.owners[0].resolution.owner() == Some(local)).await;
+    running.until(|r| r.owners[0].resolution.target() == Some(local)).await;
     running.stop().await;
 }
 
-fn permission_card(group: &ConfigModule, source: DeviceId, nonce: [u8; 16]) -> crate::device_cards::SpeakerIcon {
-    speaker_card(group, source, nonce, true).resource.icon
+fn permission_card(owner: &Owner, source: DeviceId, nonce: [u8; 16]) -> crate::device_cards::SpeakerIcon {
+    speaker_card(&owner.group, &owner.audio.overview(), source, nonce)
+        .resource
+        .icon
 }
 
 #[tokio::test]
 async fn restoring_exit_publishes_silent_source_recovery_before_status_notification() {
     use crate::device_cards::{SpeakerActivity, SpeakerIcon};
     let mut r = Running::start(false).await;
-    r.claim(1, false);
-    r.until(|r| r.owners.iter().all(|o| matches!(o.resolution, Resolution::None { .. })))
-        .await;
+    r.select_exit(1, false);
+    r.until(|r| {
+        r.owners
+            .iter()
+            .all(|o| o.audio.merged() && matches!(o.resolution, Resolution::None))
+    })
+    .await;
     let source = &mut r.owners[0];
     let group = source.group.clone();
     let id = source.links.id();
@@ -2100,11 +2593,11 @@ async fn restoring_exit_publishes_silent_source_recovery_before_status_notificat
     let observed = observations.clone();
     source.on_status = Some(Arc::new(move |status| {
         if matches!(status.phase, AudioPhase::Forwarding | AudioPhase::SoundSleep) {
-            let card = speaker_card(&group, id, nonce, true);
+            let card = speaker_card(&group, &status.overview, id, nonce);
             lock(&observed).push((status.phase, card.resource.icon, card.activity));
         }
     }));
-    r.claim(1, true);
+    r.select_exit(1, true);
     r.until(Running::prepared_route_ready).await;
     assert_eq!(r.owners[0].sent.load(Ordering::Relaxed), 0);
     let observations = lock(&observations).clone();
@@ -2124,9 +2617,13 @@ async fn restoring_exit_publishes_silent_source_recovery_before_status_notificat
 async fn restoring_exit_publishes_a_real_source_fault_before_status_notification() {
     use crate::device_cards::{ResourceFaultCode, SpeakerActivity, SpeakerIcon};
     let mut r = Running::start(false).await;
-    r.claim(1, false);
-    r.until(|r| r.owners.iter().all(|o| matches!(o.resolution, Resolution::None { .. })))
-        .await;
+    r.select_exit(1, false);
+    r.until(|r| {
+        r.owners
+            .iter()
+            .all(|o| o.audio.merged() && matches!(o.resolution, Resolution::None))
+    })
+    .await;
     lock(&r.platforms[0].0).capture_init_error = Some("synthetic capture unavailable".into());
     let source = &mut r.owners[0];
     let group = source.group.clone();
@@ -2136,11 +2633,11 @@ async fn restoring_exit_publishes_a_real_source_fault_before_status_notification
     let observed = observations.clone();
     source.on_status = Some(Arc::new(move |status| {
         if status.phase == AudioPhase::Failed {
-            let card = speaker_card(&group, id, nonce, true);
+            let card = speaker_card(&group, &status.overview, id, nonce);
             lock(&observed).push((card.resource.icon, card.activity, card.resource.fault.unwrap().code));
         }
     }));
-    r.claim(1, true);
+    r.select_exit(1, true);
     r.until(|r| r.owners[0].source_failed).await;
     assert_eq!(r.owners[0].sent.load(Ordering::Relaxed), 0);
     let observations = lock(&observations).clone();
@@ -2159,9 +2656,9 @@ async fn restoring_exit_publishes_a_real_source_fault_before_status_notification
 
 fn speaker_card(
     group: &ConfigModule,
+    overview: &oink_audio::route::Overview,
     source: DeviceId,
     nonce: [u8; 16],
-    exit_baseline: bool,
 ) -> crate::device_cards::SpeakerCard {
     use crate::device_cards::*;
     let facts = if group
@@ -2200,16 +2697,13 @@ fn speaker_card(
             rtt_ms: None,
             live_boot: Some(nonce),
             facts: Some(facts),
-            capabilities: vec!["oink.device-options/1".into(), "oink.device-resources/1".into()],
+            capabilities: vec!["oink.device/2".into(), "oink.device/2".into()],
             order: None,
         }],
         screen_shared: vec![],
         focus: FocusObservation::default(),
-        exit_baseline,
+        audio: overview.clone(),
         microphone_resolution: Default::default(),
-        local_exit_selection_ready: true,
-        selected_exit: None,
-        exit_claim: None,
         emergency_delivery: None,
     };
     Projector::new().unwrap().update(&inputs, 1).unwrap().cards[0]
@@ -2241,7 +2735,7 @@ async fn fresh_member_cards_can_precede_audio_baseline_reconciliation() {
                             items
                                 .0
                                 .iter()
-                                .any(|item| item.option() == Ok(dto::LocalOption::AudioExitClaim))
+                                .any(|item| item.option() == Ok(dto::LocalOption::ForwardingControls))
                         })
                 })
             });
@@ -2256,22 +2750,37 @@ async fn fresh_member_cards_can_precede_audio_baseline_reconciliation() {
     for owner in &r.owners {
         assert_eq!(owner.resolution, Resolution::Unknown);
         assert_eq!(lock(&owner.state).resolution, Resolution::Unknown);
+        // Unjoined: this device shows its own configuration only.
+        let overview = owner.audio.overview();
+        assert!(!overview.joined);
         for peer in &r.owners {
-            let speaker = speaker_card(&owner.group, peer.links.id(), peer.links.boot().nonce, false);
-            assert_eq!(speaker.forwarding_enabled, Some(false));
-            assert_eq!(speaker.resource.configured_mode, Some(SpeakerMode::Unused));
+            let speaker = speaker_card(&owner.group, &overview, peer.links.id(), peer.links.boot().nonce);
+            if peer.links.id() == owner.links.id() {
+                assert_eq!(speaker.forwarding_enabled, Some(false));
+                assert_eq!(speaker.resource.configured_mode, Some(SpeakerMode::Unused));
+            } else {
+                assert_eq!(speaker.resource.configured_mode, None);
+            }
         }
     }
-    // One reconciliation consumes the already authenticated null claims. No
-    // capability/permission change, retry, or elapsed-time fallback is needed.
+    // Reconciliation merges (the smaller ID founds, the other merges with it):
+    // no capability/permission change, retry or elapsed-time fallback.
+    r.until(|r| r.owners.iter().all(|o| o.audio.merged())).await;
     for owner in &mut r.owners {
         owner.apply();
         owner.publish(owner.phase());
         let status = lock(&owner.state);
-        assert!(matches!(status.resolution, Resolution::None { .. }), "{status:?}");
-        assert!(!status.settings.forwarding_enabled);
+        assert!(matches!(status.resolution, Resolution::None), "{status:?}");
+        assert!(status.overview.joined);
         assert!(!status.source_muted);
         assert_eq!(status.sent, 0);
+    }
+    for owner in &r.owners {
+        let overview = owner.audio.overview();
+        for peer in &r.owners {
+            let speaker = speaker_card(&owner.group, &overview, peer.links.id(), peer.links.boot().nonce);
+            assert_eq!(speaker.resource.configured_mode, Some(SpeakerMode::Unused));
+        }
     }
     r.stop().await;
 }
@@ -2357,7 +2866,7 @@ async fn permission_changes_update_capture_description_peer_facts_and_cards() {
                 .capture,
             capture
         );
-        assert_eq!(permission_card(&owner.group, source, nonce), icon);
+        assert_eq!(permission_card(owner, source, nonce), icon);
         r.until(|r| {
             r.owners[1]
                 .group
@@ -2380,7 +2889,7 @@ async fn permission_changes_update_capture_description_peer_facts_and_cards() {
                 })
         })
         .await;
-        assert_eq!(permission_card(&r.owners[1].group, source, nonce), icon);
+        assert_eq!(permission_card(&r.owners[1], source, nonce), icon);
         assert_eq!(
             lock(&r.platforms[0].0).queries,
             queries,
@@ -2475,10 +2984,11 @@ async fn exit_driver_operation_retains_source_offer_received_during_maintenance(
     running.owners[1].prepare_driver_change(active.clone()).unwrap();
     let native_events = lock(&running.platforms[1].0).events.clone();
     let native_opens = lock(&running.platforms[1].0).opened_outputs.len();
-    // An idle WASAPI source can reopen while the exit's driver installer owns
-    // its audio guard. M0 stays live and delivers the replacement offer once.
-    let deadline = Instant::now() + Duration::from_secs(11);
-    running.owners[0].tick_source_at(deadline);
+    // A source capture can rebuild (native restart) while the exit's driver
+    // installer owns its audio guard. M0 stays live and delivers the
+    // replacement offer once.
+    lock(&running.platforms[0].0).capture_restart = Some("audio service restarted".into());
+    running.owners[0].tick_source();
     assert!(running.owners[0].capture.is_none());
     running
         .until(|r| {
@@ -2838,32 +3348,39 @@ async fn silent_audio_control_sleeps_but_onset_is_sent_without_a_control_tick() 
 }
 
 #[tokio::test]
-async fn microphone_receive_without_source_is_a_durable_owner_preference() {
+async fn microphone_receive_is_the_own_audio_configuration() {
     let mut running = Running::new().await;
+    let me = running.owners[0].links.id();
+    // Without the virtual microphone this device cannot receive by itself.
+    if !running.owners[0].virtual_microphone_ready() {
+        assert_eq!(
+            running.owners[0].set_mode(me, Role::Microphone, Mode::Shared),
+            Err(dto::ControlFailure::Unsupported)
+        );
+    }
+    // A setter elsewhere turns it on: stored and published with this
+    // device's own configuration, executed as local while it cannot receive.
+    assert_eq!(
+        running.owners[1].set_mode(me, Role::Microphone, Mode::Shared),
+        Ok(dto::ControlOutcome::Applied)
+    );
+    running.until(|r| r.owners[0].receiving()).await;
+    assert!(lock(&running.owners[0].store).owner().audio(me).0.receive.on);
+    assert!(running.owners[0].microphone.resolution.target().is_none());
+    // The retired option 24 is refused.
     let owner = &mut running.owners[0];
-    let option = dto::LocalOption::MicrophoneReceiveMuted;
-    for muted in [false, true] {
-        let revision = lock(&owner.store).owner().revision(option).unwrap();
-        let applied = owner
+    assert_eq!(
+        owner
             .set_option(
                 &boot(owner.links.boot()),
                 owner.group.applied().group,
-                option,
-                revision,
-                muted.write(),
+                dto::LocalOption::from_number(24),
+                1,
+                true.write()
             )
-            .unwrap();
-        assert!(matches!(
-            applied.outcome,
-            dto::ControlOutcome::Applied | dto::ControlOutcome::NoChange
-        ));
-        assert!(applied.persisted);
-        assert!(owner.microphone.resolution.owner().is_none());
-        assert_eq!(
-            lock(&owner.store).owner().item(option).unwrap().value().unwrap(),
-            muted.write()
-        );
-    }
+            .unwrap_err(),
+        dto::ControlFailure::UnsupportedOption
+    );
     running.stop().await;
 }
 
@@ -3030,11 +3547,11 @@ async fn remote_exit_fault_keeps_source_speaker_card_healthy() {
         .into(),
     )
     .unwrap();
-    let peer = owner.resolution.owner().unwrap();
+    let peer = owner.resolution.target().unwrap();
     owner.message(peer, Message::AudioRouteFault(fault));
     owner.publish_observations().unwrap();
     assert_eq!(
-        permission_card(&owner.group, owner.links.id(), owner.links.boot().nonce),
+        permission_card(owner, owner.links.id(), owner.links.boot().nonce),
         crate::device_cards::SpeakerIcon::Forwarding
     );
     assert_eq!(owner.phase(), AudioPhase::WaitingForExit);
@@ -3082,10 +3599,10 @@ async fn service_reset_requires_fresh_metadata_and_same_device_notifications_do_
 }
 
 #[tokio::test]
-async fn failed_playback_follows_a_new_default_output_without_a_new_exit_claim() {
+async fn failed_playback_follows_a_new_default_output_without_a_new_exit_choice() {
     let mut running = Running::start(false).await;
     let owner = &mut running.owners[1];
-    let claim = owner.resolution.stamp();
+    let claim = owner.resolution.version();
     owner.fail_playback("temporary endpoint initialization failure".into());
     owner.accept_devices(Ok(DeviceSnapshot {
         service_generation: None,
@@ -3105,7 +3622,7 @@ async fn failed_playback_follows_a_new_default_output_without_a_new_exit_claim()
     );
     assert!(owner.playback.is_some());
     assert_eq!(owner.bound_output.as_deref(), Some("new-default"));
-    assert_eq!(owner.resolution.stamp(), claim);
+    assert_eq!(owner.resolution.version(), claim);
     running.stop().await;
 }
 
@@ -3132,7 +3649,7 @@ async fn failed_playback_retries_the_same_endpoint_without_another_notification(
 async fn playback_retry_is_bounded_and_keeps_claim_but_replaces_output_generation() {
     let mut running = Running::start(false).await;
     let owner = &mut running.owners[1];
-    let claim = owner.resolution.stamp();
+    let claim = owner.resolution.version();
     let binding = owner.output_binding();
     let queries = lock(&running.platforms[1].0).queries;
     lock(&running.platforms[1].0).playback_init_error = Some("endpoint temporarily unavailable".into());
@@ -3165,7 +3682,7 @@ async fn playback_retry_is_bounded_and_keeps_claim_but_replaces_output_generatio
     assert!(owner.playback.is_some());
     assert!(owner.playback_retry_at.is_none());
     assert_eq!(owner.playback_retry_delay, PLAYBACK_RETRY_INITIAL);
-    assert_eq!(owner.resolution.stamp(), claim);
+    assert_eq!(owner.resolution.version(), claim);
     assert_ne!(
         owner.output_binding(),
         binding,
@@ -3251,8 +3768,11 @@ async fn playback_retry_recovers_a_returning_selected_endpoint_without_falling_b
 #[tokio::test]
 async fn cached_volume_context_tracks_consent_and_local_and_remote_output_generations() {
     let mut r = Running::start(false).await;
-    r.until(|r| r.owners.iter().all(|owner| owner.volume.load().is_some()))
-        .await;
+    // Only the forwarding source holds a volume-key context. The exit's own
+    // forward switch is masked by the exit role (global audio configuration):
+    // its keys stay native on its own output.
+    r.until(|r| r.owners[0].volume.load().is_some()).await;
+    assert!(r.owners[1].volume.load().is_none());
     let original = r.owners[0].volume.load().as_ref().as_ref().unwrap().clone();
     r.owners[0].refresh_volume_context();
     assert!(Arc::ptr_eq(
@@ -3260,10 +3780,10 @@ async fn cached_volume_context_tracks_consent_and_local_and_remote_output_genera
         r.owners[0].volume.load().as_ref().as_ref().unwrap()
     ));
 
-    r.owners[0].settings.forwarding_enabled = false;
+    r.owners[0].set_own_forwarding(false);
     r.owners[0].refresh_volume_context();
     assert!(r.owners[0].volume.load().is_none());
-    r.owners[0].settings.forwarding_enabled = true;
+    r.owners[0].set_own_forwarding(true);
     r.owners[0].refresh_volume_context();
     assert_eq!(
         r.owners[0].volume.load().as_ref().as_ref().unwrap().receiver_output(),
@@ -3273,19 +3793,15 @@ async fn cached_volume_context_tracks_consent_and_local_and_remote_output_genera
     let old_generation = original.receiver_output().unwrap().generation().unwrap();
     r.owners[1].refresh_exit_binding(true).unwrap();
     let generation = r.owners[1]
-        .volume
-        .load()
-        .as_ref()
-        .as_ref()
+        .exit_volume
+        .state()
         .unwrap()
-        .receiver_output()
+        .version()
         .unwrap()
-        .generation()
+        .output_generation()
         .unwrap();
-    assert!(
-        generation > old_generation,
-        "a local rebind invalidates the cached context immediately"
-    );
+    assert!(generation > old_generation, "a local rebind is a new output generation");
+    assert!(r.owners[1].volume.load().is_none(), "still no context on the exit");
     r.owners[1].publish_observations().unwrap();
     r.until(|r| {
         r.owners[0]
@@ -3352,40 +3868,42 @@ async fn cached_peer_outputs_follow_facts_and_disappear_when_the_member_is_remov
 }
 
 #[tokio::test]
-async fn source_quality_negotiates_each_profile_and_falls_back_in_both_directions() {
-    use oink_audio::negotiation::{Profile, Quality};
-    for omitted in [None, Some("oink.audio.quality/1")] {
-        for sender in [0, 1] {
-            let mut running = Running::with_quality_capability(true, omitted).await;
+async fn source_quality_negotiates_each_profile_in_both_directions() {
+    use oink_audio::negotiation::Quality;
+    // Quality is part of the merged audio domain in v2.  The old
+    // audio.quality/2 fallback was a separate-capability behavior and is no
+    // longer a valid negotiation state; exercise every quality profile in
+    // both directions while the audio domain is present.
+    for sender in [0, 1] {
+        let mut running = Running::with_quality_capability(true, None).await;
+        running
+            .until(|r| {
+                r.owners
+                    .iter()
+                    .all(|o| o.audio.merged() && matches!(o.resolution, Resolution::None))
+            })
+            .await;
+        lock(&running.platforms[sender].0).capture_rate = Some(44_100);
+        running.select_exit(1 - sender, true);
+        for quality in [Quality::Smooth, Quality::Quality, Quality::Lossless] {
+            let mut settings = running.owners[sender].settings.clone();
+            settings.quality = quality;
+            running.owners[sender].install_settings(settings).unwrap();
+            let expected = quality.profile(44_100);
             running
-                .until(|r| r.owners.iter().all(|o| matches!(o.resolution, Resolution::None { .. })))
+                .until(|r| {
+                    r.owners[sender].selected.as_ref().is_some_and(|s| s.format == expected)
+                        && r.owners[sender].capture.is_some()
+                })
                 .await;
-            lock(&running.platforms[sender].0).capture_rate = Some(44_100);
-            running.claim(1 - sender, true);
-            for quality in [Quality::Smooth, Quality::Quality, Quality::Lossless] {
-                let mut settings = running.owners[sender].settings.clone();
-                settings.quality = quality;
-                running.owners[sender].install_settings(settings).unwrap();
-                let expected = if omitted.is_some() {
-                    Profile::Opus5ms
-                } else {
-                    quality.profile(44_100)
-                };
-                running
-                    .until(|r| {
-                        r.owners[sender].selected.as_ref().is_some_and(|s| s.format == expected)
-                            && r.owners[sender].capture.is_some()
-                    })
-                    .await;
-                let platform = lock(&running.platforms[sender].0);
-                assert_eq!(platform.encoder.as_ref().unwrap().config(), expected.config());
-                drop(platform);
-                let offer = running.owners[sender].source_session.offer().unwrap();
-                assert_eq!(offer.preferred_descriptor().unwrap().is_some(), omitted.is_none());
-                assert_eq!(running.owners[sender].settings.quality, quality);
-            }
-            running.stop().await;
+            let platform = lock(&running.platforms[sender].0);
+            assert_eq!(platform.encoder.as_ref().unwrap().config(), expected.config());
+            drop(platform);
+            let offer = running.owners[sender].source_session.offer().unwrap();
+            assert!(offer.preferred_descriptor().unwrap().is_some());
+            assert_eq!(running.owners[sender].settings.quality, quality);
         }
+        running.stop().await;
     }
 }
 
@@ -3394,7 +3912,7 @@ async fn lossless_rate_failure_leaves_no_unsent_offer_behind() {
     use oink_audio::negotiation::Profile;
     let mut running = Running::new().await;
     lock(&running.platforms[0].0).capture_rate_error = Some("no default output".into());
-    running.claim(1, true);
+    running.select_exit(1, true);
     running.until(|r| r.owners[0].source_failed).await;
     // A failed rate query must not leave a begun offer that was never sent:
     // the next reconciliation would treat it as current and never offer again.
@@ -3416,4 +3934,154 @@ async fn lossless_rate_failure_leaves_no_unsent_offer_behind() {
         })
         .await;
     running.stop().await;
+}
+
+#[tokio::test]
+async fn mobile_endpoint_state_uses_the_authenticated_boot_and_fences_commands() {
+    use super::mobile_endpoints::MobileAudioDirection;
+
+    let mut running = Running::new().await;
+    let phone = running.owners[1].links.boot();
+    let desktop = running.owners[0].links.id();
+    // No `enabled` key: the mode is the global audio configuration.
+    let direction = |phase: dto::EndpointPhase, generation: u64| {
+        dto::EndpointDirection::from_raw(
+            [
+                (1, true.write()),
+                (3, phase.write()),
+                (4, generation.write()),
+                (5, dto::EndpointCloseReason::None.write()),
+            ]
+            .into(),
+        )
+        .unwrap()
+    };
+    let enabled = direction(dto::EndpointPhase::Running, 2);
+    let inactive = direction(dto::EndpointPhase::Off, 0);
+    let state = dto::AudioEndpointState::from_raw(
+        [
+            (1, boot(phone).write()),
+            (2, 4u64.write()),
+            (3, enabled.write()),
+            (4, inactive.write()),
+            (5, inactive.write()),
+            (6, inactive.write()),
+            (9, 2u64.write()),
+            (10, 0u64.write()),
+            (11, dto::EndpointCloseReason::None.write()),
+        ]
+        .into(),
+    )
+    .unwrap();
+
+    let mut forged = state.clone().into_raw();
+    forged.insert(1, boot(running.owners[0].links.boot()).write());
+    running.owners[0].message(
+        phone.device_id,
+        Message::AudioEndpointState(dto::AudioEndpointState::from_raw(forged).unwrap()),
+    );
+    assert!(lock(&running.owners[0].mobile_audio_states).is_empty());
+
+    running.owners[1]
+        .streams
+        .send(desktop, &Message::AudioEndpointState(state.clone()), Instant::now())
+        .unwrap();
+    running
+        .until(|running| lock(&running.owners[0].mobile_audio_states).contains_key(&phone.device_id))
+        .await;
+    let owner = &mut running.owners[0];
+    let target = lock(&owner.mobile_audio_states)[&phone.device_id]
+        .microphone_send
+        .target;
+    assert_eq!(target.direction, MobileAudioDirection::MicrophoneSend);
+    let deadline = Instant::now() + Duration::from_secs(1);
+    let mut stale = target;
+    stale.generation.0 -= 1;
+    assert!(
+        owner
+            .control_mobile_audio(EndpointAction::Start, stale, deadline)
+            .is_err()
+    );
+    // A PC starts an endpoint only on an Android phone (this peer is not); turning a
+    // phone back to local is the card's audio mode (Clear(phone)), not a close.
+    assert!(
+        owner
+            .control_mobile_audio(EndpointAction::Start, target, deadline)
+            .is_err()
+    );
+
+    // M22: each direction carries its own activation, and a refused command
+    // is answered and kept for the card until the next accepted one.
+    let refusal = |outcome: dto::ControlOutcome, reason: dto::EndpointRefusal| {
+        Message::AudioEndpointResult(
+            dto::AudioEndpointResult::from_raw(
+                [
+                    (1, FixedBytes([5; 16]).write()),
+                    (2, boot(phone).write()),
+                    (3, dto::EndpointDirectionKind::MicrophoneSend.write()),
+                    (4, outcome.write()),
+                    (5, reason.write()),
+                ]
+                .into(),
+            )
+            .unwrap(),
+        )
+    };
+    running.owners[1]
+        .streams
+        .send(
+            desktop,
+            &refusal(dto::ControlOutcome::Refused, dto::EndpointRefusal::Stale),
+            Instant::now(),
+        )
+        .unwrap();
+    let refused = dto::EndpointRefusal::Stale.number();
+    running
+        .until(|r| {
+            lock(&r.owners[0].mobile_audio_states)[&phone.device_id]
+                .microphone_send
+                .refusal
+                == Some(refused)
+        })
+        .await;
+    let mut activated = state.into_raw();
+    let mut microphone = enabled.into_raw();
+    microphone.insert(6, FixedBytes([9; 16]).write());
+    activated.insert(3, dto::EndpointDirection::from_raw(microphone).unwrap().write());
+    activated.insert(2, 5u64.write());
+    running.owners[1]
+        .streams
+        .send(
+            desktop,
+            &Message::AudioEndpointState(dto::AudioEndpointState::from_raw(activated).unwrap()),
+            Instant::now(),
+        )
+        .unwrap();
+    running
+        .until(|r| lock(&r.owners[0].mobile_audio_states)[&phone.device_id].revision.0 == 5)
+        .await;
+    let states = lock(&running.owners[0].mobile_audio_states)[&phone.device_id];
+    assert_eq!(states.microphone_send.target.activation_id, Some([9; 16]));
+    assert_eq!(states.speaker_receive.target.activation_id, None);
+    assert_eq!(
+        states.microphone_send.refusal,
+        Some(refused),
+        "a state update keeps the refusal"
+    );
+    running.owners[1]
+        .streams
+        .send(
+            desktop,
+            &refusal(dto::ControlOutcome::Applied, dto::EndpointRefusal::None),
+            Instant::now(),
+        )
+        .unwrap();
+    running
+        .until(|r| {
+            lock(&r.owners[0].mobile_audio_states)[&phone.device_id]
+                .microphone_send
+                .refusal
+                .is_none()
+        })
+        .await;
 }

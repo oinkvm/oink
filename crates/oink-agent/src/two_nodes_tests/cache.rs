@@ -97,7 +97,7 @@ fn clipboard_store_recovered(config: &crate::config_module::ConfigModule) -> boo
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cache_recovery_observation_does_not_require_a_membership_publication() {
     use crate::config_module::runtime_tests::{same_group, start, stop};
-    use oink_protocol::v1::dto;
+    use oink_protocol::v2::dto;
     let nodes = start(same_group(1)).await;
     let group = &nodes[0].group;
     assert!(!clipboard_store_recovered(group));

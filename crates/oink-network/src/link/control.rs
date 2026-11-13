@@ -183,6 +183,15 @@ pub enum LinkMsg {
     MigrateDrained(Migration),
     MigrateCommit(Migration),
     MigrateCommitted(Migration),
+    /// N0 on the link's path: follower to arbiter, route selection between
+    /// direct connections of the pair.
+    RouteRequest {
+        path_id: PathId,
+        request_id: u64,
+        action: RouteAction,
+    },
+    /// N0 on the link's path: arbiter to follower.
+    RouteState(RouteState),
     /// N1 or the pooled TCP connection, see [`LowMsg::is_hop_control`].
     Low {
         binding: LowBinding,
@@ -232,4 +241,50 @@ pub struct RelayReservation {
     pub random: [u8; 16],
     pub source_connection: ConnectionId,
     pub target_connection: ConnectionId,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RouteAction {
+    /// Use this requester-dialed connection only if it still matches the
+    /// remembered preference; this action never changes that preference.
+    Use {
+        connection: ConnectionId,
+        pinned: Option<std::net::Ipv4Addr>,
+    },
+    /// Replace the pair's remembered preference, independently of reachability.
+    Remember { pin: Option<RoutePin> },
+    /// The requester measured this connection of its own as a better
+    /// automatic route. Remembered targets use Use with an explicit binding.
+    Propose { connection: ConnectionId, median_us: u32 },
+}
+
+/// One pin of a pair: who dials and which address of the other end.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct RoutePin {
+    pub dialer: DeviceId,
+    pub target: std::net::Ipv4Addr,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RouteState {
+    pub path_id: PathId,
+    pub route_revision: RouteRevision,
+    pub active: ConnectionId,
+    pub pin: Option<RoutePin>,
+    /// The dialer-reported target may be outside the acceptor's NAT.
+    pub pin_connection: Option<ConnectionId>,
+    pub set_by: Option<DeviceId>,
+    pub answers: Option<u64>,
+    pub refused: Option<u32>,
+}
+
+/// `LinkRouteState.refused` values (protocol-v2 section 11).
+pub mod route_refusal {
+    pub const NOT_REQUESTER_DIALED: u32 = 0;
+    pub const NOT_STANDBY_OR_CURRENT: u32 = 1;
+    pub const MIGRATING: u32 = 3;
+    pub const CONNECTION_GONE: u32 = 4;
+    /// The current connection still carries another path (the first hop of
+    /// a relayed link, or one end of a forwarded transit).
+    pub const CARRIES_PATHS: u32 = 5;
 }

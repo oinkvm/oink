@@ -33,15 +33,20 @@ impl Rig {
                 initiator_boot: boot,
                 random: [n; 16],
             };
-            let (hop, receiver) = N1::new(connection, peer, "127.0.0.1:9".parse().unwrap());
+            let (hop, receiver) = N1::new(
+                connection,
+                peer,
+                "127.0.0.1:9".parse().unwrap(),
+                Arc::new(arc_swap::ArcSwapOption::empty()),
+            );
             view.hops.push(hop);
             receivers.push(receiver);
             view.routes.push(Route {
                 agreement: Some(
-                    oink_protocol::v1::admission::Agreement::new(
-                        oink_protocol::v1::registry::BASELINE
+                    oink_protocol::v2::admission::Agreement::new(
+                        oink_protocol::v2::registry::BASELINE
                             .iter()
-                            .chain(["oink.diagnostics.collect/1"].iter())
+                            .chain(["oink.diagnostics/2", "oink.low/1"].iter())
                             .map(|s| s.to_string()),
                     )
                     .unwrap(),
@@ -115,6 +120,176 @@ impl Rig {
         (pool, auth)
     }
 }
+#[tokio::test]
+async fn queued_peer_info_survives_route_retirement_but_lease_controls_do_not() {
+    let mut rig = Rig::new(1);
+    let grant = rig.grants[0];
+    rig.fill(0).await;
+    rig.core.publish_advert(grant).unwrap();
+    let view = rig.core.network.hub.view.load_full();
+    let mut source = super::super::wire::PoolSource {
+        receiver: rig.receivers.remove(0),
+        advert: view.hops[0].advert.clone(),
+        port: rig.core.network.clone(),
+        prefer_info: true,
+    };
+    rig.core.network.hub.view.store(Arc::new(View {
+        routes: vec![],
+        hops: view.hops.clone(),
+    }));
+    assert!(!rig.core.network.low_current(grant));
+    let info = source.take().expect("physical Info must survive its old logical route");
+    assert!(
+        matches!(crate::link::control_wire::decode(&info.bytes).unwrap(), crate::link::control::LinkMsg::Low { message, .. } if matches!(message.as_ref(), LowMsg::Info { .. }))
+    );
+    assert!(
+        source.take().is_none(),
+        "a stale lease control still requires its grant"
+    );
+    rig.core.stop().await;
+}
+
+#[tokio::test]
+async fn peer_info_before_route_admission_is_available_to_the_first_open() {
+    let rig = Rig::new(1);
+    let grant = rig.grants[0];
+    let view = rig.core.network.hub.view.load_full();
+    // The authenticated physical connection receives Info before N0 registers
+    // N1 or commits its logical route. No operation is authorized yet.
+    rig.core.network.hub.view.store(Arc::new(View::default()));
+    assert!(!rig.core.network.low_current(grant));
+    let peer_info = Arc::new(arc_swap::ArcSwapOption::empty());
+    peer_info.store(Some(Arc::new(LowMsg::Info {
+        paced: true,
+        port: Some(9),
+        failure: None,
+    })));
+    assert!(rig.core.admit(grant, None).await.is_err());
+    let original = &view.hops[0];
+    let (hop, _controls) = N1::new(original.connection, original.neighbor, original.address, peer_info);
+    rig.core.network.hub.view.store(Arc::new(View {
+        routes: view.routes.clone(),
+        hops: vec![hop.clone()],
+    }));
+    // Keep this unit test at the admission boundary, without dialing TCP.
+    let pool = rig.core.pool(grant).unwrap();
+    lock(&pool.state).warm = WarmState::Opening;
+    let (pool, auth) = rig.core.admit(grant, None).await.unwrap();
+    let request = LowRequest {
+        request: [9; 16],
+        connection: [9; 16],
+        options: Some(LowOptions {
+            send_max: 0,
+            receive_max: 0,
+            operation_max: 0,
+        }),
+        extra: false,
+        keep_alive: true,
+        purpose: LowTcpPurpose::Warm,
+        paced: true,
+        binding: grant.binding,
+        route_tag: 9,
+        kind: StreamKind::LowControl as u16,
+    };
+    rig.core.accept_request(pool.clone(), auth, request).await;
+    assert!(
+        lock(&pool.state).pending.contains_key(&[9; 16]),
+        "the first Open must be admitted"
+    );
+    assert!(
+        matches!(
+            hop.advert.load().as_deref().map(|info| &info.message),
+            Some(LowMsg::Info { .. })
+        ),
+        "reply with our physical listener facts too"
+    );
+    rig.core.stop().await;
+}
+
+#[tokio::test]
+async fn retiring_last_route_preserves_the_physical_peer_info() {
+    let rig = Rig::new(1);
+    let grant = rig.grants[0];
+    let view = rig.core.network.hub.view.load_full();
+    view.hops[0].peer_info.store(Some(Arc::new(LowMsg::Info {
+        paced: true,
+        port: Some(9),
+        failure: None,
+    })));
+    let old = rig.core.pool(grant).unwrap();
+    lock(&old.state).warm = WarmState::Opening;
+    rig.core.admit(grant, None).await.unwrap();
+    rig.core.network.hub.view.store(Arc::new(View {
+        routes: vec![],
+        hops: view.hops.clone(),
+    }));
+    rig.core.revoke_stale();
+    assert!(lock(&rig.core.pools).is_empty());
+    // Reopening N1 on the same physical connection must inherit its facts too.
+    let original = &view.hops[0];
+    let (hop, _controls) = N1::new(
+        original.connection,
+        original.neighbor,
+        original.address,
+        original.peer_info.clone(),
+    );
+    rig.core.network.hub.view.store(Arc::new(View {
+        routes: view.routes.clone(),
+        hops: vec![hop],
+    }));
+    let replacement = rig.core.pool(grant).unwrap();
+    lock(&replacement.state).warm = WarmState::Opening;
+    rig.core.admit(grant, None).await.unwrap();
+    assert!(!Arc::ptr_eq(&old, &replacement));
+    assert_eq!(
+        lock(&replacement.state).advert.as_ref().map(|info| info.port),
+        Some(Some(9))
+    );
+    rig.core.stop().await;
+}
+
+#[tokio::test]
+async fn peer_info_worker_does_not_keep_a_retired_n1_alive() {
+    let rig = Rig::new(1);
+    let view = rig.core.network.hub.view.load_full();
+    let hop = Arc::downgrade(&view.hops[0]);
+    rig.core.reconcile().await;
+    rig.core.network.hub.view.store(Arc::new(View::default()));
+    drop(view);
+    rig.core.reconcile().await;
+    assert!(
+        hop.upgrade().is_none(),
+        "the receive worker must release the retired hop and its sender"
+    );
+    rig.core.stop().await;
+}
+
+#[tokio::test]
+async fn cached_listener_changes_wait_on_their_hop_not_global_reconciliation() {
+    let rig = Rig::new(2);
+    let (pool, _) = rig.fill(0).await;
+    lock(&pool.state).advert = Some(Advert {
+        paced: true,
+        port: Some(9),
+        failure: None,
+    });
+    let view = rig.core.network.hub.view.load_full();
+    view.hops[0].peer_info.store(Some(Arc::new(LowMsg::Info {
+        paced: true,
+        port: Some(10),
+        failure: None,
+    })));
+    view.hops[0].peer_info_changed.notify_one();
+    timeout(Duration::from_secs(1), rig.core.reconcile())
+        .await
+        .expect("a saturated hop must not block other routes");
+    // Hop zero's mandatory Refresh has no capacity yet. Hop one's newly
+    // registered grant can still publish control work immediately.
+    assert_eq!(lock(&pool.state).advert.as_ref().unwrap().port, Some(9));
+    drop(rig.core.queue_control(rig.grants[1], LowMsg::Refresh).await.unwrap());
+    rig.core.stop().await;
+}
+
 #[tokio::test]
 async fn mandatory_capacity_waits_are_per_hop_and_cancel_with_authority() {
     let mut rig = Rig::new(2);

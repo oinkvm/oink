@@ -1,10 +1,10 @@
 //! Live output volume belongs to the selected exit, not to persisted source gain.
-//! This owner fences absolute writes with Boot, claim, output generation and
+//! This owner fences absolute writes with Boot, route version, output generation and
 //! revision, and reports the actual readback rather than an optimistic slider.
-use oink_protocol::v1::{
+use oink_protocol::v2::{
     RawMap, RawValue,
     dto::{
-        Boot, ControlFailure, ControlOutcome, ExitClaimStamp, ExitVolumeResult, ExitVolumeState, ExitVolumeStatus,
+        AudioRouteVersion, Boot, ControlFailure, ControlOutcome, ExitVolumeResult, ExitVolumeState, ExitVolumeStatus,
         ExitVolumeVersion, SetExitVolume,
     },
     schema::{WireDto, WireValue},
@@ -66,15 +66,18 @@ impl From<ControlFailure> for ApplyError {
     }
 }
 
-pub struct Owner {
+pub type Owner = VolumeOwner<dyn Endpoint>;
+pub type SendOwner = VolumeOwner<dyn Endpoint + Send>;
+
+pub struct VolumeOwner<E: Endpoint + ?Sized> {
     boot: Boot,
     generation: u64,
     state: Option<ExitVolumeState>,
-    endpoint: Option<Box<dyn Endpoint>>,
+    endpoint: Option<Box<E>>,
     presses: Vec<keys::Press>,
     completed: VecDeque<(Boot, SetExitVolume, ExitVolumeResult)>,
 }
-impl std::fmt::Debug for Owner {
+impl<E: Endpoint + ?Sized> std::fmt::Debug for VolumeOwner<E> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Owner")
             .field("state", &self.state)
@@ -82,7 +85,7 @@ impl std::fmt::Debug for Owner {
             .finish_non_exhaustive()
     }
 }
-impl Owner {
+impl<E: Endpoint + ?Sized> VolumeOwner<E> {
     pub fn new(boot: Boot) -> Self {
         Self {
             boot,
@@ -105,39 +108,51 @@ impl Owner {
     /// audio-service restart cannot revive an old volume or media context.
     pub fn bind(
         &mut self,
-        claim: ExitClaimStamp,
+        route: AudioRouteVersion,
         output_id: Option<String>,
-        endpoint: Result<Box<dyn Endpoint>, Fault>,
+        endpoint: Result<Box<E>, Fault>,
     ) -> Result<(), ControlFailure> {
-        if claim.owner().and_then(|owner| owner.ordering_key()).ok()
-            != self.boot.device_id().and_then(|owner| owner.ordering_key()).ok()
-        {
-            return Err(ControlFailure::NotExit);
+        self.bind_at_generation(route, output_id, crate::session::next_generation()?, endpoint)
+    }
+
+    /// Bind the same already allocated native generation as the media route.
+    /// The caller binds only while this device is the resolved exit of `route`.
+    pub fn bind_at_generation(
+        &mut self,
+        route: AudioRouteVersion,
+        output_id: Option<String>,
+        generation: u64,
+        endpoint: Result<Box<E>, Fault>,
+    ) -> Result<(), ControlFailure> {
+        if generation == 0 {
+            return Err(ControlFailure::InvalidValue);
         }
-        self.generation = crate::session::next_generation()?;
-        self.presses.clear();
         let version = ExitVolumeVersion::from_raw(RawMap::from([
             (1, self.boot.write()),
             (3, output_id.map_or(RawValue::Null, RawValue::Text)),
-            (4, self.generation.into()),
+            (4, generation.into()),
             (5, 1_u64.into()),
-            (6, claim.write()),
+            (6, route.write()),
         ]))
         .map_err(|_| ControlFailure::InvalidValue)?;
-        let reading = match endpoint {
-            Ok(mut endpoint) => {
-                let reading = endpoint.read();
-                self.endpoint = Some(endpoint);
-                reading
-            }
-            Err(fault) => {
-                self.endpoint = None;
-                Err(fault)
-            }
-        };
-        self.state = Some(state(version, reading)?);
+        let (endpoint, reading) = read_endpoint(endpoint);
+        let state = state(version, reading)?;
+        self.endpoint = endpoint;
+        self.generation = generation;
+        self.presses.clear();
+        self.state = Some(state);
         Ok(())
     }
+
+    /// The route is unchanged when a platform bridge registers or detaches.
+    /// Keep its generation and advance the revision if the readback changes.
+    pub fn replace_endpoint(&mut self, endpoint: Result<Box<E>, Fault>) -> Result<(), ControlFailure> {
+        let (endpoint, reading) = read_endpoint(endpoint);
+        self.apply_reading(reading)?;
+        self.endpoint = endpoint;
+        Ok(())
+    }
+
     pub fn refresh(&mut self, force: bool) -> Result<bool, ControlFailure> {
         let Some(endpoint) = &mut self.endpoint else {
             return Ok(false);
@@ -215,7 +230,7 @@ impl Owner {
         if expected.exit() != version.exit() {
             return Err(ControlFailure::StaleBoot.into());
         }
-        if expected.exit_claim() != version.exit_claim() {
+        if expected.route_version() != version.route_version() {
             return Err(ControlFailure::RouteChanged.into());
         }
         if expected.output_generation() != version.output_generation() || expected.output_id() != version.output_id() {
@@ -257,6 +272,16 @@ impl Owner {
         .expect("validated volume result")
     }
 }
+fn read_endpoint<E: Endpoint + ?Sized>(endpoint: Result<Box<E>, Fault>) -> (Option<Box<E>>, Result<Reading, Fault>) {
+    match endpoint {
+        Ok(mut endpoint) => {
+            let reading = endpoint.read();
+            (Some(endpoint), reading)
+        }
+        Err(fault) => (None, Err(fault)),
+    }
+}
+
 fn state(version: ExitVolumeVersion, reading: Result<Reading, Fault>) -> Result<ExitVolumeState, ControlFailure> {
     let mut raw = RawMap::from([(1, version.write())]);
     match reading {
@@ -275,7 +300,7 @@ fn state(version: ExitVolumeVersion, reading: Result<Reading, Fault>) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::claims::Stamp;
+    use crate::route::Version;
     use oink_foundation::DeviceId;
     use std::{cell::RefCell, rc::Rc};
     #[derive(Clone)]
@@ -307,21 +332,17 @@ mod tests {
         }
     }
     fn boot(nonce: u8) -> Boot {
-        let stamp = Stamp {
-            counter: 1,
-            owner: DeviceId([1; 32]),
-        }
-        .to_wire();
+        let stamp = route_version(1);
         Boot::from_raw(RawMap::from([
-            (1, stamp.owner().unwrap().write()),
+            (1, stamp.author().unwrap().write()),
             (2, RawValue::Bytes(vec![nonce; 16])),
         ]))
         .unwrap()
     }
-    fn claim(counter: u64) -> ExitClaimStamp {
-        Stamp {
-            counter,
-            owner: DeviceId([1; 32]),
+    fn route_version(stamp: u64) -> AudioRouteVersion {
+        Version {
+            stamp,
+            author: DeviceId([1; 32]),
         }
         .to_wire()
     }
@@ -336,7 +357,11 @@ mod tests {
         ))));
         let mut owner = Owner::new(boot(1));
         owner
-            .bind(claim(1), Some("synthetic-output".into()), Ok(Box::new(fake.clone())))
+            .bind(
+                route_version(1),
+                Some("synthetic-output".into()),
+                Ok(Box::new(fake.clone())),
+            )
             .unwrap();
         (owner, fake)
     }
@@ -366,7 +391,7 @@ mod tests {
             native_code: None,
         };
         let (mut owner, _) = setup();
-        owner.bind(claim(1), None, Err(unsupported)).unwrap();
+        owner.bind(route_version(1), None, Err(unsupported)).unwrap();
         let command = request(&owner, 1, 20);
         let result = owner.set(&boot(9), command);
         assert_eq!(result.outcome().unwrap(), ControlOutcome::Refused);
@@ -410,7 +435,7 @@ mod tests {
             let (mut owner, fake) = setup();
             owner
                 .bind(
-                    claim(1),
+                    route_version(1),
                     Some("synthetic-output".into()),
                     Ok(Box::new(Partial {
                         fake: fake.clone(),
@@ -443,27 +468,67 @@ mod tests {
         assert_eq!(owner.state().unwrap().muted().unwrap(), Some(true));
     }
     #[test]
-    fn output_claim_and_boot_aba_are_fenced_and_retired_exit_cannot_write() {
+    fn native_binding_generation_survives_platform_endpoint_replacement() {
+        let (mut owner, original) = setup();
+        owner
+            .bind_at_generation(
+                route_version(1),
+                Some("native".into()),
+                321,
+                Ok(Box::new(original.clone())),
+            )
+            .unwrap();
+        let stale = request(&owner, 7, 80);
+        let replacement = Fake(Rc::new(RefCell::new((
+            Reading {
+                percent: 55,
+                muted: false,
+            },
+            0,
+            false,
+        ))));
+        owner.replace_endpoint(Ok(Box::new(replacement.clone()))).unwrap();
+        let version = owner.state().unwrap().version().unwrap();
+        assert_eq!(version.output_generation(), Ok(321));
+        assert_eq!(version.revision(), Ok(2));
+        assert_eq!(owner.set(&boot(9), stale).reason(), Ok(ControlFailure::StaleRevision));
+        assert_eq!(replacement.0.borrow().1, 0);
+    }
+
+    #[test]
+    fn output_route_and_boot_aba_are_fenced_and_retired_exit_cannot_write() {
         for kind in 0..4 {
             let (mut owner, fake) = setup();
             let request = request(&owner, 1, 20);
             let reason = match kind {
                 0 => {
                     owner
-                        .bind(claim(1), Some("synthetic-output".into()), Ok(Box::new(fake.clone())))
+                        .bind(
+                            route_version(1),
+                            Some("synthetic-output".into()),
+                            Ok(Box::new(fake.clone())),
+                        )
                         .unwrap();
                     ControlFailure::OutputChanged
                 }
                 1 => {
                     owner
-                        .bind(claim(3), Some("synthetic-output".into()), Ok(Box::new(fake.clone())))
+                        .bind(
+                            route_version(3),
+                            Some("synthetic-output".into()),
+                            Ok(Box::new(fake.clone())),
+                        )
                         .unwrap();
                     ControlFailure::RouteChanged
                 }
                 2 => {
                     owner = Owner::new(boot(2));
                     owner
-                        .bind(claim(1), Some("synthetic-output".into()), Ok(Box::new(fake.clone())))
+                        .bind(
+                            route_version(1),
+                            Some("synthetic-output".into()),
+                            Ok(Box::new(fake.clone())),
+                        )
                         .unwrap();
                     ControlFailure::StaleBoot
                 }
@@ -505,7 +570,11 @@ mod tests {
         }
         let (mut owner, fake) = setup();
         owner
-            .bind(claim(1), Some("synthetic-output".into()), Ok(Box::new(Partial(fake))))
+            .bind(
+                route_version(1),
+                Some("synthetic-output".into()),
+                Ok(Box::new(Partial(fake))),
+            )
             .unwrap();
         let command = request(&owner, 1, 20);
         let result = owner.set(&boot(9), command);
@@ -515,7 +584,7 @@ mod tests {
     }
     #[test]
     fn physical_key_press_is_pinned_deduplicated_and_retired_with_output() {
-        use oink_protocol::v1::dto::{AudioSessionContext, ReceiverOutputBinding};
+        use oink_protocol::v2::dto::{AudioSessionContext, ReceiverOutputBinding};
         let (mut owner, fake) = setup();
         let version = owner.state().unwrap().version().unwrap();
         let output = ReceiverOutputBinding::from_raw(
@@ -532,7 +601,7 @@ mod tests {
                 (1, boot(9).write()),
                 (2, 1u64.write()),
                 (3, output.write()),
-                (4, claim(1).write()),
+                (4, route_version(1).write()),
             ]
             .into(),
         )
@@ -568,7 +637,11 @@ mod tests {
         );
         assert_eq!(fake.0.borrow().1, 3);
         owner
-            .bind(claim(1), Some("synthetic-output".into()), Ok(Box::new(fake.clone())))
+            .bind(
+                route_version(1),
+                Some("synthetic-output".into()),
+                Ok(Box::new(fake.clone())),
+            )
             .unwrap();
         assert_eq!(owner.key(event).unwrap_err(), ControlFailure::OutputChanged);
         assert_eq!(fake.0.borrow().1, 3);
@@ -596,7 +669,7 @@ mod tests {
         let (mut owner, fake) = setup();
         owner
             .bind(
-                claim(1),
+                route_version(1),
                 Some("synthetic-output".into()),
                 Ok(Box::new(Deferred(fake.clone()))),
             )
@@ -630,7 +703,7 @@ mod tests {
     #[test]
     fn unavailable_volume_is_unknown_and_pause_is_not_an_authorization_gate() {
         let (mut owner, _) = setup();
-        owner.bind(claim(1), None, Err(Fault::unavailable())).unwrap();
+        owner.bind(route_version(1), None, Err(Fault::unavailable())).unwrap();
         assert_eq!(owner.state().unwrap().volume_percent().unwrap(), None);
         let request = request(&owner, 1, 20);
         assert_eq!(

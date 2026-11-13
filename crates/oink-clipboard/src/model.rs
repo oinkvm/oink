@@ -2,7 +2,7 @@
 //! Format names and node names are business data, never diagnostic labels.
 use oink_foundation::clipboard::ClipPlatform;
 
-pub const AUTO_PULL_BYTES: u64 = oink_protocol::v1::limits::AUTO_FETCH as u64;
+pub const AUTO_PULL_BYTES: u64 = oink_protocol::v2::limits::AUTO_FETCH as u64;
 pub const REPRESENTATION_BYTES: u64 = 256 * 1024 * 1024;
 pub const SNAPSHOT_BYTES: u64 = 1024 * 1024 * 1024;
 pub const INVENTORY_BYTES: usize = 8 * 1024 * 1024;
@@ -106,6 +106,34 @@ impl Inventory {
             .iter()
             .flat_map(|item| &item.representations)
             .any(|rep| matches!(rep.data, RepresentationData::Promise(..)))
+    }
+
+    /// The file root whose picture the item at `index` is.
+    ///
+    /// An image file published with its decoded bitmap (a phone's photos on
+    /// the PC that received them) is listed as an anchor item for the root —
+    /// `file` set, no representations — directly followed by an item whose
+    /// representations are all bitmaps. The bitmap cannot sit on the file item
+    /// itself: standard formats of a file item are its icon and are never
+    /// published (`wanted`). A native writer that carries several bitmaps
+    /// puts each one on its root's own native item (macOS: one pasteboard item
+    /// per image with its PNG/TIFF and file URL); Windows has one bitmap per
+    /// clipboard and takes the first.
+    pub fn bitmap_root(&self, index: usize) -> Option<NodeId> {
+        let item = self.items.get(index)?;
+        let anchor = self.items.get(index.checked_sub(1)?)?;
+        let root = anchor.file?;
+        (item.file.is_none()
+            && !item.virtual_files
+            && !item.representations.is_empty()
+            && item
+                .representations
+                .iter()
+                .all(|rep| rep.standard == Some(StandardFormat::Png))
+            && !anchor.virtual_files
+            && anchor.representations.is_empty()
+            && self.roots.iter().any(|node| node.id == root))
+        .then_some(root)
     }
 
     /// Projection retains item/representation order. File delivery identities are
@@ -213,7 +241,7 @@ impl Inventory {
             return Err(Unavailable::LimitExceeded);
         }
         let encoded = crate::wire::inventory(self)
-            .and_then(|value| oink_protocol::v1::schema::WireDto::encode(&value, INVENTORY_BYTES))
+            .and_then(|value| oink_protocol::v2::schema::WireDto::encode(&value, INVENTORY_BYTES))
             .map_err(|_| Unavailable::InvalidData)?;
         if encoded.len() > INVENTORY_BYTES {
             return Err(Unavailable::LimitExceeded);
@@ -255,7 +283,7 @@ mod automatic_file_tests {
     }
     #[test]
     fn files_inline_and_readers_share_exactly_one_protocol_budget() {
-        assert_eq!(AUTO_PULL_BYTES, oink_protocol::v1::limits::AUTO_FETCH as u64);
+        assert_eq!(AUTO_PULL_BYTES, oink_protocol::v2::limits::AUTO_FETCH as u64);
         let mut inventory = offer(AUTO_PULL_BYTES - 1, RepresentationData::Inline(vec![1]));
         assert!(inventory.automatic_pull(ClipPlatform::Mac));
         inventory.items[0].representations[0].data = RepresentationData::Inline(vec![1, 2]);
@@ -299,6 +327,124 @@ mod automatic_file_tests {
     }
 }
 
+/// Inventories in the `Inventory::bitmap_root` shape, shared by the native
+/// writer tests of both platforms.
+#[cfg(all(test, debug_assertions))]
+pub(crate) mod file_images {
+    use super::*;
+
+    /// One root per entry, in order; an entry that is `true` is an image and
+    /// also gets its bitmap item. Root `i` is `NodeId(i + 1)`; image `i`'s
+    /// bitmap is representation `RepresentationId(i)` on item `64 + i`.
+    pub(crate) fn inventory(images: &[bool]) -> Inventory {
+        let mut items = Vec::new();
+        let mut roots = Vec::new();
+        for (index, image) in images.iter().enumerate() {
+            let index = index as u32;
+            let root = NodeId(u64::from(index) + 1);
+            roots.push(FileNode {
+                id: root,
+                parent: None,
+                name: if *image {
+                    format!("photo-{index}.jpg")
+                } else {
+                    format!("notes-{index}.pdf")
+                },
+                kind: NodeKind::File,
+                size: ContentSize::Known(4),
+                version: 1,
+                modified_ms: None,
+                exec_bits: None,
+            });
+            items.push(ContentItem {
+                id: ItemId(index),
+                file: Some(root),
+                virtual_files: false,
+                representations: Vec::new(),
+            });
+            if *image {
+                items.push(ContentItem {
+                    id: ItemId(64 + index),
+                    file: None,
+                    virtual_files: false,
+                    representations: vec![Representation {
+                        id: RepresentationId(index),
+                        format: NativeFormat::Unknown(crate::wire::portable(StandardFormat::Png).0),
+                        medium: Medium::Bytes,
+                        aspect: 1,
+                        index: -1,
+                        standard: Some(StandardFormat::Png),
+                        data: RepresentationData::Reader {
+                            size: ContentSize::Known(4),
+                        },
+                    }],
+                });
+            }
+        }
+        Inventory {
+            id: OfferId {
+                clip: ClipId {
+                    origin: oink_foundation::DeviceId([3; 32]),
+                    seq: 1,
+                },
+                generation: 1,
+            },
+            platform: ClipPlatform::Unknown,
+            items,
+            roots,
+        }
+    }
+
+    #[test]
+    fn each_bitmap_names_the_image_file_before_it() {
+        // photo, document, photo, photo
+        let inventory = inventory(&[true, false, true, true]);
+        assert_eq!(inventory.validate(), Ok(()));
+        let paired: Vec<_> = (0..inventory.items.len())
+            .filter_map(|index| {
+                inventory
+                    .bitmap_root(index)
+                    .map(|root| (inventory.items[index].id, root))
+            })
+            .collect();
+        assert_eq!(
+            paired,
+            [
+                (ItemId(64), NodeId(1)),
+                (ItemId(66), NodeId(3)),
+                (ItemId(67), NodeId(4))
+            ]
+        );
+        // The anchors stay file items; their bitmaps are published for every
+        // target, the anchors themselves carry nothing.
+        for target in [ClipPlatform::Mac, ClipPlatform::Windows] {
+            assert_eq!(
+                inventory.wanted(target).map(|rep| rep.id).collect::<Vec<_>>(),
+                [RepresentationId(0), RepresentationId(2), RepresentationId(3)]
+            );
+        }
+    }
+
+    #[test]
+    fn a_bitmap_without_an_empty_anchor_is_not_a_file_picture() {
+        let mut inventory = inventory(&[true]);
+        // An anchor with its own representations is an ordinary file item
+        // (e.g. a Finder file URL): the next item is not its picture.
+        let mut anchored = inventory.clone();
+        anchored.items[0].representations = anchored.items[1].representations.clone();
+        anchored.items[0].representations[0].id = RepresentationId(9);
+        assert_eq!(anchored.bitmap_root(1), None);
+        // Not every representation a bitmap.
+        let mut mixed = inventory.clone();
+        mixed.items[1].representations[0].standard = Some(StandardFormat::Text);
+        assert_eq!(mixed.bitmap_root(1), None);
+        // The anchor's root must be one of the offer's roots.
+        inventory.roots.clear();
+        assert_eq!(inventory.bitmap_root(1), None);
+        assert_eq!(inventory.bitmap_root(0), None);
+    }
+}
+
 /// A cursor belongs to one immutable direct-child view, never a live iterator.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -338,7 +484,7 @@ impl DirectoryPage {
         }
         if self.entries.len() > DIRECTORY_PAGE_ENTRIES
             || crate::wire::page(self)
-                .and_then(|value| oink_protocol::v1::schema::WireDto::encode(&value, DIRECTORY_PAGE_BYTES))
+                .and_then(|value| oink_protocol::v2::schema::WireDto::encode(&value, DIRECTORY_PAGE_BYTES))
                 .map_err(|_| Unavailable::InvalidData)?
                 .len()
                 > DIRECTORY_PAGE_BYTES
@@ -457,7 +603,6 @@ pub enum ContentMsg {
     /// target-facing readers can resolve locally. Native accepted is NOT stored.
     TargetStored {
         delivery: DeliveryId,
-        receipt: [u8; 32],
     },
     Failed {
         delivery: DeliveryId,
@@ -465,7 +610,6 @@ pub enum ContentMsg {
     },
     TerminalAck {
         delivery: DeliveryId,
-        receipt: Option<[u8; 32]>,
     },
     /// Authorize persistent real-file access while the offered source is live.
     CloudLinkRequest {

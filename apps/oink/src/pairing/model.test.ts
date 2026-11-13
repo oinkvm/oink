@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { describe, expect, it, vi } from 'vitest';
-import { AddressQueryOwner, pairProblemText } from './model';
+import { AddressQueryOwner, pairProblemText, presentPeer } from './model';
 import type { FoundPeer, PairingEvent } from '../api/pairing';
 import { setLanguage } from '../i18n';
 const found=(generation:string):FoundPeer=>({query_id:'query',generation,prepared:true,peer:{device:'2'.repeat(64),name:'Device',os:'windows',listen:null,remote:{family:0,address:[192,0,2,4],port:47470,interface_scope:0}}});
@@ -38,4 +38,10 @@ it.each(['no_route','no_network_interface','peer_unreachable','socket_error','ne
     expect(message).not.toBe(pairProblemText({code:44}));
     expect(message).not.toBe(language==='en'?'Unavailable':'不可用');
   }
+});
+describe('peer platform',()=>{
+  it('keeps phones as phones in pairing rows',()=>{
+    for(const [os,shown] of [['ios','ios'],['android','android'],['macos','mac'],['windows','win'],['linux','linux'],['other','other']] as const)
+      expect(presentPeer({...found('g').peer,os}).os).toBe(shown);
+  });
 });

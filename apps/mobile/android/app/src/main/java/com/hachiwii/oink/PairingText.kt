@@ -1,0 +1,67 @@
+package com.hachiwii.oink
+
+import uniffi.oink_mobile_ffi.AddressNetworkProblem
+
+/** Chinese text of a pairing / address-query problem code, the same table as the PC's `pairProblemText`. */
+internal fun pairProblemText(code: UInt): String = when (code.toInt()) {
+    0 -> "请输入有效的 IPv4 地址"
+    1 -> "端口应在 1–65535 之间"
+    3 -> "不能与当前设备配对"
+    4 -> "目标主机不可达"
+    5 -> "连接被拒绝"
+    6 -> "连接超时"
+    7 -> "该地址上没有 Oink 设备"
+    8 -> "设备身份已变化，请重新搜索"
+    9 -> "对方的协议版本不兼容"
+    10 -> "对方不支持所需功能"
+    11 -> "设备正忙，请稍后重试"
+    12 -> "操作过于频繁，请稍后重试"
+    13 -> "对方拒绝了配对"
+    14 -> "对方取消了配对"
+    15 -> "已取消配对"
+    16 -> "对方关闭了配对"
+    17 -> "连接已断开"
+    18 -> "请输入六位配对码"
+    19 -> "配对码不正确，请重新输入"
+    20 -> "尝试次数已用完"
+    21 -> "此配对已结束"
+    22 -> "设备已经连接"
+    23 -> "已由另一配对会话接替"
+    24 -> "设备组已变化"
+    25 -> "设备数量已达上限"
+    26 -> "设备组数据超过限制"
+    27 -> "无法验证设备组成员"
+    28 -> "设备组合并冲突"
+    30 -> "无法保存配对结果"
+    31 -> "无法确认提交结果"
+    32 -> "无法获取合并证明"
+    33 -> "设备成员资格已撤销"
+    34 -> "设备组已变化，无法撤销"
+    35 -> "不允许此操作"
+    36 -> "搜索结果的连接已断开，请重新搜索"
+    37 -> "配对状态已变化，请重试"
+    38 -> "配对协议异常"
+    39 -> "设备状态已变化，请重新搜索"
+    40 -> "配对已经提交"
+    41 -> "无法验证设备身份"
+    42 -> "没有共同支持的加密方式"
+    43 -> "不支持该屏幕排列"
+    44 -> "配对服务不可用"
+    45 -> "网络操作超时"
+    46 -> "对方还有没处理的配对请求，请稍后重试"
+    else -> "配对状态未知"
+}
+
+/** Manual add: the typed network problem wins over the generic code (PC `pairProblemText`). */
+internal fun addressProblemText(network: AddressNetworkProblem?, code: UInt): String = when (network) {
+    AddressNetworkProblem.INVALID_ADDRESS -> "请输入有效的 IPv4 地址，例如 192.168.1.20"
+    AddressNetworkProblem.UNREACHABLE -> "目标主机不可达"
+    AddressNetworkProblem.TIMEOUT -> "连接超时"
+    AddressNetworkProblem.REFUSED -> "连接被拒绝"
+    AddressNetworkProblem.INCOMPATIBLE -> "对方的协议版本不兼容"
+    AddressNetworkProblem.NOT_OINK -> "该地址上没有 Oink 设备"
+    AddressNetworkProblem.SELF_DEVICE -> "不能与当前设备配对"
+    AddressNetworkProblem.NO_NETWORK -> "本机没有连接网络"
+    AddressNetworkProblem.BUSY -> "设备正忙，请稍后重试"
+    null -> pairProblemText(code)
+}

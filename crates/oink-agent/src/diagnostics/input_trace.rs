@@ -418,7 +418,7 @@ impl InputTrace {
         group: GroupId,
         source_layout: Arc<oink_display::layout::Layout>,
         owners: Arc<std::collections::BTreeMap<DeviceId, oink_display::layout::OwnerLayoutPreferences>>,
-        version: oink_protocol::v1::dto::ConfigVersion,
+        version: oink_protocol::v2::dto::ConfigVersion,
         input_online: Option<std::collections::BTreeSet<DeviceId>>,
     ) {
         let Some(mut cache) = self.dedup.pop() else {

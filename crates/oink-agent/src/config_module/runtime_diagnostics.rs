@@ -33,7 +33,7 @@ impl Owner {
         let previous = self.shared.diagnostic_layout.load();
         let previous = previous.as_ref().as_ref();
         let register = self.state.layout().map_err(internal)?;
-        let value = v1::layout::register_value(&register).map_err(internal)?;
+        let value = v2::layout::register_value(&register).map_err(internal)?;
         let saved = Arc::new(layout_wire::from_wire(&value).map_err(internal)?);
         let saved_members = self.state.roster().members().map(|m| m.device).collect::<Vec<_>>();
         let installed = self.router_compilation.clone().unwrap_or_else(|| {

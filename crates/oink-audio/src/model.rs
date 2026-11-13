@@ -1,7 +1,7 @@
 //! Local audio observations and the explicit v1 telemetry projection.
 pub use dto::{AudioPhase, UserFacingCode};
 use oink_foundation::DeviceId;
-use oink_protocol::v1::{
+use oink_protocol::v2::{
     self, RawMap, RawValue, dto,
     schema::{WireDto, WireValue},
 };
@@ -24,8 +24,8 @@ macro_rules! numeric_json {
         }
     };
 }
-numeric_json!(phase_json, oink_protocol::v1::dto::AudioPhase);
-numeric_json!(problem_json, oink_protocol::v1::dto::UserFacingCode);
+numeric_json!(phase_json, oink_protocol::v2::dto::AudioPhase);
+numeric_json!(problem_json, oink_protocol::v2::dto::UserFacingCode);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Problem {
@@ -53,7 +53,7 @@ impl Problem {
         )
         .expect("typed problem")
     }
-    pub fn from_wire(value: dto::UserFacingProblem) -> v1::Result<Self> {
+    pub fn from_wire(value: dto::UserFacingProblem) -> v2::Result<Self> {
         Ok(Self {
             code: value.code()?,
             native_code: value.native_code()?,
@@ -149,7 +149,7 @@ pub struct DeviceAudioState {
     pub receivers: Vec<ReceiverReport>,
 }
 impl DeviceAudioState {
-    pub fn to_wire(&self) -> v1::Result<dto::AudioState> {
+    pub fn to_wire(&self) -> v2::Result<dto::AudioState> {
         let outputs = self
             .outputs
             .iter()
@@ -163,7 +163,7 @@ impl DeviceAudioState {
                 )
                 .map(|output| output.write())
             })
-            .collect::<v1::Result<Vec<_>>>()?;
+            .collect::<v2::Result<Vec<_>>>()?;
         let receivers = self
             .receivers
             .iter()
@@ -186,7 +186,7 @@ impl DeviceAudioState {
                 )
                 .map(|report| report.write())
             })
-            .collect::<v1::Result<Vec<_>>>()?;
+            .collect::<v2::Result<Vec<_>>>()?;
         dto::AudioState::from_raw(RawMap::from([
             (3, self.permission.to_wire().write()),
             (4, self.source_muted.write()),
@@ -203,7 +203,7 @@ impl DeviceAudioState {
             (15, self.problem.map(Problem::to_wire).write()),
         ]))
     }
-    pub fn from_wire(value: dto::AudioState) -> v1::Result<Self> {
+    pub fn from_wire(value: dto::AudioState) -> v2::Result<Self> {
         let outputs = value
             .outputs()?
             .0
@@ -214,7 +214,7 @@ impl DeviceAudioState {
                     reported_latency_ms: output.reported_latency_ms()?,
                 })
             })
-            .collect::<v1::Result<Vec<_>>>()?;
+            .collect::<v2::Result<Vec<_>>>()?;
         let receivers = value
             .receivers()?
             .0
@@ -228,7 +228,7 @@ impl DeviceAudioState {
                             .public_key()?
                             .0
                             .try_into()
-                            .map_err(|_| v1::ErrorCode::MalformedFrame)?,
+                            .map_err(|_| v2::ErrorCode::MalformedFrame)?,
                     ),
                     received: report.received()?,
                     concealed: report.concealed()?,
@@ -236,7 +236,7 @@ impl DeviceAudioState {
                     buffered_ms: report.buffered_ms()?,
                 })
             })
-            .collect::<v1::Result<Vec<_>>>()?;
+            .collect::<v2::Result<Vec<_>>>()?;
         Ok(Self {
             phase: value.phase()?,
             problem: value.problem()?.map(Problem::from_wire).transpose()?,

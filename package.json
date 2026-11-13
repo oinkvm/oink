@@ -15,7 +15,7 @@
   "scripts": {
     "licenses": "node build-support/generate-licenses.mjs",
     "licenses:check": "node build-support/generate-licenses.mjs --check",
-    "licenses:test": "node --test build-support/license-policy.test.mjs build-support/check-package-licenses.test.mjs build-support/generate-licenses.test.mjs"
+    "licenses:test": "node --test build-support/license-policy.test.mjs build-support/check-package-licenses.test.mjs build-support/generate-licenses.test.mjs build-support/maven-licenses.test.mjs"
   },
   "license": "GPL-3.0-only"
 }

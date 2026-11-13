@@ -3,6 +3,8 @@ use super::*;
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct Location {
+    #[serde(default)]
+    pub tracked: Option<crate::tracked_file::TrackedFile>,
     path: PathBuf,
     original: PathBuf,
     pub fingerprint: local::Fingerprint,
@@ -16,6 +18,12 @@ pub(super) struct Location {
     volume: PathBuf,
 }
 impl Location {
+    pub fn relative_to(&self, root: &Self) -> io::Result<PathBuf> {
+        self.original
+            .strip_prefix(&root.original)
+            .map(Path::to_path_buf)
+            .map_err(|_| unavailable(Unavailable::Permission))
+    }
     pub fn immutable(&self) -> io::Result<PathBuf> {
         if self.inspect(&self.path)? != self.fingerprint {
             return Err(unavailable(Unavailable::Superseded));
@@ -47,6 +55,7 @@ impl Location {
             }
         }
         let result = Self {
+            tracked: None,
             original: path.clone(),
             path,
             fingerprint,
@@ -92,6 +101,12 @@ impl Location {
         }
     }
     pub fn resolve(&self) -> io::Result<PathBuf> {
+        // A phone proxy can change disk identity at Cloud Files handoff. Its
+        // persistent holder reference authorizes that exact new object; the old
+        // cache path must never be recaptured (it may name a replacement).
+        if let Some(tracked) = &self.tracked {
+            return tracked.resolve().map_err(crate::tracked_file::ResolveError::into_io);
+        }
         if !self.followed.is_empty() {
             for guard in &self.followed {
                 guard.verify()?;
@@ -153,6 +168,7 @@ impl Location {
     }
     pub fn refresh(&self, path: &Path) -> io::Result<Self> {
         let mut location = Self::capture(path)?;
+        location.tracked = self.tracked.clone();
         location.original = self.original.clone();
         location.followed = self.followed.clone();
         Ok(location)

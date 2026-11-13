@@ -2,15 +2,15 @@
 use serde::{Deserialize, Serialize};
 
 /// Largest encoded message on a reliable stream other than configuration control.
-pub const MAX_RELIABLE_MESSAGE: usize = crate::v1::limits::RELIABLE_FRAME;
+pub const MAX_RELIABLE_MESSAGE: usize = crate::v2::limits::RELIABLE_FRAME;
 /// Largest encoded configuration-control message.
 /// A larger one is an error at the sender, logged; never truncated or split.
-pub const MAX_GROUP_STATE_MESSAGE: usize = crate::v1::limits::CONFIG_FRAME;
+pub const MAX_GROUP_STATE_MESSAGE: usize = crate::v2::limits::CONFIG_FRAME;
 /// Largest datagram including its flow number: fits every hop at the minimum path MTU of
 /// 1200 bytes. Posting a larger message is refused and counted.
-pub const MAX_DATAGRAM: usize = crate::v1::limits::DATAGRAM;
+pub const MAX_DATAGRAM: usize = crate::v2::limits::DATAGRAM;
 /// Largest encoded message on a low-priority operation.
-pub const MAX_LOW_MESSAGE: usize = crate::v1::limits::LOW_FRAME;
+pub const MAX_LOW_MESSAGE: usize = crate::v2::limits::LOW_FRAME;
 
 /// Concurrent unidirectional streams one side may have open on a QUIC connection.
 pub const MAX_UNI_STREAMS: u32 = 256;
@@ -53,8 +53,6 @@ pub enum StreamKind {
     Projection = 12,
     /// Capability-gated companion layout-profile configuration snapshots.
     LayoutProfiles = 13,
-    LayoutProfilesV2 = 14,
-    LayoutProfilesV3 = 15,
 }
 
 impl StreamKind {
@@ -72,8 +70,6 @@ impl StreamKind {
             11 => Self::Cache,
             12 => Self::Projection,
             13 => Self::LayoutProfiles,
-            14 => Self::LayoutProfilesV2,
-            15 => Self::LayoutProfilesV3,
             _ => return None,
         })
     }
@@ -130,11 +126,11 @@ pub struct StreamHeader {
     pub datagram_flow: u32,
 }
 
-pub const MAX_STREAM_HEADER: usize = crate::v1::limits::MAX_HEADER;
+pub const MAX_STREAM_HEADER: usize = crate::v2::limits::MAX_HEADER;
 
 impl StreamHeader {
-    pub fn to_wire(self) -> crate::v1::frame::StreamHeader {
-        crate::v1::frame::StreamHeader {
+    pub fn to_wire(self) -> crate::v2::frame::StreamHeader {
+        crate::v2::frame::StreamHeader {
             kind: self.tag.kind as u16,
             priority: self.priority as u8,
             route_tag: self.route_tag,
@@ -146,7 +142,7 @@ impl StreamHeader {
         out.extend_from_slice(&self.to_wire().encode().expect("valid local stream header"));
     }
     pub fn decode(bytes: &[u8]) -> Result<Option<(Self, usize)>, FrameError> {
-        let Some((header, size)) = crate::v1::frame::StreamHeader::parse(bytes).map_err(|_| FrameError::Header)? else {
+        let Some((header, size)) = crate::v2::frame::StreamHeader::parse(bytes).map_err(|_| FrameError::Header)? else {
             return Ok(None);
         };
         let kind = u8::try_from(header.kind)
@@ -174,8 +170,10 @@ impl StreamHeader {
 }
 
 /// Close and reject codes, one set for both. They travel with the reader's stop
-/// request or the writer's reset. There is no "paused" code: a paused device neither
-/// rejects nor closes streams opened towards it.
+/// request or the writer's reset. `Paused`: the device paused sharing of this
+/// stream's kind (B0 while clipboard sharing is paused, 2026-11-10); it closes
+/// the stream both ways and rejects a new one, so a requester fails at once
+/// instead of waiting for an answer the paused device cannot send.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum StreamCode {
     None,
@@ -197,6 +195,7 @@ pub enum StreamCode {
     Cancelled,
     StateConflict,
     InvalidHeader,
+    Paused,
     Unknown(u64),
 }
 impl StreamCode {
@@ -210,7 +209,7 @@ impl StreamCode {
             5 => Self::Resend,
             6 => Self::UnknownMessage,
             7 => Self::UnnegotiatedCapability,
-            8 => Self::UnsupportedMajor,
+            100 => Self::UnsupportedMajor,
             9 => Self::MissingCapability,
             10 => Self::UnsupportedValue,
             11 => Self::AuthenticationFailed,
@@ -221,6 +220,7 @@ impl StreamCode {
             16 => Self::Cancelled,
             17 => Self::StateConflict,
             18 => Self::InvalidHeader,
+            19 => Self::Paused,
             other => Self::Unknown(other),
         }
     }
@@ -234,7 +234,7 @@ impl StreamCode {
             Self::Resend => 5,
             Self::UnknownMessage => 6,
             Self::UnnegotiatedCapability => 7,
-            Self::UnsupportedMajor => 8,
+            Self::UnsupportedMajor => 100,
             Self::MissingCapability => 9,
             Self::UnsupportedValue => 10,
             Self::AuthenticationFailed => 11,
@@ -245,6 +245,7 @@ impl StreamCode {
             Self::Cancelled => 16,
             Self::StateConflict => 17,
             Self::InvalidHeader => 18,
+            Self::Paused => 19,
             Self::Unknown(other) => other,
         }
     }

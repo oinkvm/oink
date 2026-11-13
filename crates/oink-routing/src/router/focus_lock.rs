@@ -45,6 +45,22 @@ impl Router {
             return Err(FocusLockError::Paused);
         }
         let destination = self.layout.pointer_destination(self.me(), target);
+        // A screenless member compiles no layout: land at the centre of the
+        // target's primary screen from its DeviceFacts (protocol §14.2).
+        let destination = destination.or_else(|| {
+            if !self.cfg.screenless {
+                return None;
+            }
+            let peer = self.peers.get(&target)?;
+            let screen = peer
+                .displays
+                .iter()
+                .find(|display| display.is_primary)
+                .or_else(|| peer.displays.first())?;
+            let center = screen.bounds.center();
+            (screen.bounds.w > 0.0 && screen.bounds.h > 0.0 && center.x.is_finite() && center.y.is_finite())
+                .then(|| ScreenPos::new(ScreenId::new(target, screen.key.clone()), center))
+        });
         // Older peers drop 0x1301 unread: both the target and the holder that
         // sends it must have negotiated the hidden entry, or the source would leave.
         let hidden = destination
@@ -136,11 +152,15 @@ impl Router {
     pub fn toggle_locked(&mut self) {
         self.request_focus_lock(None);
     }
-    fn request_focus_lock(&mut self, locked: Option<bool>) {
+    pub(super) fn request_focus_lock(&mut self, locked: Option<bool>) {
         if self.paused {
             return;
         }
         let holder = self.locked_device().unwrap_or(self.holder);
+        // A screenless member without a target has no focus of its own to pin.
+        if self.cfg.screenless && holder == self.me() && !self.screen_focus_active() {
+            return;
+        }
         if self.layout.source_requires_target(holder) {
             return;
         }
@@ -1204,6 +1224,70 @@ mod tests {
         deliver(&mut a, &mut b);
         assert_eq!(a.focus().holder, A);
     }
+    #[test]
+    fn android_input_target_uses_arrangement_geometry() {
+        let (mut desktop, _) = pair();
+        desktop.set_layout(super::super::connection_tests::session_layout(A, DeviceId([3; 32])));
+        desktop.set_peer_os(B, Os::Android, 1);
+        assert!(!desktop.layout.contains_device(B));
+        assert_eq!(desktop.move_pointer_to(B), Err(FocusLockError::Unavailable));
+
+        let display = oink_foundation::display::ANDROID_INPUT_DISPLAY;
+        desktop.set_peer_displays(
+            B,
+            vec![DisplayInfo {
+                key: display.into(),
+                name: "Built-in display".into(),
+                bounds: Rect::new(0.0, 0.0, 400.0, 800.0),
+                pixel_width: 400,
+                pixel_height: 800,
+                reference_extent: None,
+                rotation_deg: 0,
+                is_primary: true,
+                is_builtin: true,
+                is_virtual: false,
+            }],
+        );
+        assert!(
+            desktop
+                .layout
+                .focus_candidates(A)
+                .iter()
+                .all(|target| target.screen.device != B)
+        );
+        assert_eq!(desktop.move_pointer_to(B), Err(FocusLockError::Unavailable));
+        let mut layout = crate::SimpleLayout::new();
+        layout.add_screen(
+            ScreenId::new(A, "a"),
+            Rect::new(0., 0., 1000., 800.),
+            Rect::new(0., 0., 1000., 800.),
+        );
+        layout.add_screen(
+            ScreenId::new(B, display),
+            Rect::new(0., 0., 400., 800.),
+            Rect::new(1000., 0., 400., 800.),
+        );
+        desktop.set_layout(Arc::new(layout));
+        desktop.move_pointer_to(B).unwrap();
+        assert!(desktop.drain_outputs().iter().any(|output| matches!(output,
+            Output::Send { to, msg: Message::Control(ControlMsg::FocusEnter { display: key, pos, .. }), .. }
+                if *to == B && key == display && *pos == Point::new(200.0, 400.0)
+        )));
+        assert_eq!(desktop.focus().holder, B);
+        physical(
+            &mut desktop,
+            InputEvent::Key {
+                code: KeyCode(0x0007_0004),
+                pressed: true,
+            },
+        );
+        assert!(desktop.drain_outputs().iter().any(|output| matches!(output,
+            Output::Send { to, msg: Message::Input(InputMsg::Key { pressed: true, .. }), .. } if *to == B
+        )));
+        desktop.return_pointer_home();
+        assert_eq!(desktop.focus().holder, A);
+    }
+
     #[test]
     fn pointer_shortcut_remote_holder_request_is_epoch_fenced() {
         let (mut a, mut b) = pair();

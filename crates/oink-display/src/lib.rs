@@ -101,6 +101,34 @@ pub trait DisplayBackend: Send + Sync {
     }
 }
 
+/// The system scale of a local display (protocol §7, DisplayFact key 13):
+/// macOS 1 (native coordinates are points, already logical); Windows the
+/// screen's effective DPI / 96, recorded by the last enumeration (native
+/// coordinates are physical pixels). `None` when unknown.
+pub fn system_scale(key: &str) -> Option<f64> {
+    if cfg!(target_os = "macos") {
+        return Some(1.0);
+    }
+    SYSTEM_SCALES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(key)
+        .copied()
+}
+
+static SYSTEM_SCALES: std::sync::Mutex<std::collections::BTreeMap<String, f64>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+#[cfg_attr(not(windows), allow(dead_code))]
+fn record_system_scale(key: &str, scale: f64) {
+    if scale.is_finite() && scale > 0.0 {
+        SYSTEM_SCALES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key.to_owned(), scale);
+    }
+}
+
 /// 创建本机平台的实现。
 pub fn platform_backend() -> Result<Box<dyn DisplayBackend>, DisplayError> {
     #[cfg(target_os = "macos")]

@@ -48,6 +48,24 @@ fn session(node: &Node, id: &str) -> pairing::PairView {
 async fn request(a: &Node, b: &Node) -> (String, String) {
     common::request(a, b).await
 }
+/// This node's own speaker "forward" switch (global audio configuration).
+fn forwarding(node: &Node) -> bool {
+    node.audio_status()
+        .unwrap()
+        .overview
+        .switch(node.id(), oink_audio::route::Role::Speaker)
+        == Some(true)
+}
+/// The forward switch persisted in a node's own audio configuration.
+fn saved_forwarding(dir: &Path) -> bool {
+    oink_agent::config::AgentConfig::load_from(dir)
+        .unwrap()
+        .owner()
+        .audio(oink_foundation::DeviceId([0; 32]))
+        .0
+        .forward
+        .on
+}
 
 #[test]
 fn fresh_install_and_pairing_keep_audio_local() {
@@ -56,15 +74,12 @@ fn fresh_install_and_pairing_keep_audio_local() {
         "fresh_install_and_pairing_keep_audio_local",
         Some(4),
         async {
-            use oink_agent::{
-                config::AgentConfig,
-                device_cards::{SpeakerIcon, SpeakerMode},
-            };
+            use oink_agent::device_cards::{SpeakerIcon, SpeakerMode};
             let temp = tempfile::tempdir().unwrap();
             let a = Node::start_with_fake_platform(options(temp.path(), "a")).await.unwrap();
             let b = Node::start_with_fake_platform(options(temp.path(), "b")).await.unwrap();
             for node in [&a, &b] {
-                assert!(!node.audio_status().unwrap().settings.forwarding_enabled);
+                assert!(!forwarding(node));
                 assert!(!node.audio_status().unwrap().source_muted);
             }
             common::pair(&a, &b).await;
@@ -75,7 +90,7 @@ fn fresh_install_and_pairing_keep_audio_local() {
                     let cards = node.device_cards().unwrap();
                     !matches!(
                         node.audio_status().unwrap().resolution,
-                        oink_audio::claims::Resolution::Unknown
+                        oink_audio::route::Resolution::Unknown
                     ) && cards.cards.len() == 2
                         && cards.cards.iter().all(|card| {
                             card.status.as_ref().is_some_and(|s| {
@@ -87,12 +102,9 @@ fn fresh_install_and_pairing_keep_audio_local() {
             .await;
             for node in [&a, &b] {
                 let status = node.audio_status().unwrap();
+                assert!(!forwarding(node), "pairing must not opt in a fresh source");
                 assert!(
-                    !status.settings.forwarding_enabled,
-                    "pairing must not opt in a fresh source"
-                );
-                assert!(
-                    matches!(status.resolution, oink_audio::claims::Resolution::None { .. }),
+                    matches!(status.resolution, oink_audio::route::Resolution::None),
                     "{status:?}"
                 );
                 assert!(!status.source_muted);
@@ -103,13 +115,7 @@ fn fresh_install_and_pairing_keep_audio_local() {
                     assert_eq!(speaker.resource.configured_mode, Some(SpeakerMode::Unused));
                     assert_eq!(speaker.resource.icon, SpeakerIcon::Unused);
                 }
-                assert!(
-                    !AgentConfig::load_from(node.data_dir())
-                        .unwrap()
-                        .settings
-                        .audio
-                        .forwarding_enabled
-                );
+                assert!(!saved_forwarding(node.data_dir()));
             }
             a.shutdown().await;
             b.shutdown().await;
@@ -129,10 +135,15 @@ fn joining_a_group_with_an_explicit_exit_keeps_new_sources_local() {
                 device_cards::{CardAction, SpeakerMode},
             };
             let temp = tempfile::tempdir().unwrap();
-            // A previous explicit source choice remains authoritative.
+            // A previous explicit forward choice (this device's own audio
+            // configuration) remains authoritative.
             AgentConfig::load_from(&temp.path().join("a"))
                 .unwrap()
-                .update(|s| s.audio.forwarding_enabled = true)
+                .update_owner(|owner| {
+                    let (mut own, last) = owner.audio(oink_foundation::DeviceId([0; 32]));
+                    own.forward.on = true;
+                    owner.commit_audio(own, last)
+                })
                 .unwrap();
             let a = Node::start_with_fake_platform(options(temp.path(), "a")).await.unwrap();
             let b = Node::start_with_fake_platform(options(temp.path(), "b")).await.unwrap();
@@ -170,23 +181,25 @@ fn joining_a_group_with_an_explicit_exit_keeps_new_sources_local() {
                 "explicit exit choice refused: {reply:?}"
             );
             common::until("explicit exit resolved", || {
-                a.audio_status().unwrap().resolution.owner() == Some(b.id())
+                a.audio_status().unwrap().resolution.target() == Some(b.id())
             })
             .await;
             let c = Node::start_with_fake_platform(options(temp.path(), "c")).await.unwrap();
-            assert!(!c.audio_status().unwrap().settings.forwarding_enabled);
+            assert!(!forwarding(&c));
             common::pair(&c, &b).await;
             common::until("joined audio baseline", || {
-                c.audio_status().unwrap().resolution.owner() == Some(b.id())
+                c.audio_status().unwrap().resolution.target() == Some(b.id())
             })
             .await;
+            // The exit keeps forward on for when it loses the exit (Q1); the
+            // joining source stays local.
+            assert!(!forwarding(&c));
             for node in [&b, &c] {
                 let status = node.audio_status().unwrap();
-                assert!(!status.settings.forwarding_enabled);
                 assert!(!status.source_muted);
                 assert_eq!(status.sent, 0);
             }
-            assert!(a.audio_status().unwrap().settings.forwarding_enabled);
+            assert!(forwarding(&a));
             // Audio resolution and the immutable UI cards publish separately.
             // Wait for the card's own baseline before asserting its mode.
             common::until("joined source local card", || {
@@ -203,15 +216,9 @@ fn joining_a_group_with_an_explicit_exit_keeps_new_sources_local() {
                 node.shutdown().await;
             }
             let restarted = Node::start_with_fake_platform(options(temp.path(), "c")).await.unwrap();
-            assert!(!restarted.audio_status().unwrap().settings.forwarding_enabled);
+            assert!(!forwarding(&restarted));
             restarted.shutdown().await;
-            assert!(
-                AgentConfig::load_from(&temp.path().join("a"))
-                    .unwrap()
-                    .settings
-                    .audio
-                    .forwarding_enabled
-            );
+            assert!(saved_forwarding(&temp.path().join("a")));
         },
     );
 }
@@ -388,7 +395,7 @@ fn onboarding_admits_one_pairing_and_regular_mode_keeps_the_pending_limit() {
                     .any(|s| s.id == refused && s.phase == 8)
             })
             .await;
-            assert_eq!(session(&c, &refused).terminal.unwrap().code, 13); // Declined
+            assert_eq!(session(&c, &refused).terminal.unwrap().code, 11); // QueueFull: nobody declined
             assert!(b.pairings().unwrap().requests.is_empty());
             assert!(!b.pairings().unwrap().sessions.iter().any(|s| s.id == refused));
             assert_eq!(session(&b, &first).phase, 2);
@@ -416,7 +423,7 @@ fn onboarding_admits_one_pairing_and_regular_mode_keeps_the_pending_limit() {
                 session(&c, &refused_again).phase == 8
             })
             .await;
-            assert_eq!(session(&c, &refused_again).terminal.unwrap().code, 13);
+            assert_eq!(session(&c, &refused_again).terminal.unwrap().code, 11);
             b.set_onboarding_connect(false).unwrap();
             let normal = start_request(&c, &b, "normal-after-onboarding").await;
             common::until("normal mode accepts another pending request", || {
@@ -719,4 +726,188 @@ async fn different_groups_merge_in_the_explicit_request_direction_scenario() {
     for node in first.iter().chain(&second) {
         node.shutdown().await;
     }
+}
+
+/// A desktop and a phone paired over loopback, both online to each other.
+async fn paired_mobile(
+    root: &Path,
+) -> (
+    Node,
+    oink_mobile_core::MobileNetwork,
+    oink_foundation::DeviceId,
+    std::path::PathBuf,
+) {
+    use oink_foundation::session::Boot;
+    use oink_mobile_core::{MobileNetwork, MobileNetworkConfig};
+    use oink_network::{group_state::State, identity::Identity, pairing as network_pairing};
+    use oink_protocol::v2::{limits, schema::WireDto};
+
+    let desktop = Node::start_with_fake_platform(options(root, "desktop")).await.unwrap();
+    let desktop_addr = ([127, 0, 0, 1], desktop.network_info().unwrap().port).into();
+    let seed = [81; 32];
+    let mobile_id = Identity::from_seed(seed);
+    let mobile_group = State::create(&mobile_id, "test phone", "android", 1).unwrap();
+    let mobile_dir = root.join("mobile");
+    let state_path = mobile_dir.join("group-state.v2");
+    let mobile = MobileNetwork::start(MobileNetworkConfig {
+        identity_seed: seed,
+        boot: Boot {
+            device_id: mobile_id.id(),
+            nonce: [91; 16],
+        },
+        bind: "127.0.0.1:0".parse().unwrap(),
+        group_state: Some(mobile_group.wire().encode(limits::CONFIG_STATE).unwrap()),
+        group_state_path: state_path.clone(),
+        pairing_journal_path: mobile_dir.join("pairing-recovery.cbor"),
+        device_name: "test phone".into(),
+        os: "android".into(),
+        form_factor: None,
+        trusted_peers: Vec::new(),
+        trust_path: None,
+        process: Default::default(),
+    })
+    .await
+    .unwrap();
+    mobile.dial(desktop.id(), vec![desktop_addr]).unwrap();
+    common::until("mobile authenticated desktop greeting", || {
+        mobile.authenticated_advert(desktop.id()).is_some()
+    })
+    .await;
+    let pair = mobile.start_pairing(desktop.id()).unwrap();
+    common::converge(&[&desktop], "desktop receives the mobile pairing request", || {
+        desktop
+            .pairings()
+            .unwrap()
+            .requests
+            .iter()
+            .any(|request| request.id == pair)
+    })
+    .await;
+    let pending = desktop
+        .pairings()
+        .unwrap()
+        .requests
+        .into_iter()
+        .find(|request| request.id == pair)
+        .unwrap();
+    let client = desktop.clone();
+    let accepted = tokio::task::spawn_blocking(move || client.accept_pairing(pending.id, pending.revision))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(accepted, pairing::PairReply::Value(_)));
+    let code = mobile.pairing_code(&pair).unwrap();
+    let submitted = common::submit(&desktop, pair.clone(), 1, code).await;
+    assert!(matches!(submitted, pairing::PairReply::Value(_)));
+    common::until("C0 pairing receipt and desktop facts on the phone", || {
+        let state = mobile.pairing_snapshot().unwrap();
+        let session = state
+            .sessions
+            .iter()
+            .find(|session| network_pairing::key(session.id) == pair);
+        assert!(
+            !session.is_some_and(|session| session.phase == network_pairing::Phase::Ended),
+            "{session:?}"
+        );
+        session.is_some_and(|session| session.phase == network_pairing::Phase::Completed)
+            && mobile.peer_facts(desktop.id()).is_some()
+            && desktop.device_cards().unwrap().cards.iter().any(|card| {
+                card.device.0 == mobile_id.id()
+                    && matches!(card.connection, oink_agent::device_cards::CardConnection::Online { .. })
+            })
+    })
+    .await;
+    (desktop, mobile, mobile_id.id(), state_path)
+}
+
+#[test]
+fn mobile_pairing_converges_with_desktop_owner() {
+    common::watchdog::run(
+        module_path!(),
+        "mobile_pairing_converges_with_desktop_owner",
+        Some(4),
+        async {
+            use oink_network::group_state::State;
+            use oink_protocol::v2::{dto, limits, schema::WireDto};
+
+            let temp = tempfile::tempdir().unwrap();
+            let (desktop, mobile, mobile_id, state_path) = paired_mobile(temp.path()).await;
+            let bytes = std::fs::read(state_path).unwrap();
+            let wire =
+                dto::GroupState::from_raw(oink_protocol::v2::cbor::decode_map(&bytes, limits::CONFIG_STATE).unwrap())
+                    .unwrap();
+            let persisted = State::from_wire(wire).unwrap();
+            assert!(persisted.roster().contains(desktop.id()));
+            assert!(persisted.roster().contains(mobile_id));
+            mobile.stop().await;
+            desktop.shutdown().await;
+        },
+    );
+}
+
+/// Route selection is baseline core/2 on phones too (route design D10,
+/// protocol-v2 11.3): the desktop's route menu for a phone has data, and a
+/// choice made on the desktop moves the link and pins it on the phone.
+#[test]
+fn desktop_measures_and_chooses_a_phone_route() {
+    common::watchdog::run(
+        module_path!(),
+        "desktop_measures_and_chooses_a_phone_route",
+        Some(4),
+        async {
+            use oink_agent::api::{DeviceKey, RouteRowState, RouteSelection};
+            use oink_network::link::{Direction, RouteRecord};
+
+            let temp = tempfile::tempdir().unwrap();
+            let (desktop, mobile, mobile_id, _) = paired_mobile(temp.path()).await;
+            let phone_addr = mobile.local_addr();
+            let phone_ip = phone_addr.ip().to_string();
+            // The phone dialed, so the desktop is the passive end; it keeps a
+            // standby to the phone's published endpoint and measures it.
+            common::until("desktop measures the phone's published endpoint", || {
+                desktop.member_routes(DeviceKey(mobile_id)).is_ok_and(|routes| {
+                    routes.available
+                        && !routes.relayed
+                        && routes.passive
+                        && routes.can_replace
+                        && routes.rows.iter().any(|row| {
+                            row.ip == phone_ip && row.port == phone_addr.port() && row.state == RouteRowState::Reachable
+                        })
+                })
+            })
+            .await;
+            let client = desktop.clone();
+            let ip = phone_ip.clone();
+            let applied = tokio::task::spawn_blocking(move || {
+                client.set_member_route(DeviceKey(mobile_id), RouteSelection::Address { ip })
+            })
+            .await
+            .unwrap()
+            .unwrap();
+            assert!(applied);
+            let desktop_id = desktop.id();
+            common::until("the phone follows the desktop's choice and keeps its pin", || {
+                mobile
+                    .links()
+                    .by_peer(desktop_id)
+                    .and_then(|entry| entry.route.clone())
+                    .is_some_and(|route| {
+                        route.direction == Direction::Inbound
+                            && route.pin == Some(RouteRecord::Incoming(std::net::Ipv4Addr::LOCALHOST))
+                            && route.pin_set_by == Some(desktop_id)
+                    })
+            })
+            .await;
+            common::until("the desktop is the active end on the chosen address", || {
+                desktop.member_routes(DeviceKey(mobile_id)).is_ok_and(|routes| {
+                    !routes.passive
+                        && matches!(&routes.selection, RouteSelection::Address { ip } if *ip == phone_ip)
+                        && routes.rows.iter().any(|row| row.current && row.ip == phone_ip)
+                })
+            })
+            .await;
+            mobile.stop().await;
+            desktop.shutdown().await;
+        },
+    );
 }

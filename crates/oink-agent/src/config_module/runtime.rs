@@ -11,13 +11,12 @@ use oink_network::{
     discovery::{Advert, Discovery, DiscoveryConfig, Sighting},
     group_state::State,
     link::{ConfigEvent, DialFailure, DialMode, DialOrigin, Direction, Disconnect, LinkId, LinkPath, PostError},
-    pair_journal::Journal,
-    pair_merge::Transactions,
-    pairing::{self, Sessions},
+    member::{self, Membership},
+    pairing,
     roster::Anchor,
     wire_identity as wire,
 };
-use oink_protocol::v1::{
+use oink_protocol::v2::{
     Message, RawValue,
     schema::{WireDto, WireValue},
 };
@@ -29,12 +28,13 @@ use std::{
 use tokio::sync::{mpsc, watch};
 #[path = "runtime_diagnostics.rs"]
 mod diagnostics;
+#[path = "member_host.rs"]
+mod member_host;
 #[path = "pairing_api.rs"]
 mod pairing_api;
-#[path = "recovery.rs"]
-mod recovery;
 #[path = "runtime_state.rs"]
 mod state_owner;
+use member_host::SessionView;
 /// Maximum idle interval on a greeted, unadmitted C0, including one opened
 /// before either peer learned membership. Real configuration admission normally
 /// takes about 150 ms; ten seconds leaves ample scheduling/network margin.
@@ -214,11 +214,11 @@ impl Dial {
 pub(super) struct Owner {
     config: Arc<Mutex<crate::config::AgentConfig>>,
     owner_gate: Arc<Mutex<()>>,
-    pending_effects: VecDeque<oink_network::pair_merge::Effect>,
     projection_retry: Option<Instant>,
     pending_revocation: Option<State>,
-    projection_announced: Option<[u8; 32]>,
-    recovery_projected: Vec<(LinkId, Option<Message>, bool)>,
+    /// Shared member decisions: pairing sessions, merge transactions, the
+    /// pairing journal and old-root recovery (`oink_network::member`).
+    pub(super) member: Membership,
     state: State,
     pointer_shortcuts_pending: bool,
     needs_apply: bool,
@@ -233,11 +233,10 @@ pub(super) struct Owner {
     incoming_tx: mpsc::UnboundedSender<Incoming>,
     incoming: mpsc::UnboundedReceiver<Incoming>,
     sessions: BTreeMap<LinkId, Link>,
-    pairs: Sessions,
     onboarding_connect: bool,
-    transactions: Transactions,
-    journal: Journal,
     blocks: Option<crate::config::records::BlockList>,
+    /// See [`ConfigDeps::pairing`].
+    pairing: bool,
     block_stream: String,
     block_revision: u64,
     presence: crate::config::records::PresenceStore,
@@ -252,14 +251,14 @@ pub(super) struct Owner {
     endpoints: HashMap<PairId, api::PairEndpoint>,
     local_terminal: VecDeque<api::PairView>,
     operations: VecDeque<(String, String, serde_json::Value)>,
-    proof_objects: oink_network::pair_objects::Objects,
-    proof_expected: HashMap<(LinkId, [u8; 32]), recovery::Expected>,
-    lookups: HashMap<LinkId, (Anchor, Instant)>,
-    recovery_due: HashMap<PairId, Instant>,
     pub(super) local: Facts,
     facts: BTreeMap<DeviceId, Arc<dto::DeviceFacts>>,
     last_facts: Instant,
     network_checked: Instant,
+    /// Test only: this member accepts connections but never dials (a peer
+    /// behind NAT). Unlike a held dial flag, no later event re-enables it.
+    #[cfg(test)]
+    no_outbound_dials: bool,
     #[cfg(test)]
     pub(super) hold_facts: bool,
     #[cfg(test)]
@@ -293,6 +292,60 @@ impl ConfigModule {
         let _ = self.commands.send(Command::Run(Box::new(f)));
     }
 }
+/// Decode the stored group state the way [`Owner::start`] reads it, without
+/// writing anything. The backend runs this before it binds a socket: a file
+/// that cannot be read and content that does not decode (for example a
+/// register whose stored value has another shape) are the same case for the
+/// user, the IPC-only "group state unreadable" alert with its reset. `Err`
+/// names the failing step and register.
+pub fn check_group_state(data_dir: &std::path::Path, device: DeviceId) -> Result<(), String> {
+    fn at<E: std::fmt::Display>(step: &'static str) -> impl FnOnce(E) -> String {
+        move |error| format!("{step}: {error}")
+    }
+    let Some(stored) = group_store::load(&data_dir.join(group_store::STATE_FILE), device).map_err(at("load"))? else {
+        return Ok(());
+    };
+    let roster = stored.state.roster().map_err(at("roster"))?;
+    let anchor = Anchor {
+        group: stored.group(),
+        root: oink_network::roster::root_id(&roster).map_err(at("roster root"))?,
+    };
+    let wire = stored.to_wire().map_err(at("project stored state"))?;
+    // Decode each known register value on its own first, so the error names
+    // the register instead of only a field path inside it.
+    for register in wire.registers().map_err(at("registers"))?.0 {
+        let kind = register.kind().map_err(at("register kind"))?;
+        let value = register.value();
+        let decoded = match kind {
+            2 => value.and_then(dto::LayoutValue::from_raw).map(drop),
+            oink_network::pointer_slots::REGISTER_KIND => value.and_then(dto::PointerShortcutSlots::from_raw).map(drop),
+            oink_network::device_order::REGISTER_KIND => value.and_then(dto::DeviceOrder::from_raw).map(drop),
+            oink_network::pointer_base::REGISTER_KIND => value.and_then(dto::PointerBase::from_raw).map(drop),
+            _ => Ok(()),
+        };
+        decoded.map_err(|error| {
+            let name = v2::registry::REGISTER_KINDS
+                .iter()
+                .find(|(known, _)| *known == kind)
+                .map_or("unknown", |(_, name)| name);
+            format!("register {kind:#06x} {name}: {error}")
+        })?;
+    }
+    let state = State::verify(wire, anchor).map_err(at("verify retained state"))?;
+    if !state.roster().contains(device) {
+        // Start replaces a state without this device by a new group.
+        return Ok(());
+    }
+    stored.has_legacy_layout().map_err(at("layout storage"))?;
+    let register = stored.layout_register().map_err(at("stored layout"))?;
+    layout_wire::has_device_visibility_record(&register, device).map_err(at("stored layout visibility"))?;
+    let layout = state.layout().map_err(at("layout"))?;
+    layout.version().map_err(at("layout version"))?;
+    let value = v2::layout::register_value(&layout).map_err(at("layout value"))?;
+    value.source().map_err(at("layout source"))?;
+    layout_wire::from_wire(&value).map_err(at("layout geometry"))?;
+    Ok(())
+}
 impl Owner {
     pub fn start(deps: ConfigDeps, config: oink_network::NetworkConfig) -> Result<ConfigModule, StartError> {
         let fail = |e: &dyn std::fmt::Display| StartError::Unreadable(e.to_string());
@@ -308,15 +361,23 @@ impl Owner {
                 value
             }
         };
-        let mut journal =
-            Journal::load(&deps.data_dir.join(oink_network::pair_journal::FILE), device).map_err(|e| fail(&e))?;
-        journal.recover().map_err(|e| fail(&e))?;
+        let (member, pending) = Membership::start(
+            &deps.data_dir.join(oink_network::pair_journal::FILE),
+            deps.identity.clone(),
+            deps.links.boot(),
+        )
+        .map_err(|e| fail(&e))?;
         // A committed pairing projection must be acknowledged against its
         // exact signed target state before the one-time legacy visibility seed
         // can advance the shared layout register.
-        let defer_visibility_seed = journal.pending_projection().map_err(|e| fail(&e))?.is_some();
-        if let Some(projected) = journal.pending_projection().map_err(|e| fail(&e))? {
-            if let Some(bundle) = journal.pending_bundle().map_err(|e| fail(&e))? {
+        let defer_visibility_seed = pending.is_some();
+        // The journal acknowledges exactly the retained state written below. A
+        // 0.3.x projection keeps its old storage shape on disk while the
+        // runtime uses its v2 projection, so the runtime digest differs (M2).
+        let mut projected_digest = None;
+        if let Some(projected) = pending {
+            projected_digest = Some(oink_network::group_merge::digest(&projected).map_err(|e| fail(&e))?);
+            if let Some(bundle) = member.journal.pending_bundle().map_err(|e| fail(&e))? {
                 let intent = bundle.certificate().and_then(|c| c.intent()).map_err(|e| fail(&e))?;
                 deps.application
                     .prepare_profile_join_with_target(
@@ -325,18 +386,20 @@ impl Owner {
                     )
                     .map_err(StartError::Unreadable)?;
             }
-            stored.state = projected;
+            stored.replace_runtime_state(projected).map_err(|e| fail(&e))?;
             group_store::save(&path, &stored).map_err(|e| fail(&e))?;
         }
         let roster = stored.state.roster().map_err(|e| fail(&e))?;
         let anchor = Anchor {
             group: stored.group(),
-            root: roster.root_id().map_err(|e| fail(&e))?.0,
+            root: oink_network::roster::root_id(&roster).map_err(|e| fail(&e))?,
         };
-        let mut state = State::verify(stored.to_wire(), anchor).map_err(|e| fail(&e))?;
+        let mut state = State::verify(stored.to_wire().map_err(|e| fail(&e))?, anchor).map_err(|e| fail(&e))?;
         if !state.roster().contains(device) {
             state = State::create(&deps.identity, &config.device_name, &config.os, now_ms()).map_err(|e| fail(&e))?;
-            stored.state = state.wire().clone();
+            stored
+                .replace_runtime_state(state.wire().clone())
+                .map_err(|e| fail(&e))?;
             group_store::save(&path, &stored).map_err(|e| fail(&e))?;
         }
         // One-time upgrade of this device's legacy owner visibility. This is
@@ -349,7 +412,7 @@ impl Owner {
         let seed_marker = deps.data_dir.join("layout-visibility-seeded");
         let register = stored.layout_register().map_err(|e| fail(&e))?;
         let has_visibility = layout_wire::has_device_visibility_record(&register, device).map_err(|e| fail(&e))?;
-        let owner_has_screen = v1::layout::register_value(&register)
+        let owner_has_screen = v2::layout::register_value(&register)
             .map_err(|e| fail(&e))?
             .devices()
             .map_err(|e| fail(&e))?
@@ -363,7 +426,8 @@ impl Owner {
                     == Some(device)
             })
             .is_some_and(|group| group.screens().is_ok_and(|screens| !screens.0.is_empty()));
-        if !defer_visibility_seed && !seed_marker.exists() && !has_visibility && owner_has_screen {
+        let legacy_layout = stored.has_legacy_layout().map_err(|e| fail(&e))?;
+        if !legacy_layout && !defer_visibility_seed && !seed_marker.exists() && !has_visibility && owner_has_screen {
             let version = register.version().map_err(|e| fail(&e))?;
             if stored
                 .edit_layout(&version, |raw| {
@@ -371,15 +435,16 @@ impl Owner {
                 })
                 .map_err(|e| fail(&e))?
             {
-                state = State::verify(stored.to_wire(), state.roster().anchor()).map_err(|e| fail(&e))?;
+                state = State::verify(stored.to_wire().map_err(|e| fail(&e))?, state.roster().anchor())
+                    .map_err(|e| fail(&e))?;
                 group_store::save(&path, &stored).map_err(|e| fail(&e))?;
                 oink_foundation::storage::atomic_write(&seed_marker, b"1").map_err(|e| fail(&e))?;
             }
-        } else if !defer_visibility_seed && !seed_marker.exists() && !owner_has_screen {
+        } else if !legacy_layout && !defer_visibility_seed && !seed_marker.exists() && !owner_has_screen {
             oink_foundation::storage::atomic_write(&seed_marker, b"1").map_err(|e| fail(&e))?;
         }
         let anchor = state.roster().anchor();
-        let value = v1::layout::register_value(&state.layout().map_err(|e| fail(&e))?).map_err(|e| fail(&e))?;
+        let value = v2::layout::register_value(&state.layout().map_err(|e| fail(&e))?).map_err(|e| fail(&e))?;
         let layout = Arc::new(layout_wire::from_wire(&value).map_err(|e| fail(&e))?);
         let owners = Arc::new(BTreeMap::new());
         let devices = BTreeSet::from([device]);
@@ -396,7 +461,7 @@ impl Owner {
             let _gate = deps.owner_gate.lock().map_err(|e| fail(&e))?;
             let mut owner_config = deps.config.lock().map_err(|e| fail(&e))?;
             let mut next_owner = owner_config.owner().clone();
-            next_owner.switch_group(anchor.group, device).map_err(|e| fail(&e))?;
+            next_owner.switch_group(anchor.group).map_err(|e| fail(&e))?;
             let pause = dto::LocalPauseState::from_raw(
                 [
                     (1, false.write()),
@@ -406,22 +471,17 @@ impl Owner {
                 .into(),
             )
             .map_err(|e| fail(&e))?;
-            local
-                .owner(
-                    next_owner.preferences(),
-                    pause,
-                    next_owner.claims(anchor.group).watermark(),
-                )
-                .map_err(|e| fail(&e))?;
-            local.group(anchor.group, &next_owner, device).map_err(|e| fail(&e))?;
+            local.owner(next_owner.preferences(), pause).map_err(|e| fail(&e))?;
+            local.group(anchor.group, &next_owner).map_err(|e| fail(&e))?;
             owner_config
-                .update_owner(|owner| owner.switch_group(anchor.group, device))
+                .update_owner(|owner| owner.switch_group(anchor.group))
                 .map_err(|e| fail(&e))?;
         }
         let applied = AppliedState {
             group: anchor.group,
             roster_digest: state.roster().digest().map_err(|e| fail(&e))?,
             pointer_slots: state.pointer_slots().map_err(|e| fail(&e))?,
+            pointer_base: state.pointer_base().map_err(|e| fail(&e))?,
             device_order: state.device_order().map_err(|e| fail(&e))?,
             members: state.roster().members().map(|m| m.device).collect(),
             layout: layout.clone(),
@@ -502,11 +562,9 @@ impl Owner {
         let mut owner = Self {
             config: deps.config,
             owner_gate: deps.owner_gate,
-            pending_effects: VecDeque::new(),
             projection_retry: None,
             pending_revocation: None,
-            projection_announced: None,
-            recovery_projected: Vec::new(),
+            member,
             state,
             pointer_shortcuts_pending: true,
             needs_apply: false,
@@ -521,11 +579,9 @@ impl Owner {
             incoming_tx,
             incoming,
             sessions: BTreeMap::new(),
-            pairs: Sessions::new(links.boot()),
             onboarding_connect: false,
-            transactions: Transactions::default(),
-            journal,
             blocks,
+            pairing: deps.pairing,
             block_stream: format!("{:032x}", u128::from_le_bytes(random_id().map_err(|e| fail(&e))?)),
             block_revision: 0,
             presence,
@@ -540,14 +596,12 @@ impl Owner {
             endpoints: HashMap::new(),
             local_terminal: VecDeque::new(),
             operations: VecDeque::new(),
-            proof_objects: Default::default(),
-            proof_expected: HashMap::new(),
-            lookups: HashMap::new(),
-            recovery_due: HashMap::new(),
             local,
             facts: BTreeMap::new(),
             last_facts: Instant::now(),
             network_checked: Instant::now() - Duration::from_secs(2),
+            #[cfg(test)]
+            no_outbound_dials: false,
             #[cfg(test)]
             hold_facts: false,
             #[cfg(test)]
@@ -568,13 +622,10 @@ impl Owner {
             .application
             .apply_state(&owner.stored)
             .map_err(StartError::Unreadable)?;
-        if owner.journal.pending_projection().map_err(|e| fail(&e))?.is_some() {
-            owner
-                .journal
-                .projected(owner.state.digest().map_err(|e| fail(&e))?)
-                .map_err(|e| fail(&e))?;
+        if let Some(digest) = projected_digest {
+            owner.member.replayed(digest).map_err(|e| fail(&e))?;
         }
-        if defer_visibility_seed {
+        if defer_visibility_seed && !legacy_layout {
             let owner_visibility = {
                 let config_guard = owner.config.lock().map_err(|e| fail(&e))?;
                 layout_wire::owner_preferences(&config_guard.owner().preferences()).map_err(|e| fail(&e))?
@@ -591,8 +642,11 @@ impl Owner {
                     })
                     .map_err(|e| fail(&e))?
                 {
-                    owner.state =
-                        State::verify(owner.stored.to_wire(), owner.state.roster().anchor()).map_err(|e| fail(&e))?;
+                    owner.state = State::verify(
+                        owner.stored.to_wire().map_err(|e| fail(&e))?,
+                        owner.state.roster().anchor(),
+                    )
+                    .map_err(|e| fail(&e))?;
                     group_store::save(&path, &owner.stored).map_err(|e| fail(&e))?;
                     oink_foundation::storage::atomic_write(&seed_marker, b"1").map_err(|e| fail(&e))?;
                     owner
@@ -656,7 +710,7 @@ impl Owner {
                 _=tokio::time::sleep_until(deadline.into())=>self.tick(),
             }
         }
-        let effects = self.pairs.shutdown();
+        let effects = self.member.pairs.shutdown();
         self.pair_effects(effects);
         // Give queued terminal controls one bounded drain opportunity before stop.
         for link in self.sessions.keys().copied().collect::<Vec<_>>() {
@@ -683,12 +737,12 @@ impl Owner {
         if self.pending_revocation.is_some() || self.needs_apply {
             deadline = deadline.min(Instant::now() + Duration::from_millis(50));
         }
-        for at in self.recovery_due.values() {
-            deadline = deadline.min((*at).max(Instant::now() + Duration::from_millis(100)));
+        if let Some(at) = self.member.next_deadline() {
+            deadline = deadline.min(at.max(Instant::now() + Duration::from_millis(100)));
         }
         for link in self.sessions.values() {
             if let Some(at) = link.deadline
-                && (link.peer.is_none() || link.departing || !self.pairs.has_lease(link.peer_boot))
+                && (link.peer.is_none() || link.departing || !self.member.pairs.has_lease(link.peer_boot))
             {
                 deadline = deadline.min(at);
             }
@@ -715,26 +769,11 @@ impl Owner {
                 deadline = deadline.min(at);
             }
         }
-        if let Some(at) = self.transactions.next_deadline() {
-            deadline = deadline.min(at);
-        }
-        if let Some(at) = self.proof_objects.next_deadline() {
-            deadline = deadline.min(at);
-        }
-        for expected in self.proof_expected.values() {
-            deadline = deadline.min(expected.deadline);
-        }
-        for (_, at) in self.lookups.values() {
-            deadline = deadline.min(*at);
-        }
         for seen in self.nearby.values() {
             deadline = deadline.min(seen.at + Duration::from_secs(90));
         }
         for start in self.connecting.values() {
             deadline = deadline.min(start.deadline);
-        }
-        if let Some(at) = self.pairs.next_deadline() {
-            deadline = deadline.min(at);
         }
         deadline
     }
@@ -761,20 +800,7 @@ impl Owner {
                     self.links.disconnect(id, Disconnect::LeavingGroup);
                     return;
                 }
-                let relay = if event.path != LinkPath::Direct {
-                    Some(dto::RelayContext::from_raw(
-                        [
-                            (1, wire::path(event.path_id).write()),
-                            (2, event.route_revision.write()),
-                            (3, wire::boot(if outbound { self.links.boot() } else { peer }).write()),
-                            (4, wire::boot(if outbound { peer } else { self.links.boot() }).write()),
-                        ]
-                        .into(),
-                    ))
-                } else {
-                    None
-                };
-                let result = relay.transpose().and_then(|relay| {
+                let result = admission::relay_context(self.links.boot(), &event).and_then(|relay| {
                     admission::GreetingSession::new(
                         self.links.boot(),
                         peer,
@@ -866,6 +892,12 @@ impl Owner {
                     let _ = self.publish();
                 }
             }
+            ConfigEvent::ProtocolIncompatible { peer } => {
+                if self.state.roster().contains(peer) && self.incompatible.insert(peer) {
+                    let _ = self.publish();
+                }
+                self.fail_connecting(peer, dto::PairCode::UnsupportedProtocol);
+            }
             ConfigEvent::DialFailed { peer, reason } => {
                 let dial = self.dials.entry(peer).or_default();
                 dial.failed(reason, Instant::now());
@@ -880,6 +912,38 @@ impl Owner {
                 );
             }
             ConfigEvent::ControlClosed { stream, .. } => self.close(stream.link, Disconnect::HandshakeFailed),
+            ConfigEvent::RouteRecord { link, peer, record } => {
+                if !self.sessions.get(&link).is_some_and(|s| s.peer_boot.device_id == peer) {
+                    return;
+                }
+                // Resolve the remembered target before persisting it, from its
+                // route row or authenticated facts; dialing may still be pending.
+                let dialed = match record {
+                    Some(oink_network::link::RouteRecord::Dial(ip)) => self
+                        .links
+                        .links()
+                        .by_peer(peer)
+                        .and_then(|entry| entry.route.as_ref())
+                        .and_then(|route| {
+                            route
+                                .rows
+                                .iter()
+                                .find(|row| row.address.ip() == std::net::IpAddr::V4(ip))
+                                .map(|row| row.address)
+                        })
+                        .or_else(|| {
+                            self.route_addresses(peer)
+                                .into_iter()
+                                .find(|address| address.ip() == std::net::IpAddr::V4(ip))
+                        }),
+                    _ => None,
+                };
+                if let Err(error) = self.address_book.set_route_record(peer, record, dialed) {
+                    tracing::warn!(?error, ?record, "could not retain the route pin");
+                } else {
+                    self.links.update_route_addresses(peer, self.route_addresses(peer));
+                }
+            }
             ConfigEvent::PathChanged { link, path } => {
                 if let Some(session) = self.sessions.get_mut(&link) {
                     session.path = path;
@@ -913,7 +977,7 @@ impl Owner {
                     Ok(bytes) => {
                         if let Err(error) = self.control(link, &bytes) {
                             tracing::debug!(code=?error.code, link=?link,
-                                type_id=?v1::frame::OpaqueFrame::parse_exact(&bytes, v1::limits::CONFIG_FRAME).ok().map(|frame| frame.header.type_id),
+                                type_id=?v2::frame::OpaqueFrame::parse_exact(&bytes, v2::limits::CONFIG_FRAME).ok().map(|frame| frame.header.type_id),
                                 ready=self.sessions.get(&link).is_some_and(|session| session.ready),
                                 departing=self.sessions.get(&link).is_some_and(|session| session.departing),
                                 "C0 validation failed");
@@ -940,39 +1004,24 @@ impl Owner {
         link.outbox.push_back(bytes);
         self.flush(id);
     }
-    fn send(&mut self, id: LinkId, message: Message) -> v1::Result<()> {
-        let message = if let Message::ConfigFacts(facts) = message {
-            let links = self.links.links();
-            let agreement = self
-                .sessions
-                .get(&id)
-                .and_then(|session| links.by_peer(session.peer_boot.device_id))
-                .map(|link| &link.agreement);
-            let supports = |cap| agreement.is_some_and(|agreement| agreement.contains(cap));
-            // Use this exact C0 negotiation, including retained member lanes;
-            // a newer selected link for the same device must not widen it.
-            let keymap_supported = self
-                .sessions
-                .get(&id)
-                .and_then(|s| s.peer.as_ref())
-                .is_some_and(|peer| peer.agreement.contains("oink.input.keymap-none/1"));
-            let facts = super::facts::for_keymap_capability(facts, keymap_supported)?;
-            let facts = super::facts::for_touchpad_capability(facts, supports("oink.input.touchpad-options/1"))?;
-            let facts = super::facts::for_mouse_capability(facts, supports("oink.input.mouse-disabled/1"))?;
-            let facts = super::facts::for_local_output_capability(facts, supports("oink.audio.local-output/1"))?;
-            Message::ConfigFacts(super::facts::for_accessibility_capability(
-                facts,
-                supports("oink.input.accessibility/1"),
-            )?)
-        } else {
-            message
-        };
-        let bytes = v1::frame::encode(&message, v1::limits::CONFIG_FRAME)?;
+    /// Every v2 peer decodes the complete DeviceFacts: there is no
+    /// per-capability projection of the facts (protocol-v2 section 1.1).
+    fn send(&mut self, id: LinkId, message: Message) -> v2::Result<()> {
+        let bytes = v2::frame::encode(&message, v2::limits::CONFIG_FRAME)?;
+        // The link layer's send gate decides what this C0 can carry; the
+        // refusal is the caller's typed error, never a reason to close C0.
+        if self
+            .sessions
+            .get(&id)
+            .is_some_and(|session| session.tx.admits(&bytes).is_err())
+        {
+            return Err(v2::ErrorCode::UnnegotiatedCapability.into());
+        }
         self.send_bytes(id, bytes);
         // Posting can synchronously retire a closed or over-budget C0. Its
         // caller must stop the transition before reading that session again.
         if !self.sessions.contains_key(&id) {
-            return Err(v1::ErrorCode::NotReady.into());
+            return Err(v2::ErrorCode::NotReady.into());
         }
         Ok(())
     }
@@ -984,6 +1033,10 @@ impl Owner {
                     link.outbox.pop_front();
                 }
                 Err(PostError::Full) => break,
+                Err(PostError::Unnegotiated | PostError::Paused) => {
+                    // Checked in `send`; the gate only widens afterwards.
+                    link.outbox.pop_front();
+                }
                 Err(_) => {
                     self.close(id, Disconnect::HandshakeFailed);
                     break;
@@ -1012,17 +1065,14 @@ impl Owner {
     fn drop_link(&mut self, id: LinkId) {
         if let Some(link) = self.sessions.remove(&id) {
             link.reader.abort();
-            self.transactions.drop_link(id.0);
-            self.proof_objects.drop_link(id.0);
-            self.proof_expected.retain(|(link, _), _| *link != id);
-            self.lookups.remove(&id);
             let links = self.links.links();
             let replacement = links
                 .by_peer(link.peer_boot.device_id)
                 .filter(|selected| selected.link != id);
-            if !replacement.is_some_and(|selected| selected.peer_boot == link.peer_boot) {
-                let effects = self.pairs.lost(link.peer_boot);
-                self.pair_effects(effects);
+            let ended = !replacement.is_some_and(|selected| selected.peer_boot == link.peer_boot);
+            let outs = self.member.link_lost(id, ended.then_some(link.peer_boot), &self.state);
+            let _ = self.execute(None, outs);
+            if ended {
                 if self.facts.get(&link.peer_boot.device_id).is_some_and(|facts| {
                     facts.boot().ok().and_then(|boot| wire::read_boot(&boot).ok()) == Some(link.peer_boot)
                 }) {
@@ -1055,17 +1105,17 @@ impl Owner {
         } else {
             for (link, state) in self.held_config_states.take().unwrap() {
                 let frame =
-                    v1::frame::encode(&Message::ConfigState(state), v1::limits::CONFIG_FRAME).map_err(internal)?;
+                    v2::frame::encode(&Message::ConfigState(state), v2::limits::CONFIG_FRAME).map_err(internal)?;
                 self.control(link, &frame).map_err(internal)?;
             }
         }
         Ok(())
     }
-    fn control(&mut self, id: LinkId, bytes: &[u8]) -> v1::Result<()> {
+    fn control(&mut self, id: LinkId, bytes: &[u8]) -> v2::Result<()> {
         if self.sessions.get(&id).is_some_and(|session| session.departing) {
             return Ok(());
         }
-        let peer = self.sessions.get(&id).ok_or(v1::ErrorCode::NotReady)?.peer_boot;
+        let peer = self.sessions.get(&id).ok_or(v2::ErrorCode::NotReady)?.peer_boot;
         if self.sessions[&id].peer.is_none() {
             let response = self
                 .sessions
@@ -1078,7 +1128,7 @@ impl Owner {
                 Err(error) => {
                     if matches!(
                         error.code,
-                        v1::ErrorCode::UnsupportedMajor | v1::ErrorCode::MissingCapability
+                        v2::ErrorCode::UnsupportedMajor | v2::ErrorCode::MissingCapability
                     ) {
                         self.incompatible.insert(peer.device_id);
                         let _ = self.publish();
@@ -1095,15 +1145,14 @@ impl Owner {
             let result = self
                 .sessions
                 .get(&id)
-                .ok_or(v1::ErrorCode::NotReady)?
+                .ok_or(v2::ErrorCode::NotReady)?
                 .greeting
                 .result()
                 .cloned()
-                .ok_or(v1::ErrorCode::NotReady)?;
+                .ok_or(v2::ErrorCode::NotReady)?;
             self.links.set_agreement(id, result.agreement.clone());
             self.links.set_peer_formats(id, result.formats.clone());
             self.links.set_peer_audio(id, result.audio.clone());
-            let same = result.anchor()? == self.state.roster().anchor();
             let session = self.sessions.get_mut(&id).expect("link");
             session.peer = Some(result);
             session.deadline = Some(Instant::now() + ADMISSION_TIMEOUT);
@@ -1121,186 +1170,74 @@ impl Owner {
                 };
                 let _ = self.address_book.remember(peer.device_id, listen);
             }
-            // Same-root membership claims are not authority. A newly introduced
-            // peer must retry after an already trusted member updates our roster.
-            // Different-root direct C0 remains available to the existing PAKE flow.
-            if same && !self.state.roster().contains(peer.device_id) {
-                if self.state.roster().next_epoch(peer.device_id)? == 1 {
-                    return Err(v1::ErrorCode::AuthenticationFailed.into());
-                }
-                // A locally recorded removed member still needs the existing
-                // bounded revocation reply to leave its stale group. This lane
-                // never consumes its state or waits for membership to arrive.
-                self.sessions.get_mut(&id).expect("link").deadline = Some(Instant::now() + Duration::from_millis(200));
-                return Ok(());
+            let facts = self.link_facts(id).ok_or(v2::ErrorCode::NotReady)?;
+            let outbound = self.sessions[&id].direction == Direction::Outbound;
+            let outs = self.member.greeted(id, &facts, outbound, &self.state, Instant::now())?;
+            if !outs.iter().any(|out| matches!(out, member::Out::AwaitRemoved { .. })) {
+                self.finish_queries(peer.device_id);
+                self.start_connecting(peer.device_id);
             }
-            self.finish_queries(peer.device_id);
-            self.start_connecting(peer.device_id);
-            self.reconcile_peer(id)?;
-            let session = self.sessions.get(&id).ok_or(v1::ErrorCode::NotReady)?;
-            if same && session.direction == Direction::Outbound && self.state.roster().contains(peer.device_id) {
-                self.begin_admission(id)?;
-            } else if !same && self.state.roster().contains(peer.device_id) {
-                self.lookup(id)?;
-            }
-            return Ok(());
+            return self.execute(Some(id), outs);
         }
-        let message = v1::frame::OpaqueFrame::parse_exact(bytes, v1::limits::CONFIG_FRAME)?.decode()?;
-        let hash = self.sessions[&id].peer.as_ref().expect("greeting").hash()?;
-        if let Message::ConfigPairDecisionReply(reply) = &message {
-            let pair = wire::read_pair(&reply.pair_id()?)?;
-            if self.transactions.contains(pair)
-                && reply.outcome()?.variant()? == v1::schema::Open::Known(dto::DecisionKind::Aborted)
-                && dto::DecisionAborted::from_raw(reply.outcome()?.body()?)?
-                    .problem()?
-                    .code()?
-                    == dto::PairCode::StateChanged
-            {
-                let effects = self
-                    .transactions
-                    .receive(
-                        id.0,
-                        peer,
-                        message,
-                        &self.identity,
-                        &self.state,
-                        &mut self.journal,
-                        Instant::now(),
-                        now_ms(),
-                    )
-                    .map_err(|_| v1::ErrorCode::StateConflict)?;
-                return self
-                    .merge_effects(effects)
-                    .map_err(|_| v1::ErrorCode::StateConflict.into());
-            }
-        }
-        let recovery = match &message {
-            Message::ConfigPairEnded(value) => value.lookup()?.is_some(),
-            Message::ConfigPairReceipt(value) => !self.transactions.contains(wire::read_pair(&value.pair_id()?)?),
-            Message::ConfigPairObjectBegin(value) => {
-                self.proof_expected.contains_key(&(id, value.object()?.digest()?.0))
-            }
-            Message::ConfigPairObjectChunk(value) => self.proof_objects.contains(id.0, value.digest()?.0),
-            Message::ConfigPairObjectEnd(value) => self.proof_objects.contains(id.0, value.digest()?.0),
-            _ => false,
-        };
-        if let Message::ConfigPairObjectBegin(value) = &message {
-            let object = value.object()?;
-            let existing = self.proof_objects.contains(id.0, object.digest()?.0)
-                || self.transactions.has_object(id.0, object.digest()?.0);
-            let bytes = if existing { 0 } else { object.bytes()? as usize };
-            if !existing
-                && (self.proof_objects.staging_bytes() + self.transactions.staging_bytes() + bytes > 4 * 1024 * 1024
-                    || self.proof_objects.staging_count(id.0) + self.transactions.staging_count(id.0) >= 2)
-            {
-                return Err(v1::ErrorCode::LimitExceeded.into());
-            }
-        }
-        if recovery {
-            return self.recovery_message(id, peer, message);
+        let message = v2::frame::OpaqueFrame::parse_exact(bytes, v2::limits::CONFIG_FRAME)?.decode()?;
+        let facts = self.link_facts(id).ok_or(v2::ErrorCode::NotReady)?;
+        if member::handles(&message) {
+            let greeting = self.sessions[&id].peer.clone().expect("greeting");
+            let gate = member::Gate {
+                enabled: self.pairing,
+                blocked: self.blocks.as_ref().is_none_or(|b| b.contains(peer.device_id)),
+                exclusive: self.onboarding_connect,
+                external_busy: !self.connecting.is_empty(),
+            };
+            let direct = self.sessions[&id].path == LinkPath::Direct;
+            let outs = self.member.receive(
+                id,
+                &facts,
+                &greeting,
+                direct,
+                message,
+                &self.state,
+                gate,
+                Instant::now(),
+            )?;
+            return self.execute(Some(id), outs);
         }
         match message {
             Message::ConfigRequest(request) => {
-                if !self.state.roster().contains(peer.device_id) {
-                    if self.sessions[&id].peer.as_ref().expect("greeting").anchor()? != self.state.roster().anchor()
-                        || self.state.roster().next_epoch(peer.device_id)? == 1
-                    {
-                        return Err(v1::ErrorCode::AuthenticationFailed.into());
-                    }
-                    self.send(
-                        id,
-                        admission::reply(
-                            &self.state,
-                            self.identity.id(),
-                            hash,
-                            self.links.links().ready_count() as u8,
-                        )?,
-                    )?;
-                    self.sessions.get_mut(&id).unwrap().deadline = Some(Instant::now() + Duration::from_millis(200));
-                    return Ok(());
-                }
-                if let Some(candidate) =
-                    admission::request_revocation(&self.state, &request, self.identity.id(), peer.device_id, hash)?
-                {
-                    self.receive_revocation(candidate)?;
-                    return Ok(());
-                }
-
-                let candidate =
-                    admission::receive_request(&self.state, &request, self.identity.id(), peer.device_id, hash)?;
-                self.commit(candidate.clone())
-                    .map_err(|_| v1::ErrorCode::StateConflict)?;
-                let advanced = self.sessions[&id]
-                    .accepted
-                    .as_ref()
-                    .is_none_or(|previous| previous.digest().ok() != candidate.digest().ok());
-                self.sessions.get_mut(&id).expect("link").accepted = Some(candidate.clone());
-                self.links.set_half_open(id);
-                if advanced {
-                    self.sessions.get_mut(&id).expect("link").deadline = Some(Instant::now() + ADMISSION_TIMEOUT);
-                }
-                self.send(
-                    id,
-                    admission::reply(
-                        &candidate,
-                        self.identity.id(),
-                        hash,
-                        self.links.links().ready_count() as u8,
-                    )?,
-                )?;
+                let connected = self.links.links().ready_count() as u8;
+                let outs = self.member.request(id, &facts, &request, &self.state, connected)?;
+                self.execute(Some(id), outs)?;
             }
             Message::ConfigReply(reply) => {
-                self.require_known_member(id)?;
-                let sent = self.sessions[&id].sent.as_ref().ok_or(v1::ErrorCode::StateConflict)?;
-                if let Some(candidate) =
-                    admission::reply_revocation(&self.state, sent, &reply, self.identity.id(), peer.device_id, hash)?
-                {
-                    self.receive_revocation(candidate)?;
-                    return Ok(());
-                }
-                let accepted =
-                    admission::receive_reply(&self.state, sent, &reply, self.identity.id(), peer.device_id, hash)?;
-                self.commit(accepted.merged).map_err(|_| v1::ErrorCode::StateConflict)?;
-                // Done can reach the peer before this owner gets to ready().
-                // Its first Facts may then reach N0 immediately. Fence the
-                // verified reply's half-open phase before exposing Done, just
-                // as the responder fences this phase before exposing Reply.
-                self.links.set_half_open(id);
-                self.send(id, admission::done(&accepted.acknowledged, hash)?)?;
-                self.ready(id)?;
-                // Done acknowledges the peer's frozen Reply, while commit may
-                // preserve a newer local register or reconcile pointer slots.
-                // Publish that union only after ordered Done has made the peer ready.
-                if self.state.digest()? != accepted.acknowledged.digest()? {
-                    self.send(id, Message::ConfigState(self.state.wire().clone()))?;
-                }
+                let sent = self.sessions[&id].sent.clone().ok_or(v2::ErrorCode::StateConflict)?;
+                let outs = self.member.reply(id, &facts, &sent, &reply, &self.state)?;
+                self.execute(Some(id), outs)?;
             }
             Message::ConfigDone(done) => {
-                admission::receive_done(
-                    self.sessions[&id]
-                        .accepted
-                        .as_ref()
-                        .ok_or(v1::ErrorCode::StateConflict)?,
-                    &done,
-                    hash,
-                )?;
-                self.ready(id)?;
+                let accepted = self.sessions[&id]
+                    .accepted
+                    .clone()
+                    .ok_or(v2::ErrorCode::StateConflict)?;
+                let outs = self.member.done(id, &accepted, &done)?;
+                self.execute(Some(id), outs)?;
             }
-            Message::ConfigFacts(facts) => {
+            Message::ConfigFacts(incoming) => {
+                let facts = incoming;
                 if wire::read_boot(&facts.boot()?)? != peer {
-                    return Err(v1::ErrorCode::AuthenticationFailed.into());
+                    return Err(v2::ErrorCode::AuthenticationFailed.into());
                 }
-                if self
-                    .retired_anchor(id)
-                    .is_some_and(|old| facts.group().is_ok_and(|group| group.0 == old.group.0))
-                {
+                let retired = facts
+                    .group()
+                    .ok()
+                    .and_then(|group| self.member.retired(&self.link_facts(id)?, &self.state, group.0));
+                if retired.is_some() {
                     // The peer may have queued these before receiving our merge
                     // proof. Drain the old group's facts without publishing them
                     // or closing the C0 needed for signed readmission.
                     return Ok(());
                 }
                 if !self.sessions[&id].ready || facts.group()?.0 != self.state.roster().anchor().group.0 {
-                    return Err(v1::ErrorCode::AuthenticationFailed.into());
+                    return Err(v2::ErrorCode::AuthenticationFailed.into());
                 }
                 let old = self.facts.get(&peer.device_id);
                 if old.is_some_and(|old| old.fact_sequence().unwrap_or(u64::MAX) >= facts.fact_sequence().unwrap_or(0))
@@ -1313,18 +1250,20 @@ impl Owner {
                     // The historical cache excludes sequence and link measurements.
                     self.cache
                         .observe(facts.clone())
-                        .map_err(|_| v1::ErrorCode::StateConflict)?;
+                        .map_err(|_| v2::ErrorCode::StateConflict)?;
                 }
                 self.facts.insert(peer.device_id, Arc::new(facts));
                 if !telemetry_only {
                     self.links
                         .update_addresses(peer.device_id, self.member_candidates(peer.device_id));
+                    self.links
+                        .update_route_addresses(peer.device_id, self.route_addresses(peer.device_id));
                 }
                 if !self.needs_apply {
                     if telemetry_only {
                         self.publish_fact_observation(peer.device_id);
                     } else {
-                        self.publish().map_err(|_| v1::ErrorCode::StateConflict)?;
+                        self.publish().map_err(|_| v2::ErrorCode::StateConflict)?;
                     }
                 }
                 self.shared.emit(ConfigChange::Facts {
@@ -1334,202 +1273,25 @@ impl Owner {
             }
             Message::ConfigState(state) => {
                 if !self.sessions[&id].ready {
-                    if let Some(old) = self.retired_anchor(id)
-                        && state.group()?.0 == old.group.0
-                    {
+                    if let Some(old) = self.member.retired(&facts, &self.state, state.group()?.0) {
                         // As with Facts, a valid old-group update can cross our
                         // local retirement. Verify it, but never apply it here.
                         State::verify(state, old)?;
                         return Ok(());
                     }
-                    return Err(v1::ErrorCode::NotReady.into());
+                    return Err(v2::ErrorCode::NotReady.into());
                 }
                 #[cfg(test)]
                 if let Some(held) = &mut self.held_config_states {
                     held.push((id, state));
                     return Ok(());
                 }
-                let incoming_layout = state
-                    .registers()?
-                    .0
-                    .into_iter()
-                    .find(|register| register.kind() == Ok(2))
-                    .ok_or(v1::ErrorCode::MalformedFrame)?;
-                let order_kind = oink_network::device_order::REGISTER_KIND;
-                let incoming_order = state.registers()?.0.into_iter().find(|r| r.kind() == Ok(order_kind));
-                let candidate = self.state.receive_update(&state, peer.device_id, self.identity.id())?;
-                // A stale or losing concurrent layout update is valid input,
-                // but the sender must learn the register selected by our
-                // counter-only merge and device-id tie-break. The device order
-                // register converges the same way; a 0.3.x sender without it
-                // relays it opaquely once it has been sent.
-                let resend_layout =
-                    candidate.layout()? != incoming_layout || candidate.register(order_kind)? != incoming_order;
-                let local_removed = !candidate.roster().contains(self.identity.id());
-                let removed = self
-                    .sessions
-                    .iter()
-                    .filter_map(|(link, s)| {
-                        // Absence is a revocation only for a previous member.
-                        // A separate direct pairing/prepared-query peer is not
-                        // in this roster yet and may wait for human input forever.
-                        ((self.state.roster().contains(s.peer_boot.device_id)
-                            && !candidate.roster().contains(s.peer_boot.device_id))
-                            || local_removed)
-                            .then_some(*link)
-                    })
-                    .collect::<Vec<_>>();
-                let digest = candidate.digest()?;
-                if let Err(error) = self.commit(candidate) {
-                    if !self.needs_apply || self.state.digest()? != digest {
-                        return Err(v1::ErrorCode::StateConflict.into());
-                    }
-                    // The authenticated update is durable. A local native failure
-                    // keeps the previous applied view and streams until tick retries;
-                    // it does not invalidate the peer's C0 admission.
-                    tracing::warn!(%error, "saved group update awaits native application");
-                }
-                if resend_layout {
-                    self.send(id, Message::ConfigState(self.state.wire().clone()))?;
-                }
-                for link in removed {
-                    self.close(link, Disconnect::MemberRemoved);
-                }
-                if local_removed {
-                    self.fresh_after_revocation()
-                        .map_err(|_| v1::ErrorCode::StateConflict)?;
-                }
+                let outs = self.member.state_update(id, peer.device_id, &state, &self.state)?;
+                self.execute(Some(id), outs)?;
             }
-            Message::ConfigPairRequest(request) => {
-                if self.sessions[&id].path != LinkPath::Direct {
-                    return Err(v1::ErrorCode::InvalidChannel.into());
-                }
-                let greeting = self.sessions[&id].peer.as_ref().expect("greeting");
-                let pair = wire::read_pair(&request.pair_id()?)?;
-                if !self.pairs.knows(pair) {
-                    let context = request.context()?;
-                    if context.negotiation_hash()?.0 != greeting.hash()? {
-                        return Err(v1::ErrorCode::AuthenticationFailed.into());
-                    }
-                    let source = greeting.anchor()?;
-                    let target = self.state.roster().anchor();
-                    if context.source_group()?.0 != source.group.0
-                        || context.source_root_id()?.0 != source.root
-                        || context.target_group()?.0 != target.group.0
-                        || context.target_root_id()?.0 != target.root
-                        || context.destination_group()?.0 != target.group.0
-                        || context.source_count()? != greeting.greeting.advert()?.count()?
-                        || context.target_count()? != self.state.roster().members().count() as u8
-                    {
-                        let effects = self.pairs.refuse(
-                            pair,
-                            peer,
-                            pairing::problem(dto::PairCode::GroupChanged, dto::PairStage::Request),
-                        );
-                        self.pair_effects(effects);
-                        return Ok(());
-                    }
-                    if source == target {
-                        let effects = self.pairs.refuse(
-                            pair,
-                            peer,
-                            pairing::problem(dto::PairCode::AlreadyConnected, dto::PairStage::Request),
-                        );
-                        self.pair_effects(effects);
-                        return Ok(());
-                    }
-                }
-                let blocked =
-                    self.blocks.as_ref().is_none_or(|b| b.contains(peer.device_id)) || self.onboarding_pairing_busy();
-                let effects = self
-                    .pairs
-                    .request(request, peer, greeting.transcript.clone(), blocked, Instant::now())
-                    .map_err(|_| v1::ErrorCode::AuthenticationFailed)?;
-                self.pair_effects(effects);
-            }
-            Message::ConfigPairPrepare(_)
-            | Message::ConfigPairReady(_)
-            | Message::ConfigPairCommitPermit(_)
-            | Message::ConfigPairCommit(_)
-            | Message::ConfigPairCommitted(_)
-            | Message::ConfigPairObjectBegin(_)
-            | Message::ConfigPairObjectChunk(_)
-            | Message::ConfigPairObjectEnd(_)
-            | Message::ConfigPairReceipt(_) => {
-                if self.sessions[&id].path != LinkPath::Direct {
-                    return Err(v1::ErrorCode::InvalidChannel.into());
-                }
-                let pair = self
-                    .transactions
-                    .associated_pair(id.0, &message)
-                    .ok_or(v1::ErrorCode::StateConflict)?;
-                if self.pairs.view(pair).is_some_and(|view| view.peer != peer) {
-                    return Err(v1::ErrorCode::AuthenticationFailed.into());
-                }
-                match self.transactions.receive(
-                    id.0,
-                    peer,
-                    message,
-                    &self.identity,
-                    &self.state,
-                    &mut self.journal,
-                    Instant::now(),
-                    now_ms(),
-                ) {
-                    Ok(effects) => {
-                        if let Some(view) = self.pairs.view(pair) {
-                            let phase = view.phase;
-                            if let Ok(effects) = self.pairs.progress(pair, phase, Instant::now()) {
-                                self.pair_effects(effects);
-                            }
-                        }
-                        self.merge_effects(effects).map_err(|_| v1::ErrorCode::StateConflict)?;
-                    }
-                    Err(error) => {
-                        tracing::warn!(%error, "pairing merge message failed");
-                        let code = match error {
-                            oink_network::pair_merge::Error::Journal(oink_network::pair_journal::Error::Io(_)) => {
-                                dto::PairCode::LocalStorageFailed
-                            }
-                            oink_network::pair_merge::Error::Wire(error) => match error.code {
-                                v1::ErrorCode::UnsupportedValue => dto::PairCode::UnsupportedLayout,
-                                v1::ErrorCode::LimitExceeded => dto::PairCode::MergeTooLarge,
-                                v1::ErrorCode::AuthenticationFailed => dto::PairCode::AuthenticationFailed,
-                                _ => dto::PairCode::StateChanged,
-                            },
-                            _ => dto::PairCode::MergeConflict,
-                        };
-                        self.pair_problem(id, peer, pair, pairing::problem(code, dto::PairStage::Prepare))?;
-                    }
-                }
-            }
-            Message::ConfigPairQueued(_)
-            | Message::ConfigPairAccept(_)
-            | Message::ConfigPairDeclined(_)
-            | Message::ConfigPairFeedback(_)
-            | Message::ConfigPairPake(_)
-            | Message::ConfigPairCancel(_)
-            | Message::ConfigPairEnded(_) => {
-                let pair = self
-                    .transactions
-                    .associated_pair(id.0, &message)
-                    .ok_or(v1::ErrorCode::StateConflict)?;
-                if self.pairs.view(pair).is_some_and(|view| view.peer != peer) {
-                    return Err(v1::ErrorCode::AuthenticationFailed.into());
-                }
-                match self.pairs.receive(peer, message, Instant::now()) {
-                    Ok(effects) => self.pair_effects(effects),
-                    Err(problem) => self.pair_problem(id, peer, pair, problem)?,
-                }
-            }
-            Message::ConfigMergeLookup(_)
-            | Message::ConfigMergeTransfer(_)
-            | Message::ConfigMergeReceipt(_)
-            | Message::ConfigPairDecisionQuery(_)
-            | Message::ConfigPairDecisionReply(_) => self.recovery_message(id, peer, message)?,
             Message::ControlPowerState(value) => {
                 if !self.sessions[&id].ready || !self.state.roster().contains(peer.device_id) {
-                    return Err(v1::ErrorCode::NotReady.into());
+                    return Err(v2::ErrorCode::NotReady.into());
                 }
                 self.shared.emit(ConfigChange::PowerState {
                     group: self.shared.applied.load().group,
@@ -1553,7 +1315,7 @@ impl Owner {
             | Message::LayoutArrangementRequest(_)
             | Message::LayoutArrangementResult(_) => {
                 if !self.sessions[&id].ready || !self.state.roster().contains(peer.device_id) {
-                    return Err(v1::ErrorCode::NotReady.into());
+                    return Err(v2::ErrorCode::NotReady.into());
                 }
                 self.shared.emit(ConfigChange::DeviceControl {
                     peer: peer.device_id,
@@ -1569,65 +1331,41 @@ impl Owner {
                     });
                 }
             }
-            _ => return Err(v1::ErrorCode::InvalidChannel.into()),
+            // Negotiated but not handled here: a typed error, the C0 stays
+            // (change plan §2.2). Only an admitted member gets one.
+            message if self.sessions[&id].ready && self.state.roster().contains(peer.device_id) => {
+                let out = member::unhandled(id, &message)?;
+                self.execute(Some(id), vec![out])?;
+            }
+            _ => return Err(v2::ErrorCode::InvalidChannel.into()),
         }
         Ok(())
     }
-    fn pair_problem(
-        &mut self,
-        link: LinkId,
-        peer: oink_foundation::session::Boot,
-        pair: PairId,
-        problem: dto::PairProblem,
-    ) -> v1::Result<()> {
-        if self.pairs.view(pair).is_some_and(|view| {
-            view.peer == peer && !matches!(view.phase, pairing::Phase::Ended | pairing::Phase::Completed)
-        }) {
-            let effects = self.pairs.fail(pair, problem);
-            self.pair_effects(effects);
-            Ok(())
-        } else {
-            self.send(
-                link,
-                Message::ConfigPairEnded(dto::PairEnded::from_raw(
-                    [(1, wire::pair(pair).write()), (2, problem.write())].into(),
-                )?),
-            )
-        }
-    }
-    fn retired_anchor(&self, id: LinkId) -> Option<Anchor> {
+    pub(super) fn link_facts(&self, id: LinkId) -> Option<member::LinkFacts> {
         let session = self.sessions.get(&id)?;
-        let old = session.admitted_anchor?;
-        (!session.ready
-            && old != self.state.roster().anchor()
-            && self.state.roster().contains(session.peer_boot.device_id))
-        .then_some(old)
+        Some(member::LinkFacts {
+            boot: session.peer_boot,
+            greeted: session.peer.as_ref()?.anchor().ok()?,
+            ready: session.ready,
+            departing: session.departing,
+            admitted: session.admitted_anchor,
+        })
     }
-    fn require_known_member(&self, id: LinkId) -> v1::Result<()> {
+    fn require_known_member(&self, id: LinkId) -> v2::Result<()> {
         let peer = self
             .sessions
             .get(&id)
-            .ok_or(v1::ErrorCode::NotReady)?
+            .ok_or(v2::ErrorCode::NotReady)?
             .peer_boot
             .device_id;
         if !self.state.roster().contains(peer) {
-            return Err(v1::ErrorCode::AuthenticationFailed.into());
+            return Err(v2::ErrorCode::AuthenticationFailed.into());
         }
         Ok(())
     }
-    fn begin_admission(&mut self, id: LinkId) -> v1::Result<()> {
+    fn begin_admission(&mut self, id: LinkId) -> v2::Result<()> {
         self.require_known_member(id)?;
-        let hash = self.sessions[&id]
-            .peer
-            .as_ref()
-            .ok_or(v1::ErrorCode::NotReady)?
-            .hash()?;
-        let request = admission::request(
-            &self.state,
-            self.identity.id(),
-            hash,
-            self.links.links().ready_count() as u8,
-        )?;
+        let request = admission::request(&self.state, self.identity.id(), self.links.links().ready_count() as u8)?;
         let session = self.sessions.get_mut(&id).expect("link");
         let advanced = match &session.sent {
             Some(previous) => previous.digest()? != self.state.digest()?,
@@ -1661,8 +1399,8 @@ impl Owner {
                     && !session.departing
                     && session.sent.is_none()
                     && session.accepted.is_none()
-                    && !self.lookups.contains_key(id)
-                    && !self.pairs.has_lease(session.peer_boot))
+                    && !self.member.looking_up(*id)
+                    && !self.member.pairs.has_lease(session.peer_boot))
                 .then_some(*id)
             })
             .collect::<Vec<_>>();
@@ -1672,43 +1410,28 @@ impl Owner {
             }
         }
     }
-    fn ready(&mut self, id: LinkId) -> v1::Result<()> {
+    fn ready(&mut self, id: LinkId) -> v2::Result<()> {
         self.require_known_member(id)?;
-        let session = self.sessions.get_mut(&id).ok_or(v1::ErrorCode::NotReady)?;
+        let session = self.sessions.get_mut(&id).ok_or(v2::ErrorCode::NotReady)?;
         session.ready = true;
         session.admitted_anchor = Some(self.state.roster().anchor());
         session.deadline = None;
         let peer = session.peer_boot;
+        // The persisted route pin goes first: the arbiter announces it, a
+        // follower restores it only when the arbiter has none (design 5.5).
+        self.links
+            .set_route_record(id, self.address_book.route_record(peer.device_id));
         self.links.set_ready(id);
         let dial = self.dials.entry(peer.device_id).or_default();
         dial.failures = 0;
         dial.ready_link = Some(id);
         self.presence
             .observe(self.state.roster().anchor().group, peer.device_id, now_ms())
-            .map_err(|_| v1::ErrorCode::StateConflict)?;
+            .map_err(|_| v2::ErrorCode::StateConflict)?;
         self.send(id, Message::ConfigFacts(self.local.value().clone()))?;
-        let pairs = self
-            .pairs
-            .snapshot()
-            .sessions
-            .into_iter()
-            .filter(|p| p.peer == peer && self.transactions.bundle(p.id).is_some())
-            .map(|p| p.id)
-            .collect::<Vec<_>>();
-        for pair in pairs {
-            let effects = self
-                .transactions
-                .admitted(pair)
-                .map_err(|_| v1::ErrorCode::StateConflict)?;
-            self.merge_effects(effects).map_err(|_| v1::ErrorCode::StateConflict)?;
-        }
-        let current = self.state.roster().anchor();
-        if self.lookups.get(&id).is_some_and(|(source, _)| *source == current) {
-            self.lookups.remove(&id);
-            self.migration(current, Some(current), api::MigrationPhase::Adopted, None);
-        }
-        self.recovery_ready(id)?;
-        self.publish().map_err(|_| v1::ErrorCode::StateConflict)?;
+        let outs = self.member.ready(id, peer, &self.state)?;
+        self.execute(Some(id), outs)?;
+        self.publish().map_err(|_| v2::ErrorCode::StateConflict)?;
         Ok(())
     }
     fn tick(&mut self) {
@@ -1742,7 +1465,7 @@ impl Owner {
             }
         }
         if self.projection_retry.is_some_and(|at| now >= at) {
-            let _ = self.merge_effects(Vec::new());
+            let _ = self.project();
         }
         if self.needs_apply && self.projection_retry.is_none() {
             let _ = self.commit(self.state.clone());
@@ -1752,39 +1475,26 @@ impl Owner {
             .values()
             .any(|seen| now >= seen.at + Duration::from_secs(90))
         {
+            let expired_incompatible = self.nearby.values().any(|seen| {
+                let advert = &seen.sighting.advert;
+                now >= seen.at + Duration::from_secs(90)
+                    && self.state.roster().contains(advert.id)
+                    && !advert.supports_current_protocol()
+            });
             self.publish_nearby();
+            if expired_incompatible {
+                let _ = self.publish();
+            }
         }
-        let recovery_peers = self
-            .sessions
-            .iter()
-            .filter_map(|(id, s)| (!s.departing && s.peer.is_some()).then_some(*id))
-            .collect::<Vec<_>>();
-        for id in recovery_peers {
-            let _ = self.reconcile_peer(id);
-        }
-        self.expire_recovery(now);
-        for pair in self.transactions.expire(now) {
-            let effects = self.pairs.fail(
-                pair,
-                pairing::problem(dto::PairCode::NetworkTimeout, dto::PairStage::Prepare),
-            );
-            self.pair_effects(effects);
-        }
-        if let Ok(effects) = self
-            .transactions
-            .retry_permits(&self.identity, &self.state, &mut self.journal)
-        {
-            let _ = self.merge_effects(effects);
-        }
-        let effects = self.pairs.tick(now);
-        self.pair_effects(effects);
+        let outs = self.member.tick(now, &self.state, &SessionView(&self.sessions));
+        let _ = self.execute(None, outs);
         for id in self
             .sessions
             .iter()
             .filter_map(|(id, l)| {
                 l.deadline
                     .filter(|at| now >= *at)
-                    .filter(|_| l.peer.is_none() || l.departing || !self.pairs.has_lease(l.peer_boot))
+                    .filter(|_| l.peer.is_none() || l.departing || !self.member.pairs.has_lease(l.peer_boot))
                     .map(|_| *id)
             })
             .collect::<Vec<_>>()
@@ -1840,11 +1550,18 @@ impl Owner {
                 if self.sessions.values().any(|l| l.peer_boot.device_id == peer) {
                     continue;
                 }
+                #[cfg(test)]
+                if self.no_outbound_dials {
+                    continue;
+                }
                 let addresses = self.member_candidates(peer);
                 let dial = self.dials.entry(peer).or_default();
                 if !dial.due(self.identity.id(), peer, now) {
                     continue;
                 }
+                // Phones dial and are dialled like PCs: direct first, then a
+                // relay through a PC (a phone is a relay endpoint, never a
+                // relay station; protocol-v2 §1.1).
                 let mode = if dial.last_relayed {
                     DialMode::All
                 } else {
@@ -1896,13 +1613,45 @@ impl Owner {
                 }
             }
         }
-        if let Some(seen) = self.nearby.get(&peer) {
+        if let Some(seen) = self.nearby.get(&peer)
+            && seen.sighting.advert.supports_current_protocol()
+        {
             addresses.extend(&seen.sighting.addrs);
         }
         let mut seen = BTreeSet::new();
         addresses.retain(|address| seen.insert(*address));
         addresses
     }
+    /// Published endpoints plus the remembered manual endpoint. The latter can
+    /// be a NAT address that the peer cannot publish in its own interface facts.
+    /// This list is only for connected route probing; initial dialing remains
+    /// member_candidates, with every address and both directions as before.
+    fn route_addresses(&self, peer: DeviceId) -> Vec<SocketAddr> {
+        let addresses: Vec<_> = self
+            .facts
+            .get(&peer)
+            .and_then(|facts| facts.endpoints().ok())
+            .into_iter()
+            .flat_map(|endpoints| endpoints.0)
+            .filter(|endpoint| endpoint.family() == Ok(dto::AddressFamily::Ipv4))
+            .filter_map(|endpoint| {
+                let octets = <[u8; 4]>::try_from(endpoint.address().ok()?.0.as_slice()).ok()?;
+                let ip = std::net::Ipv4Addr::from(octets);
+                let port = endpoint.port().ok()?;
+                (!ip.is_unspecified() && !ip.is_multicast() && ip != std::net::Ipv4Addr::BROADCAST)
+                    .then_some(SocketAddr::from((ip, port)))
+            })
+            .collect();
+        self.address_book.route_candidates(peer, addresses)
+    }
+    fn protocol_incompatible(&self, peer: DeviceId) -> bool {
+        self.incompatible.contains(&peer)
+            || self
+                .nearby
+                .get(&peer)
+                .is_some_and(|seen| !seen.sighting.advert.supports_current_protocol())
+    }
+
     fn sighting(&mut self, sighting: Sighting) {
         let peer = sighting.advert.id;
         if peer == self.identity.id() {
@@ -1911,6 +1660,7 @@ impl Owner {
         if self.nearby.len() >= 4096 && !self.nearby.contains_key(&peer) {
             return;
         }
+        let was_incompatible = self.protocol_incompatible(peer);
         let changed = self
             .nearby
             .get(&peer)
@@ -1928,6 +1678,9 @@ impl Owner {
             let dial = self.dials.entry(peer).or_default();
             if changed && !dial.active && dial.failures > 0 {
                 dial.reset(Instant::now());
+            }
+            if was_incompatible != self.protocol_incompatible(peer) {
+                let _ = self.publish();
             }
         }
         self.publish_nearby();

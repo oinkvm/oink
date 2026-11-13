@@ -11,7 +11,7 @@ use crate::{
 };
 use oink_display::arrangement::{NativeConfiguration, NativeOrigin};
 use oink_foundation::{Point, Size};
-use oink_protocol::v1::{
+use oink_protocol::v2::{
     Message, RawValue as V, dto as d,
     schema::{WireDto, WireValue},
 };
@@ -141,7 +141,7 @@ fn response(
         (6, V::Array(preferences.iter().map(WireValue::write).collect())),
     ]
     .into_iter()
-    .collect::<oink_protocol::v1::RawMap>();
+    .collect::<oink_protocol::v2::RawMap>();
     if let Some(native) = native.and_then(|n| wire::native(n).ok()) {
         raw.insert(4, native.write());
     }
@@ -404,7 +404,7 @@ impl Node {
                     origin: Point::new(o.origin()?.x()?, o.origin()?.y()?),
                 })
             })
-            .collect::<oink_protocol::v1::Result<Vec<_>>>()
+            .collect::<oink_protocol::v2::Result<Vec<_>>>()
             .map_err(wire::invalid)?;
         let bits = request
             .disabled()
@@ -412,7 +412,7 @@ impl Node {
             .0
             .into_iter()
             .map(wire::read_disabled)
-            .collect::<oink_protocol::v1::Result<Vec<_>>>()
+            .collect::<oink_protocol::v2::Result<Vec<_>>>()
             .map_err(wire::invalid)?;
         #[cfg(windows)]
         if bits
@@ -640,7 +640,7 @@ impl Node {
                     if !status_only {
                         loop {
                             let layout_ready = result.layout_version().map_err(wire::invalid)?.is_none_or(|v| {
-                                oink_protocol::v1::retained::layout_version_cmp(&config.applied().version, &v)
+                                oink_protocol::v2::retained::layout_version_cmp(&config.applied().version, &v)
                                     .is_ok_and(|o| o != std::cmp::Ordering::Less)
                             });
                             let facts_ready = result.fact_sequence().map_err(wire::invalid)?.is_none_or(|sequence| {
@@ -690,7 +690,7 @@ impl Node {
             (8, V::Array(bits.iter().map(wire::disabled).collect())),
         ]
         .into_iter()
-        .collect::<oink_protocol::v1::RawMap>();
+        .collect::<oink_protocol::v2::RawMap>();
         if let Some(p) = super::state::preference(&facts, d::LocalOption::ScreenPreferences) {
             raw.insert(6, p.revision().map_err(wire::invalid)?.write());
         }

@@ -71,6 +71,9 @@ pub const EVENT_BACKLOG: usize = 4096;
 pub const CLOSING_STOPPING: &str = "stopping";
 /// `closing` 的取值：这条订阅积压太多，服务进程断开它（服务仍在运行）。
 pub const CLOSING_LAGGED: &str = "lagged";
+/// `closing` 的取值：网络层出错，服务进程在同一进程里重启后台（`host::supervise`），
+/// 稍后在新的地址与令牌上重新接受订阅；界面等它回来再订阅，不退出。
+pub const CLOSING_RESTARTING: &str = "restarting";
 pub const CLOSING_BUILD_MISMATCH: &str = "build_mismatch";
 
 /// Local IPC is private to one bundle build, including its embedded frontend.
@@ -394,6 +397,16 @@ async fn finish_response(lines: &mut Frames<tokio::io::ReadHalf<transport::Async
     let _ = lines;
 }
 
+/// Why this backend closes its subscriptions: it stops, or it is about to
+/// restart after a network-layer failure.
+fn closing_reason(node: &Node) -> &'static str {
+    if node.restart_reason().is_some() {
+        CLOSING_RESTARTING
+    } else {
+        CLOSING_STOPPING
+    }
+}
+
 /// 事件订阅：把服务的事件逐行推给这条连接，直到对方断开、服务退出或积压过多。
 async fn stream_events(
     mut lines: Frames<tokio::io::ReadHalf<transport::AsyncStream>>,
@@ -432,12 +445,12 @@ async fn stream_events(
                     // Losing the server task/sender is a broken connection, not
                     // an explicit shutdown request. Only a true value announces stop.
                     if requested.is_ok() {
-                        write_line(&mut w, &serde_json::json!({ "closing": CLOSING_STOPPING })).await?;
+                        write_line(&mut w, &serde_json::json!({ "closing": closing_reason(&node) })).await?;
                     }
                     return Ok(());
                 }
                 () = node.wait_for_stop() => {
-                    write_line(&mut w, &serde_json::json!({ "closing": CLOSING_STOPPING })).await?;
+                    write_line(&mut w, &serde_json::json!({ "closing": closing_reason(&node) })).await?;
                     return Ok(());
                 }
                 // 订阅连接接收本客户端的可见视图需求；EOF 表示对方断开。

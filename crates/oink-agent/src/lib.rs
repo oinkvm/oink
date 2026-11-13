@@ -47,6 +47,7 @@ mod audio;
 pub mod backend;
 pub mod diagnostics;
 pub mod microphone_plugin;
+pub mod mobile_v2;
 pub mod streams;
 pub mod threads;
 

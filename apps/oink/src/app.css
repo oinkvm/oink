@@ -526,6 +526,7 @@ input::-ms-reveal, input::-ms-clear { display: none; }
   pointer-events: none;
 }
 .scr__name { max-width: 100%; font: 600 12px/1.25 var(--ok-font); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.scr__name .os-logo { display: inline-block; vertical-align: -0.25em; margin-inline-end: 4px; }
 .scr__res { font: 450 10.5px/1.25 var(--ok-font-mono); color: var(--ok-text-2); font-variant-numeric: tabular-nums; white-space: nowrap; }
 @container (max-height: 72px) { .scr__res { display: none; } }
 @container (max-width: 64px) { .scr__label { display: none; } }

@@ -1,49 +1,17 @@
 //! Explicit conversion at the authenticated identity boundary.
-use oink_foundation::{
-    DeviceId,
-    session::{Boot, BootPair, ConnectionId, PairId, PathId},
-};
-use oink_protocol::v1::{
+use oink_foundation::session::{BootPair, ConnectionId, PairId, PathId};
+use oink_protocol::v2::{
     self, RawValue, dto,
     schema::{WireDto, WireValue},
 };
 
-pub fn device(value: DeviceId) -> dto::DeviceId {
-    dto::DeviceId::from_raw(
-        [
-            (1, RawValue::from(dto::ED25519)),
-            (2, RawValue::Bytes(value.0.to_vec())),
-        ]
-        .into(),
-    )
-    .expect("fixed Ed25519 identity")
+/// Local correlation hash for authenticated group objects. v2 deliberately
+/// has no generic wire `Digest` DTO.
+pub fn object_digest(bytes: &[u8]) -> [u8; 32] {
+    *blake3::hash(bytes).as_bytes()
 }
-pub fn read_device(value: &dto::DeviceId) -> v1::Result<DeviceId> {
-    value.require_supported()?;
-    Ok(DeviceId(
-        value
-            .public_key()?
-            .0
-            .try_into()
-            .map_err(|_| v1::ErrorCode::MalformedFrame)?,
-    ))
-}
-pub fn boot(value: Boot) -> dto::Boot {
-    dto::Boot::from_raw(
-        [
-            (1, device(value.device_id).write()),
-            (2, RawValue::Bytes(value.nonce.to_vec())),
-        ]
-        .into(),
-    )
-    .expect("fixed boot identity")
-}
-pub fn read_boot(value: &dto::Boot) -> v1::Result<Boot> {
-    Ok(Boot {
-        device_id: read_device(&value.device_id()?)?,
-        nonce: value.nonce()?.0,
-    })
-}
+
+pub use oink_protocol::v2::identity::{boot, device, read_boot, read_device};
 pub fn boot_pair(value: BootPair) -> dto::BootPair {
     dto::BootPair::from_raw(
         [
@@ -54,9 +22,9 @@ pub fn boot_pair(value: BootPair) -> dto::BootPair {
     )
     .expect("canonical boot pair")
 }
-pub fn read_boot_pair(value: &dto::BootPair) -> v1::Result<BootPair> {
+pub fn read_boot_pair(value: &dto::BootPair) -> v2::Result<BootPair> {
     BootPair::new(read_boot(&value.coordinator()?)?, read_boot(&value.follower()?)?)
-        .ok_or(v1::ErrorCode::MalformedFrame.into())
+        .ok_or(v2::ErrorCode::MalformedFrame.into())
 }
 pub fn connection(value: ConnectionId) -> dto::ConnectionId {
     dto::ConnectionId::from_raw(
@@ -68,7 +36,7 @@ pub fn connection(value: ConnectionId) -> dto::ConnectionId {
     )
     .expect("fixed connection identity")
 }
-pub fn read_connection(value: &dto::ConnectionId) -> v1::Result<ConnectionId> {
+pub fn read_connection(value: &dto::ConnectionId) -> v2::Result<ConnectionId> {
     Ok(ConnectionId {
         initiator_boot: read_boot(&value.initiator_boot()?)?,
         random: value.random()?.0,
@@ -84,7 +52,7 @@ pub fn pair(value: PairId) -> dto::PairId {
     )
     .expect("fixed pairing identity")
 }
-pub fn read_pair(value: &dto::PairId) -> v1::Result<PairId> {
+pub fn read_pair(value: &dto::PairId) -> v2::Result<PairId> {
     Ok(PairId {
         initiator_boot: read_boot(&value.initiator_boot()?)?,
         random: value.random()?.0,
@@ -100,13 +68,13 @@ pub fn path(value: PathId) -> dto::PathId {
     )
     .expect("fixed path identity")
 }
-pub fn read_path(value: &dto::PathId) -> v1::Result<PathId> {
+pub fn read_path(value: &dto::PathId) -> v2::Result<PathId> {
     let path = PathId {
         boot_pair: read_boot_pair(&value.boot_pair()?)?,
         coordinator_counter: value.coordinator_counter()?,
     };
     if !path.valid() {
-        return Err(v1::ErrorCode::MalformedFrame.into());
+        return Err(v2::ErrorCode::MalformedFrame.into());
     }
     Ok(path)
 }

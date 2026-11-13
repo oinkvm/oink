@@ -3,15 +3,15 @@ use oink_foundation::content::ClipId;
 use oink_foundation::content::Holder;
 use oink_foundation::{Point, clipboard::ClipData};
 use oink_input::InputBackend;
-use oink_protocol::v1::{
+use oink_protocol::v2::{
     self, dto,
     schema::{WireDto, WireValue},
 };
-fn drain_wire(read: &mut oink_network::link::RecvStream) -> Vec<v1::Message> {
+fn drain_wire(read: &mut oink_network::link::RecvStream) -> Vec<v2::Message> {
     let mut messages = vec![];
     while let Ok(Some(bytes)) = read.take() {
         messages.push(
-            v1::frame::OpaqueFrame::parse_exact(&bytes, v1::limits::RELIABLE_FRAME)
+            v2::frame::OpaqueFrame::parse_exact(&bytes, v2::limits::RELIABLE_FRAME)
                 .unwrap()
                 .decode()
                 .unwrap(),
@@ -106,7 +106,7 @@ fn prepared_large_drag_posts_head_before_focus_without_waiting_for_the_ordinary_
     // No ordinary consumer has run. I0 already holds both messages in order.
     let messages = drain_wire(&mut read);
     assert_eq!(messages.len(), 2);
-    let v1::Message::AttachmentHead(head) = &messages[0] else {
+    let v2::Message::AttachmentHead(head) = &messages[0] else {
         panic!("head");
     };
     let header = dto::DragAttachment::from_raw(head.header().unwrap().body().unwrap())
@@ -127,15 +127,15 @@ fn prepared_large_drag_posts_head_before_focus_without_waiting_for_the_ordinary_
     let remaining = head.remaining().unwrap() as usize;
     assert_eq!(prefix + remaining, 2000);
     assert!(remaining > 0);
-    assert!(v1::frame::encode(&messages[0], v1::limits::RELIABLE_FRAME).is_ok());
+    assert!(v2::frame::encode(&messages[0], v2::limits::RELIABLE_FRAME).is_ok());
     assert_eq!(
-        decode(&v1::frame::encode(&messages[1], v1::limits::RELIABLE_FRAME).unwrap()).unwrap(),
+        decode(&v2::frame::encode(&messages[1], v2::limits::RELIABLE_FRAME).unwrap()).unwrap(),
         focus(&h)
     );
     assert!(h.driver.current_outbound(peer(), stream));
     let ordinary: Vec<_> = h._main.try_iter().collect();
     assert!(ordinary.iter().any(|command| matches!(command, MainCommand::Attachment { stream: s, message, .. } if *s == stream && *message == messages[0])));
-    assert!(ordinary.iter().any(|command| matches!(command, MainCommand::Low { stream: s, message: v1::Message::AttachmentItems(tail), .. } if *s == stream && tail.items().unwrap().descriptor_count().unwrap() == remaining)));
+    assert!(ordinary.iter().any(|command| matches!(command, MainCommand::Low { stream: s, message: v2::Message::AttachmentItems(tail), .. } if *s == stream && tail.items().unwrap().descriptor_count().unwrap() == remaining)));
 }
 #[test]
 fn failed_head_never_launches_a_large_tail() {
@@ -168,7 +168,7 @@ fn failed_head_never_launches_a_large_tail() {
     assert!(!h._main.try_iter().any(|command| matches!(
         command,
         MainCommand::Low {
-            message: v1::Message::AttachmentItems(_),
+            message: v2::Message::AttachmentItems(_),
             ..
         } | MainCommand::Attachment { .. }
     )));
@@ -205,7 +205,7 @@ fn attachment_refusals_follow_the_exact_input_pair_and_are_not_input_stream_fail
     while h._main.try_recv().is_ok() {}
     let incoming = h.driver.pairs[&peer()].inbound.as_ref().unwrap().0.id();
     let outgoing = h.driver.pairs[&peer()].outbound.as_ref().unwrap().0.id();
-    let result = v1::Message::AttachmentResult(
+    let result = v2::Message::AttachmentResult(
         dto::AttachmentResult::from_raw(
             [
                 (1, 4u64.write()),
@@ -219,7 +219,7 @@ fn attachment_refusals_follow_the_exact_input_pair_and_are_not_input_stream_fail
         .unwrap(),
     );
     write
-        .post(v1::frame::encode(&result, v1::limits::RELIABLE_FRAME).unwrap())
+        .post(v2::frame::encode(&result, v2::limits::RELIABLE_FRAME).unwrap())
         .unwrap();
     assert!(h.driver.read());
     assert!(h.driver.adapter.attached(peer()));
@@ -233,7 +233,7 @@ fn attachment_refusals_follow_the_exact_input_pair_and_are_not_input_stream_fail
     h.driver.command(InputCommand::OutboundGone { peer: peer() });
     while h._main.try_recv().is_ok() {}
     write
-        .post(v1::frame::encode(&result, v1::limits::RELIABLE_FRAME).unwrap())
+        .post(v2::frame::encode(&result, v2::limits::RELIABLE_FRAME).unwrap())
         .unwrap();
     h.driver.read();
     assert!(
@@ -242,16 +242,16 @@ fn attachment_refusals_follow_the_exact_input_pair_and_are_not_input_stream_fail
             .any(|command| matches!(command, MainCommand::Attachment { .. }))
     );
     let mut wrong = match result {
-        v1::Message::AttachmentResult(value) => value.into_raw(),
+        v2::Message::AttachmentResult(value) => value.into_raw(),
         _ => unreachable!(),
     };
     wrong.insert(2, dto::AttachmentKind::Offer.write());
     wrong.insert(4, oink_clipboard::wire::offer_id(notice(vec![]).key.offer).write());
-    let wrong = v1::Message::AttachmentResult(dto::AttachmentResult::from_raw(wrong).unwrap());
+    let wrong = v2::Message::AttachmentResult(dto::AttachmentResult::from_raw(wrong).unwrap());
     // A clipboard-family reply cannot be admitted on I0.
     assert!(
         wire::decode(
-            &v1::frame::encode(&wrong, v1::limits::RELIABLE_FRAME).unwrap(),
+            &v2::frame::encode(&wrong, v2::limits::RELIABLE_FRAME).unwrap(),
             &fixture_admission(peer(), LinkId(1)),
             false
         )
@@ -358,7 +358,7 @@ fn preview_pixels_and_encoding_leave_input_through_an_ordinary_command() {
 #[test]
 fn exported_browser_artwork_larger_than_i0_does_not_detach_or_lose_focus() {
     use image::ImageEncoder;
-    use oink_protocol::v1::RawValue;
+    use oink_protocol::v2::RawValue;
     use oink_routing::dnd::{PreviewBinding, SourceMode};
     let mut pixels = vec![255u8; 64 * 96 * 4];
     let mut noise = 1u32;
@@ -374,7 +374,7 @@ fn exported_browser_artwork_larger_than_i0_does_not_detach_or_lose_focus() {
     image::codecs::png::PngEncoder::new(&mut png)
         .write_image(&pixels, 64, 96, image::ExtendedColorType::Rgba8)
         .unwrap();
-    assert!(png.len() > v1::limits::RELIABLE_FRAME && png.len() <= 32768);
+    assert!(png.len() > v2::limits::RELIABLE_FRAME && png.len() <= 32768);
     let image = oink_foundation::dnd::DragImage {
         png: png.into(),
         width: 64.,
@@ -437,9 +437,9 @@ fn exported_browser_artwork_larger_than_i0_does_not_detach_or_lose_focus() {
         "optional artwork detached the input stream"
     );
     assert_eq!(messages.len(), 2);
-    assert!(matches!(&messages[0], v1::Message::DndNotice(_)));
+    assert!(matches!(&messages[0], v2::Message::DndNotice(_)));
     assert_eq!(
-        decode(&v1::frame::encode(&messages[1], v1::limits::RELIABLE_FRAME).unwrap()).unwrap(),
+        decode(&v2::frame::encode(&messages[1], v2::limits::RELIABLE_FRAME).unwrap()).unwrap(),
         focus(&h)
     );
     assert!(
@@ -450,7 +450,7 @@ fn exported_browser_artwork_larger_than_i0_does_not_detach_or_lose_focus() {
 
     // Replay the former inline field with the same otherwise-valid declaration.
     // A legal <=32 KiB thumbnail overflows the 16 KiB I0 frame before FocusEnter.
-    let v1::Message::DndNotice(notice) = messages[0].clone() else {
+    let v2::Message::DndNotice(notice) = messages[0].clone() else {
         unreachable!()
     };
     let mut legacy = notice.into_raw();
@@ -469,9 +469,9 @@ fn exported_browser_artwork_larger_than_i0_does_not_detach_or_lose_focus() {
         .unwrap()
         .write(),
     );
-    let legacy = v1::Message::DndNotice(dto::DndNotice::from_raw(legacy).unwrap());
+    let legacy = v2::Message::DndNotice(dto::DndNotice::from_raw(legacy).unwrap());
     assert_eq!(
-        v1::frame::encode(&legacy, v1::limits::RELIABLE_FRAME).unwrap_err().code,
-        v1::ErrorCode::LimitExceeded
+        v2::frame::encode(&legacy, v2::limits::RELIABLE_FRAME).unwrap_err().code,
+        v2::ErrorCode::LimitExceeded
     );
 }

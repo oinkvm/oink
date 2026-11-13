@@ -4,13 +4,13 @@ use crate::{
     node::{Node, lock},
     threads::input::InputCommand,
 };
-use oink_protocol::v1::{
+use oink_protocol::v2::{
     Message, RawMap, dto,
     schema::{List, WireDto, WireValue},
 };
 use std::collections::BTreeMap;
 type Failure = dto::ControlFailure;
-fn field<T>(result: oink_protocol::v1::Result<T>) -> Result<T, Failure> {
+fn field<T>(result: oink_protocol::v2::Result<T>) -> Result<T, Failure> {
     result.map_err(|_| Failure::InvalidValue)
 }
 fn current(item: &dto::DevicePreference) -> Result<dto::LocalOptionState, Failure> {
@@ -36,8 +36,8 @@ struct GlobalVisibilityEdit {
 /// The owner preference remains the CAS input and response compatibility shell;
 /// the actual visibility is committed to the shared layout register below.
 fn screen_visibility_edits(
-    before: &oink_protocol::v1::RawValue,
-    after: &oink_protocol::v1::RawValue,
+    before: &oink_protocol::v2::RawValue,
+    after: &oink_protocol::v2::RawValue,
 ) -> Result<Vec<GlobalVisibilityEdit>, Failure> {
     let before = dto::ScreenPreferencesValue::read(before).map_err(|_| Failure::InvalidValue)?;
     let after = dto::ScreenPreferencesValue::read(after).map_err(|_| Failure::InvalidValue)?;
@@ -74,9 +74,9 @@ fn screen_visibility_edits(
 /// preserves gain and future fields while restoring enabled values to the old
 /// baseline, so owner preferences can no longer become visibility authority.
 fn without_screen_visibility(
-    before: &oink_protocol::v1::RawValue,
-    after: &oink_protocol::v1::RawValue,
-) -> Result<oink_protocol::v1::RawValue, Failure> {
+    before: &oink_protocol::v2::RawValue,
+    after: &oink_protocol::v2::RawValue,
+) -> Result<oink_protocol::v2::RawValue, Failure> {
     let before = dto::ScreenPreferencesValue::read(before).map_err(|_| Failure::InvalidValue)?;
     let enabled = before
         .screens()
@@ -91,19 +91,19 @@ fn without_screen_visibility(
         })
         .collect::<Result<BTreeMap<_, _>, Failure>>()?;
     let mut raw = after.as_map().map_err(|_| Failure::InvalidValue)?.clone();
-    if let Some(oink_protocol::v1::RawValue::Array(screens)) = raw.get_mut(&1) {
+    if let Some(oink_protocol::v2::RawValue::Array(screens)) = raw.get_mut(&1) {
         for screen in screens {
-            let oink_protocol::v1::RawValue::Map(fields) = screen else {
+            let oink_protocol::v2::RawValue::Map(fields) = screen else {
                 return Err(Failure::InvalidValue);
             };
             let display = match fields.get(&1) {
-                Some(oink_protocol::v1::RawValue::Text(display)) => display.clone(),
+                Some(oink_protocol::v2::RawValue::Text(display)) => display.clone(),
                 _ => return Err(Failure::InvalidValue),
             };
             fields.insert(3, enabled.get(&display).copied().unwrap_or(true).write());
         }
     }
-    Ok(oink_protocol::v1::RawValue::Map(raw))
+    Ok(oink_protocol::v2::RawValue::Map(raw))
 }
 impl Node {
     pub(crate) fn edit_local_input_settings(
@@ -204,9 +204,9 @@ impl Node {
                         .any(|screen| screen.display == display.key)
                 })
                 .map(|display| {
-                    oink_protocol::v1::RawValue::Map(
+                    oink_protocol::v2::RawValue::Map(
                         [
-                            (1, oink_protocol::v1::RawValue::Text(display.key.clone())),
+                            (1, oink_protocol::v2::RawValue::Text(display.key.clone())),
                             (2, 1f64.write()),
                             // A virtual screen is still visible until the user hides it.
                             (3, true.write()),
@@ -218,10 +218,10 @@ impl Node {
             if upserts.is_empty() {
                 false
             } else {
-                let patch = oink_protocol::v1::RawValue::Map(
+                let patch = oink_protocol::v2::RawValue::Map(
                     [(
                         1,
-                        oink_protocol::v1::RawValue::Map([(1, oink_protocol::v1::RawValue::Array(upserts))].into()),
+                        oink_protocol::v2::RawValue::Map([(1, oink_protocol::v2::RawValue::Array(upserts))].into()),
                     )]
                     .into(),
                 );
@@ -316,21 +316,12 @@ impl Node {
         }
         let (item, outcome, reason, sequence, persisted) = if matches!(
             option,
-            dto::LocalOption::ForwardingEnabled
-                | dto::LocalOption::ForwardingControls
-                | dto::LocalOption::AudioExitClaim
-                | dto::LocalOption::MicrophoneShareClaim
+            dto::LocalOption::ForwardingControls
                 | dto::LocalOption::MicrophoneControls
-                | dto::LocalOption::MicrophoneReceiveMuted
                 | dto::LocalOption::MicrophoneInput
         ) {
             let audio = self.inner.audio.get().ok_or(Failure::Offline)?;
-            let item = if option == dto::LocalOption::AudioExitClaim {
-                let value = bool::read(&patch).map_err(|_| Failure::InvalidValue)?;
-                self.inner
-                    .rt
-                    .block_on(audio.set_claim(super::runtime::boot(requester), group, value, expected))?
-            } else if field(request.defer_persistence())? {
+            let item = if field(request.defer_persistence())? {
                 self.inner.rt.block_on(audio.set_option_with_persistence(
                     super::runtime::boot(requester),
                     group,
@@ -538,6 +529,14 @@ impl Node {
         self.owner_authority(requester, group, &Message::ConfigPauseDevice(request.clone()))?;
         let remote = requester.device.0 != self.id();
         let paused = field(request.paused())?;
+        // Every pause/resume of this device passes here; record who asked
+        // (local requests also log their entry point: UI/CLI, hotkey, menu).
+        tracing::info!(
+            paused,
+            remote,
+            requester = %requester.device.0,
+            "applying sharing pause request"
+        );
         self.consume_local_emergency();
         let observed = self.input_status().map_err(|_| Failure::ApplyFailed)?;
         let mut candidate = lock(&self.inner.controls).pause.clone();

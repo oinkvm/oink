@@ -1,0 +1,27 @@
+{
+  "OinkCopy-darkBlue.shortcut": {
+    "source_sha256": "0b092e9813d49b75eeca94f155465d16d6d3465ec31c109bdd24eafdf83d1c31",
+    "signed_sha256": "1459ba35f72e4dead7518e45b53d6a5ce3148b6bd8a5765035769b4e6dea011c",
+    "certificate_not_after": "2027-12-09T20:06:32Z"
+  },
+  "OinkCopy-darkOrange.shortcut": {
+    "source_sha256": "ad5177749400a670fb253b178c8aa9aa034724e704b169dff0c17e2cf4122259",
+    "signed_sha256": "9da3f45a73247854a3f212ed86e3281068fb1a08fa2cfe2d9e8b276c7a2a842b",
+    "certificate_not_after": "2027-12-07T19:39:48Z"
+  },
+  "OinkCopy-red.shortcut": {
+    "source_sha256": "b37d52a0efdf4333ab23b54be3b0f77112521d53e5e9b349919df84ae6140c2d",
+    "signed_sha256": "c3a1acd9f06348898a4e08024949c64a6bbf73d228aa93a37da29f06b446efd7",
+    "certificate_not_after": "2027-12-07T20:58:01Z"
+  },
+  "OinkCopy-teal.shortcut": {
+    "source_sha256": "38732ec347bec67e64bb83e2f2af955a57304c31c4cd79c40e48cc7ef78787d5",
+    "signed_sha256": "83e7a4923aba70c89df324ae3cd5b85f06ba13de942c13978da78c0f54a17b9a",
+    "certificate_not_after": "2027-12-07T20:32:29Z"
+  },
+  "OinkCopy-violet.shortcut": {
+    "source_sha256": "0ad562da3bc84dd2519f7e5f0da3afece843912d3af29e0cdbf2913e9a7512a7",
+    "signed_sha256": "b7ae2c712a1f25f03b9137ecdfefeb0b5534790c2b08cf46b9e63bc76a215121",
+    "certificate_not_after": "2027-12-08T18:21:39Z"
+  }
+}

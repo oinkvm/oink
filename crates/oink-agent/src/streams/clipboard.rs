@@ -16,7 +16,7 @@ use oink_network::link::{
 };
 use oink_protocol::{
     frame::{StreamCode, StreamKind},
-    v1::{self, Message, dto, schema::Open},
+    v2::{self, Message, dto, schema::Open},
 };
 use std::{
     collections::HashMap,
@@ -48,6 +48,7 @@ struct Peer {
     // Payload already consumed; retain the Low handle until both ENDs arrive.
     finishing: Vec<tokio::task::JoinHandle<()>>,
     early_tail: Option<EarlyTail>,
+    history_operations: Vec<tokio::task::JoinHandle<()>>,
 }
 
 /// Ordinary-thread owner of this module's streams. `poll` returns messages to its
@@ -55,12 +56,19 @@ struct Peer {
 #[derive(Debug)]
 pub struct ClipboardStreams {
     links: LinkLayer,
+    config: ConfigModule,
     wake: std::sync::Arc<tokio::sync::Notify>,
     peers: HashMap<DeviceId, Peer>,
     paused: bool,
     low: Vec<InboundLow>,
     closed: Vec<(DeviceId, StreamId)>,
     offer: Option<dto::ClipboardOffer>,
+    history_summary: Option<dto::HistorySummary>,
+    witnessed_offer: Option<dto::ClipboardOffer>,
+    /// Order of the newest group offer witnessed (kept across local changes,
+    /// unlike `witnessed_offer`). An own offer below it is no longer the
+    /// group's current clip and is never put on a stream again.
+    newest: Option<(u64, DeviceId)>,
     next_attachment: u64,
     assemblies: crate::attachment::link::Assemblies,
     files: std::sync::Arc<files::FileLinks>,
@@ -75,12 +83,16 @@ impl ClipboardStreams {
         Self {
             files,
             links,
+            config,
             wake: Default::default(),
             peers: HashMap::new(),
             paused,
             low: Vec::new(),
             closed: Vec::new(),
             offer: None,
+            history_summary: None,
+            witnessed_offer: None,
+            newest: None,
             next_attachment: 0,
             assemblies: Default::default(),
         }
@@ -103,7 +115,21 @@ impl ClipboardStreams {
 
     fn valid(message: &Message) -> bool {
         match message {
-            Message::ClipboardOffer(_) => true,
+            Message::ClipboardOffer(_)
+            | Message::ClipboardCurrentQuery(_)
+            | Message::ClipboardCurrentResult(_)
+            | Message::ClipboardHeadUpdate(_)
+            | Message::ClipboardShareBegin(_)
+            | Message::ClipboardShareAccept(_)
+            | Message::ClipboardShareReject(_)
+            | Message::ClipboardShareResult(_)
+            | Message::ClipboardShareCancel(_)
+            | Message::HistorySummary(_)
+            | Message::HistoryIndexRequest(_)
+            | Message::HistoryIndex(_)
+            | Message::HistoryPull(_)
+            | Message::HistoryRecords(_)
+            | Message::HistoryDelta(_) => true,
             Message::AttachmentHead(head) => {
                 head.header().and_then(|h| h.variant()) == Ok(Open::Known(dto::AttachmentKind::Offer))
             }
@@ -115,7 +141,7 @@ impl ClipboardStreams {
         self.links
             .links()
             .by_peer(peer)
-            .is_some_and(|entry| entry.agreement.contains("oink.clipboard/1"))
+            .is_some_and(|entry| entry.opens(StreamKind::Clipboard))
     }
 
     fn advance(&mut self, peer: DeviceId, now: Instant) {
@@ -128,6 +154,12 @@ impl ClipboardStreams {
     }
 
     fn step(&mut self, peer: DeviceId, step: Step, now: Instant) {
+        // A paused B0 closes with `Paused` so the peer knows why.
+        let code = if self.paused {
+            StreamCode::Paused
+        } else {
+            StreamCode::None
+        };
         let Some(state) = self.peers.get_mut(&peer) else {
             return;
         };
@@ -137,8 +169,10 @@ impl ClipboardStreams {
             Step::Open(tag) | Step::Reopen { open: tag, .. } => Some(tag),
         };
         if let Some(tx) = state.tx.take() {
-            tracing::debug!(?peer, stream=?tx.id(), "closing Clipboard stream");
-            self.links.close_stream(tx.id(), StreamCode::None);
+            tracing::debug!(?peer, stream=?tx.id(), ?code, "closing Clipboard stream");
+            // Through the handle: a `close_stream` command can lose its code
+            // to the dropped handle's own close (the peer would see `None`).
+            tx.close_with(code);
         }
         state.packets_tx = None;
         for (_, operation) in state.operations.drain() {
@@ -162,7 +196,13 @@ impl ClipboardStreams {
         state.tx = Some(tx);
         state.packets_tx = packets;
         self.refresh_offer(peer);
-        let opening = self.peers[&peer].opening.clone();
+        let mut opening = self.peers[&peer].opening.clone();
+        if self.history_capable(peer)
+            && !self.history_phone(peer)
+            && let Some(summary) = &self.history_summary
+        {
+            opening.push(Message::HistorySummary(summary.clone()));
+        }
         for message in opening {
             if self.post(peer, &message, now).is_err() {
                 return;
@@ -175,7 +215,7 @@ impl ClipboardStreams {
         if !Self::valid(message) {
             return Err(PostError::TooLarge);
         }
-        let bytes = v1::frame::encode(message, v1::limits::RELIABLE_FRAME).map_err(|_| PostError::TooLarge)?;
+        let bytes = v2::frame::encode(message, v2::limits::RELIABLE_FRAME).map_err(|_| PostError::TooLarge)?;
         let state = self.peers.get_mut(&peer).ok_or(PostError::Closed)?;
         let result = state.tx.as_ref().ok_or(PostError::Closed)?.post(bytes);
         let failure = match result {
@@ -216,6 +256,75 @@ impl ClipboardStreams {
         self.advance(peer, now);
         self.post(peer, message, now)
     }
+    fn history_phone(&self, peer: DeviceId) -> bool {
+        self.config
+            .members()
+            .members
+            .iter()
+            .any(|m| m.device == peer && m.is_mobile())
+    }
+    fn history_capable(&self, peer: DeviceId) -> bool {
+        self.links.links().by_peer(peer).is_some_and(|e| e.permits(0x0356))
+    }
+    pub fn set_history_summary(&mut self, summary: dto::HistorySummary, exchange: bool) {
+        self.history_summary = Some(summary.clone());
+        if exchange && !self.paused {
+            for peer in self.peers.keys().copied().collect::<Vec<_>>() {
+                if self.history_capable(peer) && !self.history_phone(peer) {
+                    let _ = self.send(peer, &Message::HistorySummary(summary.clone()), Instant::now());
+                }
+            }
+        }
+    }
+    #[cfg(all(test, debug_assertions))]
+    pub(crate) fn history_operations_for_test(&self, peer: DeviceId) -> usize {
+        self.peers.get(&peer).map_or(0, |p| {
+            p.history_operations.iter().filter(|task| !task.is_finished()).count()
+        })
+    }
+    pub fn send_history(&mut self, peer: DeviceId, message: &Message) -> Result<(), PostError> {
+        if self.paused || !self.history_capable(peer) {
+            return Err(PostError::Closed);
+        }
+        // A Reliable holder must not overtake the record sent on Low. The
+        // outbox retries after orderly completion, without an extra timeout.
+        if self
+            .peers
+            .get(&peer)
+            .is_some_and(|p| p.history_operations.iter().any(|task| !task.is_finished()))
+        {
+            return Err(PostError::Full);
+        }
+        if v2::frame::encode(message, v2::limits::RELIABLE_FRAME).is_ok() {
+            return self.send(peer, message, Instant::now());
+        }
+        let bytes = v2::frame::encode(message, v2::limits::LOW_FRAME)
+            .map_err(|_| PostError::TooLarge)?
+            .len();
+        let state = self.peers.get_mut(&peer).ok_or(PostError::Closed)?;
+        let link = state.link;
+        let links = self.links.clone();
+        let message = message.clone();
+        let send_max = oink_foundation::transfer::LowOptions::message_bytes(bytes);
+        let wake = self.wake.clone();
+        state.history_operations.push(tokio::spawn(async move {
+            let options = oink_foundation::transfer::LowOptions {
+                send_max,
+                receive_max: 0,
+                operation_max: send_max,
+            };
+            if let Ok(mut stream) = links.open_low(link, StreamKind::Clipboard, options).await
+                && stream.send(&message).await.is_ok()
+            {
+                stream.finish();
+                // FIN is half-close. Retain the Low handle through the peer's
+                // EOF: dropping after our FIN cancels its deferred effect.
+                while let Ok(Some(_)) = stream.recv().await {}
+            }
+            wake.notify_one();
+        }));
+        Ok(())
+    }
     /// Call on queue wake and at the earliest `deadline`. Only this module is serviced.
     pub fn poll(&mut self, now: Instant) -> Vec<(DeviceId, Message)> {
         for state in self.peers.values_mut() {
@@ -252,8 +361,13 @@ impl ClipboardStreams {
                 }
             }
             state.operations.retain(|_, operation| !operation.is_finished());
+            state.history_operations.retain(|operation| !operation.is_finished());
             if let Some(stream) = invalid {
-                self.links.close_stream(stream, StreamCode::Invalid);
+                // Through the handle, which `stream_closed` then drops: a
+                // `close_stream` command can lose its code to that drop.
+                if let Some(rx) = state.rx.as_ref().filter(|rx| rx.id() == stream) {
+                    rx.close_with(StreamCode::Invalid);
+                }
                 self.stream_closed(stream, StreamClosed::Local);
             }
         }
@@ -281,14 +395,23 @@ impl ClipboardStreams {
                         }
                     }
                     Err(_) => {
-                        self.links.close_stream(stream, StreamCode::Invalid);
+                        // Through the handle, which `stream_closed` then drops.
+                        if let Some(rx) = self
+                            .peers
+                            .get(&peer)
+                            .and_then(|state| state.rx.as_ref())
+                            .filter(|rx| rx.id() == stream)
+                        {
+                            rx.close_with(StreamCode::Invalid);
+                        }
                         self.stream_closed(stream, StreamClosed::Local);
                     }
                 },
-                message => {
+                message @ Message::ClipboardOffer(_) => {
                     self.assemblies.clear(stream);
                     self.record_offer(peer, message, &mut applied);
                 }
+                message => applied.push((peer, message)),
             }
         }
         for peer in self.peers.keys().copied().collect::<Vec<_>>() {
@@ -297,6 +420,14 @@ impl ClipboardStreams {
         if !self.paused {
             for (peer, state) in &mut self.peers {
                 for message in state.received.drain(..) {
+                    // The file binding made when this offer arrived during the
+                    // pause was cancelled when sharing resumed; the offer is
+                    // current again now that it is delivered.
+                    if let Message::ClipboardOffer(offer) = &message
+                        && let Ok(id) = offer.id().and_then(oink_clipboard::wire::local_offer_id)
+                    {
+                        self.files.accept(*peer, id.clip);
+                    }
                     applied.push((*peer, message));
                 }
             }
@@ -367,7 +498,7 @@ impl StreamModule for ClipboardStreams {
             rx: None,
             packets_tx: None,
             packets_rx: None,
-            wanted: self.offer.is_some(),
+            wanted: self.offer.is_some() || self.history_summary.is_some(),
             supported,
             opening: Vec::new(),
             tail: None,
@@ -375,6 +506,7 @@ impl StreamModule for ClipboardStreams {
             operations: HashMap::new(),
             finishing: Vec::new(),
             early_tail: None,
+            history_operations: vec![],
         });
         self.advance(peer, Instant::now());
     }
@@ -385,6 +517,9 @@ impl StreamModule for ClipboardStreams {
         self.files.link_lost(peer, link, reason);
         let state = self.peers.remove(&peer).unwrap();
         for (_, operation) in state.operations {
+            operation.abort();
+        }
+        for operation in state.history_operations {
             operation.abort();
         }
         for operation in state.finishing {
@@ -412,6 +547,13 @@ impl StreamModule for ClipboardStreams {
             stream.reject(StreamCode::StaleOrdinal);
             return;
         }
+        // While clipboard sharing is paused nothing can be answered on B0: a
+        // phone opening it to ask learns why at once (it never waits for a
+        // reply this device cannot send).
+        if self.paused {
+            stream.reject(StreamCode::Paused);
+            return;
+        }
         if let Some(old) = state.rx.take() {
             self.links.close_stream(old.id(), StreamCode::None);
             self.closed.push((stream.peer, old.id()));
@@ -432,7 +574,12 @@ impl StreamModule for ClipboardStreams {
         self.wake.notify_one();
         state.rx = Some(rx);
         state.packets_rx = packets;
+        // The peer is sharing again: a B0 it refused as Paused reopens now.
+        let resumed = state.machine.peer_resumed();
         self.accept_early_tail(peer);
+        if resumed {
+            self.advance(peer, Instant::now());
+        }
     }
     fn inbound_low(&mut self, mut operation: InboundLow) {
         let peer = operation.stream.peer();
@@ -456,7 +603,7 @@ impl StreamModule for ClipboardStreams {
                 // Retain it under the link until its matching head identifies
                 // the reliable ordinal; never bind it to whichever rx is current.
                 let bytes =
-                    v1::frame::encode(&operation.first, v1::limits::LOW_FRAME).map_or(usize::MAX, |frame| frame.len());
+                    v2::frame::encode(&operation.first, v2::limits::LOW_FRAME).map_or(usize::MAX, |frame| frame.len());
                 let queued: usize = self
                     .peers
                     .values()
@@ -507,7 +654,18 @@ impl StreamModule for ClipboardStreams {
             state.finishing.push(tokio::spawn(async move {
                 let _ = operation.stream.recv().await;
             }));
-        } else if oink_clipboard::wire::local_content(operation.first.clone()).is_ok() {
+        } else if matches!(
+            operation.first,
+            Message::HistoryDelta(_)
+                | Message::HistoryRecords(_)
+                | Message::HistoryIndex(_)
+                | Message::ClipboardContentRead(_)
+                | Message::ContentThumbnailRead(_)
+                | Message::ClipboardShareTextChunk(_)
+                | Message::ClipboardShareTextEnd(_)
+                | Message::ContentOffer(_)
+        ) || oink_clipboard::wire::local_content(operation.first.clone()).is_ok()
+        {
             self.low.push(operation);
         } else {
             operation.stream.cancel();
@@ -551,9 +709,18 @@ impl StreamModule for ClipboardStreams {
         self.paused = paused;
         self.files.pause_changed(paused);
         if paused {
-            for state in self.peers.values_mut() {
+            for (peer, state) in &mut self.peers {
+                for task in state.history_operations.drain(..) {
+                    task.abort();
+                }
                 for (_, operation) in state.operations.drain() {
                     operation.abort();
+                }
+                // B0 closes both ways: the peer's requests could not be answered.
+                if let Some(rx) = state.rx.take() {
+                    rx.close_with(StreamCode::Paused);
+                    self.assemblies.clear(rx.id());
+                    self.closed.push((*peer, rx.id()));
                 }
             }
         }
@@ -563,7 +730,20 @@ impl StreamModule for ClipboardStreams {
         }
     }
     fn facts_changed(&mut self, peer: DeviceId, capabilities_changed: bool) {
+        // New facts may be the peer's resume (its pause state is a fact). A
+        // late `Paused` refusal of a B0 opened during the peer's pause would
+        // otherwise park it until some later Facts (`StreamMachine::peer_facts`).
+        let peer_paused = super::peer_facts_paused(&self.config, peer);
+        let now = Instant::now();
+        let (redial, resumed) = self.peers.get_mut(&peer).map_or((Step::Nothing, false), |state| {
+            let redial = peer_paused.map_or(Step::Nothing, |paused| state.machine.peer_facts(paused, now));
+            (redial, state.machine.peer_resumed())
+        });
+        self.step(peer, redial, now);
         if !capabilities_changed {
+            if resumed {
+                self.advance(peer, Instant::now());
+            }
             return;
         }
         let supported = self.supported(peer);
@@ -576,11 +756,27 @@ impl StreamModule for ClipboardStreams {
 }
 
 impl ClipboardStreams {
+    pub fn network(&self) -> LinkLayer {
+        self.links.clone()
+    }
     pub fn file_links(&self) -> std::sync::Arc<files::FileLinks> {
         self.files.clone()
     }
     /// A new local copy replaces the state used by every subsequent open and retry.
-    pub fn set_offer(&mut self, offer: Option<dto::ClipboardOffer>) {
+    ///
+    /// An own offer that a newer group offer already replaced (republished
+    /// after a pause on a device that does not receive) is not announced: it
+    /// is not the group's current clip. The witnessed newer offer stays.
+    pub fn set_offer(&mut self, mut offer: Option<dto::ClipboardOffer>) {
+        if let Some(stale) = offer.as_ref().filter(|offer| self.superseded(offer)) {
+            tracing::debug!(
+                offer = ?stale.id().ok().and_then(|id| oink_clipboard::wire::local_offer_id(id).ok()),
+                "own clipboard offer superseded by a newer group offer: not announced"
+            );
+            offer = None;
+        } else {
+            self.witnessed_offer = offer.clone();
+        }
         self.offer = offer;
         for peer in self.peers.keys().copied().collect::<Vec<_>>() {
             let already_open = self.peers[&peer].tx.is_some();
@@ -603,6 +799,72 @@ impl ClipboardStreams {
             }
         }
     }
+    /// A group offer this device has seen: accepted, or (receiving off) only
+    /// observed. True when it is newer than the witnessed one.
+    ///
+    /// Our own announced offer that it orders after is withdrawn from every
+    /// stream: it is no longer the group's current clip, so a peer that
+    /// connects later (a phone reads it automatically as this PC's current
+    /// clipboard) must not get it. Writing the newer clip here replaced the
+    /// own offer's native source, so it is not even readable any more
+    /// (2026-11-12: a Windows test machine kept pushing its replaced offer 1302 to phones).
+    pub(crate) fn witness_offer(&mut self, offer: &dto::ClipboardOffer) -> bool {
+        let order = offer_order(offer);
+        if order > self.newest {
+            self.newest = order;
+        }
+        if self.offer.as_ref().is_some_and(|own| self.superseded(own)) {
+            tracing::debug!(
+                offer = ?self.offer.as_ref().and_then(|own| own.id().ok()).and_then(|id| oink_clipboard::wire::local_offer_id(id).ok()),
+                "own clipboard offer superseded by a newer group offer: withdrawn"
+            );
+            self.withdraw_offer();
+        }
+        if order > self.witnessed_offer.as_ref().and_then(offer_order) {
+            self.witnessed_offer = Some(offer.clone());
+            true
+        } else {
+            false
+        }
+    }
+
+    pub(crate) fn witnessed_offer(&self) -> Option<&dto::ClipboardOffer> {
+        self.witnessed_offer.as_ref()
+    }
+
+    /// The own offer put on new and reopened streams.
+    #[cfg(all(test, debug_assertions))]
+    pub(crate) fn announced_offer(&self) -> Option<&dto::ClipboardOffer> {
+        self.offer.as_ref()
+    }
+
+    fn superseded(&self, offer: &dto::ClipboardOffer) -> bool {
+        offer_order(offer) < self.newest
+    }
+
+    pub(crate) fn forget_offer(&mut self, id: oink_clipboard::model::OfferId) {
+        let matches =
+            |offer: &dto::ClipboardOffer| offer.id().and_then(oink_clipboard::wire::local_offer_id).ok() == Some(id);
+        if self.offer.as_ref().is_some_and(matches) {
+            self.withdraw_offer();
+        }
+        if self.witnessed_offer.as_ref().is_some_and(matches) {
+            self.witnessed_offer = None;
+        }
+        for peer in self.peers.values_mut() {
+            peer.received
+                .retain(|message| !matches!(message,Message::ClipboardOffer(offer) if matches(offer)));
+        }
+    }
+
+    /// Stops announcing the own offer without touching the witnessed one.
+    fn withdraw_offer(&mut self) {
+        self.offer = None;
+        for peer in self.peers.keys().copied().collect::<Vec<_>>() {
+            self.refresh_offer(peer);
+        }
+    }
+
     fn refresh_offer(&mut self, peer: DeviceId) {
         let Some(offer) = self.offer.clone() else {
             if let Some(state) = self.peers.get_mut(&peer) {
@@ -642,7 +904,7 @@ impl ClipboardStreams {
         }
         let links = self.links.clone();
         let link = state.link;
-        let bytes = v1::frame::encode(&message, v1::limits::LOW_FRAME).map_or(0, |b| b.len());
+        let bytes = v2::frame::encode(&message, v2::limits::LOW_FRAME).map_or(0, |b| b.len());
         let send_max = oink_foundation::transfer::LowOptions::message_bytes(bytes);
         let Message::AttachmentItems(items) = &message else {
             return;
@@ -687,6 +949,9 @@ impl ClipboardStreams {
 impl Drop for ClipboardStreams {
     fn drop(&mut self) {
         for peer in self.peers.values_mut() {
+            for task in peer.history_operations.drain(..) {
+                task.abort();
+            }
             for (_, operation) in peer.operations.drain() {
                 operation.abort();
             }
@@ -714,8 +979,15 @@ super::lifecycle_tests::owner_lifecycle_tests!(
     }
 );
 
+/// The group's copy order of an offer (clipboard.md §6): Lamport clock, then
+/// origin device.
+fn offer_order(offer: &dto::ClipboardOffer) -> Option<(u64, DeviceId)> {
+    let id = oink_clipboard::wire::local_offer_id(offer.id().ok()?).ok()?;
+    Some((offer.clock().ok()?, id.clip.origin))
+}
+
 fn decode_reliable(links: &LinkLayer, peer: DeviceId, link: LinkId, bytes: &[u8]) -> Result<Message, ()> {
-    use v1::{
+    use v2::{
         admission::{Context, Phase},
         registry::Transport,
     };
@@ -729,7 +1001,7 @@ fn decode_reliable(links: &LinkLayer, peer: DeviceId, link: LinkId, bytes: &[u8]
         direct: matches!(entry.path, oink_network::link::LinkPath::Direct),
         old_member_lane: false,
     };
-    let frame = v1::frame::OpaqueFrame::parse_exact(bytes, v1::limits::RELIABLE_FRAME).map_err(|e| {
+    let frame = v2::frame::OpaqueFrame::parse_exact(bytes, v2::limits::RELIABLE_FRAME).map_err(|e| {
         links.report_protocol_violation(link, context.payload_violation(0, e.code));
     })?;
     context

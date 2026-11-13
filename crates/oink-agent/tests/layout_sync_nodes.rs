@@ -12,7 +12,7 @@ use oink_agent::api::{AgentApi, Placement, ScreenKey};
 use oink_agent::node::{Node, NodeOptions};
 use oink_foundation::display::DisplayInfo;
 use oink_foundation::{Point, Rect, Size};
-use oink_protocol::v1::schema::WireDto;
+use oink_protocol::v2::schema::WireDto;
 use oink_test_support::input::FakeInput;
 
 fn display(key: &str, reference: Size) -> DisplayInfo {
@@ -110,7 +110,7 @@ fn identical(a: &Node, b: &Node) -> bool {
         .ok()??
         .layout_register()
         .ok()?
-        .encode(oink_protocol::v1::limits::CONFIG_STATE)
+        .encode(oink_protocol::v2::limits::CONFIG_STATE)
         .ok()
     };
     la.1.revision > 0 && la.1 == lb.1 && la.0 == lb.0 && register(a).is_some() && register(a) == register(b)

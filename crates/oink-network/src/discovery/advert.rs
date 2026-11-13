@@ -1,6 +1,6 @@
 //! Untrusted discovery hints. Only the later TLS handshake authenticates a key.
 use oink_foundation::{DeviceId, GroupId};
-use oink_protocol::v1::{
+use oink_protocol::v2::{
     self, RawValue, dto,
     schema::{WireDto, WireValue},
 };
@@ -12,7 +12,7 @@ pub struct ProtocolOffer {
     pub highest_minor: u16,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Advert {
     pub id: DeviceId,
     pub name: String,
@@ -22,6 +22,8 @@ pub struct Advert {
     pub protocols: Vec<ProtocolOffer>,
     pub identity_algorithms: Vec<String>,
     pub os: String,
+    pub build: String,
+    pub device_kind: dto::DeviceKind,
 }
 
 impl Advert {
@@ -33,15 +35,25 @@ impl Advert {
             count,
             port,
             protocols: vec![ProtocolOffer {
-                major: v1::MAJOR,
-                highest_minor: v1::MINOR,
+                major: v2::MAJOR,
+                highest_minor: v2::MINOR,
             }],
             identity_algorithms: vec![dto::ED25519.into()],
             os,
+            build: env!("CARGO_PKG_VERSION").into(),
+            device_kind: dto::DeviceKind::Desktop,
         }
     }
 
-    pub fn to_wire(&self) -> v1::Result<dto::Advert> {
+    pub fn supports_current_protocol(&self) -> bool {
+        self.protocols.iter().any(|protocol| protocol.major == v2::MAJOR)
+            && self
+                .identity_algorithms
+                .iter()
+                .any(|algorithm| algorithm == dto::ED25519)
+    }
+
+    pub fn to_wire(&self) -> v2::Result<dto::Advert> {
         dto::Advert::from_raw(
             [
                 (
@@ -73,15 +85,19 @@ impl Advert {
                     RawValue::Array(self.identity_algorithms.iter().cloned().map(RawValue::Text).collect()),
                 ),
                 (9, RawValue::Text(self.os.clone())),
+                (10, v2::MAJOR.write()),
+                (11, v2::MINOR.write()),
+                (12, RawValue::Text(self.build.clone())),
+                (13, self.device_kind.write()),
             ]
             .into(),
         )
     }
 
-    pub fn from_wire(advert: &dto::Advert) -> v1::Result<Self> {
+    pub fn from_wire(advert: &dto::Advert) -> v2::Result<Self> {
         let identity = advert.id()?;
         if identity.algorithm()?.0 != dto::ED25519 {
-            return Err(v1::ErrorCode::UnsupportedValue.into());
+            return Err(v2::ErrorCode::UnsupportedValue.into());
         }
         Ok(Self {
             id: DeviceId(
@@ -89,7 +105,7 @@ impl Advert {
                     .public_key()?
                     .0
                     .try_into()
-                    .map_err(|_| v1::ErrorCode::MalformedFrame)?,
+                    .map_err(|_| v2::ErrorCode::MalformedFrame)?,
             ),
             name: advert.name()?.0,
             group: GroupId(advert.group()?.0),
@@ -105,9 +121,11 @@ impl Advert {
                         highest_minor: p.highest_minor()?,
                     })
                 })
-                .collect::<v1::Result<_>>()?,
+                .collect::<v2::Result<_>>()?,
             identity_algorithms: advert.identity_algorithms()?.0.into_iter().map(|a| a.0).collect(),
             os: advert.os()?.0,
+            build: advert.build()?.0,
+            device_kind: advert.device_kind()?,
         })
     }
 }

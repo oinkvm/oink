@@ -58,11 +58,13 @@ impl helper::Native for Native {
                 scan,
                 extended,
                 down: true,
+                vk_scan,
             } => os.held.push(Command::Key {
                 code,
                 scan,
                 extended,
                 down: false,
+                vk_scan,
             }),
             Command::Button { .. } | Command::Key { .. } => os.held.retain(|up| *up != command),
             Command::Release => {
@@ -277,6 +279,7 @@ fn native_error_releases_owned_keys_then_reconnects_without_replaying_input() {
         scan: true,
         extended: false,
         down: true,
+        vk_scan: 0,
     };
     fixture.client.request(down, false, false).unwrap();
     let error = fixture
@@ -376,6 +379,7 @@ fn reconnect_during_disconnected_generation_cleanup_cannot_discard_new_input() {
         scan: true,
         extended: false,
         down: true,
+        vk_scan: 0,
     };
     inside_initial.recv().unwrap();
     let client = fixture.client.clone();
@@ -632,6 +636,7 @@ fn disconnect_and_restart_release_before_new_input_and_discard_stale_work() {
         scan: true,
         extended: false,
         down: true,
+        vk_scan: 0,
     };
     let generation = server.begin();
     let work = |generation, id, command| helper::Work {
@@ -660,6 +665,7 @@ fn disconnect_and_restart_release_before_new_input_and_discard_stale_work() {
         scan: true,
         extended: false,
         down: false,
+        vk_scan: 0,
     };
     assert_eq!(os.lock().unwrap().events, [down, up, new]);
     assert!(os.lock().unwrap().held.is_empty());

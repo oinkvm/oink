@@ -86,7 +86,7 @@ use oink_network::link::{
 };
 use oink_protocol::{
     frame::{StreamCode, StreamKind},
-    v1::{self, Message, admission, frame::OpaqueFrame},
+    v2::{self, Message, admission, frame::OpaqueFrame},
 };
 use std::{collections::HashMap, time::Instant};
 
@@ -204,7 +204,7 @@ impl AudioStreams {
     /// Telemetry can open M0 between any audio-capable members, without M1
     /// admission. The negotiated capability replaces a separate support message.
     pub fn enable_state_reports(&mut self, peer: DeviceId) {
-        if self.config.peer_supports(peer, "oink.audio.state/1") {
+        if self.config.peer_opens(peer, StreamKind::Audio) {
             if let Some(state) = self.peers.get_mut(&peer) {
                 state.wanted = true;
             }
@@ -221,6 +221,10 @@ impl AudioStreams {
                 | Message::AudioPrepareRefused(_)
                 | Message::AudioRouteFault(_)
                 | Message::AudioState(_)
+                | Message::AudioEndpointState(_)
+                | Message::AudioEndpointRequest(_)
+                | Message::AudioEndpointRelease(_)
+                | Message::AudioEndpointResult(_)
                 | Message::AudioMediaState(_)
                 | Message::MicrophoneDemand(_)
                 | Message::MicrophonePrepared(_)
@@ -230,12 +234,12 @@ impl AudioStreams {
         )
     }
     fn supported(&self, peer: DeviceId) -> bool {
-        self.config.applied().members.contains(&peer) && self.config.peer_supports(peer, "oink.audio/1")
+        self.config.applied().members.contains(&peer) && self.config.peer_opens(peer, StreamKind::Audio)
     }
     fn context(agreement: &admission::Agreement, direct: bool) -> admission::Context<'_> {
         admission::Context {
             kind: 5,
-            transport: v1::registry::Transport::Reliable,
+            transport: v2::registry::Transport::Reliable,
             phase: admission::Phase::Member,
             agreement,
             direct,
@@ -299,8 +303,8 @@ impl AudioStreams {
             return Err(PostError::TooLarge);
         }
         let agreement = self.config.peer_agreement(peer).ok_or(PostError::Closed)?;
-        let bytes = v1::frame::encode(message, v1::limits::RELIABLE_FRAME).map_err(|_| PostError::TooLarge)?;
-        let frame = OpaqueFrame::parse_exact(&bytes, v1::limits::RELIABLE_FRAME).map_err(|_| PostError::TooLarge)?;
+        let bytes = v2::frame::encode(message, v2::limits::RELIABLE_FRAME).map_err(|_| PostError::TooLarge)?;
+        let frame = OpaqueFrame::parse_exact(&bytes, v2::limits::RELIABLE_FRAME).map_err(|_| PostError::TooLarge)?;
         let direct = self
             .links
             .links()
@@ -326,8 +330,8 @@ impl AudioStreams {
     /// Memory-only M0 snapshot; the network writes it on each fourth Pulse.
     pub fn set_heartbeat_state(&self, peer: DeviceId, message: &Message) -> Result<(), PostError> {
         let agreement = self.config.peer_agreement(peer).ok_or(PostError::Closed)?;
-        let bytes = v1::frame::encode(message, v1::limits::RELIABLE_FRAME).map_err(|_| PostError::TooLarge)?;
-        let frame = OpaqueFrame::parse_exact(&bytes, v1::limits::RELIABLE_FRAME).map_err(|_| PostError::TooLarge)?;
+        let bytes = v2::frame::encode(message, v2::limits::RELIABLE_FRAME).map_err(|_| PostError::TooLarge)?;
+        let frame = OpaqueFrame::parse_exact(&bytes, v2::limits::RELIABLE_FRAME).map_err(|_| PostError::TooLarge)?;
         let direct = self
             .links
             .links()
@@ -373,7 +377,7 @@ impl AudioStreams {
                 while let Ok(Some(bytes)) = rx.take() {
                     let message = match agreement.and_then(|agreement| {
                         let context = Self::context(agreement, direct);
-                        let frame = match OpaqueFrame::parse_exact(&bytes, v1::limits::RELIABLE_FRAME) {
+                        let frame = match OpaqueFrame::parse_exact(&bytes, v2::limits::RELIABLE_FRAME) {
                             Ok(frame) => frame,
                             Err(error) => {
                                 violation = Some(context.payload_violation(0, error.code));
@@ -384,7 +388,7 @@ impl AudioStreams {
                             Ok(message) if Self::valid(&message) => Some(message),
                             Ok(_) => {
                                 violation = Some(
-                                    context.payload_violation(frame.header.type_id, v1::ErrorCode::InvalidChannel),
+                                    context.payload_violation(frame.header.type_id, v2::ErrorCode::InvalidChannel),
                                 );
                                 None
                             }
@@ -410,7 +414,11 @@ impl AudioStreams {
                 if let Some(violation) = violation {
                     self.links.report_protocol_violation(stream.link, violation);
                 }
-                self.links.close_stream(stream, StreamCode::Invalid);
+                // Through the handle, which `stream_closed` then drops: a
+                // `close_stream` command can lose its code to that drop.
+                if let Some(rx) = state.rx.as_ref().filter(|rx| rx.id() == stream) {
+                    rx.close_with(StreamCode::Invalid);
+                }
                 self.stream_closed(stream, StreamClosed::Local);
             }
         }
@@ -647,7 +655,7 @@ impl AudioStreams {
         self.report_media_state(kind, burst, true, true, now);
     }
     fn report_media_state(&mut self, kind: MediaKind, burst: u64, sleeping: bool, closed: bool, now: Instant) {
-        use v1::schema::{WireDto, WireValue};
+        use v2::schema::{WireDto, WireValue};
         let table = match kind {
             MediaKind::Speaker => self.forward.load(),
             MediaKind::Microphone => self.microphone_forward.load(),
@@ -661,6 +669,9 @@ impl AudioStreams {
         self.media_reports
             .retain(|(k, peer), _| *k != kind || destinations.iter().any(|(p, ..)| p == peer));
         for (peer, stream, packets) in destinations {
+            if !self.config.peer_opens(peer, StreamKind::Audio) {
+                continue;
+            }
             let key = (kind, peer);
             if self
                 .media_reports
@@ -685,19 +696,17 @@ impl AudioStreams {
                     reported |= packets.post(&bytes[..len]).is_ok();
                 }
             }
-            if self.config.peer_supports(peer, "oink.audio.media-health/1") {
-                let state = v1::dto::AudioMediaState::from_raw(
-                    [
-                        (1, kind.to_wire().write()),
-                        (2, stream.write()),
-                        (3, burst.write()),
-                        (4, sleeping.write()),
-                    ]
-                    .into(),
-                )
-                .expect("bounded media state");
-                reported |= self.send(peer, &Message::AudioMediaState(state), now).is_ok();
-            }
+            let state = v2::dto::AudioMediaState::from_raw(
+                [
+                    (1, kind.to_wire().write()),
+                    (2, stream.write()),
+                    (3, burst.write()),
+                    (4, sleeping.write()),
+                ]
+                .into(),
+            )
+            .expect("bounded media state");
+            reported |= self.send(peer, &Message::AudioMediaState(state), now).is_ok();
             if reported {
                 self.media_reports.insert(key, (stream, burst, sleeping, now));
             }
@@ -910,7 +919,7 @@ impl MediaReader {
             owner: std::sync::atomic::AtomicU8::new(0),
         }
     }
-    pub fn observe_media(&self, state: &v1::dto::AudioMediaState, now: Instant) {
+    pub fn observe_media(&self, state: &v2::dto::AudioMediaState, now: Instant) {
         if state.kind() != Ok(self.kind.to_wire()) || state.stream_id().ok() != self.identity.map(|i| i.1) {
             return;
         }
@@ -1121,7 +1130,7 @@ mod direct_media_tests {
     #[test]
     fn media_health_detects_blackholes_after_sleep_and_fences_old_streams() {
         use std::time::Duration;
-        use v1::schema::{WireDto, WireValue};
+        use v2::schema::{WireDto, WireValue};
         let (send, recv) = datagram_pair(
             LinkId(1),
             StreamTag {
@@ -1144,9 +1153,9 @@ mod direct_media_tests {
         assert!(reader.read().1.is_none());
         assert_eq!(reader.health_error(now + Duration::from_secs(60)), None);
         let state = |stream: u64, burst: u64, sleeping: bool| {
-            v1::dto::AudioMediaState::from_raw(
+            v2::dto::AudioMediaState::from_raw(
                 [
-                    (1, v1::dto::AudioMediaKind::Speaker.write()),
+                    (1, v2::dto::AudioMediaKind::Speaker.write()),
                     (2, stream.write()),
                     (3, burst.write()),
                     (4, sleeping.write()),
@@ -1521,7 +1530,7 @@ mod heartbeat_state_tests {
             streams.set_heartbeat_state(peer, &state).unwrap();
             let tx = streams.peers[&peer].tx.as_ref().unwrap();
             let latest = oink_network::link::testing::heartbeat_messages(tx);
-            assert_eq!(latest, [v1::frame::encode(&state, v1::limits::RELIABLE_FRAME).unwrap()]);
+            assert_eq!(latest, [v2::frame::encode(&state, v2::limits::RELIABLE_FRAME).unwrap()]);
             assert_eq!(tx.id(), initial_id, "periodic state stays on the original M0");
         }
         streams

@@ -16,6 +16,9 @@ pub enum Reason {
     Emergency,
     RecoveredCrash,
     PeerRestart,
+    /// This backend's network layer ended with a fatal error and the host
+    /// restarts it (saved automatically just before the restart).
+    NetworkFailure,
 }
 impl Reason {
     fn label(self) -> &'static str {
@@ -24,6 +27,7 @@ impl Reason {
             Self::Emergency => "emergency",
             Self::RecoveredCrash => "recovered_crash",
             Self::PeerRestart => "peer_restart",
+            Self::NetworkFailure => "network_failure",
         }
     }
 }
@@ -252,8 +256,8 @@ pub(crate) struct Store {
     pub(super) network_member_limit: u64,
     pub(super) network_received: u64,
     pub(super) network_expanded: u64,
-    pub(super) network_environments: BTreeMap<String, (String, oink_protocol::v1::dto::Snapshot)>,
-    pub(super) network_ends: BTreeMap<String, oink_protocol::v1::dto::DiagnosticsEnd>,
+    pub(super) network_environments: BTreeMap<String, (String, oink_protocol::v2::dto::Snapshot)>,
+    pub(super) network_ends: BTreeMap<String, oink_protocol::v2::dto::DiagnosticsEnd>,
     pub gathered_environments: BTreeMap<String, (String, Snapshot)>,
     pub segments: VecDeque<Meta>,
     pub clocks: Vec<ClockSample>,
@@ -267,6 +271,11 @@ pub(crate) struct Store {
     pub missing_members: BTreeMap<String, String>,
     pub requested_range: Option<(i64, i64)>,
     pub evicted_by_device: BTreeMap<String, u64>,
+    pub mobile_proxy: super::mobile::MobileProxyStore,
+    pub mobile_anonymizer: Option<super::Anonymizer>,
+    pub mobile_unavailable_holders: BTreeMap<String, String>,
+    pub mobile_partial: bool,
+    pub mobile_evicted_bytes: u64,
 }
 pub(super) fn token_ok(s: &str) -> bool {
     s.len() == 24 && s.bytes().all(|b| b.is_ascii_hexdigit())
@@ -285,7 +294,7 @@ fn atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 }
 // Markers and completed exports remain durable. Live ring segments and export
 // staging use atomic publication without forcing each file onto the device.
-fn replace(path: &Path, bytes: &[u8], durable: bool) -> std::io::Result<()> {
+pub(super) fn replace(path: &Path, bytes: &[u8], durable: bool) -> std::io::Result<()> {
     let tmp = path.with_extension("tmp");
     let mut f = File::create(&tmp)?;
     f.write_all(bytes)?;
@@ -378,6 +387,8 @@ impl Store {
     ) -> anyhow::Result<Self> {
         private_dir(&dir)?;
         private_dir(&dir.join("buffer"))?;
+        let mobile_proxy_root = dir.join("mobile-proxy");
+        let mobile_holder = device.clone();
         let instance = blake3::hash(format!("{}-{}-{:?}", utc_us(), std::process::id(), Instant::now()).as_bytes())
             .to_hex()[..24]
             .to_owned();
@@ -396,7 +407,7 @@ impl Store {
             next: 0,
             snapshot: Snapshot::default(),
             gathered_environments: BTreeMap::new(),
-            network_member_limit: oink_protocol::v1::limits::DIAGNOSTIC_COLLECTION as u64,
+            network_member_limit: oink_protocol::v2::limits::DIAGNOSTIC_COLLECTION as u64,
             network_received: 0,
             network_expanded: 0,
             network_environments: BTreeMap::new(),
@@ -413,6 +424,13 @@ impl Store {
             missing_members: BTreeMap::new(),
             requested_range: None,
             evicted_by_device: BTreeMap::new(),
+            // Only the path is recorded here; the proxy directory is read on first
+            // use, and its failures never fail recorder startup.
+            mobile_proxy: super::mobile::MobileProxyStore::new(mobile_proxy_root, mobile_holder),
+            mobile_anonymizer: None,
+            mobile_unavailable_holders: BTreeMap::new(),
+            mobile_partial: false,
+            mobile_evicted_bytes: 0,
         };
         let domain = fs::read_to_string(s.dir.join("domain")).ok();
         if domain.as_deref() == Some(s.device.as_str()) {
@@ -538,6 +556,7 @@ impl Store {
         snapshot.export_source = Some(Arc::new(
             tempfile::Builder::new().prefix("export-").tempdir_in(&self.dir)?,
         ));
+        snapshot.mobile_proxy = self.mobile_proxy.pin(&self.dir, None);
         for entry in fs::read_dir(&self.dir)? {
             self.check_cancelled()?;
             let entry = entry?;
@@ -664,6 +683,9 @@ impl Store {
             }
             self.bytes = 0;
             self.clocks.clear();
+            if let Err(error) = self.mobile_proxy.clear() {
+                tracing::warn!(%error, "mobile diagnostic proxy data could not be deleted");
+            }
         }
         Ok(())
     }
@@ -846,6 +868,7 @@ impl Store {
                 "emergency" => Reason::Emergency,
                 "recovered_crash" => Reason::RecoveredCrash,
                 "peer_restart" => Reason::PeerRestart,
+                "network_failure" => Reason::NetworkFailure,
                 _ => continue,
             };
             let summary = tests::bundle_summary(&e.path());
@@ -877,9 +900,18 @@ impl Store {
     pub(super) fn export_snapshot_between(&self, start: i64, end: i64) -> anyhow::Result<Self> {
         self.export_snapshot_at(self.clock.now(), Some((start, end)))
     }
+
+    pub(super) fn accept_mobile_remote(
+        &mut self,
+        segment: super::mobile::MobileDiagnosticSegment,
+        holder: String,
+    ) -> anyhow::Result<bool> {
+        self.mobile_proxy.accept_remote(segment, holder)
+    }
     fn export_snapshot_at(&self, at: clock::Stamp, range: Option<(i64, i64)>) -> anyhow::Result<Self> {
         let dir = tempfile::Builder::new().prefix("export-").tempdir_in(&self.dir)?;
         let mut snapshot = self.clone();
+        snapshot.mobile_proxy = self.mobile_proxy.pin(&self.dir, range);
         if let Some((start, end)) = range {
             // Local metadata is already validated. Do not hard-link and then
             // unlink the rest of the retained history for a short save. Keep
@@ -1177,7 +1209,57 @@ impl Store {
                 serde_json::json!({"version":remote.version()?.0,"source_tree_sha256":remote.source_tree_sha256()?.0}),
             );
         }
-        let manifest = serde_json::json!({"schema":SCHEMA,"export_clock":{"device":self.device,"instance":self.instance,"clock_id":export_clock.clock_id,"utc_us":export_clock.utc_us},"cutoff_complete":cutoff_complete,"reason":reason,"at_ms":at_ms,"version":env!("OINK_RELEASE_VERSION"),"source_tree_sha256":env!("OINK_DIAGNOSTIC_SOURCE_TREE_SHA256"),"devices":aliases,"screens":screens,"versions":versions,"unrecognized_diagnostic_events":spool.unrecognized,"unrecognized_snapshot_fields":({let mut counts=spool.unknown_snapshot_fields.clone();for (_,snapshot) in self.network_environments.values(){for key in wire::unknown_snapshot_fields(snapshot){*counts.entry(key).or_insert(0u64)+=1;}}counts}),"normalized_peer_coverage":self.normalized_peer_coverage(export_clock.clock_id)?,"peer_ends":self.network_ends.iter().map(|(d,e)| (d.clone(),wire::json(&oink_protocol::v1::schema::WireValue::write(e)))).collect::<BTreeMap<_,_>>(),"coverage":self.segments,"dropped":dropped,"errors":errors,"evicted_segments":self.evicted,"corrupt_segments":self.corrupt,"missing_members":missing_members,"requested_range_us":self.requested_range.map(|(start,end)| (if start == i64::MIN {None} else {Some(start)},end)),"evicted_segments_by_device":({ let mut evicted = self.evicted_by_device.clone(); evicted.insert(self.device.clone(),self.evicted); evicted }),"missing":["Process termination may lose queued events since the last segment publication. Ring segments are not individually fsynced; power loss or OS failure may lose an OS-buffered tail of unknown duration.","Offline, unsupported, disabled, timed out or failed members contribute only completed segments; inspect missing_members and coverage.","Captured repeat follows router state; injected repeat provenance is unknown (null).","QUIC loss counters are unavailable on relay paths; initial session-lock state can be unknown.","Free-form log text and application identity are intentionally excluded; resolve callsite with source tree provenance.","Crash summaries contain typed exception classes and numeric timestamps; unavailable values are explicit."]});
+        let (mobile_start, mobile_end) = self.requested_range.unwrap_or((i64::MIN, i64::MAX));
+        // One phone at a time: read its logs, write its entries, keep only the
+        // manifest summary. These entries precede manifest.json in the archive.
+        let mut mobile_sources = serde_json::Map::new();
+        let mut mobile_partial =
+            self.mobile_partial || !self.mobile_unavailable_holders.is_empty() || self.mobile_proxy.unavailable();
+        let mut mobile_evicted_bytes = self.mobile_evicted_bytes;
+        for source in self.mobile_proxy.overview(mobile_start, mobile_end).sources {
+            self.check_cancelled()?;
+            let mut export = self.mobile_proxy.export_source(&source, mobile_start, mobile_end);
+            let mut alias = source;
+            if let Some(anonymizer) = &self.mobile_anonymizer {
+                export.anonymize(anonymizer);
+                alias = super::mobile::alias_device(anonymizer, &alias);
+            }
+            mobile_partial |= export.partial;
+            mobile_evicted_bytes = mobile_evicted_bytes.saturating_add(export.evicted_bytes);
+            let source_path = alias.replace('/', "_");
+            for item in &export.segments {
+                let segment = &item.segment;
+                let name = format!(
+                    "mobile/{source_path}/segments/{}-{}-{}-{}.json",
+                    segment.session_id, segment.batch_id, segment.sequence, segment.offset
+                );
+                zip.start_file(name, options)?;
+                write_json(
+                    &mut zip,
+                    &serde_json::json!({
+                        "holder_device": item.holder_device,
+                        "source_device": segment.source_device,
+                        "session_id": segment.session_id,
+                        "batch_id": segment.batch_id,
+                        "sequence": segment.sequence,
+                        "offset": segment.offset,
+                        "first_at_us": segment.first_at_us,
+                        "last_at_us": segment.last_at_us,
+                        "bytes": item.bytes,
+                        "segment": segment,
+                    }),
+                )?;
+            }
+            mobile_sources.insert(alias, export.manifest());
+        }
+        let mobile_manifest = serde_json::json!({
+            "partial": mobile_partial,
+            "evicted_bytes": mobile_evicted_bytes,
+            "sources": mobile_sources,
+            "unavailable_holders": self.mobile_unavailable_holders,
+            "store_unavailable": self.mobile_proxy.unavailable(),
+        });
+        let manifest = serde_json::json!({"schema":SCHEMA,"export_clock":{"device":self.device,"instance":self.instance,"clock_id":export_clock.clock_id,"utc_us":export_clock.utc_us},"cutoff_complete":cutoff_complete,"reason":reason,"at_ms":at_ms,"version":env!("OINK_RELEASE_VERSION"),"source_tree_sha256":env!("OINK_DIAGNOSTIC_SOURCE_TREE_SHA256"),"devices":aliases,"screens":screens,"versions":versions,"unrecognized_diagnostic_events":spool.unrecognized,"unrecognized_snapshot_fields":({let mut counts=spool.unknown_snapshot_fields.clone();for (_,snapshot) in self.network_environments.values(){for key in wire::unknown_snapshot_fields(snapshot){*counts.entry(key).or_insert(0u64)+=1;}}counts}),"normalized_peer_coverage":self.normalized_peer_coverage(export_clock.clock_id)?,"peer_ends":self.network_ends.iter().map(|(d,e)| (d.clone(),wire::json(&oink_protocol::v2::schema::WireValue::write(e)))).collect::<BTreeMap<_,_>>(),"coverage":self.segments,"dropped":dropped,"errors":errors,"evicted_segments":self.evicted,"corrupt_segments":self.corrupt,"missing_members":missing_members,"requested_range_us":self.requested_range.map(|(start,end)| (if start == i64::MIN {None} else {Some(start)},end)),"evicted_segments_by_device":({ let mut evicted = self.evicted_by_device.clone(); evicted.insert(self.device.clone(),self.evicted); evicted }),"mobile_diagnostics":mobile_manifest,"missing":["Process termination may lose queued events since the last segment publication. Ring segments are not individually fsynced; power loss or OS failure may lose an OS-buffered tail of unknown duration.","Offline, unsupported, disabled, timed out or failed members contribute only completed segments; inspect missing_members and coverage.","Captured repeat follows router state; injected repeat provenance is unknown (null).","QUIC loss counters are unavailable on relay paths; initial session-lock state can be unknown.","Free-form log text and application identity are intentionally excluded; resolve callsite with source tree provenance.","Crash summaries contain typed exception classes and numeric timestamps; unavailable values are explicit."]});
         zip.start_file("manifest.json", options)?;
         {
             let mut entry = BufWriter::with_capacity(EXPORT_BUFFER, &mut zip);
@@ -1197,19 +1279,19 @@ impl Store {
             spool.write_timeline(&mut zip, Some(device))?;
             let snapshot = &snapshots[device];
             if let Some(end) = self.network_ends.get(device) {
-                use oink_protocol::v1::schema::WireDto;
+                use oink_protocol::v2::schema::WireDto;
                 zip.start_file(format!("devices/{alias}/collection-end.cbor"), options)?;
                 // Retain the existing v1 Low message, including every coverage
                 // range from released peers. The 16 KiB reliable-channel bound
                 // is unrelated and rejects ordinary saves with many segments.
-                zip.write_all(&end.encode(oink_protocol::v1::limits::LOW_FRAME)?)?;
+                zip.write_all(&end.encode(oink_protocol::v2::limits::LOW_FRAME)?)?;
             }
             let remote = spool
                 .wire_snapshots
                 .get(device)
                 .or_else(|| self.network_environments.get(device));
             if let Some((instance, remote)) = remote {
-                use oink_protocol::v1::schema::{WireDto, WireValue};
+                use oink_protocol::v2::schema::{WireDto, WireValue};
                 if let Some((_, current)) = self.network_environments.get(device) {
                     zip.start_file(format!("devices/{alias}/current-environment.cbor"), options)?;
                     zip.write_all(&current.encode(MAX_SEGMENT_RAW)?)?;
@@ -1281,7 +1363,10 @@ impl Store {
     pub(super) fn retain_bundles(&self, newest: &BundleInfo) -> anyhow::Result<()> {
         // Only automatic crash reports participate. Manual and emergency files
         // are never candidates, and retention never opens their zip/manifest.
-        if !matches!(newest.reason, Reason::RecoveredCrash | Reason::PeerRestart) {
+        if !matches!(
+            newest.reason,
+            Reason::RecoveredCrash | Reason::PeerRestart | Reason::NetworkFailure
+        ) {
             return Ok(());
         }
         let mut crashes = Vec::new();
@@ -1299,7 +1384,10 @@ impl Store {
             else {
                 continue;
             };
-            if !matches!(reason.split('-').next(), Some("recovered_crash" | "peer_restart")) {
+            if !matches!(
+                reason.split('-').next(),
+                Some("recovered_crash" | "peer_restart" | "network_failure")
+            ) {
                 continue;
             }
             let Ok(time) = time.parse::<i64>() else { continue };
@@ -1371,7 +1459,7 @@ struct TimelineSpool {
     file: BufReader<File>,
     runs: Vec<Run>,
     snapshots: BTreeMap<String, (String, Snapshot)>,
-    wire_snapshots: BTreeMap<String, (String, oink_protocol::v1::dto::Snapshot)>,
+    wire_snapshots: BTreeMap<String, (String, oink_protocol::v2::dto::Snapshot)>,
     unrecognized: BTreeMap<String, u64>,
     unknown_snapshot_fields: BTreeMap<u32, u64>,
     position: u64,
@@ -1395,7 +1483,7 @@ impl TimelineSpool {
             let rows: Vec<(usize, u64, i64, i64, serde_json::Value)> = if meta.network {
                 let segment = wire::segment(&store.read(meta)?)?;
                 let mut current = Vec::new();
-                use oink_protocol::v1::schema::{Ascii, required};
+                use oink_protocol::v2::schema::{Ascii, required};
                 for (index, row) in wire::rows(&segment)?.iter().enumerate() {
                     let row = row.as_map()?;
                     let event = row
@@ -1403,7 +1491,7 @@ impl TimelineSpool {
                         .ok_or_else(|| anyhow::anyhow!("diagnostic row has no event"))?
                         .as_map()?;
                     let kind = required::<Ascii<96>>(event, 1)?.0;
-                    let recognized = oink_protocol::v1::dto::diagnostic_event_schema(&kind).is_some();
+                    let recognized = oink_protocol::v2::dto::diagnostic_event_schema(&kind).is_some();
                     if !recognized {
                         *unrecognized.entry(kind.clone()).or_insert(0u64) += 1;
                     }

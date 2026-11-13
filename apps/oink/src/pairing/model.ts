@@ -4,10 +4,11 @@ import { fingerprint } from '../api/identity';
 import { problemText, tr } from '../i18n';
 import type { MessageKey } from '../i18n';
 import type { Peer } from './data';
+import { deviceOs } from '../devices/types';
 
 export const addressText = (address:SocketAddress) => address.family===0 && address.address.length===4 ? address.address.join('.') : '';
 export function presentPeer(peer:PeerView):Peer {
-  return {compatible:true,id:peer.device,device:peer.device,deviceId:fingerprint(peer.device),name:peer.name,os:peer.os==='macos'?'mac':peer.os==='windows'?'win':peer.os==='linux'?'linux':'other',ip:addressText(peer.remote),port:peer.remote.port};
+  return {compatible:true,id:peer.device,device:peer.device,deviceId:fingerprint(peer.device),name:peer.name,os:deviceOs(peer.os),ip:addressText(peer.remote),port:peer.remote.port};
 }
 export { PairFailure } from '../api/pairing';
 export function pairProblemText(problem:Pick<PairProblem,'code'|'network_problem'>):string {
@@ -25,7 +26,7 @@ export function pairProblemText(problem:Pick<PairProblem,'code'|'network_problem
     34:'设备组已变化，无法撤销',35:'不允许此操作',36:'搜索结果的连接已断开，请重新搜索',
     37:'配对状态已变化，请重试',38:'配对协议异常',39:'设备状态已变化，请重新搜索',40:'配对已经提交',
     41:'无法验证设备身份',42:'没有共同支持的加密方式',43:'不支持该屏幕排列',44:'配对服务不可用',
-    45:'网络操作超时',46:'对方等待处理的请求过多，请稍后重试',
+    45:'网络操作超时',46:'对方还有没处理的配对请求，请稍后重试',
   };
   return tr(messages[problem.code]??'配对状态未知');
 }

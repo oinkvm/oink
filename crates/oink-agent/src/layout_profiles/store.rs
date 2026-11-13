@@ -6,7 +6,7 @@ use super::{
 };
 use crate::api::GroupKey;
 use base64::Engine;
-use oink_protocol::v1::{dto::LayoutProfileCatalogV3, schema::WireDto};
+use oink_protocol::v2::{dto::LayoutProfileCatalog, schema::WireDto};
 use std::{
     io::Read,
     path::{Path, PathBuf},
@@ -48,7 +48,7 @@ fn read(root: &Path, group: GroupKey) -> Result<Option<Catalog>> {
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(encoded)
         .map_err(failure)?;
-    let encoded = LayoutProfileCatalogV3::decode(&bytes, MAX_BYTES).map_err(failure)?;
+    let encoded = LayoutProfileCatalog::decode(&bytes, MAX_BYTES).map_err(failure)?;
     let catalog = wire::read_catalog(encoded)?;
     if catalog.group != group {
         return Err(failure("catalog group mismatch"));
@@ -61,7 +61,7 @@ pub fn save(root: &Path, catalog: &Catalog) -> Result<()> {
 }
 pub fn save_with_operations(root: &Path, catalog: &Catalog, operations: &Operations) -> Result<()> {
     catalog.validate()?;
-    let bytes = wire::catalog(catalog)
+    let bytes = wire::storage_catalog(catalog)
         .map_err(failure)?
         .encode(MAX_BYTES)
         .map_err(failure)?;

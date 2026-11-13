@@ -16,7 +16,7 @@ async fn measurement_clock_does_not_republish_idle_state_and_source_phase_is_typ
     }
     assert_eq!(lock(&counts).1, 60);
     assert!(lock(&counts).0 <= 1, "unchanged idle state is not a statistics clock");
-    running.claim(1, true);
+    running.select_exit(1, true);
     running.until(|r| r.owners[0].capture.is_some()).await;
     running.supply(0, 0.1);
     running.owners[0].publish_at(AudioPhase::Forwarding, base + Duration::from_secs(61));
@@ -41,7 +41,7 @@ async fn local_audio_quality_samples_without_a_ui_and_flushes_on_receiver_retire
             lock(&captured).record(at, named);
         }
     }));
-    running.claim(1, true);
+    running.select_exit(1, true);
     running.until(|r| r.owners[0].capture.is_some()).await;
     for _ in 0..8 {
         running.supply(0, 0.1);

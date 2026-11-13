@@ -11,7 +11,7 @@ use crate::{
     node::{Node, lock},
 };
 use oink_foundation::Point;
-use oink_protocol::v1::{RawValue as V, dto, schema::WireValue};
+use oink_protocol::v2::{RawValue as V, dto, schema::WireValue};
 use std::collections::BTreeSet;
 
 fn stale() -> ProfileError {
@@ -774,7 +774,7 @@ impl Node {
                     .iter()
                     .flat_map(|(id, requests)| {
                         requests.iter().map(move |(device, request)| {
-                            use oink_protocol::v1::schema::WireDto;
+                            use oink_protocol::v2::schema::WireDto;
                             Ok((
                                 id.clone(),
                                 *device,

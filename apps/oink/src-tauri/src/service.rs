@@ -175,10 +175,12 @@ pub fn check_backend_ownership(data_dir: &Path) -> Result<(), String> {
 }
 
 /// Follows the backend for the UI's lifetime. There is no spawn path here and
-/// no reconnect to a backend that went away. The one exception is a backend
-/// that is still running and dropped this subscription for falling behind:
-/// subscribe again and let `resubscribed` reload every view, as the IPC
-/// contract describes. Exiting instead left the user with no UI at all.
+/// no reconnect to a backend that went away. Two exceptions subscribe again
+/// and let `resubscribed` reload every view, as the IPC contract describes: a
+/// backend that is still running and dropped this subscription for falling
+/// behind, and one that restarts in its own process after a network-layer
+/// failure (it announces that, keeps its process ownership and comes back
+/// on a new endpoint). Exiting instead left the user with no UI at all.
 pub fn follow(
     api: &RemoteApi,
     connected: impl FnOnce(&ServiceInfo),
@@ -186,11 +188,46 @@ pub fn follow(
     ended: impl FnOnce(EventsEnd),
 ) {
     let mut end = api.follow_events(connected);
-    while end == EventsEnd::Lagged {
-        tracing::warn!("backend dropped a lagging event subscription; subscribing again");
-        end = api.follow_events(&resubscribed);
+    loop {
+        match end {
+            EventsEnd::Lagged => {
+                tracing::warn!("backend dropped a lagging event subscription; subscribing again");
+                end = api.follow_events(&resubscribed);
+            }
+            EventsEnd::Restarting => {
+                tracing::info!("backend restarts after a network-layer failure; waiting to subscribe again");
+                end = match wait_for_restart(api) {
+                    Ok(()) => api.follow_events(&resubscribed),
+                    Err(end) => end,
+                };
+            }
+            _ => break,
+        }
     }
     ended(end);
+}
+
+/// The longest restart back-off (30 s) plus a normal backend startup.
+const RESTART_WAIT: Duration = Duration::from_secs(90);
+
+/// Waits until the restarted backend answers on its new endpoint.
+fn wait_for_restart(api: &RemoteApi) -> Result<(), EventsEnd> {
+    let deadline = Instant::now() + RESTART_WAIT;
+    loop {
+        // The process keeps its ownership through the restart: losing it
+        // means the backend exited instead of restarting.
+        if oink_agent::instance::is_running(api.data_dir()) != Some(true) {
+            return Err(EventsEnd::Lost("backend exited while restarting".into()));
+        }
+        api.reset_connections();
+        if api.hello_with_timeout(Duration::from_millis(200)).is_ok() {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(EventsEnd::Lost("backend did not come back after its restart".into()));
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
 }
 
 /// Explicit reopen waits for both roles before creating their replacements.

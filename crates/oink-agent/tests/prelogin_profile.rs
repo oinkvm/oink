@@ -91,6 +91,12 @@ fn a_prelogin_working_copy_rejoins_as_the_same_device_and_refuses_pairing() {
             })
             .await;
             assert!(common::linked(&a, device));
+            // Device cards, remote options, system arrangement and diagnostics
+            // of the logon desktop stay available to the member (review M4).
+            let agreement = a.link_config().unwrap().peer_agreement(device).unwrap();
+            for capability in ["oink.device/2", "oink.layout/2", "oink.diagnostics/2"] {
+                assert!(agreement.contains(capability), "{capability}");
+            }
             common::phase("an outsider cannot pair with the pre-login backend");
             let outsider = Node::start_with_fake_platform(options(root.path(), "outsider", 0))
                 .await

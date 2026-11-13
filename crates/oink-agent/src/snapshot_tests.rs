@@ -179,7 +179,7 @@ fn display_alerts_follow_native_failure_and_recovery_without_connect_flashes() {
                 .and_then(|resources| resources.faults().ok().flatten())
                 .and_then(|faults| faults.screen().ok().flatten())
                 .and_then(|fault| fault.code().ok())
-                == Some(oink_protocol::v1::dto::ResourceFaultCode::BackendFailed)
+                == Some(oink_protocol::v2::dto::ResourceFaultCode::BackendFailed)
         })
         .await;
         assert_eq!(alerts(&b), 0, "peer resource faults are not local enumeration notices");
@@ -960,8 +960,8 @@ fn local_contacts_capability_and_effective_preference_recover() {
                 let result = tokio::task::spawn_blocking(move || {
                     requester.edit_device_option(
                         target.into(),
-                        oink_protocol::v1::dto::LocalOption::AcceptContacts,
-                        oink_protocol::v1::RawValue::Bool(true),
+                        oink_protocol::v2::dto::LocalOption::AcceptContacts,
+                        oink_protocol::v2::RawValue::Bool(true),
                     )
                 })
                 .await
@@ -982,9 +982,9 @@ fn local_contacts_capability_and_effective_preference_recover() {
                 .unwrap()
                 .0
                 .into_iter()
-                .find(|p| p.option() == Ok(oink_protocol::v1::dto::LocalOption::AcceptContacts))
+                .find(|p| p.option() == Ok(oink_protocol::v2::dto::LocalOption::AcceptContacts))
                 .unwrap();
-            assert_eq!(preference.value().unwrap(), oink_protocol::v1::RawValue::Bool(true));
+            assert_eq!(preference.value().unwrap(), oink_protocol::v2::RawValue::Bool(true));
         }
         assert!(a.input_settings().unwrap().mac_scroll_feel);
         assert!(b.input_settings().unwrap().mac_scroll_feel);
@@ -1072,8 +1072,8 @@ fn local_contacts_capability_and_effective_preference_recover() {
                     .and_then(|f| f.preferences().ok().flatten())
                     .is_some_and(|p| {
                         p.0.iter().any(|p| {
-                            p.option() == Ok(oink_protocol::v1::dto::LocalOption::MacScrollFeel)
-                                && p.value() == Ok(oink_protocol::v1::RawValue::Bool(enabled))
+                            p.option() == Ok(oink_protocol::v2::dto::LocalOption::MacScrollFeel)
+                                && p.value() == Ok(oink_protocol::v2::RawValue::Bool(enabled))
                         })
                     })
             })
@@ -1082,11 +1082,11 @@ fn local_contacts_capability_and_effective_preference_recover() {
             assert_eq!(
                 remote
                     .iter()
-                    .find(|p| p.option() == Ok(oink_protocol::v1::dto::LocalOption::MacScrollFeel))
+                    .find(|p| p.option() == Ok(oink_protocol::v2::dto::LocalOption::MacScrollFeel))
                     .unwrap()
                     .value()
                     .unwrap(),
-                oink_protocol::v1::RawValue::Bool(enabled)
+                oink_protocol::v2::RawValue::Bool(enabled)
             );
             assert!(
                 b.input_settings().unwrap().mac_scroll_feel,
@@ -1099,20 +1099,20 @@ fn local_contacts_capability_and_effective_preference_recover() {
         a.publish_local_options();
         for (option, field) in [
             (
-                oink_protocol::v1::dto::LocalOption::TouchpadInjection,
+                oink_protocol::v2::dto::LocalOption::TouchpadInjection,
                 "accept_contacts",
             ),
             (
-                oink_protocol::v1::dto::LocalOption::NativeMultifinger,
+                oink_protocol::v2::dto::LocalOption::NativeMultifinger,
                 "native_multifinger",
             ),
-            (oink_protocol::v1::dto::LocalOption::MacScrollFeel, "mac_scroll_feel"),
+            (oink_protocol::v2::dto::LocalOption::MacScrollFeel, "mac_scroll_feel"),
         ] {
             for enabled in [false, true] {
                 let requester = b.clone();
                 let target = a.id();
                 tokio::task::spawn_blocking(move || {
-                    requester.edit_device_option(target.into(), option, oink_protocol::v1::RawValue::Bool(enabled))
+                    requester.edit_device_option(target.into(), option, oink_protocol::v2::RawValue::Bool(enabled))
                 })
                 .await
                 .unwrap()
@@ -1124,7 +1124,7 @@ fn local_contacts_capability_and_effective_preference_recover() {
                 let reloaded = crate::config::AgentConfig::load_from(&configs[0].data_dir).unwrap();
                 assert_eq!(
                     reloaded.owner().value(option),
-                    Some(oink_protocol::v1::RawValue::Bool(enabled))
+                    Some(oink_protocol::v2::RawValue::Bool(enabled))
                 );
                 assert_eq!(
                     serde_json::to_value(b.input_settings().unwrap()).unwrap()[field],
@@ -1165,8 +1165,8 @@ fn contact_acceptance_is_owned_by_the_receiver_and_survives_restart() {
                     .and_then(|facts| facts.preferences().ok().flatten())
                     .is_some_and(|items| {
                         items.0.iter().any(|item| {
-                            item.option() == Ok(oink_protocol::v1::dto::LocalOption::AcceptContacts)
-                                && item.value() == Ok(oink_protocol::v1::RawValue::Bool(false))
+                            item.option() == Ok(oink_protocol::v2::dto::LocalOption::AcceptContacts)
+                                && item.value() == Ok(oink_protocol::v2::RawValue::Bool(false))
                         })
                     })
             })

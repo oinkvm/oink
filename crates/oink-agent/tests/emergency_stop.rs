@@ -13,7 +13,7 @@ use oink_agent::node::{Node, NodeOptions};
 use oink_foundation::display::DisplayInfo;
 use oink_foundation::input::{CapturedEvent, InputEvent, KeyCode, SourceKind};
 use oink_foundation::{Point, Rect, Size};
-use oink_protocol::v1::dto;
+use oink_protocol::v2::dto;
 use oink_test_support::clipboard::FakeClipboard;
 use oink_test_support::input::FakeInput;
 

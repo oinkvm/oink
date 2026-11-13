@@ -1,7 +1,7 @@
 //! Native owners report only observed resource outcomes. Preference choices,
 //! focus, peer availability, and cursor visibility never manufacture a fault.
 use oink_foundation::input::PermissionState;
-use oink_protocol::v1::dto::ResourceFaultCode;
+use oink_protocol::v2::dto::ResourceFaultCode;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

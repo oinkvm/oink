@@ -3,7 +3,7 @@ use super::*;
 use crate::record::{RecordRead, RecordWrite};
 use oink_protocol::{
     frame::MAX_LOW_MESSAGE,
-    v1::{
+    v2::{
         Message,
         admission::{Agreement, Context, Phase},
         frame::{self, FrameHeader, OpaqueFrame},
@@ -106,9 +106,13 @@ impl BulkStream {
             }
             let bytes = frame::encode(message, MAX_LOW_MESSAGE).map_err(|_| LowError::TooLarge)?;
             let frame = OpaqueFrame::parse_exact(&bytes, MAX_LOW_MESSAGE).map_err(|_| LowError::TooLarge)?;
-            self.context()
-                .admit(frame.header)
-                .map_err(|v| LowError::Io(std::io::Error::other(format!("{:?}", v.code))))?;
+            // The send gate: the same registry rule the peer applies.
+            self.context().admit(frame.header).map_err(|v| match v.code {
+                oink_protocol::v2::ErrorCode::UnnegotiatedCapability
+                | oink_protocol::v2::ErrorCode::InvalidChannel
+                | oink_protocol::v2::ErrorCode::UnknownMessage => LowError::Unnegotiated,
+                code => LowError::Io(std::io::Error::other(format!("{code:?}"))),
+            })?;
             if bytes.len() > MAX_LOW_MESSAGE {
                 return Err(LowError::TooLarge);
             }

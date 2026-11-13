@@ -12,7 +12,7 @@ use oink_foundation::{
     input::{CapturedEvent, InputEvent, KeyCode, SourceKind},
 };
 use oink_protocol::frame::StreamKind;
-use oink_protocol::v1::{
+use oink_protocol::v2::{
     self, dto as w,
     schema::{Open, WireDto},
 };
@@ -107,7 +107,7 @@ fn wire_environment(zip: &mut zip::ZipArchive<std::fs::File>, alias: &str) -> w:
         .unwrap();
     w::Snapshot::decode(&bytes, oink_agent::diagnostics::MAX_SEGMENT_RAW).unwrap()
 }
-fn scalar(values: Vec<w::NamedScalar>, name: &str) -> v1::RawValue {
+fn scalar(values: Vec<w::NamedScalar>, name: &str) -> v2::RawValue {
     values
         .into_iter()
         .find(|v| v.name().unwrap().0 == name)
@@ -194,9 +194,9 @@ fn each_member_exports_its_current_runtime_environment_without_a_local_save() {
                     .await;
                 }
                 let bundle = call(&a, |n| n.export_diagnostics()).await.unwrap();
-                assert_eq!(bundle.included_device_count, Some(3));
-                assert_eq!(bundle.missing_device_count, Some(0));
                 let m = manifest(&bundle.path);
+                assert_eq!(bundle.included_device_count, Some(3), "export manifest: {m:#}");
+                assert_eq!(bundle.missing_device_count, Some(0), "export manifest: {m:#}");
                 let mut zip = zip::ZipArchive::new(std::fs::File::open(&bundle.path).unwrap()).unwrap();
                 for (index, node) in [&a, &b, &c].into_iter().enumerate() {
                     let group = node.link_config().unwrap().applied().group;
@@ -243,15 +243,15 @@ fn each_member_exports_its_current_runtime_environment_without_a_local_save() {
                         assert!(!permissions.secure_input_active().unwrap());
                         assert_eq!(
                             scalar(env.settings().unwrap().0, "forward_gestures"),
-                            v1::RawValue::Bool(index != round)
+                            v2::RawValue::Bool(index != round)
                         );
                         assert_eq!(
                             scalar(env.settings().unwrap().0, "diagnostics_enabled"),
-                            v1::RawValue::Bool(true)
+                            v2::RawValue::Bool(true)
                         );
                         assert_eq!(
                             scalar(env.routing_numbers().unwrap().0, "remote_scroll_speed"),
-                            v1::RawValue::F64((index + round + 1) as f64)
+                            v2::RawValue::F64((index + round + 1) as f64)
                         );
                         assert_eq!(
                             env.button_handoff().unwrap().unwrap().mode().unwrap(),
@@ -634,7 +634,7 @@ async fn local_recording_three_member_save_offline_pause_emergency_and_privacy_s
             let env = wire_environment(&mut zip, alias);
             assert_eq!(
                 scalar(env.settings().unwrap().0, "sharing_enabled"),
-                v1::RawValue::Bool(false)
+                v2::RawValue::Bool(false)
             );
             assert!(env.permissions().unwrap().is_some());
             continue;

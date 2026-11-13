@@ -2,7 +2,7 @@
 //! is removed only after its screen appears in the durably applied layout.
 use crate::config::store::StoreError;
 use base64::Engine;
-use oink_protocol::v1::{self, dto, schema::WireDto};
+use oink_protocol::v2::{self, dto, schema::WireDto};
 use std::{io::Read, path::Path};
 
 pub const DETACHED_FILE: &str = "detached-screens.json";
@@ -97,7 +97,7 @@ pub fn load(path: &Path) -> Result<DetachedScreens, StoreError> {
         let bytes = base64::engine::general_purpose::STANDARD
             .decode(encoded.as_str().ok_or(StoreError::Invalid)?)
             .map_err(|_| StoreError::Invalid)?;
-        let placement = dto::ScreenPlacement::from_raw(v1::cbor::decode_map(&bytes, v1::limits::CONFIG_STATE)?)?;
+        let placement = dto::ScreenPlacement::from_raw(v2::cbor::decode_map(&bytes, v2::limits::CONFIG_STATE)?)?;
         let id = placement.id()?;
         if ids
             .iter()
@@ -127,7 +127,7 @@ pub fn save(path: &Path, state: &DetachedScreens) -> Result<(), StoreError> {
         extra.insert(
             "placement_cbor".into(),
             base64::engine::general_purpose::STANDARD
-                .encode(screen.placement.encode(v1::limits::CONFIG_STATE)?)
+                .encode(screen.placement.encode(v2::limits::CONFIG_STATE)?)
                 .into(),
         );
         entries.push(serde_json::Value::Object(extra));
@@ -146,7 +146,7 @@ pub fn save(path: &Path, state: &DetachedScreens) -> Result<(), StoreError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use oink_protocol::v1::{RawValue, schema::WireValue};
+    use oink_protocol::v2::{RawValue, schema::WireValue};
     fn screen(n: u32) -> dto::ScreenPlacement {
         let rect = RawValue::Map(
             [

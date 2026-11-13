@@ -117,12 +117,17 @@ impl Router {
             p.touchpad_options = supported;
         }
     }
+    /// Whether `peer` is a phone, from its DeviceFacts: a phone is a trackpad
+    /// source like a Mac (`Peer::trackpad_source`).
+    pub fn set_peer_mobile(&mut self, peer: DeviceId, mobile: bool) {
+        self.peers.entry(peer).or_insert_with(|| Peer::new(0)).mobile = mobile;
+    }
     pub(super) fn touchpad_options_enabled(&self, origin: DeviceId) -> bool {
         self.cfg.os == Os::Windows
             && self
                 .peers
                 .get(&origin)
-                .is_some_and(|p| p.os == Os::MacOS && p.touchpad_options)
+                .is_some_and(|p| p.trackpad_source() && p.touchpad_options)
     }
     fn contacts_destination(&self) -> Option<DeviceId> {
         if self.cfg.settings.forward_gestures && !self.paused && self.capture_available {
@@ -615,7 +620,7 @@ impl Router {
                 && self.touchpad_contacts.is_some();
             let classify = native
                 && (self.cfg.settings.mac_scroll_feel || native_scroll_only)
-                && self.peers.get(&origin).is_some_and(|p| p.os == Os::MacOS);
+                && self.peers.get(&origin).is_some_and(Peer::trackpad_source);
             let path = if !native {
                 MultiPath::Gestures
             } else if classify {

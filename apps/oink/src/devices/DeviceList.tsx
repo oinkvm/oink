@@ -1,9 +1,13 @@
 import { tr, problemText } from '../i18n';
 import { useEffect, useRef, useState, type KeyboardEvent as ReactKeyboardEvent, type MouseEvent, type PointerEvent as ReactPointerEvent, type ReactNode } from 'react';
 import { Tooltip } from 'oink-ui';
-import { Badge, CursorMark, GameMark, Glyph, OsLogo, PauseMark, Signal, SignalMark } from './icons';
+import { routeSummary, useRoutes } from './RouteMenu';
+import { api } from '../api/client';
+import { agent } from '../api/store';
+import { Badge, CursorMark, GameMark, Glyph, OsLogo, PauseMark, Signal, SignalMark, UpgradeMark } from './icons';
 import type { BadgeName, GlyphName } from './icons';
-import type { Device, DeviceGroup } from './types';
+import { isMobile, type Device, type DeviceGroup } from './types';
+import type { MobileAudioKind } from './mobileAudio';
 import { canDisableInput, faultReason, formatLastSeen, offlineReasonText, gameActive } from './data';
 import type { ShareKind } from './data';
 import { VolumeRow, hasVolume } from './VolumeRow';
@@ -11,6 +15,7 @@ import type { SpeakerAction, MicrophoneAction } from './VolumeRow';
 import { PermissionHint, type PermissionHintKind } from '../permissions/PermissionHint';
 import './devices.css';
 import { useCardLatency } from './useCardLatency';
+import { latencyNumber } from './latency';
 import { applyPlacement, placementFor, slotAt, stepPlacement, type Placement } from './reorder';
 type Tone = 'accent' | 'muted' | 'good' | 'bad' | 'warn';
 interface Indicator {
@@ -74,7 +79,8 @@ export function indicators(d: Device, noExit = false): Indicator[] {
     const microphone: Indicator = { glyph:'microphone', tone:micFault?'warn':mode==='source'?'accent':mode==='receiver'?'good':'muted',
         badge:micFault?'warning':mode==='source'?(mic?.muted?'mute':'send'):mode==='receiver'?(mic?.waitingForSource?'warning':'receive'):'mute',
         label:tr('麦克风：{0}', microphoneState(d)) };
-    return [share('mouse', tr('鼠标'), d.mouse), keyboard, speaker, microphone];
+    // A phone has no mouse or keyboard of its own to share; its row shows audio only.
+    return isMobile(d) ? [speaker, microphone] : [share('mouse', tr('鼠标'), d.mouse), keyboard, speaker, microphone];
 }
 function actionFor(d: Device, kind: ShareKind): string | null {
     if (kind === 'speaker') return tr('点击选中这台设备');
@@ -95,15 +101,40 @@ function actionFor(d: Device, kind: ShareKind): string | null {
             return d[kind] === 'shared' ? tr('停止共享') : tr('切换为{0}', tr('共享'));
     }
 }
+/** Phone gestures: mute stays on the owner controls; "切回本地" and (only when
+ * allowed) start use the phone's audio endpoints. Nothing else is offered. */
+export function mobileAudioGestures(d: Device, kind: MobileAudioKind): { single: string | null; double: { label: string; action: 'close' | 'start' } | null } {
+    const endpoint = d.mobileAudio?.[kind === 'speaker' && d.speaker.mode === 'forwarding' ? 'forward' : kind];
+    const active = kind !== 'microphone' ? (d.speaker.mode === 'exit' || d.speaker.mode === 'forwarding') : microphoneMode(d) === 'source';
+    const muted = kind === 'speaker' ? d.speaker.muted : !!d.microphone?.muted;
+    const canMute = kind === 'speaker' ? !!d.speaker.canSetVolume : !!d.microphone?.canSetVolume;
+    const single = active && canMute ? (muted ? tr('取消静音') : tr('静音')) : null;
+    const double = active
+        ? endpoint?.enabled ? { label: tr('切回本地'), action: 'close' as const } : null
+        : endpoint?.canStart ? { label: kind === 'speaker' ? tr('使用手机扬声器') : tr('使用手机麦克风'), action: 'start' as const } : null;
+    return { single, double };
+}
 export function audioTooltip(d: Device, kind: 'speaker' | 'microphone', exitName: string | null): string[] {
     let state: string, single: string, double: string | null;
+    if (isMobile(d)) {
+        const gestures = mobileAudioGestures(d, kind);
+        if (kind === 'speaker') {
+            const sp = d.speaker;
+            state = sp.mode === 'unknown' || sp.mode === 'fault' ? tr('扬声器：不可用，{0}', faultReason(d, 'speaker'))
+                : sp.mode === 'exit' ? tr('扬声器：出口') : sp.mode === 'forwarding' ? exitName ? tr('扬声器：转发到 {0}', exitName) : tr('等待音频出口') : tr('扬声器：本地');
+        } else {
+            const fault = d.microphone?.fault && d.microphone.fault.code !== 'none' ? d.microphone.fault.code : null;
+            state = fault ? tr('麦克风：不可用，{0}', problemText(fault)) : microphoneMode(d) === 'source' ? tr('麦克风：发送') : tr('麦克风：本地');
+        }
+        return [state, ...(gestures.single ? [tr('单击：{0}', gestures.single)] : []), ...(gestures.double ? [tr('双击：{0}', gestures.double.label)] : [])];
+    }
     if (kind === 'speaker') {
         const sp = d.speaker;
         if (sp.mode === 'unknown' || sp.mode === 'fault') {
             state = tr('扬声器：不可用，{0}', faultReason(d, 'speaker')); single = tr('选中设备'); double = null;
         } else if (sp.mode === 'exit') {
             state = tr('扬声器：出口');
-            single = sp.muted ? tr('取消静音') : tr('静音'); double = tr('停止共享');
+            single = sp.muted ? tr('取消静音') : tr('静音'); double = d.os === 'android' || d.os === 'ios' ? tr('切回本地') : tr('停止共享');
         } else if (sp.mode === 'forwarding') {
             state = exitName ? tr('扬声器：转发到 {0}', exitName)
                 : tr('扬声器：不可用，{0}', sp.selectedExitUnavailable ? tr('所选出口不可用') : sp.exitUnknown ? tr('等待音频出口') : tr('无出口'));
@@ -119,7 +150,7 @@ export function audioTooltip(d: Device, kind: 'speaker' | 'microphone', exitName
             : mode==='source' && !d.microphone?.permissionGranted ? 'permission_denied' : null;
         state = mode==='local' ? tr('麦克风：本地') : fault ? tr('麦克风：不可用，{0}', problemText(fault)) : mode==='source' ? tr('麦克风：发送') : tr('麦克风：接收');
         single = mode==='local'?tr('接收其他设备共享的麦克风'):mode==='source'?(muted?tr('取消静音'):tr('静音')):tr('停止接收');
-        double = mode==='source'?tr('停止共享'):mode==='receiver'?tr('改为发送'):tr('共享本机麦克风');
+        double = mode==='source' ? (d.os === 'android' || d.os === 'ios' ? tr('切回本地') : tr('停止共享')) : mode==='receiver'?tr('改为发送'):tr('共享本机麦克风');
     }
     return [state, tr('单击：{0}', single), ...(double ? [tr('双击：{0}', double)] : []), ...(kind==='microphone' && microphoneMode(d)==='receiver' && d.microphone?.waitingForSource ? [tr('当前没有设备共享麦克风')] : [])];
 }
@@ -177,20 +208,28 @@ function Connection({ d }: {
     d: Device;
 }) {
     const latency = useCardLatency(d);
+    const routes = useRoutes(d.id);
     if (d.group === 'self')
         return null;
     const offline = d.group === 'offline';
-    return (<span className="dev-conn" role="img" aria-label={offline ? offlineReasonText(d.offlineReason) : latency === null ? tr('延迟未知') : tr('延迟 {0} 毫秒', latency)}>
+    const label = offline ? offlineReasonText(d.offlineReason) : latency === null ? tr('延迟未知') : tr('延迟 {0} 毫秒', latency);
+    // The current route in the latency tooltip (route-selection design Q13).
+    const route = offline ? null : routeSummary(routes, d.name);
+    return (<Tooltip interactive={false} disabled={offline} content={route ?? label}
+        onOpenChange={open => { if (open && !offline) void api.memberRoutes(d.id).then(agent.routes.adopt, () => undefined); }}>
+      <span className="dev-conn" role="img" aria-label={label}>
       <Signal latency={latency} offline={offline}/>
       
       {!offline && (<span className="dev-conn__ms">
-          <span className="dev-conn__num">{latency === null ? '—' : Math.round(latency)}</span>{latency !== null && <small>ms</small>}
+          <span className="dev-conn__num">{latency === null ? '—' : latencyNumber(latency)}</span>{latency !== null && <small>ms</small>}
         </span>)}
-    </span>);
+      </span>
+    </Tooltip>);
 }
-function MetaLine({ d, now, onToggle, onSpeaker, onMicrophone, onGrantPermission, onSelect, interactive, tabbable, exitName }: {
+function MetaLine({ d, now, onToggle, onSpeaker, onMicrophone, onMobileAudio, onGrantPermission, onSelect, interactive, tabbable, exitName }: {
     d: Device;
     now: number;
+    onMobileAudio?: (kind: MobileAudioKind, action: 'close' | 'start') => void;
     onToggle?: (kind: ShareKind, mode: 'single' | 'double') => void;
     onSpeaker?: (action:SpeakerAction) => void;
     onSelect:()=>void;
@@ -203,7 +242,7 @@ function MetaLine({ d, now, onToggle, onSpeaker, onMicrophone, onGrantPermission
     const microphoneAction = useRef(onMicrophone);
     microphoneAction.current = onMicrophone;
     if (d.group === 'offline') {
-        return <span className="dev__meta"><span className="dev__seen">{tr('上次在线 {0}', formatLastSeen(d.lastSeen, now))}</span></span>;
+        return <span className="dev__meta"><span className="dev__seen">{d.offlineReason === 'protocol_incompatible' ? tr('版本过低，请升级') : tr('上次在线 {0}', formatLastSeen(d.lastSeen, now))}</span></span>;
     }
     if (d.paused && d.pauseReason === 'input_backlog') {
         return <span className="dev__meta" title={tr('输入积压超过 5 秒，已暂停共享')}><span className="dev__seen">{tr('输入积压超过 5 秒，已暂停共享')}</span></span>;
@@ -212,6 +251,17 @@ function MetaLine({ d, now, onToggle, onSpeaker, onMicrophone, onGrantPermission
       <span className="dev__status" onClickCapture={e => { if (interactive && e.detail <= 1) onSelect(); }}
         onKeyDownCapture={e => { if (interactive && e.key === 'Enter' && e.shiftKey) onSelect(); }}>
         {indicators(d, exitName === null).map((ind) => {
+            if(isMobile(d) && (ind.glyph==='microphone' || ind.glyph==='speaker')) {
+                const kind = ind.glyph;
+                const gestures = mobileAudioGestures(d, kind);
+                const tooltip = audioTooltip(d, kind, exitName);
+                const has = !!(gestures.single || gestures.double);
+                return <StatusIcon key={ind.glyph} ind={ind} tooltip={tooltip} tabbable={tabbable} action={interactive && has ? tooltip.slice(1).join('；') : null} double={!!gestures.double}
+                    onActivate={has ? click => {
+                        if (click === 'double') { if (gestures.double) onMobileAudio?.(kind, gestures.double.action); }
+                        else if (gestures.single) (kind === 'speaker' ? onSpeaker : onMicrophone)?.({ type: 'mute' });
+                    } : undefined}/>;
+            }
             if(ind.glyph==='microphone') {
                 const mode=microphoneMode(d);
                 const tooltip=audioTooltip(d,'microphone',exitName);
@@ -280,6 +330,7 @@ export interface DeviceListProps {
     onToggle?: (id: string, kind: ShareKind, mode: 'single' | 'double') => void;
     onSpeaker?: (id: string, a: SpeakerAction) => void;
     onMicrophone?: (id: string, a: MicrophoneAction) => void;
+    onMobileAudio?: (id: string, kind: MobileAudioKind, action: 'close' | 'start') => void;
     onPause?: (id: string, paused: boolean) => void;
     onGrantAccessibility?: () => void;
     onGrantPermission?: (id: string, kind: 'input_monitoring' | 'microphone') => void;
@@ -368,7 +419,7 @@ function useReorder(online: Device[], enabled: boolean, onReorder: DeviceListPro
     };
     return { shown, list, rowProps, reordering: !!drag };
 }
-export function DeviceList({ devices, selectedId, onSelect, onToggle, onSpeaker, onMicrophone, onPause, onGrantAccessibility, onGrantPermission, growIds, hiddenScreens, collapsed, now = Date.now(), onReorder }: DeviceListProps) {
+export function DeviceList({ devices, selectedId, onSelect, onToggle, onSpeaker, onMicrophone, onMobileAudio, onPause, onGrantAccessibility, onGrantPermission, growIds, hiddenScreens, collapsed, now = Date.now(), onReorder }: DeviceListProps) {
     const exit = devices.find(d => d.group !== 'offline' && d.speaker.mode === 'exit');
     const reorderable = !!onReorder && !collapsed;
     const reorder = useReorder(devices.filter(d => d.group === 'online'), reorderable, onReorder);
@@ -385,7 +436,7 @@ export function DeviceList({ devices, selectedId, onSelect, onToggle, onSpeaker,
             </h3>
             <ul className="devs__list" ref={online ? reorder.list : undefined} data-reordering={online && reorder.reordering ? '' : undefined}>
               {list.map((d) => (<li key={d.id} {...(online ? reorder.rowProps(d.id) : {})}>
-                  <DeviceItem onGrantPermission={onGrantPermission ? kind => onGrantPermission(d.id, kind) : undefined} onGrantAccessibility={onGrantAccessibility} d={d} now={now} selected={!collapsed && d.id === selectedId} collapsed={collapsed} exitName={exit?.name ?? null} onSelect={() => onSelect(d.id)} onToggle={onToggle ? (kind, mode) => onToggle(d.id, kind, mode) : undefined} onSpeaker={onSpeaker ? (a) => onSpeaker(d.id, a) : undefined} onPause={onPause ? (p) => onPause(d.id, p) : undefined} onMicrophone={onMicrophone ? a=>onMicrophone(d.id,a) : undefined} grow={collapsed && !!growIds?.has(d.id)} hiddenScreens={hiddenScreens?.get(d.id) ?? 0} reorderable={online && reorderable && list.length > 1}/>
+                  <DeviceItem onGrantPermission={onGrantPermission ? kind => onGrantPermission(d.id, kind) : undefined} onGrantAccessibility={onGrantAccessibility} d={d} now={now} selected={!collapsed && d.id === selectedId} collapsed={collapsed} exitName={exit?.name ?? null} onSelect={() => onSelect(d.id)} onToggle={onToggle ? (kind, mode) => onToggle(d.id, kind, mode) : undefined} onSpeaker={onSpeaker ? (a) => onSpeaker(d.id, a) : undefined} onPause={onPause ? (p) => onPause(d.id, p) : undefined} onMicrophone={onMicrophone ? a=>onMicrophone(d.id,a) : undefined} onMobileAudio={onMobileAudio ? (kind, action) => onMobileAudio(d.id, kind, action) : undefined} grow={collapsed && !!growIds?.has(d.id)} hiddenScreens={hiddenScreens?.get(d.id) ?? 0} reorderable={online && reorderable && list.length > 1}/>
                 </li>))}
             </ul>
           </section>);
@@ -396,12 +447,12 @@ function DeviceHit({ d, now, selected, collapsed, onSelect, reorderable }: {
     d: Device; now: number; selected: boolean; collapsed: boolean; onSelect: () => void; reorderable?: boolean;
 }) {
     const latency = useCardLatency(d);
-    const summary = d.group === 'offline' ? tr('{0}，离线，上次在线 {1}', d.name, formatLastSeen(d.lastSeen, now)) : d.group === 'online' ? tr('{0}，在线，延迟 {1} ms', d.name, latency === null ? tr("未知") : latency) : tr('{0}，本机', d.name);
+    const summary = d.group === 'offline' ? d.offlineReason === 'protocol_incompatible' ? tr('{0}，版本过低，请升级', d.name) : tr('{0}，离线，上次在线 {1}', d.name, formatLastSeen(d.lastSeen, now)) : d.group === 'online' ? tr('{0}，在线，延迟 {1} ms', d.name, latency === null ? tr("未知") : latency) : tr('{0}，本机', d.name);
     const pausedNote = d.group !== 'offline' && d.paused ? tr('，已暂停') : '';
     const screenOff = d.group !== 'offline' && d.screen === 'disabled';
     const game = d.group !== 'offline' && gameActive(d) && (d.cursor === 'local' || d.cursor === 'locked');
     const cursorNote = d.group !== 'offline' && (d.cursor === 'local' || d.cursor === 'locked') ? (d.cursor === 'locked' ? tr('，指针锁定在这里') : tr('，指针在这里')) : '';
-    return (<Tooltip interactive={false} placement="right" disabled={!collapsed} content={d.group === 'online' ? `${d.name} · ${latency === null ? tr("延迟未知") : `${Math.round(latency)} ms`}` : d.name}>
+    return (<Tooltip interactive={false} placement="right" disabled={!collapsed} content={d.group === 'online' ? `${d.name} · ${latency === null ? tr("延迟未知") : `${latencyNumber(latency)} ms`}` : d.name}>
       <button type="button" className="dev__hit ok-focusable" aria-current={selected ? 'true' : undefined} aria-disabled={d.group === 'offline' ? 'true' : undefined} aria-label={summary + pausedNote + (screenOff ? tr('，屏幕已禁用') : '') + (game ? tr('，游戏模式已开启') : '') + cursorNote} aria-keyshortcuts={reorderable ? 'Alt+ArrowUp Alt+ArrowDown' : undefined} onClick={onSelect}/>
       </Tooltip>);
 }
@@ -409,7 +460,7 @@ function DeviceSignal({ d, shown }: { d: Device; shown: boolean }) {
     const latency = useCardLatency(d);
     return <SignalMark latency={latency} offline={d.group === 'offline'} shown={shown}/>;
 }
-export function DeviceItem({ d, now, selected, collapsed, exitName = null, onSelect, onToggle, onSpeaker, onMicrophone, volumeOpen = false, grow = false, hiddenScreens = 0, onGrantAccessibility, onGrantPermission, reorderable = false }: {
+export function DeviceItem({ d, now, selected, collapsed, exitName = null, onSelect, onToggle, onSpeaker, onMicrophone, onMobileAudio, volumeOpen = false, grow = false, hiddenScreens = 0, onGrantAccessibility, onGrantPermission, reorderable = false }: {
     d: Device;
     now: number;
     selected: boolean;
@@ -420,6 +471,7 @@ export function DeviceItem({ d, now, selected, collapsed, exitName = null, onSel
     onToggle?: (kind: ShareKind, mode: 'single' | 'double') => void;
     onSpeaker?: (a: SpeakerAction) => void;
     onMicrophone?: (a: MicrophoneAction) => void;
+    onMobileAudio?: (kind: MobileAudioKind, action: 'close' | 'start') => void;
     onPause?: (paused: boolean) => void;
     volumeOpen?: boolean;
     grow?: boolean;
@@ -434,10 +486,12 @@ export function DeviceItem({ d, now, selected, collapsed, exitName = null, onSel
     return (<div className="dev" data-ctx={`device:${d.id}`} data-group={d.group} data-current={selected ? '' : undefined} data-grow={grow && hasVolume(d) ? '' : undefined}>
       <DeviceHit d={d} now={now} selected={selected} collapsed={collapsed} onSelect={onSelect} reorderable={reorderable}/>
       <span className="dev__os">
-        <OsLogo os={d.os}/>
+        <OsLogo os={d.os} formFactor={d.formFactor} privileged={d.privileged}/>
+        {d.offlineReason === 'protocol_incompatible' && <UpgradeMark/>}
         
         
-        {d.group !== 'self' && <DeviceSignal d={d} shown={collapsed && !(d.group === 'online' && d.paused)}/>}
+        {/* The upgrade mark replaces the collapsed offline signal in the same corner. */}
+        {d.group !== 'self' && <DeviceSignal d={d} shown={collapsed && !(d.group === 'online' && d.paused) && d.offlineReason !== 'protocol_incompatible'}/>}
         {d.group !== 'offline' && <PauseMark shown={!!d.paused}/>}
         
         {game ? <GameMark tooltip={!collapsed}/>
@@ -445,7 +499,7 @@ export function DeviceItem({ d, now, selected, collapsed, exitName = null, onSel
       </span>
       <span className="dev__text">
         <span className="dev__title"><span className="dev__name">{d.name}</span>{d.accessibilityMissing ? <AccessibilityIndicator local={d.group === 'self'} onGrant={onGrantAccessibility} tabbable={!collapsed}/> : hiddenScreens > 0 && <Tooltip interactive={false} content={tr('{0} 块屏幕已隐藏', hiddenScreens)}><span className="dev__hidden" role="img" aria-label={tr('{0} 块屏幕已隐藏', hiddenScreens)}><svg viewBox="0 0 16 16" aria-hidden><path d="M2 8s2.3-4.2 6-4.2S14 8 14 8s-2.3 4.2-6 4.2S2 8 2 8Z"/><circle cx="8" cy="8" r="1.8"/><path d="M3 3l10 10"/></svg></span></Tooltip>}</span>
-        <MetaLine onGrantPermission={onGrantPermission} onSelect={selected ? () => {} : onSelect} onSpeaker={onSpeaker} onMicrophone={onMicrophone} d={d} now={now} onToggle={onToggle} interactive={!collapsed} tabbable exitName={exitName}/>
+        <MetaLine onGrantPermission={onGrantPermission} onSelect={selected ? () => {} : onSelect} onSpeaker={onSpeaker} onMicrophone={onMicrophone} onMobileAudio={onMobileAudio} d={d} now={now} onToggle={onToggle} interactive={!collapsed} tabbable exitName={exitName}/>
       </span>
       <Connection d={d}/>
       

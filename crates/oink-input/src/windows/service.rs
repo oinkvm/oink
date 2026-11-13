@@ -84,11 +84,20 @@ fn command(i: &INPUT) -> Result<Command, InputError> {
         if i.r#type == INPUT_KEYBOARD {
             let k = i.Anonymous.ki;
             let scan = k.dwFlags.contains(KEYEVENTF_SCANCODE);
-            Ok(Command::Key {
-                code: if scan { k.wScan } else { k.wVk.0 },
-                scan,
-                extended: k.dwFlags.contains(KEYEVENTF_EXTENDEDKEY),
-                down: !k.dwFlags.contains(KEYEVENTF_KEYUP),
+            Ok(if k.dwFlags.contains(KEYEVENTF_UNICODE) {
+                Command::Unicode {
+                    unit: k.wScan,
+                    down: !k.dwFlags.contains(KEYEVENTF_KEYUP),
+                }
+            } else {
+                Command::Key {
+                    code: if scan { k.wScan } else { k.wVk.0 },
+                    scan,
+                    extended: k.dwFlags.contains(KEYEVENTF_EXTENDEDKEY),
+                    down: !k.dwFlags.contains(KEYEVENTF_KEYUP),
+                    // A virtual key keeps the scan code sent with it (numpad digits).
+                    vk_scan: if scan { 0 } else { k.wScan },
+                }
             })
         } else if i.r#type == INPUT_MOUSE {
             let m = i.Anonymous.mi;
@@ -140,6 +149,29 @@ fn command(i: &INPUT) -> Result<Command, InputError> {
 #[cfg(all(test, debug_assertions))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn numpad_keys_reach_the_service_with_virtual_key_and_scan_code() {
+        use crate::KeyCode;
+        // HID usage, scan code, virtual key (keymap: NumLock-independent numpad).
+        for (usage, scan, vk) in [(0x59, 0x4F, 0x61), (0x5D, 0x4C, 0x65), (0x63, 0x53, 0x6E)] {
+            for down in [true, false] {
+                let input = super::super::inject::key(KeyCode::keyboard(usage), down).unwrap();
+                let command = command(&input).unwrap();
+                assert_eq!(
+                    command,
+                    Command::Key {
+                        code: vk,
+                        scan: false,
+                        extended: false,
+                        down,
+                        vk_scan: scan,
+                    }
+                );
+                assert_eq!(Command::decode(&command.encode()), Some(command));
+            }
+        }
+    }
 
     #[test]
     fn helper_commands_carry_the_quicker_untagged_form_for_buttons_only() {

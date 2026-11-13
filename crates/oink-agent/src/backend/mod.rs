@@ -4,7 +4,9 @@
 //! on-demand Tauri process owns both normal windows and the nonactivating panel.
 //! Windows: the SYSTEM service creates a user-session UIAccess backend; the
 //! normal-user Tauri process owns the tray and all WebViews. Neither platform
-//! automatically restarts a dead backend. UI loss never stops sharing.
+//! automatically restarts a dead backend process; a backend whose network
+//! layer failed restarts itself in process (`host::supervise`). UI loss never
+//! stops sharing.
 
 pub mod cli;
 pub mod foreground;
@@ -55,6 +57,12 @@ pub(crate) fn attach(node: &Node) {
         }),
         crate::api::LiveViews::default(),
     );
+}
+
+/// The attached backend was retired for a restart (`host::supervise`):
+/// requests until the next `attach` find no backend.
+pub(crate) fn detach() {
+    *NODE.lock().unwrap() = None;
 }
 
 pub(crate) fn node() -> ApiResult<Node> {

@@ -23,6 +23,7 @@ struct State {
     error: Option<io::Error>,
     attempted: bool,
     failed: bool,
+    requested: bool,
 }
 #[derive(Debug)]
 pub(super) struct Socket {
@@ -76,6 +77,7 @@ impl Socket {
                 error: None,
                 attempted: false,
                 failed: false,
+                requested: false,
             }),
             wake,
         }))
@@ -96,15 +98,49 @@ impl Socket {
             result
         }
     }
-    /// One attempt per failed socket. All fd-owning pollers must be dropped too:
-    /// Quinn retains its previous socket while migrating to the replacement.
+    /// Test only: fail for good as after a failed rebind. The next receive
+    /// returns the error, which ends Quinn's endpoint driver.
+    #[cfg(test)]
+    pub(super) fn fail_for_test(&self) {
+        let mut state = self.state.lock().expect("endpoint socket");
+        state.error = Some(io::Error::other("test: endpoint socket failed"));
+        state.attempted = true;
+        state.failed = true;
+        if let Some(wake) = state.recv_wake.take() {
+            wake.wake();
+        }
+        for slot in state.pollers.values_mut() {
+            if let Some(wake) = slot.wake.take() {
+                wake.wake();
+            }
+        }
+    }
+    /// The owner asks for a fresh socket even though this one has not failed:
+    /// Android keeps a socket on the network it was created on (review H17).
+    pub(super) fn request_rebind(&self) {
+        self.state.lock().expect("endpoint socket").requested = true;
+        self.wake.notify_one();
+    }
+    /// One attempt per failed socket or request. All fd-owning pollers must be
+    /// dropped too: Quinn retains its previous socket while migrating to the
+    /// replacement.
     pub(super) fn rebind(self: &Arc<Self>, endpoint: &quinn::Endpoint) -> io::Result<Option<Arc<Self>>> {
         let mut state = self.state.lock().expect("endpoint socket");
-        if state.error.is_none() || state.attempted {
+        let defunct = state.error.is_some() && !state.attempted;
+        let requested = std::mem::take(&mut state.requested);
+        if !defunct && !requested {
             return Ok(None);
         }
-        state.attempted = true;
-        let error = copy_error(state.error.as_ref().expect("socket error"));
+        state.attempted |= defunct;
+        let error = state.error.as_ref().map(copy_error);
+        // Quinn keeps polling this socket while it migrates to the replacement:
+        // a requested rebind parks it exactly like a defunct one, and it is
+        // never rebound again.
+        let parked_by_request = state.error.is_none();
+        if parked_by_request {
+            state.error = Some(io::Error::other("endpoint socket replaced on request"));
+            state.attempted = true;
+        }
         state.inner = None;
         for slot in state.pollers.values_mut() {
             slot.io = None;
@@ -120,13 +156,18 @@ impl Socket {
             Ok(socket)
         });
         tracing::warn!(
-            %error, error_code = ?error.raw_os_error(),
+            error = ?error, error_code = ?error.as_ref().and_then(io::Error::raw_os_error), requested,
             rebind_result = ?result.as_ref().map(|_| ()),
-            "defunct UDP endpoint socket rebind"
+            "UDP endpoint socket rebind"
         );
-        if result.is_err() {
+        if let Err(failure) = &result {
             let mut state = self.state.lock().expect("endpoint socket");
             state.failed = true;
+            // A requested rebind of a healthy socket has no earlier error:
+            // surface the bind failure itself.
+            if parked_by_request {
+                state.error = Some(copy_error(failure));
+            }
             if let Some(wake) = state.recv_wake.take() {
                 wake.wake();
             }

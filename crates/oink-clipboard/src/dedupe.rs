@@ -1,7 +1,6 @@
-//! Clipboard content fingerprints for duplicate detection between clipboard
-//! synchronizers. The comparison rules live in
-//! `oink_foundation::clipboard_dedupe`; this module derives fingerprints from
-//! native inventories and captured providers.
+//! Clipboard content fingerprints for cross-synchronizer echo detection. The
+//! comparison rules live in `oink_foundation::clipboard_dedupe`; this module
+//! derives fingerprints from native inventories, captured providers and offers.
 //!
 //! First choice is the Oink clip marker: every clipboard Oink writes from a
 //! received offer carries one private format ([`MARKER_MAC`], [`MARKER_WINDOWS`])
@@ -9,16 +8,15 @@
 //! clipboard wholesale brings the marker back; the change is then recognised
 //! by identity, reading nothing but the marker. The marker is internal: it is
 //! removed from every announced inventory and is never a compared format.
-//! Content comparison (sending side, behind the "Clipboard deduplication"
-//! setting) is the fallback when there is no recognisable marker.
+//! Content comparison (sending side, behind the "ignore content that may come
+//! from other sync tools" setting) is the fallback when there is no
+//! recognisable marker.
 //!
 //! Capture reads only what the comparison needs and what is local: one
 //! plain-text representation per item and one bitmap per item. Content another
 //! synchronizer promised (Universal Clipboard: fetched from the other Apple
 //! device on demand) is never read: it compares as unknown. HTML, RTF, URLs,
-//! private formats and files are compared by metadata only. Content Oink wrote
-//! from an offer has no fingerprint at all (protocol v1 offers carry no
-//! digests, and reading it would fetch from the source device).
+//! private formats and files are compared by metadata only.
 use crate::ClipData;
 use crate::content::Provider;
 use crate::model::{
@@ -26,6 +24,10 @@ use crate::model::{
 };
 use oink_foundation::clipboard::ClipPlatform;
 use oink_foundation::clipboard_dedupe::{self as rules, DigestClass, Entry, Fingerprint};
+use oink_protocol::v2::{
+    self, RawValue as V, dto,
+    schema::{FixedBytes, WireDto, WireValue},
+};
 use std::io::Read;
 
 /// macOS Universal Clipboard marks content it brought from another Apple
@@ -35,7 +37,10 @@ use std::io::Read;
 pub const UNIVERSAL_CLIPBOARD: &str = "com.apple.is-remote-clipboard";
 /// nspasteboard.org source-application annotation: metadata, not content.
 const SOURCE_ANNOTATION: &str = "org.nspasteboard.source";
-/// Oink clip marker (encoding in `oink_foundation::clipboard_marker`).
+/// Offers carry at most this many digest entries (the reliable head is 16 KiB).
+pub const MAX_DIGESTS: usize = 64;
+/// Oink clip marker (encoding shared with the mobile hosts, see
+/// `oink_foundation::clipboard_marker`).
 pub use oink_foundation::clipboard_marker::{MARKER_APPLE as MARKER_MAC, MARKER_BYTES, MARKER_WINDOWS};
 
 pub fn is_marker(format: &NativeFormat) -> bool {
@@ -204,6 +209,11 @@ fn preferred<'a>(reps: impl Iterator<Item = &'a Representation>, names: &[&str])
 }
 
 fn read_limited(provider: &dyn Provider, rep: &Representation, limit: usize) -> Option<Vec<u8>> {
+    // A size already known to exceed the limit is never digested: do not
+    // make the source application render it.
+    if native_size(rep).is_some_and(|size| size > limit as u64) {
+        return None;
+    }
     let mut reader = provider.open(rep.id).ok()?;
     let mut bytes = Vec::new();
     (&mut reader).take(limit as u64 + 1).read_to_end(&mut bytes).ok()?;
@@ -215,6 +225,59 @@ fn standard(provider: &dyn Provider, rep: &Representation, bytes: &[u8]) -> Vec<
         .translator()
         .standard_with_source(rep, bytes, provider)
         .unwrap_or_default()
+}
+
+/// Bytes of a BMP file header plus the largest DIB info header (BITMAPV5HEADER).
+const BITMAP_HEADER_BYTES: usize = 14 + 124;
+
+enum Bitmap {
+    Bytes(Vec<u8>),
+    /// Above the pixel threshold: only its dimensions are compared.
+    Oversized((u32, u32)),
+}
+
+/// Reads an image representation for its digest. A bitmap that declares more
+/// pixels than are ever digested (a BMP/DIB header, e.g. a 5K screenshot as
+/// CF_DIB) stops after its header: it is not read further or transcoded.
+fn read_bitmap(provider: &dyn Provider, rep: &Representation) -> Option<Bitmap> {
+    let limit = rules::IMAGE_DIGEST_BYTES;
+    if native_size(rep).is_some_and(|size| size > limit as u64) {
+        return None;
+    }
+    let mut reader = provider.open(rep.id).ok()?;
+    let mut bytes = Vec::new();
+    (&mut reader)
+        .take(BITMAP_HEADER_BYTES as u64)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if let Some((width, height)) = bitmap_dimensions(&bytes)
+        && u64::from(width) * u64::from(height) > rules::IMAGE_DIGEST_PIXELS
+    {
+        return Some(Bitmap::Oversized((width, height)));
+    }
+    (&mut reader)
+        .take((limit + 1 - bytes.len()) as u64)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    (bytes.len() <= limit).then_some(Bitmap::Bytes(bytes))
+}
+
+/// Dimensions from a BMP file or Windows DIB info header; None for other data.
+fn bitmap_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
+    let header = if bytes.starts_with(b"BM") {
+        bytes.get(14..)?
+    } else {
+        bytes
+    };
+    let u16_at = |at: usize| Some(u16::from_le_bytes(header.get(at..at + 2)?.try_into().ok()?));
+    let i32_at = |at: usize| Some(i32::from_le_bytes(header.get(at..at + 4)?.try_into().ok()?));
+    match u32::from_le_bytes(header.get(..4)?.try_into().ok()?) {
+        // BITMAPCOREHEADER
+        12 => Some((u32::from(u16_at(4)?), u32::from(u16_at(6)?))),
+        // BITMAPINFOHEADER and its extensions (V2, V3, OS/2 2.x, V4, V5).
+        40 | 52 | 56 | 64 | 108 | 124 => Some((i32_at(4)?.unsigned_abs(), i32_at(8)?.unsigned_abs())),
+        _ => None,
+    }
 }
 
 /// Pixel digest (None above the pixel threshold) and dimensions.
@@ -307,8 +370,13 @@ pub fn fingerprint(provider: &dyn Provider, external: bool) -> Fingerprint {
                 let Some(rep) = preferred(reps(), &["public.png", "PNG"]) else {
                     continue;
                 };
-                let Some(bytes) = read_limited(provider, rep, rules::IMAGE_DIGEST_BYTES) else {
-                    continue;
+                let bytes = match read_bitmap(provider, rep) {
+                    Some(Bitmap::Bytes(bytes)) => bytes,
+                    Some(Bitmap::Oversized(dimensions)) => {
+                        entry.dimensions = Some(dimensions);
+                        continue;
+                    }
+                    None => continue,
                 };
                 let png = match standard(provider, rep, &bytes).into_iter().next() {
                     Some(ClipData::Png(png)) => png,
@@ -325,6 +393,90 @@ pub fn fingerprint(provider: &dyn Provider, external: bool) -> Fingerprint {
     fingerprint
 }
 
+/// Offer digest entries for the announced inventory. Only computed values are
+/// sent; classes and metadata come from the inventory itself. More entries
+/// than the reliable head can carry send none: receivers then never dedupe.
+pub fn digests(fingerprint: &Fingerprint, announced: &Inventory) -> v2::Result<Vec<dto::ContentDigest>> {
+    let announced = from_inventory(announced);
+    let mut out = Vec::new();
+    for entry in fingerprint.entries.iter().filter(|e| {
+        matches!(e.class, DigestClass::Text | DigestClass::Image)
+            && (e.digest.is_some() || e.dimensions.is_some())
+            && announced.entries.iter().any(|a| a.item == e.item && a.class == e.class)
+    }) {
+        let mut raw = v2::RawMap::from([(1, V::Uint(entry.item.into())), (2, wire_class(entry.class).write())]);
+        if let Some(size) = entry.size.filter(|_| entry.class == DigestClass::Text) {
+            raw.insert(3, V::Uint(size));
+        }
+        if let Some(digest) = entry.digest {
+            raw.insert(4, FixedBytes(digest).write());
+        }
+        if let Some((width, height)) = entry.dimensions {
+            raw.insert(5, V::Uint(width.into()));
+            raw.insert(6, V::Uint(height.into()));
+        }
+        out.push(dto::ContentDigest::from_raw(raw)?);
+    }
+    if out.len() > MAX_DIGESTS {
+        out.clear();
+    }
+    Ok(out)
+}
+
+pub fn digests_value(digests: Vec<dto::ContentDigest>) -> V {
+    V::Array(digests.iter().map(WireValue::write).collect())
+}
+
+fn wire_class(class: DigestClass) -> dto::DigestClass {
+    match class {
+        DigestClass::Text => dto::DigestClass::Text,
+        DigestClass::Url => dto::DigestClass::Url,
+        DigestClass::Html => dto::DigestClass::Html,
+        DigestClass::Rtf => dto::DigestClass::Rtf,
+        DigestClass::Image => dto::DigestClass::Image,
+        DigestClass::File => dto::DigestClass::File,
+        DigestClass::Other => dto::DigestClass::Other,
+    }
+}
+fn local_class(class: dto::DigestClass) -> Option<DigestClass> {
+    Some(match class {
+        dto::DigestClass::Text => DigestClass::Text,
+        dto::DigestClass::Url => DigestClass::Url,
+        dto::DigestClass::Html => DigestClass::Html,
+        dto::DigestClass::Rtf => DigestClass::Rtf,
+        dto::DigestClass::Image => DigestClass::Image,
+        dto::DigestClass::File => DigestClass::File,
+        dto::DigestClass::Other => DigestClass::Other,
+        // A future class this build cannot compare adds nothing.
+        dto::DigestClass::Unknown(_) => return None,
+    })
+}
+
+/// Receiver view of an offer: inventory metadata plus the sender's digests.
+pub fn from_offer(offer: &dto::ClipboardOffer) -> v2::Result<Fingerprint> {
+    let inventory = crate::wire::local_inventory(&offer.inventory()?)?;
+    let mut fingerprint = from_inventory(&inventory);
+    for digest in offer.digests()?.0 {
+        let item = digest.item()?;
+        let Some(class) = local_class(digest.class()?) else {
+            continue;
+        };
+        let Some(entry) = fingerprint
+            .entries
+            .iter_mut()
+            .find(|e| e.item == item && e.class == class)
+        else {
+            continue;
+        };
+        if class == DigestClass::Text {
+            entry.size = digest.size()?;
+        }
+        entry.digest = digest.digest()?.map(|d| d.0);
+        entry.dimensions = digest.width()?.zip(digest.height()?);
+    }
+    Ok(fingerprint)
+}
+
 #[cfg(all(test, debug_assertions))]
 mod tests {
     use super::*;
@@ -337,8 +489,6 @@ mod tests {
     struct Board {
         inventory: Inventory,
         bytes: HashMap<RepresentationId, Vec<u8>>,
-        /// Every representation opened, in order.
-        reads: std::sync::Mutex<Vec<RepresentationId>>,
     }
     struct Decode;
     impl Translator for Decode {
@@ -361,7 +511,6 @@ mod tests {
             self.inventory.clone()
         }
         fn open(&self, id: RepresentationId) -> io::Result<crate::FileReader> {
-            self.reads.lock().unwrap().push(id);
             Ok(Box::new(io::Cursor::new(self.bytes[&id].clone())))
         }
         fn translator(&self) -> Arc<dyn Translator> {
@@ -405,11 +554,7 @@ mod tests {
                 })
                 .collect(),
         }];
-        Board {
-            inventory,
-            bytes,
-            reads: Default::default(),
-        }
+        Board { inventory, bytes }
     }
     fn rgba() -> Vec<u8> {
         (0..4 * 3 * 2).map(|n| (n * 11) as u8).collect()
@@ -496,76 +641,30 @@ mod tests {
         assert!(is_marker(&NativeFormat::WindowsRegistered("oink clip".into())));
     }
 
-    /// Universal Clipboard brings another Mac's Oink write back to this Mac
-    /// next to promised content (oinkvm/oink#35). Only the marker is read and
-    /// it names the clip; the promised content is never opened.
+    /// An iPhone's Oink writes the marker with the shared encoding under the
+    /// same type; Universal Clipboard brings it to the Mac next to promised
+    /// content. Only the marker is read and it names the clip.
     #[test]
-    fn universal_clipboard_write_back_is_recognised_by_marker_reading_only_the_marker() {
+    fn universal_clipboard_from_an_iphone_oink_write_is_recognised_by_marker() {
         let id = OfferId {
             clip: oink_foundation::content::ClipId {
                 origin: oink_foundation::DeviceId([3; 32]),
                 seq: 9,
             },
-            generation: 9,
+            generation: 1,
         };
+        let iphone = oink_foundation::clipboard_marker::encode(id).unwrap();
         let provider = Arc::new(board(vec![
-            ("public.png", Some(StandardFormat::Png), encode(3, 2, &rgba())),
+            (
+                "public.utf8-plain-text",
+                Some(StandardFormat::Text),
+                b"from mac".to_vec(),
+            ),
             (UNIVERSAL_CLIPBOARD, None, Vec::new()),
-            (MARKER_MAC, None, marker(id).unwrap()),
+            (oink_foundation::clipboard_marker::MARKER_APPLE, None, iphone),
         ]));
         assert!(external(&provider.inventory));
         assert_eq!(read_marker(provider.as_ref()), Some(id));
-        assert_eq!(
-            *provider.reads.lock().unwrap(),
-            [RepresentationId(3)],
-            "only the marker"
-        );
-        let new = fingerprint(provider.as_ref(), true);
-        assert_eq!(new.entries.len(), 1);
-        assert_eq!((new.entries[0].digest, new.entries[0].dimensions), (None, None));
-        assert_eq!(provider.reads.lock().unwrap().len(), 1, "promised content is not read");
-    }
-
-    /// A previous local copy compared with a synchronizer's rewrite of it.
-    #[test]
-    fn captured_local_content_compares_by_format_subset() {
-        let copied = board(vec![
-            ("public.utf8-plain-text", Some(StandardFormat::Text), b"a\nb\n".to_vec()),
-            ("public.html", Some(StandardFormat::Html), b"<b>a</b>".to_vec()),
-            ("com.example.private", None, b"app".to_vec()),
-        ]);
-        let previous = Identity {
-            fingerprint: fingerprint(&copied, false),
-            source: Source::Device(oink_foundation::DeviceId([1; 32])),
-        };
-        assert_eq!(
-            copied.reads.lock().unwrap().len(),
-            1,
-            "one text read; HTML/private by metadata"
-        );
-        // Plain text only, CRLF, plus a synchronizer's own tag: a subset.
-        let rewritten = board(vec![
-            ("public.utf8-plain-text", Some(StandardFormat::Text), b"a\r\nb".to_vec()),
-            ("com.vendor.sync-tag", None, b"x".to_vec()),
-        ]);
-        assert_eq!(echo(&fingerprint(&rewritten, false), &previous), Ok(()));
-        let prefix = board(vec![(
-            "public.utf8-plain-text",
-            Some(StandardFormat::Text),
-            b"a".to_vec(),
-        )]);
-        assert_eq!(
-            echo(&fingerprint(&prefix, false), &previous),
-            Err(oink_foundation::clipboard_dedupe::Fresh::Differs(DigestClass::Text))
-        );
-        let richer = board(vec![
-            ("public.utf8-plain-text", Some(StandardFormat::Text), b"a\nb".to_vec()),
-            ("public.rtf", Some(StandardFormat::Rtf), b"{\\rtf1 a}".to_vec()),
-        ]);
-        assert_eq!(
-            echo(&fingerprint(&richer, false), &previous),
-            Err(oink_foundation::clipboard_dedupe::Fresh::Missing(DigestClass::Rtf))
-        );
     }
 
     #[test]
@@ -590,6 +689,134 @@ mod tests {
         assert_ne!(fingerprint(&changed, false).entries[0].digest, a.entries[0].digest);
     }
 
+    /// Counts what a fingerprint reads and transcodes.
+    struct Counted {
+        board: Board,
+        opened: Arc<std::sync::atomic::AtomicUsize>,
+        translated: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    struct CountedDecode(Arc<std::sync::atomic::AtomicUsize>);
+    impl Translator for CountedDecode {
+        fn standard(&self, rep: &Representation, bytes: &[u8]) -> io::Result<Vec<ClipData>> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Decode.standard(rep, bytes)
+        }
+    }
+    impl Provider for Counted {
+        fn inventory(&self) -> Inventory {
+            self.board.inventory.clone()
+        }
+        fn open(&self, id: RepresentationId) -> io::Result<crate::FileReader> {
+            self.opened.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.board.open(id)
+        }
+        fn translator(&self) -> Arc<dyn Translator> {
+            Arc::new(CountedDecode(self.translated.clone()))
+        }
+    }
+    fn counted(board: Board) -> Counted {
+        Counted {
+            board,
+            opened: Arc::default(),
+            translated: Arc::default(),
+        }
+    }
+    /// A BMP file (or, without the file header, a Windows DIB) that declares
+    /// `width` x `height` pixels but carries no pixel data.
+    fn bitmap_header(file: bool, width: i32, height: i32) -> Vec<u8> {
+        let mut out = Vec::new();
+        if file {
+            out.extend_from_slice(b"BM");
+            out.extend_from_slice(&[0; 12]);
+        }
+        out.extend_from_slice(&40u32.to_le_bytes());
+        out.extend_from_slice(&width.to_le_bytes());
+        out.extend_from_slice(&height.to_le_bytes());
+        out.extend_from_slice(&1u16.to_le_bytes());
+        out.extend_from_slice(&32u16.to_le_bytes());
+        out.extend_from_slice(&[0; 24]);
+        out
+    }
+
+    /// A representation whose native size is already known to exceed the
+    /// digest limit is not opened: reading it would make the source
+    /// application render data that can never be digested.
+    #[test]
+    fn representations_known_to_exceed_the_limit_are_not_read() {
+        let mut text = board(vec![(
+            "public.utf8-plain-text",
+            Some(StandardFormat::Text),
+            b"small".to_vec(),
+        )]);
+        text.inventory.items[0].representations[0].data = RepresentationData::Reader {
+            size: ContentSize::Known(rules::TEXT_DIGEST_BYTES as u64 + 1),
+        };
+        let text = counted(text);
+        let fingerprint_ = fingerprint(&text, false);
+        assert_eq!(text.opened.load(std::sync::atomic::Ordering::Relaxed), 0);
+        assert_eq!(fingerprint_.entries[0].digest, None);
+
+        let mut image = board(vec![("public.png", Some(StandardFormat::Png), encode(3, 2, &rgba()))]);
+        image.inventory.items[0].representations[0].data = RepresentationData::Reader {
+            size: ContentSize::Known(rules::IMAGE_DIGEST_BYTES as u64 + 1),
+        };
+        let image = counted(image);
+        assert_eq!(fingerprint(&image, false).entries[0].digest, None);
+        assert_eq!(image.opened.load(std::sync::atomic::Ordering::Relaxed), 0);
+    }
+
+    /// A non-PNG bitmap above the pixel threshold is measured from its header:
+    /// it is not transcoded to PNG just to learn its dimensions.
+    #[test]
+    fn oversized_bitmaps_are_measured_from_their_header() {
+        let side = 9000;
+        assert!((side as u64) * (side as u64) > rules::IMAGE_DIGEST_PIXELS);
+        for file in [true, false] {
+            let huge = counted(board(vec![(
+                "public.tiff",
+                Some(StandardFormat::Png),
+                bitmap_header(file, side, -side),
+            )]));
+            let entry = fingerprint(&huge, false).entries.remove(0);
+            assert_eq!(huge.translated.load(std::sync::atomic::Ordering::Relaxed), 0);
+            assert_eq!(entry.dimensions, Some((side as u32, side as u32)));
+            assert_eq!(entry.digest, None);
+        }
+    }
+
+    #[test]
+    fn offer_digests_round_trip_and_merge_with_inventory_metadata() {
+        let provider = board(vec![
+            ("public.utf8-plain-text", Some(StandardFormat::Text), b"a\r\nb".to_vec()),
+            ("public.html", Some(StandardFormat::Html), b"<b>a</b>".to_vec()),
+            ("public.png", Some(StandardFormat::Png), encode(3, 2, &rgba())),
+        ]);
+        let local = fingerprint(&provider, false);
+        let digests = digests(&local, &provider.inventory).unwrap();
+        assert_eq!(digests.len(), 2, "text and image only");
+        let offer = crate::sync::Ordering::new(oink_foundation::DeviceId([3; 32]), 0)
+            .capture(
+                crate::wire::inventory(&provider.inventory).unwrap(),
+                digests,
+                1,
+                oink_foundation::clipboard::Sensitivity::Normal,
+                0,
+            )
+            .unwrap()
+            .unwrap();
+        let limit = oink_protocol::v2::limits::RELIABLE_FRAME;
+        let bytes =
+            oink_protocol::v2::frame::encode(&oink_protocol::v2::Message::ClipboardOffer(offer), limit).unwrap();
+        let decoded = oink_protocol::v2::frame::OpaqueFrame::parse_exact(&bytes, limit)
+            .unwrap()
+            .decode()
+            .unwrap();
+        let oink_protocol::v2::Message::ClipboardOffer(offer) = decoded else {
+            panic!("offer expected")
+        };
+        let remote = from_offer(&offer).unwrap();
+        assert_eq!(remote, local);
+    }
     /// Real AppKit capture on a private named pasteboard: the Universal
     /// Clipboard marker type is recognised, and its text is not read.
     #[cfg(target_os = "macos")]

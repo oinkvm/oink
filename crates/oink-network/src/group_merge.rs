@@ -7,12 +7,12 @@ use crate::{
     wire_identity as wire,
 };
 use oink_foundation::{DeviceId, GroupId};
-use oink_protocol::v1::{
-    self, RawMap, RawValue, dto, retained,
+use oink_protocol::v2::{
+    self, RawMap, RawValue, dto, layout,
     schema::{WireDto, WireValue},
 };
 use std::collections::{BTreeMap, BTreeSet};
-type Result<T> = v1::Result<T>;
+type Result<T> = v2::Result<T>;
 pub fn group_ref(anchor: Anchor) -> dto::GroupRef {
     dto::GroupRef::from_raw(
         [
@@ -30,11 +30,11 @@ pub fn anchor(reference: &dto::GroupRef) -> Result<Anchor> {
     })
 }
 pub fn digest<T: WireDto>(value: &T) -> Result<[u8; 32]> {
-    Ok(retained::sha256(&value.encode(v1::limits::PAIR_OBJECT)?).0)
+    Ok(wire::object_digest(&value.encode(v2::limits::PAIR_OBJECT)?))
 }
 pub fn seed(source: &State, target: Anchor, sequence: u64) -> Result<dto::MergeSeed> {
     if source.roster().anchor() == target {
-        return Err(v1::ErrorCode::StateConflict.into());
+        return Err(v2::ErrorCode::StateConflict.into());
     }
     dto::MergeSeed::from_raw(
         [
@@ -67,16 +67,16 @@ pub fn prepare(
         || context.target_root_id()?.0 != target_anchor.root
         || seed.source_state_digest()?.0 != source.digest()?
     {
-        return Err(v1::ErrorCode::StateConflict.into());
+        return Err(v2::ErrorCode::StateConflict.into());
     }
     let source_member = source
         .roster()
         .member(source_issuer)
-        .ok_or(v1::ErrorCode::AuthenticationFailed)?;
+        .ok_or(v2::ErrorCode::AuthenticationFailed)?;
     let target_member = target
         .roster()
         .member(target_issuer)
-        .ok_or(v1::ErrorCode::AuthenticationFailed)?;
+        .ok_or(v2::ErrorCode::AuthenticationFailed)?;
     let mut members = Vec::new();
     let mut proposals = Vec::new();
     let mut union = BTreeSet::new();
@@ -109,7 +109,7 @@ pub fn prepare(
     if union.len() > crate::roster::MAX_MEMBERS
         || target.roster().wire().records()?.0.len() + proposals.len() > crate::roster::MAX_RECORDS
     {
-        return Err(v1::ErrorCode::LimitExceeded.into());
+        return Err(v2::ErrorCode::LimitExceeded.into());
     }
     let intent = dto::MergeIntent::from_raw(
         [
@@ -141,7 +141,7 @@ pub fn prepare(
         ]
         .into(),
     )?;
-    plan.encode(v1::limits::PAIR_OBJECT)?;
+    plan.encode(v2::limits::PAIR_OBJECT)?;
     Ok(plan)
 }
 pub fn verify_plan(
@@ -161,15 +161,15 @@ pub fn verify_plan(
         || plan.geometry_patch() != expected.geometry_patch()
         || plan.expected_result_registers() != expected.expected_result_registers()
     {
-        return Err(v1::ErrorCode::StateConflict.into());
+        return Err(v2::ErrorCode::StateConflict.into());
     }
     let bodies = expected.unsigned_adds()?.0;
     if proposed.len() != bodies.len() {
-        return Err(v1::ErrorCode::StateConflict.into());
+        return Err(v2::ErrorCode::StateConflict.into());
     }
     for (actual, expected) in proposed.iter().zip(bodies) {
         if (1..=9).any(|k| actual.raw().get(&k) != expected.raw().get(&k)) {
-            return Err(v1::ErrorCode::StateConflict.into());
+            return Err(v2::ErrorCode::StateConflict.into());
         }
     }
     validate_plan(&source.roster().clone(), plan)?;
@@ -178,28 +178,28 @@ pub fn verify_plan(
 fn validate_plan(source: &Roster, plan: &dto::MergePlan) -> Result<State> {
     let intent = plan.intent()?;
     if source.anchor() != anchor(&intent.source()?)? || source.digest()? != intent.source_roster_digest()?.0 {
-        return Err(v1::ErrorCode::AuthenticationFailed.into());
+        return Err(v2::ErrorCode::AuthenticationFailed.into());
     }
     let source_issuer = wire::read_device(&intent.source_issuer()?)?;
     let target_issuer = wire::read_device(&intent.target_issuer()?)?;
     if wire::read_pair(&intent.pair_id()?)?.initiator_boot.device_id != source_issuer
         || intent.source()?.group()? == intent.target()?.group()?
     {
-        return Err(v1::ErrorCode::AuthenticationFailed.into());
+        return Err(v2::ErrorCode::AuthenticationFailed.into());
     }
     if source.member(source_issuer).map(|m| m.add) != Some(intent.source_issuer_ref()?.0) {
-        return Err(v1::ErrorCode::AuthenticationFailed.into());
+        return Err(v2::ErrorCode::AuthenticationFailed.into());
     }
     let target = State::verify(plan.target_base()?, anchor(&intent.target()?)?)?;
     if target.digest()? != intent.target_base_digest()?.0
         || target.roster().member(target_issuer).map(|m| m.add) != Some(intent.target_issuer_ref()?.0)
     {
-        return Err(v1::ErrorCode::AuthenticationFailed.into());
+        return Err(v2::ErrorCode::AuthenticationFailed.into());
     }
     let imports = intent.members()?.0;
     let actual = source.members().collect::<Vec<_>>();
     if imports.len() != actual.len() {
-        return Err(v1::ErrorCode::StateConflict.into());
+        return Err(v2::ErrorCode::StateConflict.into());
     }
     let mut expected = BTreeMap::new();
     let mut union = target.roster().members().map(|m| m.device).collect::<BTreeSet<_>>();
@@ -211,7 +211,7 @@ fn validate_plan(source: &Roster, plan: &dto::MergePlan) -> Result<State> {
             .map(|m| Ok(m.epoch))
             .unwrap_or_else(|| target.roster().next_epoch(device))?;
         if device != member.device || import.source_add()?.0 != member.add || import.target_epoch()? != epoch {
-            return Err(v1::ErrorCode::StateConflict.into());
+            return Err(v2::ErrorCode::StateConflict.into());
         }
         union.insert(device);
         if !target.roster().contains(device) {
@@ -219,13 +219,13 @@ fn validate_plan(source: &Roster, plan: &dto::MergePlan) -> Result<State> {
         }
     }
     if union.len() > crate::roster::MAX_MEMBERS {
-        return Err(v1::ErrorCode::LimitExceeded.into());
+        return Err(v2::ErrorCode::LimitExceeded.into());
     }
     let proposals = plan.unsigned_adds()?.0;
     if proposals.len() != expected.len()
         || proposals.len() + target.roster().wire().records()?.0.len() > crate::roster::MAX_RECORDS
     {
-        return Err(v1::ErrorCode::LimitExceeded.into());
+        return Err(v2::ErrorCode::LimitExceeded.into());
     }
     let mut seen = BTreeSet::new();
     for proposal in proposals {
@@ -235,37 +235,37 @@ fn validate_plan(source: &Roster, plan: &dto::MergePlan) -> Result<State> {
             || proposal.kind()? != dto::RecordKind::Add
             || proposal.group()?.0 != target.roster().anchor().group.0
             || wire::read_device(&proposal.issuer()?)? != target_issuer
-            || proposal.issuer_ref()?.map(|r| r.0) != Some(intent.target_issuer_ref()?.0)
+            || proposal.issuer()? != intent.target_issuer()?
         {
-            return Err(v1::ErrorCode::AuthenticationFailed.into());
+            return Err(v2::ErrorCode::AuthenticationFailed.into());
         }
-        let member = source.member(subject).ok_or(v1::ErrorCode::AuthenticationFailed)?;
+        let member = source.member(subject).ok_or(v2::ErrorCode::AuthenticationFailed)?;
         if proposal.name()?.map(|s| s.0) != member.name || proposal.os()?.map(|s| s.0) != member.os {
-            return Err(v1::ErrorCode::StateConflict.into());
+            return Err(v2::ErrorCode::StateConflict.into());
         }
     }
     let patch = plan.geometry_patch()?;
     for screen in patch.appended_devices()?.0 {
         if !source.contains(screen_key(&screen)?) {
-            return Err(v1::ErrorCode::AuthenticationFailed.into());
+            return Err(v2::ErrorCode::AuthenticationFailed.into());
         }
     }
     if apply_geometry(&target, &plan.geometry_patch()?, target_issuer)? != plan.expected_result_registers()?.0 {
-        return Err(v1::ErrorCode::StateConflict.into());
+        return Err(v2::ErrorCode::StateConflict.into());
     }
     Ok(target)
 }
 pub fn authorization(identity: &Identity, plan: &dto::MergePlan, decision: u64) -> Result<dto::Signature> {
     if identity.id() != wire::read_device(&plan.intent()?.source_issuer()?)? {
-        return Err(v1::ErrorCode::AuthenticationFailed.into());
+        return Err(v2::ErrorCode::AuthenticationFailed.into());
     }
     signature(identity, &authorization_input(plan, decision)?)
 }
 fn authorization_input(plan: &dto::MergePlan, decision: u64) -> Result<Vec<u8>> {
     if decision == 0 {
-        return Err(v1::ErrorCode::StateConflict.into());
+        return Err(v2::ErrorCode::StateConflict.into());
     }
-    let mut input = v1::labels::MERGE_AUTHORIZE.to_vec();
+    let mut input = v2::labels::MERGE_AUTHORIZE.to_vec();
     input.extend_from_slice(&digest(&plan.intent()?)?);
     input.extend_from_slice(&digest(plan)?);
     input.extend_from_slice(&decision.to_le_bytes());
@@ -282,10 +282,10 @@ pub fn commit(
     let target = validate_plan(source, plan)?;
     let intent = plan.intent()?;
     if current.digest()? != target.digest()? || identity.id() != wire::read_device(&intent.target_issuer()?)? {
-        return Err(v1::ErrorCode::StateConflict.into());
+        return Err(v2::ErrorCode::StateConflict.into());
     }
     if decision == 0 {
-        return Err(v1::ErrorCode::StateConflict.into());
+        return Err(v2::ErrorCode::StateConflict.into());
     }
     check_signature_format(&source_signature)?;
     let roster = target.roster().sign_adds(identity, &plan.unsigned_adds()?.0)?;
@@ -312,8 +312,8 @@ pub fn commit(
         (7, decision.write()),
     ]
     .into();
-    let mut input = v1::labels::MERGE_COMMITTED.to_vec();
-    input.extend(v1::cbor::encode_map(&certificate, v1::limits::PAIR_OBJECT)?);
+    let mut input = v2::labels::MERGE_COMMITTED.to_vec();
+    input.extend(v2::cbor::encode_map(&certificate, v2::limits::PAIR_OBJECT)?);
     certificate.insert(5, signature(identity, &input)?.write());
     let bundle = dto::MergeTransferBundle::from_raw(
         [
@@ -324,14 +324,14 @@ pub fn commit(
         ]
         .into(),
     )?;
-    bundle.encode(v1::limits::PAIR_OBJECT)?;
+    bundle.encode(v2::limits::PAIR_OBJECT)?;
     Ok(bundle)
 }
 /// Validates the exact target result against the signed plan. For automatic
 /// adoption the caller additionally compares the source roster with local removal
 /// knowledge and requires its own active import before installing this result.
 pub fn verify_bundle(bundle: &dto::MergeTransferBundle, trusted_source: Anchor) -> Result<State> {
-    bundle.encode(v1::limits::PAIR_OBJECT)?;
+    bundle.encode(v2::limits::PAIR_OBJECT)?;
     let certificate = bundle.certificate()?;
     let intent = certificate.intent()?;
     let plan = bundle.plan()?;
@@ -339,17 +339,17 @@ pub fn verify_bundle(bundle: &dto::MergeTransferBundle, trusted_source: Anchor) 
         || plan.intent()? != intent
         || digest(&plan)? != certificate.plan_digest()?.0
     {
-        return Err(v1::ErrorCode::AuthenticationFailed.into());
+        return Err(v2::ErrorCode::AuthenticationFailed.into());
     }
     let source = Roster::verify(bundle.source_roster()?, trusted_source)?;
     let target = validate_plan(&source, &plan)?;
     let source_issuer = wire::read_device(&intent.source_issuer()?)?;
     let target_issuer = wire::read_device(&intent.target_issuer()?)?;
     if wire::read_device(&certificate.permit_coordinator()?)? != source_issuer.min(target_issuer) {
-        return Err(v1::ErrorCode::AuthenticationFailed.into());
+        return Err(v2::ErrorCode::AuthenticationFailed.into());
     }
     if certificate.permit_decision()? == 0 {
-        return Err(v1::ErrorCode::StateConflict.into());
+        return Err(v2::ErrorCode::StateConflict.into());
     }
     check_signature_format(&certificate.source_signature()?)?;
     check_signature_format(&certificate.target_signature()?)?;
@@ -359,7 +359,7 @@ pub fn verify_bundle(bundle: &dto::MergeTransferBundle, trusted_source: Anchor) 
             .roster()
             .accepts_exact_adds(result.roster(), &plan.unsigned_adds()?.0)?
     {
-        return Err(v1::ErrorCode::AuthenticationFailed.into());
+        return Err(v2::ErrorCode::AuthenticationFailed.into());
     }
     let mut expected = target.wire().raw().clone();
     expected.insert(3, result.roster().wire().write());
@@ -374,7 +374,7 @@ pub fn verify_bundle(bundle: &dto::MergeTransferBundle, trusted_source: Anchor) 
         ),
     );
     if &expected != result.wire().raw() {
-        return Err(v1::ErrorCode::StateConflict.into());
+        return Err(v2::ErrorCode::StateConflict.into());
     }
     // Roster envelope extensions are target-owned and must not change at commit.
     if target
@@ -390,7 +390,7 @@ pub fn verify_bundle(bundle: &dto::MergeTransferBundle, trusted_source: Anchor) 
             .keys()
             .any(|k| *k != 3 && !target.roster().wire().raw().contains_key(k))
     {
-        return Err(v1::ErrorCode::StateConflict.into());
+        return Err(v2::ErrorCode::StateConflict.into());
     }
     Ok(result)
 }
@@ -405,7 +405,7 @@ pub fn adopt(bundle: &dto::MergeTransferBundle, current: &State, local: DeviceId
             .any(|m| m.device().and_then(|d| wire::read_device(&d)) == Ok(local))
         || !result.roster().contains(local)
     {
-        return Err(v1::ErrorCode::AuthenticationFailed.into());
+        return Err(v2::ErrorCode::AuthenticationFailed.into());
     }
     Ok(result)
 }
@@ -422,7 +422,7 @@ fn signature(identity: &Identity, input: &[u8]) -> Result<dto::Signature> {
 // Continue emitting v1 signatures, and retain their structural validation.
 fn check_signature_format(signature: &dto::Signature) -> Result<()> {
     if signature.algorithm()?.0 != dto::ED25519 {
-        return Err(v1::ErrorCode::AuthenticationFailed.into());
+        return Err(v2::ErrorCode::AuthenticationFailed.into());
     }
     Ok(())
 }
@@ -454,7 +454,7 @@ fn bounds(groups: &[dto::DevicePlacement]) -> Result<Option<(f64, f64, f64)>> {
 }
 fn geometry_patch(source: &State, target: &State) -> Result<dto::GeometryPatch> {
     for state in [source, target] {
-        v1::layout::require_supported_geometry(&dto::LayoutValue::from_raw(state.layout()?.value()?)?)?;
+        v2::layout::require_supported_geometry(&dto::LayoutValue::from_raw(state.layout()?.value()?)?)?;
     }
     let keep = screens(target)?;
     let keys = keep.iter().map(screen_key).collect::<Result<BTreeSet<_>>>()?;
@@ -476,7 +476,7 @@ fn geometry_patch(source: &State, target: &State) -> Result<dto::GeometryPatch> 
         (0.0, 0.0)
     };
     if !dx.is_finite() || !dy.is_finite() {
-        return Err(v1::ErrorCode::UnsupportedValue.into());
+        return Err(v2::ErrorCode::UnsupportedValue.into());
     }
     for group in &mut arriving {
         let mut raw = group.raw().clone();
@@ -497,13 +497,13 @@ fn geometry_patch(source: &State, target: &State) -> Result<dto::GeometryPatch> 
 }
 fn apply_geometry(target: &State, patch: &dto::GeometryPatch, writer: DeviceId) -> Result<Vec<dto::Register>> {
     if patch.raw().keys().any(|key| !matches!(key, 1 | 3 | 4)) || patch.source()? != dto::LayoutSource::Manual {
-        return Err(v1::ErrorCode::UnsupportedValue.into());
+        return Err(v2::ErrorCode::UnsupportedValue.into());
     }
     let appended = patch.appended_devices()?.0;
     let mut registers = target.wire().registers()?.0;
     let current = target.layout()?;
     let mut layout = dto::LayoutValue::from_raw(current.value()?)?;
-    v1::layout::require_supported_geometry(&layout)?;
+    v2::layout::require_supported_geometry(&layout)?;
     if appended.is_empty() {
         return Ok(registers);
     }
@@ -513,27 +513,27 @@ fn apply_geometry(target: &State, patch: &dto::GeometryPatch, writer: DeviceId) 
     for screen in &appended {
         let key = screen_key(screen)?;
         if !keys.insert(key) || previous.as_ref().is_some_and(|p| p >= &key) {
-            return Err(v1::ErrorCode::StateConflict.into());
+            return Err(v2::ErrorCode::StateConflict.into());
         }
         previous = Some(key);
     }
     if keep.len() + appended.len() > 256 {
-        return Err(v1::ErrorCode::LimitExceeded.into());
+        return Err(v2::ErrorCode::LimitExceeded.into());
     }
     keep.extend(appended);
     let mut raw = layout.into_raw();
     raw.insert(1, RawValue::Array(keep.iter().map(WireValue::write).collect()));
     raw.insert(2, dto::LayoutSource::Manual.write());
     layout = dto::LayoutValue::from_raw(raw)?;
-    v1::layout::require_supported_geometry(&layout)?;
-    let edited = retained::edit_register(&current, &current.version()?, wire::device(writer), |value| {
+    v2::layout::require_supported_geometry(&layout)?;
+    let edited = layout::edit_register(&current, &current.version()?, wire::device(writer), |value| {
         *value = layout.into_raw();
         Ok(())
     })?;
     *registers
         .iter_mut()
         .find(|r| r.kind() == Ok(2))
-        .ok_or(v1::ErrorCode::MalformedFrame)? = edited;
+        .ok_or(v2::ErrorCode::MalformedFrame)? = edited;
     Ok(registers)
 }
 
@@ -599,8 +599,8 @@ mod tests {
         // v1 signatures are still produced for older peers.
         let mut raw = proof.certificate().unwrap().into_raw();
         let signature = dto::Signature::from_raw(raw.remove(&5).unwrap().as_map().unwrap().clone()).unwrap();
-        let mut input = v1::labels::MERGE_COMMITTED.to_vec();
-        input.extend(v1::cbor::encode_map(&raw, v1::limits::PAIR_OBJECT).unwrap());
+        let mut input = v2::labels::MERGE_COMMITTED.to_vec();
+        input.extend(v2::cbor::encode_map(&raw, v2::limits::PAIR_OBJECT).unwrap());
         assert!(crate::identity::verify_strict(
             &b.id(),
             &input,
@@ -633,7 +633,7 @@ mod tests {
     }
     fn add_screens(state: &State, identity: &Identity, screens: Vec<RawValue>) -> State {
         let current = state.layout().unwrap();
-        let layout = retained::edit_register(
+        let layout = layout::edit_register(
             &current,
             &current.version().unwrap(),
             wire::device(identity.id()),
@@ -784,50 +784,23 @@ mod tests {
         assert_eq!(result.wire().raw().get(&99), target.wire().raw().get(&99));
     }
     #[test]
-    fn unsupported_geometry_is_retained_but_cannot_be_prepared_or_applied() {
+    fn geometry_projection_retains_unknown_screen_identity_fields() {
         let a = Identity::from_seed([1; 32]);
         let b = Identity::from_seed([2; 32]);
         let target = State::create(&b, "b", "test", 1).unwrap();
-        let mut future = screen(a.id(), "future", 0.0, 0.0, 1.0, 1.0);
-        let RawValue::Map(raw) = &mut future else {
-            unreachable!()
-        };
-        raw.insert(99, RawValue::from("unknown geometry"));
-        let source = add_screens(&State::create(&a, "a", "test", 1).unwrap(), &a, vec![future.clone()]);
-        let before = source.wire().encode(v1::limits::CONFIG_STATE).unwrap();
-        assert_eq!(
-            geometry_patch(&source, &target).unwrap_err().code,
-            v1::ErrorCode::UnsupportedValue
+        let source = add_screens(
+            &State::create(&a, "a", "test", 1).unwrap(),
+            &a,
+            vec![screen(a.id(), "future", 0.0, 0.0, 1.0, 1.0)],
         );
-        let patch = dto::GeometryPatch::from_raw(
-            [
-                (
-                    1,
-                    RawValue::Array(screens(&source).unwrap().iter().map(WireValue::write).collect()),
-                ),
-                (
-                    3,
-                    dto::Point::from_raw([(1, 0.0f64.write()), (2, 0.0f64.write())].into())
-                        .unwrap()
-                        .write(),
-                ),
-            ]
-            .into(),
-        )
-        .unwrap();
-        assert_eq!(
-            apply_geometry(&target, &patch, b.id()).unwrap_err().code,
-            v1::ErrorCode::UnsupportedValue
-        );
-        let empty = dto::GeometryPatch::from_raw(
-            [(1, RawValue::Array(vec![])), (3, patch.translation().unwrap().write())].into(),
-        )
-        .unwrap();
-        assert_eq!(
-            apply_geometry(&source, &empty, a.id()).unwrap_err().code,
-            v1::ErrorCode::UnsupportedValue
-        );
-        assert_eq!(source.wire().encode(v1::limits::CONFIG_STATE).unwrap(), before);
+        let before = source.wire().encode(v2::limits::CONFIG_STATE).unwrap();
+        let patch = geometry_patch(&source, &target).unwrap();
+        let registers = apply_geometry(&target, &patch, b.id()).unwrap();
+        let layout = registers.iter().find(|r| r.kind() == Ok(2)).unwrap();
+        let layout = dto::LayoutValue::from_raw(layout.value().unwrap()).unwrap();
+        let arrived = layout.devices().unwrap().0[0].screens().unwrap().0[0].clone();
+        assert!(arrived.id().unwrap().raw().contains_key(&99));
+        assert_eq!(source.wire().encode(v2::limits::CONFIG_STATE).unwrap(), before);
     }
     #[test]
     fn wrong_signer_zero_permit_changed_base_and_extra_result_are_rejected() {

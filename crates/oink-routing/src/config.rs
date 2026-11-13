@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 pub enum Os {
     MacOS,
     Windows,
+    Android,
     Other,
 }
 
@@ -19,6 +20,8 @@ impl Os {
             Os::MacOS
         } else if cfg!(windows) {
             Os::Windows
+        } else if cfg!(target_os = "android") {
+            Os::Android
         } else {
             Os::Other
         }
@@ -29,6 +32,7 @@ impl Os {
         match self {
             Os::MacOS => "macos",
             Os::Windows => "windows",
+            Os::Android => "android",
             Os::Other => "other",
         }
     }
@@ -37,6 +41,7 @@ impl Os {
         match s {
             "macos" => Os::MacOS,
             "windows" => Os::Windows,
+            "android" => Os::Android,
             _ => Os::Other,
         }
     }
@@ -193,6 +198,9 @@ pub struct RouterConfig {
     ///   (for example, an event-tap timeout). Release the recorded target first,
     ///   再当作新的按下处理。
     pub capture_reports_key_repeat: bool,
+    /// A screenless member (a phone, protocol §14): never the focus holder, no
+    /// local cursor; its input comes from the control page (`member_input`).
+    pub screenless: bool,
 }
 
 impl RouterConfig {
@@ -205,6 +213,7 @@ impl RouterConfig {
             app_version: env!("CARGO_PKG_VERSION").to_string(),
             settings: RoutingSettings::default(),
             capture_reports_key_repeat: true,
+            screenless: false,
         }
     }
 }

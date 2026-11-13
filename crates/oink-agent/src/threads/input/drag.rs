@@ -2,7 +2,7 @@
 use super::InputCommand;
 use oink_foundation::content::{ClipId, Holder, OfferId};
 use oink_foundation::{DeviceId, clipboard::ClipData};
-use oink_protocol::v1::{
+use oink_protocol::v2::{
     self, Message, RawValue, dto,
     schema::{WireDto, WireValue},
 };
@@ -40,9 +40,9 @@ impl Declaration {
         }
         .clone()?;
         let attachment = next_attachment();
-        let patch = |prefix: dto::DndNotice| -> v1::Result<dto::DndNotice> {
+        let patch = |prefix: dto::DndNotice| -> v2::Result<dto::DndNotice> {
             let mut envelope = crate::dnd::wire::notice(&notice.clone_without_items())?.into_raw();
-            let key = dto::DragKey::read(envelope.get(&1).ok_or(v1::ErrorCode::MalformedFrame)?)?;
+            let key = dto::DragKey::read(envelope.get(&1).ok_or(v2::ErrorCode::MalformedFrame)?)?;
             let mut inventory = prefix.inventory()?.into_raw();
             inventory.insert(1, key.offer()?.write());
             envelope.insert(7, RawValue::Map(inventory));

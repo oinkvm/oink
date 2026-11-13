@@ -7,7 +7,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Registry lookup grants a reader the offer's exact provider generation. The
 /// registry retains only real clipboard file references in a bounded FIFO; raw
-/// representations and Drop sources keep their ordinary owner lifetimes.
+/// representations and Drop sources keep their ordinary owner lifetimes. The
+/// clipboard registry also records announced real files by path, so phones
+/// read them after the registration is gone (`announced`).
 #[derive(Default)]
 pub struct Registry(
     Mutex<HashMap<OfferId, Weak<Source>>>,
@@ -15,6 +17,8 @@ pub struct Registry(
     Mutex<HashMap<DeliveryId, ClipboardReceipt>>,
     Arc<Mutex<std::collections::VecDeque<RetainedFile>>>,
     Option<grants::SourceGrants>,
+    std::sync::OnceLock<Arc<announced::AnnouncedFiles>>,
+    std::sync::OnceLock<Arc<crate::history::Store>>,
 );
 
 const RETAINED_FILES: usize = 1024;
@@ -65,6 +69,8 @@ struct Source {
     valid: AtomicBool,
     activity: Mutex<Activity>,
     clipboard_source: std::sync::OnceLock<Arc<dyn namespace::Namespace>>,
+    historical: bool,
+    history_header: std::sync::OnceLock<(u64, bool)>,
 }
 struct Activity {
     started: bool,
@@ -74,10 +80,26 @@ struct Activity {
 }
 impl Drop for Source {
     fn drop(&mut self) {
-        self.discard_pending();
+        if !self.historical {
+            self.discard_pending();
+        }
     }
 }
 impl Source {
+    fn current(&self, history: Option<&crate::history::Store>) -> bool {
+        self.valid.load(Ordering::Acquire)
+            && !self.history_header.get().is_some_and(|(clock, head_only)| {
+                *head_only
+                    && history.and_then(crate::history::Store::head_key).is_some_and(|head| {
+                        head > oink_foundation::clipboard_history::OrderKey {
+                            clock: *clock,
+                            origin: self.offer.clip.origin,
+                            seq: self.offer.clip.seq,
+                            generation: self.offer.generation,
+                        }
+                    })
+            })
+    }
     fn discard_pending(&self) {
         if let Some(grants) = &self.grants
             && grants.discard_pending(self.offer).is_err()
@@ -145,6 +167,12 @@ impl SourceLease {
     pub fn inventory(&self) -> Inventory {
         self.0.provider.inventory()
     }
+    pub fn set_history(&self, clock: u64, head_only: bool) {
+        let _ = self.0.history_header.set((clock, head_only));
+    }
+    pub fn provider(&self) -> Arc<dyn Provider> {
+        self.0.provider.clone()
+    }
 }
 impl Registry {
     #[cfg(debug_assertions)]
@@ -175,7 +203,74 @@ impl Registry {
             Default::default(),
             Default::default(),
             Some(grants),
+            Default::default(),
+            Default::default(),
         )
+    }
+
+    /// Record announced real clipboard files in `files` from now on, and
+    /// serve phones from it once a registration is gone. Set once, by the
+    /// clipboard owner, before the first registration.
+    pub fn set_announced_files(&self, files: Arc<announced::AnnouncedFiles>) {
+        let _ = self.5.set(files);
+    }
+
+    pub fn set_history(&self, store: Arc<crate::history::Store>) {
+        let _ = self.6.set(store);
+    }
+    /// The current provider preserves private native formats. Historical portable
+    /// slots and file identities are independent of that native clipboard slot.
+    fn source_for(&self, offer: OfferId) -> Option<Arc<Source>> {
+        let live = self.0.lock().unwrap().get(&offer).and_then(Weak::upgrade);
+        if let Some(source) = &live
+            && source.valid.load(Ordering::Acquire)
+        {
+            return source.current(self.6.get().map(Arc::as_ref)).then_some(source.clone());
+        }
+        let cached = self.6.get().and_then(|store| {
+            let files = live
+                .as_ref()
+                .filter(|s| s.valid.load(Ordering::Acquire))
+                .and_then(|s| s.provider.namespace())
+                .or_else(|| self.announced(offer));
+            store.provider(offer, files)
+        });
+        let Some(cached) = cached else {
+            return live;
+        };
+        let provider: Arc<dyn Provider> = cached;
+        Some(Arc::new(Source {
+            grants: self.4.clone(),
+            offer,
+            provider,
+            valid: AtomicBool::new(true),
+            activity: Mutex::new(Activity::receiving()),
+            clipboard_source: Default::default(),
+            historical: true,
+            history_header: Default::default(),
+        }))
+    }
+    /// Window eviction releases references; it never removes users' source files.
+    pub fn forget_history(&self, offer: OfferId) {
+        if let Some(source) = self
+            .0
+            .lock()
+            .unwrap()
+            .remove(&offer)
+            .and_then(|source| source.upgrade())
+        {
+            SourceLease(source).cancel();
+        }
+        self.3.lock().unwrap().retain(|f| f._source.offer != offer);
+        if let Some(files) = self.5.get() {
+            files.forget(offer);
+        }
+    }
+
+    /// The announced real files of `offer` rebuilt from their recorded paths
+    /// (blocking), when this registry records them and any is still there.
+    fn announced(&self, offer: OfferId) -> Option<Arc<dyn namespace::Namespace>> {
+        restore_announced(self.5.get()?, offer)
     }
 
     fn begin_clipboard(self: &Arc<Self>, peer: DeviceId, delivery: DeliveryId) -> io::Result<()> {
@@ -183,11 +278,7 @@ impl Registry {
             return Err(unavailable(Unavailable::Permission));
         }
         let source = self
-            .0
-            .lock()
-            .unwrap()
-            .get(&delivery.offer)
-            .and_then(Weak::upgrade)
+            .source_for(delivery.offer)
             .filter(|source| source.valid.load(Ordering::Acquire))
             .ok_or_else(|| unavailable(Unavailable::NoSuchItem))?;
         let key = (delivery.offer, peer);
@@ -322,6 +413,8 @@ impl Registry {
             provider,
             valid: AtomicBool::new(true),
             clipboard_source: std::sync::OnceLock::new(),
+            historical: false,
+            history_header: Default::default(),
             activity: Mutex::new(Activity {
                 started: false,
                 last: tokio::time::Instant::now(),
@@ -358,6 +451,13 @@ impl Registry {
             grants.observe_clipboard(Some((lease.0.offer, key)))?;
         }
         if let Some(files) = lease.0.provider.namespace() {
+            if let Some(announced) = self.5.get()
+                && let Err(error) = announced.record(lease.0.offer, files.announced_roots())
+            {
+                // Detection only: these files then stay readable by phones
+                // only while this registration exists.
+                tracing::warn!(kind = ?error.kind(), "announced clipboard files could not be recorded");
+            }
             files.retain_files(FileRetention {
                 table: Arc::downgrade(&self.3),
                 source: Arc::downgrade(&lease.0),
@@ -421,8 +521,8 @@ impl Registry {
         peer: DeviceId,
         request: ContentMsg,
         channel: &mut dyn BulkChannel,
-        source_profile: &oink_protocol::v1::dto::FormatSupport,
-        target_profile: &oink_protocol::v1::dto::FormatSupport,
+        source_profile: &oink_protocol::v2::dto::FormatSupport,
+        target_profile: &oink_protocol::v2::dto::FormatSupport,
     ) -> io::Result<()> {
         self.serve_negotiated_traced(
             peer,
@@ -444,16 +544,10 @@ impl Registry {
         else {
             return false;
         };
-        self.0
-            .lock()
-            .unwrap()
-            .get(offer)
-            .and_then(Weak::upgrade)
-            .is_some_and(|source| {
-                super::find(&source.provider.inventory(), *representation).is_some_and(|rep| {
-                    !matches!(rep.data, RepresentationData::File(_) | RepresentationData::Promise(..))
-                })
-            })
+        self.source_for(*offer).is_some_and(|source| {
+            super::find(&source.provider.inventory(), *representation)
+                .is_some_and(|rep| !matches!(rep.data, RepresentationData::File(_) | RepresentationData::Promise(..)))
+        })
     }
     /// Local source policy, selected using the authenticated requesting device.
     pub fn set_peer_file_filter(&self, peer: DeviceId, omit_ds_store: bool) {
@@ -476,8 +570,8 @@ impl Registry {
         peer: DeviceId,
         request: ContentMsg,
         channel: &mut dyn BulkChannel,
-        source_profile: &oink_protocol::v1::dto::FormatSupport,
-        target_profile: &oink_protocol::v1::dto::FormatSupport,
+        source_profile: &oink_protocol::v2::dto::FormatSupport,
+        target_profile: &oink_protocol::v2::dto::FormatSupport,
         diagnostic: oink_foundation::drag_trace::Context,
     ) -> io::Result<()> {
         if request.persistent_request() {
@@ -489,7 +583,7 @@ impl Registry {
         let Some((offer, _)) = request.request() else {
             return Err(unavailable(Unavailable::InvalidData));
         };
-        let source = self.0.lock().unwrap().get(&offer).and_then(Weak::upgrade);
+        let source = self.source_for(offer);
         if let Some(source) = source {
             let inventory = source.provider.inventory();
             match &request {
@@ -500,10 +594,22 @@ impl Registry {
                     accepted_format,
                     ..
                 } => {
+                    let mut selection_inventory = inventory.clone();
+                    if let Some(rep) = selection_inventory
+                        .items
+                        .iter_mut()
+                        .flat_map(|i| &mut i.representations)
+                        .find(|r| r.id == *representation)
+                        && rep
+                            .standard
+                            .is_some_and(|f| crate::negotiation::portable_format(f) == accepted_format)
+                    {
+                        rep.format = crate::model::NativeFormat::Unknown(accepted_format.clone());
+                    }
                     if crate::negotiation::negotiated_selection(
                         source_profile,
                         target_profile,
-                        &inventory,
+                        &selection_inventory,
                         *representation,
                         *target,
                     )
@@ -526,6 +632,235 @@ impl Registry {
         self.serve_traced(peer, request, channel, diagnostic).await
     }
 
+    /// Copies, per item, the representations a phone fetches for it
+    /// (`phone_representations`) of a registered clipboard source into
+    /// `store` (clipboard.md「手机的图片与富文本保留」, 2026-11-12 rich text):
+    /// a bitmap (portable PNG), rich text shown on its own, or plain text
+    /// together with its rich text (HTML, else RTF), so both stay readable
+    /// as a pair. Plain text without rich text is not kept (phones fetch it
+    /// right away). Only those slots are read: the other bitmap formats of
+    /// the item (Windows CF_DIB, CF_DIBV5, CF_BITMAP, PNG) are the same image
+    /// and a phone never asks for them. Runs on a blocking worker after the
+    /// offer is announced, and again when a phone joins while it is current;
+    /// already retained slots are not read again. It stops when the source
+    /// is superseded.
+    pub fn retain_for_phones(&self, lease: &SourceLease, store: &crate::retained::RetainedClips) -> io::Result<usize> {
+        use crate::model::StandardFormat;
+        let source = &lease.0;
+        let inventory = source.provider.inventory();
+        // A phone presents an offer with file roots by its roots, which stay
+        // readable by their paths (`announced`), not by these slots.
+        if !inventory.roots.is_empty() {
+            return Ok(0);
+        }
+        let mut retained = 0;
+        for item in &inventory.items {
+            if item.file.is_some() && !item.virtual_files {
+                continue;
+            }
+            let wanted = super::phone_representations(item);
+            let kept = wanted.iter().any(|rep| {
+                matches!(
+                    rep.standard,
+                    Some(StandardFormat::Png | StandardFormat::Html | StandardFormat::Rtf)
+                )
+            });
+            if !kept {
+                continue;
+            }
+            for rep in wanted {
+                if store.contains(inventory.id, item.id.0, rep.id.0) {
+                    retained += 1;
+                    continue;
+                }
+                if !source.valid.load(Ordering::Acquire) {
+                    return Err(unavailable(Unavailable::Superseded));
+                }
+                let mut reader = open_for_demand(source.provider.as_ref(), rep.id, None, false)?;
+                store.retain(inventory.id, item.id.0, rep.id.0, &mut reader)?;
+                retained += 1;
+            }
+        }
+        Ok(retained)
+    }
+
+    /// The image bytes a thumbnail is made from: the retained copy, else the
+    /// live source (bitmap slot or namespace file), else an announced file by
+    /// its recorded path. `NoSuchItem`/`Superseded` mean the original no
+    /// longer exists here.
+    fn thumbnail_source(
+        &self,
+        offer: OfferId,
+        target: crate::retained::Target,
+        store: Option<&crate::retained::RetainedClips>,
+    ) -> io::Result<Vec<u8>> {
+        use crate::retained::Target;
+        if let (Target::Representation { item, representation }, Some(store)) = (target, store)
+            && let Some((mut reader, _)) = store.open(offer, item, representation)?
+        {
+            return read_all(&mut reader);
+        }
+        let source = self.source_for(offer);
+        let source = match source {
+            Some(source) if source.valid.load(Ordering::Acquire) => source,
+            gone => {
+                if let Target::File { node, version } = target
+                    && let Some(files) = self.announced(offer)
+                {
+                    return thumbnail_file(files.as_ref(), node, version);
+                }
+                return Err(unavailable(if gone.is_none() {
+                    Unavailable::NoSuchItem
+                } else {
+                    Unavailable::Superseded
+                }));
+            }
+        };
+        match target {
+            Target::Representation { item, representation } => {
+                let inventory = source.provider.inventory();
+                let representation = RepresentationId(representation);
+                let found = portable_representation(&inventory, representation)
+                    .filter(|(found, _, format)| found.0 == item && *format == crate::model::StandardFormat::Png)
+                    .is_some();
+                if !found {
+                    return Err(unavailable(Unavailable::Unsupported));
+                }
+                read_all(&mut open_for_demand(
+                    source.provider.as_ref(),
+                    representation,
+                    None,
+                    false,
+                )?)
+            }
+            Target::File { node, version } => {
+                let files = source
+                    .provider
+                    .namespace()
+                    .ok_or_else(|| unavailable(Unavailable::NoSuchItem))?;
+                thumbnail_file(files.as_ref(), node, version)
+            }
+        }
+    }
+
+    /// A phone's `ContentThumbnailRead` (protocol-v2 §4.4), answered from the
+    /// thumbnail cache or generated and cached. Blocking: native reads and
+    /// image decoding run on the caller's worker thread.
+    pub fn thumbnail(
+        &self,
+        offer: OfferId,
+        target: crate::retained::Target,
+        edge: u32,
+        max_bytes: usize,
+        store: Option<&crate::retained::RetainedClips>,
+    ) -> ThumbnailOutcome {
+        let allowed = || {
+            self.6.get().is_none_or(|store| {
+                store.contains(offer)
+                    || self
+                        .0
+                        .lock()
+                        .unwrap()
+                        .get(&offer)
+                        .and_then(Weak::upgrade)
+                        .is_some_and(|source| source.current(Some(store)))
+            })
+        };
+        if !allowed() {
+            return ThumbnailOutcome::Expired;
+        }
+        if let Some(cached) = store.and_then(|store| store.thumbnail(offer, target, edge, max_bytes)) {
+            return ThumbnailOutcome::Ready(cached);
+        }
+        let bytes = match self.thumbnail_source(offer, target, store) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                return match reason(&error) {
+                    Unavailable::NoSuchItem | Unavailable::Superseded => ThumbnailOutcome::Expired,
+                    Unavailable::Unsupported | Unavailable::LimitExceeded => ThumbnailOutcome::Unsupported,
+                    _ => ThumbnailOutcome::Failed,
+                };
+            }
+        };
+        match crate::image_file::thumbnail(&bytes, edge, max_bytes) {
+            Ok(thumbnail) => {
+                if !allowed() {
+                    return ThumbnailOutcome::Expired;
+                }
+                if let Some(store) = store
+                    && let Err(error) = store.store_thumbnail(offer, target, edge, max_bytes, &thumbnail)
+                {
+                    tracing::debug!(kind = ?error.kind(), "thumbnail could not be cached");
+                }
+                ThumbnailOutcome::Ready(thumbnail)
+            }
+            Err(error) if matches!(error.kind(), io::ErrorKind::Unsupported | io::ErrorKind::FileTooLarge) => {
+                ThumbnailOutcome::Unsupported
+            }
+            Err(_) => ThumbnailOutcome::Failed,
+        }
+    }
+
+    /// The mobile request names stable inventory slots. Choose the portable
+    /// representation server-side so it cannot request arbitrary native bytes.
+    /// A bitmap or rich text retained for phones is served from its copy, so it stays
+    /// readable after the native clipboard changed (clipboard.md「手机的图片与富文本保留」).
+    pub async fn serve_mobile_representation(
+        self: &Arc<Self>,
+        peer: DeviceId,
+        read: &oink_protocol::v2::dto::ClipboardContentRead,
+        retained: Option<&crate::retained::RetainedClips>,
+        channel: &mut dyn BulkChannel,
+    ) -> io::Result<()> {
+        use oink_foundation::{clipboard::ClipPlatform, content::ItemId};
+        let invalid = |_| unavailable(Unavailable::InvalidData);
+        let offer = crate::wire::local_offer_id(read.offer().map_err(invalid)?).map_err(invalid)?;
+        let representation = RepresentationId(read.representation_id().map_err(invalid)?);
+        let item = ItemId(read.item_id().map_err(invalid)?);
+        if self.6.get().is_none()
+            && let Some(store) = retained
+            && let Some((reader, _)) = store.open(offer, item.0, representation.0)?
+        {
+            return serve_retained(channel, offer, representation, reader).await;
+        }
+        let source = self.source_for(offer);
+        let selection = source.as_ref().and_then(|source| {
+            let inventory = source.provider.inventory();
+            portable_representation(&inventory, representation)
+                .map(|(item, _, format)| (item, crate::negotiation::portable_format(format).to_owned()))
+        });
+        let Some((_, accepted_format)) = selection.filter(|(found, _)| *found == item) else {
+            return send(
+                channel,
+                ContentMsg::RepresentationFailed {
+                    offer,
+                    representation,
+                    reason: if source.is_some() {
+                        Unavailable::Unsupported
+                    } else {
+                        Unavailable::NoSuchItem
+                    },
+                },
+            )
+            .await;
+        };
+        self.serve_traced_for(
+            peer,
+            ContentMsg::ReadRepresentation {
+                offer,
+                representation,
+                target: ClipPlatform::Unknown,
+                item,
+                accepted_format,
+                demand: Demand::Clipboard,
+            },
+            channel,
+            oink_foundation::drag_trace::Context::current(),
+            true,
+        )
+        .await
+    }
+
     /// Serving runs outside capture/route/native threads. The agent handles the
     /// request's Drop demand before entering here; bytes alone never grant Drop.
     pub async fn serve(
@@ -545,9 +880,21 @@ impl Registry {
         channel: &mut dyn BulkChannel,
         diagnostic: oink_foundation::drag_trace::Context,
     ) -> io::Result<()> {
+        self.serve_traced_for(peer, request, channel, diagnostic, false).await
+    }
+
+    async fn serve_traced_for(
+        self: &Arc<Self>,
+        peer: DeviceId,
+        request: ContentMsg,
+        channel: &mut dyn BulkChannel,
+        diagnostic: oink_foundation::drag_trace::Context,
+        portable: bool,
+    ) -> io::Result<()> {
         if let ContentMsg::CloudLinkRequest { offer, roots, demand } = request {
-            let source = self.0.lock().unwrap().get(&offer).and_then(Weak::upgrade);
+            let source = self.source_for(offer);
             let grants = self.4.clone();
+            let history = self.6.get().cloned();
             let validity = channel.effect_validity();
             let result = tokio::task::spawn_blocking(move || {
                 if matches!(demand, Demand::Hover(holder) | Demand::Drop(holder) if holder.device != peer) {
@@ -565,7 +912,7 @@ impl Registry {
                     .namespace()
                     .ok_or_else(|| unavailable(Unavailable::NoSuchItem))?;
                 let token = grants.issue_for(peer, Some(offer), files.as_ref(), &roots, demand)?;
-                if !source.valid.load(Ordering::Acquire) || !validity() {
+                if !source.current(history.as_deref()) || !validity() {
                     if !source.valid.load(Ordering::Acquire) {
                         source.discard_pending();
                     } else {
@@ -645,7 +992,7 @@ impl Registry {
                 Demand::Drop(holder) if holder.device == peer && holder.epoch == delivery.sequence => {}
                 _ => return Err(unavailable(Unavailable::Permission)),
             }
-            let source = self.0.lock().unwrap().get(&offer).and_then(Weak::upgrade);
+            let source = self.source_for(offer);
             if source.is_none_or(|s| !s.valid.load(Ordering::Acquire)) {
                 return Err(unavailable(Unavailable::Superseded));
             }
@@ -665,7 +1012,7 @@ impl Registry {
         else {
             return Err(unavailable(Unavailable::InvalidData));
         };
-        let source = self.0.lock().unwrap().get(&offer).and_then(Weak::upgrade);
+        let source = self.source_for(offer);
         let Some(source) = source.filter(|s| s.valid.load(Ordering::Acquire)) else {
             return send(
                 channel,
@@ -677,9 +1024,17 @@ impl Registry {
             )
             .await;
         };
-        if crate::negotiation::selection(&source.provider.inventory(), representation, target)
-            != Some((item, accepted_format))
-        {
+        let inventory = source.provider.inventory();
+        let portable = portable
+            || portable_representation(&inventory, representation)
+                .is_some_and(|(_, _, format)| crate::negotiation::portable_format(format) == accepted_format);
+        let selection = if portable {
+            portable_representation(&inventory, representation)
+                .map(|(item, _, format)| (item, crate::negotiation::portable_format(format).to_owned()))
+        } else {
+            crate::negotiation::selection(&inventory, representation, target)
+        };
+        if selection != Some((item, accepted_format)) {
             return send(
                 channel,
                 ContentMsg::RepresentationFailed {
@@ -690,6 +1045,17 @@ impl Registry {
             )
             .await;
         }
+        let cached = if portable {
+            self.6
+                .get()
+                .and_then(|store| store.provider(offer, None))
+                .filter(|cached| {
+                    find(&cached.inventory(), representation)
+                        .is_some_and(|r| !matches!(r.data, RepresentationData::Unavailable(_)))
+                })
+        } else {
+            None
+        };
         let provider = source.provider.clone();
         let diagnostic = oink_foundation::drag_trace::Context {
             offer: offer.clip.seq,
@@ -706,10 +1072,21 @@ impl Registry {
                 oink_foundation::drag_trace::Context { aux: 1, ..open_context },
             );
             let result = opened.scope(|| {
+                // A marker echo can rebind this OfferId to a new live native
+                // generation. Its bytes take precedence over the immutable
+                // historical snapshot. Consult the generation guard before
+                // choosing history; a read failure is not a reason to retry.
+                let provider = match provider.reader_guard(representation).and_then(|guard| guard()) {
+                    Ok(()) => provider,
+                    Err(error) if matches!(reason(&error), Unavailable::Superseded | Unavailable::NoSuchItem) => {
+                        cached.ok_or(error)?
+                    }
+                    Err(error) => return Err(error),
+                };
                 open_for_demand(
                     provider.as_ref(),
                     representation,
-                    target,
+                    (!portable).then_some(target),
                     matches!(demand, Demand::Hover(_)),
                 )
             });
@@ -736,7 +1113,7 @@ impl Registry {
         let validity = channel.effect_validity();
         let mut offset = 0;
         loop {
-            if !source.valid.load(Ordering::Acquire) || !validity() {
+            if !source.current(self.6.get().map(Arc::as_ref)) || !validity() {
                 return send(
                     channel,
                     ContentMsg::RepresentationFailed {
@@ -765,7 +1142,7 @@ impl Registry {
             reader = returned;
             // Reading can block in a native provider. A permission change during
             // that call must win before its finished bytes enter the transport.
-            if !source.valid.load(Ordering::Acquire) || !validity() {
+            if !source.current(self.6.get().map(Arc::as_ref)) || !validity() {
                 return send(
                     channel,
                     ContentMsg::RepresentationFailed {
@@ -829,6 +1206,123 @@ impl Registry {
         }
     }
 }
+/// The bytes of image file `node` at the `version` the phone was given.
+fn thumbnail_file(files: &dyn namespace::Namespace, node: u64, version: u64) -> io::Result<Vec<u8>> {
+    let node = crate::model::NodeId(node);
+    let entry = files.select(node)?;
+    if entry.version != version {
+        return Err(unavailable(Unavailable::Superseded));
+    }
+    if !matches!(entry.size, ContentSize::Known(size) if size <= REPRESENTATION_BYTES) {
+        return Err(unavailable(Unavailable::LimitExceeded));
+    }
+    read_all(&mut files.open(node, version, 0)?)
+}
+
+/// `announced` rebuilt for `offer` (blocking); a failure to read the record
+/// is reported as the files being gone.
+fn restore_announced(announced: &announced::AnnouncedFiles, offer: OfferId) -> Option<Arc<dyn namespace::Namespace>> {
+    announced.namespace(offer).unwrap_or_else(|error| {
+        tracing::warn!(kind = ?error.kind(), "announced clipboard files could not be restored");
+        None
+    })
+}
+
+/// Result of a phone's thumbnail request (protocol-v2 `ThumbnailStatus`).
+#[derive(Debug, PartialEq, Eq)]
+pub enum ThumbnailOutcome {
+    Ready(crate::image_file::Thumbnail),
+    /// The original no longer exists on this device (24 hours passed, the
+    /// clipboard moved on without a retained copy, or the cache was cleared).
+    Expired,
+    /// Not an image this device can decode, or no preview fits the limit.
+    Unsupported,
+    Failed,
+}
+
+/// Streams a retained bitmap exactly like a live representation read.
+async fn serve_retained(
+    channel: &mut dyn BulkChannel,
+    offer: OfferId,
+    representation: RepresentationId,
+    reader: crate::retained::RetainedReader,
+) -> io::Result<()> {
+    let validity = channel.effect_validity();
+    let mut reader = reader;
+    let mut offset = 0u64;
+    loop {
+        if !validity() {
+            return send(
+                channel,
+                ContentMsg::RepresentationFailed {
+                    offer,
+                    representation,
+                    reason: Unavailable::Cancelled,
+                },
+            )
+            .await;
+        }
+        let (returned, read) = representation_work(channel, move || {
+            let mut bytes = vec![0; 1024 * 1024];
+            let result = reader.read(&mut bytes).map(|n| {
+                bytes.truncate(n);
+                bytes
+            });
+            (reader, result)
+        })
+        .await?;
+        reader = returned;
+        let bytes = match read {
+            Ok(bytes) if offset + bytes.len() as u64 <= REPRESENTATION_BYTES => bytes,
+            Ok(_) => {
+                return send(
+                    channel,
+                    ContentMsg::RepresentationFailed {
+                        offer,
+                        representation,
+                        reason: Unavailable::LimitExceeded,
+                    },
+                )
+                .await;
+            }
+            Err(error) => {
+                return send(
+                    channel,
+                    ContentMsg::RepresentationFailed {
+                        offer,
+                        representation,
+                        reason: reason(&error),
+                    },
+                )
+                .await;
+            }
+        };
+        if bytes.is_empty() {
+            return send(
+                channel,
+                ContentMsg::RepresentationEnd {
+                    offer,
+                    representation,
+                    size: offset,
+                },
+            )
+            .await;
+        }
+        let length = bytes.len() as u64;
+        send(
+            channel,
+            ContentMsg::RepresentationBytes {
+                offer,
+                representation,
+                offset,
+                bytes,
+            },
+        )
+        .await?;
+        offset += length;
+    }
+}
+
 // Representation consumers send no further frames until completion. Observe
 // their stream closing while a native source call runs, so a timed-out paste
 // releases its serving operation immediately. An already executing OS call
@@ -976,33 +1470,50 @@ impl Registry {
                 Err(error) => return send(channel, failure(reason(&error))).await,
             }
         } else {
-            let source = self.0.lock().unwrap().get(&offer).and_then(Weak::upgrade);
-            let Some(source) = source else {
-                let missing = if matches!(request.request(), Some((_, Demand::Clipboard))) {
-                    Unavailable::NoSuchItem
-                } else {
-                    Unavailable::Superseded
+            let clipboard = matches!(request.request(), Some((_, Demand::Clipboard)));
+            let source = self.source_for(offer);
+            let missing = match &source {
+                None if clipboard => Some(Unavailable::NoSuchItem),
+                None => Some(Unavailable::Superseded),
+                Some(source) if !source.valid.load(Ordering::Acquire) => Some(Unavailable::Superseded),
+                Some(_) => None,
+            };
+            if let Some(missing) = missing {
+                // Announced real files stay readable by their recorded paths
+                // once the registration is gone: the clipboard moved on,
+                // sharing was paused, Oink restarted (clipboard.md「手机的文件保留」).
+                let announced = clipboard.then(|| self.5.get().cloned()).flatten();
+                let restored = match announced {
+                    Some(announced) => tokio::task::spawn_blocking(move || restore_announced(&announced, offer))
+                        .await
+                        .ok()
+                        .flatten(),
+                    None => None,
                 };
-                return send(channel, failure(missing)).await;
-            };
-            if !source.valid.load(Ordering::Acquire) {
-                return send(channel, failure(Unavailable::Superseded)).await;
+                let Some(files) = restored else {
+                    return send(channel, failure(missing)).await;
+                };
+                (None, files)
+            } else {
+                let Some(source) = source else {
+                    return send(channel, failure(Unavailable::NoSuchItem)).await;
+                };
+                if matches!(request.request(), Some((_, Demand::Hover(_))))
+                    && source
+                        .provider
+                        .inventory()
+                        .items
+                        .iter()
+                        .flat_map(|item| &item.representations)
+                        .any(|rep| matches!(rep.data, RepresentationData::Promise(id, _) if id == node))
+                {
+                    return send(channel, failure(Unavailable::Permission)).await;
+                }
+                let Some(files) = source.provider.namespace() else {
+                    return send(channel, failure(Unavailable::NoSuchItem)).await;
+                };
+                (Some(source), files)
             }
-            if matches!(request.request(), Some((_, Demand::Hover(_))))
-                && source
-                    .provider
-                    .inventory()
-                    .items
-                    .iter()
-                    .flat_map(|item| &item.representations)
-                    .any(|rep| matches!(rep.data, RepresentationData::Promise(id, _) if id == node))
-            {
-                return send(channel, failure(Unavailable::Permission)).await;
-            }
-            let Some(files) = source.provider.namespace() else {
-                return send(channel, failure(Unavailable::NoSuchItem)).await;
-            };
-            (Some(source), files)
         };
         let active = || {
             source
@@ -1950,3 +2461,6 @@ mod persistent_tests {
         ));
     }
 }
+
+#[cfg(all(test, debug_assertions))]
+mod announced_tests;

@@ -2,7 +2,7 @@
 //! their fields, preserving other observations and monotonically sequencing sends.
 use oink_foundation::{GroupId, session::Boot};
 use oink_network::{negotiation::OfferProfile, wire_identity as wire};
-use oink_protocol::v1::{
+use oink_protocol::v2::{
     self, RawValue, dto,
     schema::{WireDto, WireValue},
 };
@@ -23,7 +23,7 @@ pub(super) struct Facts {
     value: dto::DeviceFacts,
 }
 impl Facts {
-    pub fn new(boot: Boot, group: GroupId, name: &str, os: &str, profile: &OfferProfile) -> v1::Result<Self> {
+    pub fn new(boot: Boot, group: GroupId, name: &str, os: &str, profile: &OfferProfile) -> v2::Result<Self> {
         let capabilities = dto::FactCapabilities::from_raw(
             [
                 (
@@ -45,7 +45,6 @@ impl Facts {
         let options = dto::LocalOptionsSummary::from_raw(
             [
                 (1, true.write()),
-                (2, false.write()),
                 (3, 1f32.write()),
                 (4, false.write()),
                 (5, false.write()),
@@ -59,7 +58,7 @@ impl Facts {
                 (2, 1u64.write()),
                 (
                     3,
-                    RawValue::Map([(1, v1::MAJOR.write()), (2, v1::MINOR.write())].into()),
+                    RawValue::Map([(1, v2::MAJOR.write()), (2, v2::MINOR.write())].into()),
                 ),
                 (4, RawValue::from(env!("OINK_RELEASE_VERSION"))),
                 (5, RawValue::Bytes(group.0.to_vec())),
@@ -84,6 +83,9 @@ impl Facts {
                 (13, capabilities.write()),
                 (14, options.write()),
                 (15, RawValue::Array(Vec::new())),
+                (25, dto::DeviceKind::Desktop.write()),
+                (26, v2::MAJOR.write()),
+                (27, v2::MINOR.write()),
             ]
             .into(),
         )?;
@@ -92,7 +94,7 @@ impl Facts {
     pub fn value(&self) -> &dto::DeviceFacts {
         &self.value
     }
-    pub fn links(&mut self, links: &[oink_network::link::LinkEntry]) -> v1::Result<bool> {
+    pub fn links(&mut self, links: &[oink_network::link::LinkEntry]) -> v2::Result<bool> {
         let links = links
             .iter()
             .map(|link| {
@@ -100,7 +102,7 @@ impl Facts {
                     oink_network::link::LinkPath::Direct => (dto::FactPath::Direct, None),
                     oink_network::link::LinkPath::Relayed { via } => (dto::FactPath::Relayed, Some(via)),
                 };
-                let mut raw: v1::RawMap = [
+                let mut raw: v2::RawMap = [
                     (1, wire::device(link.peer).write()),
                     (2, path.write()),
                     (5, (super::FACTS_INTERVAL.as_millis() as u32).write()),
@@ -118,13 +120,13 @@ impl Facts {
                 }
                 dto::LinkFact::from_raw(raw).map(|fact| fact.write())
             })
-            .collect::<v1::Result<Vec<_>>>()?;
+            .collect::<v2::Result<Vec<_>>>()?;
         self.edit(|raw| {
             raw.insert(15, RawValue::Array(links));
             Ok(())
         })
     }
-    pub fn edit(&mut self, edit: impl FnOnce(&mut v1::RawMap) -> v1::Result<()>) -> v1::Result<bool> {
+    pub fn edit(&mut self, edit: impl FnOnce(&mut v2::RawMap) -> v2::Result<()>) -> v2::Result<bool> {
         let mut raw = self.value.raw().clone();
         edit(&mut raw)?;
         if raw == *self.value.raw() {
@@ -135,44 +137,27 @@ impl Facts {
             self.value
                 .fact_sequence()?
                 .checked_add(1)
-                .ok_or(v1::ErrorCode::StateConflict)?
+                .ok_or(v2::ErrorCode::StateConflict)?
                 .write(),
         );
         let candidate = dto::DeviceFacts::from_raw(raw)?;
-        candidate.encode(v1::limits::CONFIG_FRAME)?;
+        candidate.encode(v2::limits::CONFIG_FRAME)?;
         self.value = candidate;
         Ok(true)
     }
-    pub fn owner(
-        &mut self,
-        preferences: Vec<dto::DevicePreference>,
-        pause: dto::LocalPauseState,
-        watermark: Option<dto::AudioExitClaim>,
-    ) -> v1::Result<bool> {
+    pub fn owner(&mut self, preferences: Vec<dto::DevicePreference>, pause: dto::LocalPauseState) -> v2::Result<bool> {
         self.edit(|raw| {
             let mut preferences = preferences;
             preferences.sort_by_key(|p| p.option().map(|o| o.number()).unwrap_or(u32::MAX));
             raw.insert(18, RawValue::Array(preferences.iter().map(WireValue::write).collect()));
             raw.insert(19, pause.write());
-            raw.insert(21, watermark.write());
             let mut options =
-                dto::LocalOptionsSummary::read(raw.get(&14).ok_or(v1::ErrorCode::MalformedFrame)?)?.into_raw();
+                dto::LocalOptionsSummary::read(raw.get(&14).ok_or(v2::ErrorCode::MalformedFrame)?)?.into_raw();
             options.insert(1, (!pause.paused()?).write());
             for preference in &preferences {
                 match preference.option()? {
-                    dto::LocalOption::AudioExitClaim => {
-                        let value = preference.value()?;
-                        if value == RawValue::Null {
-                            raw.remove(&20);
-                        } else {
-                            raw.insert(20, value);
-                        }
-                    }
                     dto::LocalOption::DeviceName => {
                         raw.insert(6, preference.value()?);
-                    }
-                    dto::LocalOption::ForwardingEnabled => {
-                        options.insert(2, bool::read(&preference.value()?)?.write());
                     }
                     dto::LocalOption::ForwardingControls => {
                         let controls = dto::ForwardingControlsValue::read(&preference.value()?)?;
@@ -185,35 +170,35 @@ impl Facts {
             Ok(())
         })
     }
-    pub fn group(
-        &mut self,
-        group: GroupId,
-        owner: &crate::config::owner::OwnerStore,
-        device: oink_foundation::DeviceId,
-    ) -> v1::Result<bool> {
-        let claims = owner.claims(group);
-        let watermark = claims.watermark();
-        let claim = claims
-            .records
-            .into_iter()
-            .find(|r| r.owner == device)
-            .and_then(|r| r.claim);
+    /// A new group: this device has not merged with it yet, so it publishes
+    /// no audio configuration until the audio owner merged (key 33 absent).
+    pub fn group(&mut self, group: GroupId, owner: &crate::config::owner::OwnerStore) -> v2::Result<bool> {
         self.edit(|raw| {
             raw.insert(5, RawValue::Bytes(group.0.to_vec()));
-            raw.insert(21, watermark.write());
             raw.insert(
                 18,
                 RawValue::Array(owner.preferences().iter().map(WireValue::write).collect()),
             );
-            if let Some(claim) = claim {
-                raw.insert(20, claim.write());
-            } else {
-                raw.remove(&20);
+            raw.remove(&AUDIO_CONFIG);
+            Ok(())
+        })
+    }
+    /// Publish the global audio configuration this device executes (its own
+    /// entry, its linked devices and both registers); `None` while unjoined.
+    pub fn audio_config(&mut self, config: Option<&oink_audio::route::AudioConfig>) -> v2::Result<bool> {
+        self.edit(|raw| {
+            match config {
+                Some(config) => {
+                    raw.insert(AUDIO_CONFIG, config.to_wire().write());
+                }
+                None => {
+                    raw.remove(&AUDIO_CONFIG);
+                }
             }
             Ok(())
         })
     }
-    pub fn clipboard(&mut self, mode: Option<dto::SharingMode>, fault: Option<dto::ResourceFault>) -> v1::Result<bool> {
+    pub fn clipboard(&mut self, mode: Option<dto::SharingMode>, fault: Option<dto::ResourceFault>) -> v2::Result<bool> {
         self.edit(|raw| {
             let mut resources = raw
                 .get(&16)
@@ -242,11 +227,7 @@ impl Facts {
             Ok(())
         })
     }
-    pub fn microphone(
-        &mut self,
-        observation: dto::MicrophoneObservation,
-        watermark: Option<dto::AudioExitClaim>,
-    ) -> v1::Result<bool> {
+    pub fn microphone(&mut self, observation: dto::MicrophoneObservation) -> v2::Result<bool> {
         self.edit(|raw| {
             let mut resources = raw
                 .get(&16)
@@ -256,7 +237,6 @@ impl Facts {
                 .unwrap_or_default();
             resources.insert(8, observation.write());
             raw.insert(16, RawValue::Map(resources));
-            raw.insert(24, watermark.write());
             Ok(())
         })
     }
@@ -267,10 +247,10 @@ impl Facts {
         speaker: dto::SpeakerObservation,
         fault: Option<dto::ResourceFault>,
         exit_volume: Option<dto::ExitVolumeState>,
-    ) -> v1::Result<bool> {
+    ) -> v2::Result<bool> {
         self.edit(|raw| {
             let mut capabilities =
-                dto::FactCapabilities::read(raw.get(&13).ok_or(v1::ErrorCode::MalformedFrame)?)?.into_raw();
+                dto::FactCapabilities::read(raw.get(&13).ok_or(v2::ErrorCode::MalformedFrame)?)?.into_raw();
             capabilities.insert(2, permission.write());
             capabilities.insert(4, RawValue::Array(outputs.iter().map(WireValue::write).collect()));
             raw.insert(13, RawValue::Map(capabilities));
@@ -310,7 +290,7 @@ impl Facts {
         options: dto::LocalOptionsSummary,
         game: Option<dto::GameObservation>,
         accessibility_granted: Option<bool>,
-    ) -> v1::Result<bool> {
+    ) -> v2::Result<bool> {
         self.edit(|raw| {
             let mut resources = raw
                 .get(&16)
@@ -346,12 +326,21 @@ impl Facts {
             resources.insert(4, RawValue::Map(merged));
             raw.insert(16, RawValue::Map(resources));
             let mut current =
-                dto::LocalOptionsSummary::read(raw.get(&14).ok_or(v1::ErrorCode::MalformedFrame)?)?.into_raw();
+                dto::LocalOptionsSummary::read(raw.get(&14).ok_or(v2::ErrorCode::MalformedFrame)?)?.into_raw();
             for key in [4, 5, 6] {
                 current.insert(
                     key,
-                    options.raw().get(&key).ok_or(v1::ErrorCode::MalformedFrame)?.clone(),
+                    options.raw().get(&key).ok_or(v2::ErrorCode::MalformedFrame)?.clone(),
                 );
+            }
+            // Optional input observation: absent means unlocked or unknown.
+            match options.raw().get(&7) {
+                Some(value) if *value != RawValue::Null => {
+                    current.insert(7, value.clone());
+                }
+                _ => {
+                    current.remove(&7);
+                }
             }
             raw.insert(14, RawValue::Map(current));
             Ok(())
@@ -359,548 +348,8 @@ impl Facts {
     }
 }
 
-/// The v1 baseline knows mouse modes 0/1 only. A disabled source is unknown to
-/// those peers, never falsely advertised as enabled/local. Keep unrelated facts.
-pub(super) fn for_mouse_capability(facts: dto::DeviceFacts, supported: bool) -> v1::Result<dto::DeviceFacts> {
-    if supported {
-        return Ok(facts);
-    }
-    let mut raw = facts.into_raw();
-    if let Some(RawValue::Array(preferences)) = raw.get_mut(&18) {
-        preferences.retain(|p| !matches!(p, RawValue::Map(v) if v.get(&1) == Some(&RawValue::Uint(1)) && v.get(&3) == Some(&RawValue::Uint(2))));
-    }
-    if let Some(RawValue::Map(resources)) = raw.get_mut(&16)
-        && resources.get(&2) == Some(&RawValue::Uint(2))
-    {
-        resources.remove(&2);
-    }
-    dto::DeviceFacts::from_raw(raw)
-}
-
-/// The optional observation travels in the existing ConfigFacts message. Strip
-/// it on every send (initial handshake and later publications) to an old peer.
-pub(super) fn for_local_output_capability(facts: dto::DeviceFacts, supported: bool) -> v1::Result<dto::DeviceFacts> {
-    if supported {
-        return Ok(facts);
-    }
-    let mut raw = facts.into_raw();
-    if let Some(RawValue::Map(resources)) = raw.get_mut(&16)
-        && let Some(RawValue::Map(speaker)) = resources.get_mut(&5)
-    {
-        speaker.remove(&9);
-    }
-    dto::DeviceFacts::from_raw(raw)
-}
-
-/// Hide new owner values and revisions from peers that did not negotiate them.
-/// LocalOption 19 remains the released two-state preference for those peers.
-pub(super) fn for_touchpad_capability(facts: dto::DeviceFacts, supported: bool) -> v1::Result<dto::DeviceFacts> {
-    if supported {
-        return Ok(facts);
-    }
-    let mut raw = facts.into_raw();
-    let keep = |item: &RawValue| !matches!(item, RawValue::Map(item) if item.get(&1).and_then(|v| v.as_u64().ok()).is_some_and(|n| matches!(n, 26..=28)));
-    if let Some(RawValue::Array(preferences)) = raw.get_mut(&18) {
-        preferences.retain(keep);
-    }
-    if let Some(RawValue::Map(resources)) = raw.get_mut(&16)
-        && let Some(RawValue::Array(revisions)) = resources.get_mut(&6)
-    {
-        revisions.retain(keep);
-    }
-    dto::DeviceFacts::from_raw(raw)
-}
-
-/// AX is an owner observation in ConfigFacts, never inferred from resource faults.
-pub(super) fn for_accessibility_capability(facts: dto::DeviceFacts, supported: bool) -> v1::Result<dto::DeviceFacts> {
-    if supported {
-        return Ok(facts);
-    }
-    let mut raw = facts.into_raw();
-    raw.remove(&23);
-    dto::DeviceFacts::from_raw(raw)
-}
-
-#[cfg(test)]
-mod mouse_mode_tests {
-    use super::*;
-    #[test]
-    fn touchpad_owner_facts_strip_only_unnegotiated_options_and_revisions() {
-        let mut facts = Facts::new(
-            Boot {
-                device_id: oink_foundation::DeviceId([1; 32]),
-                nonce: [2; 16],
-            },
-            GroupId([3; 16]),
-            "owner",
-            "windows",
-            &OfferProfile::default(),
-        )
-        .unwrap()
-        .value()
-        .clone();
-        facts
-            .edit(|raw| {
-                raw.insert(
-                    18,
-                    RawValue::Array(
-                        [19, 26, 27, 28, 900]
-                            .into_iter()
-                            .map(|n| {
-                                RawValue::Map([(1, RawValue::Uint(n)), (2, 1u64.write()), (3, true.write())].into())
-                            })
-                            .collect(),
-                    ),
-                );
-                raw.insert(
-                    16,
-                    RawValue::Map(
-                        [(
-                            6,
-                            RawValue::Array(
-                                [19, 26, 27, 28, 900]
-                                    .into_iter()
-                                    .map(|n| RawValue::Map([(1, RawValue::Uint(n)), (2, 1u64.write())].into()))
-                                    .collect(),
-                            ),
-                        )]
-                        .into(),
-                    ),
-                );
-            })
-            .unwrap();
-        assert_eq!(for_touchpad_capability(facts.clone(), true).unwrap(), facts);
-        let legacy = for_touchpad_capability(facts, false).unwrap();
-        assert_eq!(
-            legacy
-                .preferences()
-                .unwrap()
-                .unwrap()
-                .0
-                .iter()
-                .map(|p| p.option().unwrap().number())
-                .collect::<Vec<_>>(),
-            [19, 900]
-        );
-        assert_eq!(
-            legacy
-                .resources()
-                .unwrap()
-                .unwrap()
-                .option_revisions()
-                .unwrap()
-                .0
-                .iter()
-                .map(|r| r.option().unwrap().number())
-                .collect::<Vec<_>>(),
-            [19, 900]
-        );
-    }
-    #[test]
-    fn accessibility_facts_are_explicit_optional_and_capability_gated() {
-        let mut facts = Facts::new(
-            Boot {
-                device_id: oink_foundation::DeviceId([1; 32]),
-                nonce: [2; 16],
-            },
-            GroupId([3; 16]),
-            "owner",
-            "macos",
-            &OfferProfile::default(),
-        )
-        .unwrap();
-        assert_eq!(facts.value().accessibility_granted().unwrap(), None);
-        for granted in [false, true] {
-            facts
-                .edit(|raw| {
-                    raw.insert(23, granted.write());
-                    Ok(())
-                })
-                .unwrap();
-            let original = facts.value().clone();
-            assert_eq!(for_accessibility_capability(original.clone(), true).unwrap(), original);
-            let old = for_accessibility_capability(original.clone(), false).unwrap();
-            assert_eq!(old.accessibility_granted().unwrap(), None);
-            let mut expected = original.into_raw();
-            expected.remove(&23);
-            assert_eq!(old.raw(), &expected);
-            let message = v1::Message::ConfigFacts(old);
-            let encoded = v1::frame::encode(&message, v1::limits::CONFIG_FRAME).unwrap();
-            assert_eq!(
-                v1::frame::OpaqueFrame::parse_exact(&encoded, v1::limits::CONFIG_FRAME)
-                    .unwrap()
-                    .decode()
-                    .unwrap(),
-                message
-            );
-        }
-    }
-
-    #[test]
-    fn local_output_facts_are_capability_gated_for_old_peers() {
-        let mut facts = Facts::new(
-            Boot {
-                device_id: oink_foundation::DeviceId([1; 32]),
-                nonce: [2; 16],
-            },
-            GroupId([3; 16]),
-            "owner",
-            "test",
-            &OfferProfile::default(),
-        )
-        .unwrap();
-        facts
-            .edit(|raw| {
-                raw.insert(
-                    16,
-                    RawValue::Map(
-                        [(
-                            5,
-                            RawValue::Map(
-                                [
-                                    (2, dto::SpeakerActivity::Unused.write()),
-                                    (9, RawValue::Map([(1, 61u8.write()), (2, false.write())].into())),
-                                ]
-                                .into(),
-                            ),
-                        )]
-                        .into(),
-                    ),
-                );
-                Ok(())
-            })
-            .unwrap();
-        let original = facts.value().clone();
-        assert_eq!(for_local_output_capability(original.clone(), true).unwrap(), original);
-        let old = for_local_output_capability(original.clone(), false).unwrap();
-        let speaker = old.resources().unwrap().unwrap().speaker().unwrap().unwrap();
-        assert_eq!(speaker.local_output().unwrap(), None);
-        assert_eq!(speaker.activity().unwrap(), Some(dto::SpeakerActivity::Unused));
-        assert_eq!(old.fact_sequence().unwrap(), original.fact_sequence().unwrap());
-        // The old-peer frame is still the normal v1 ConfigFacts, with no new field.
-        let frame = v1::frame::encode(&v1::Message::ConfigFacts(old.clone()), v1::limits::CONFIG_FRAME).unwrap();
-        assert_eq!(
-            v1::frame::OpaqueFrame::parse_exact(&frame, v1::limits::CONFIG_FRAME)
-                .unwrap()
-                .decode()
-                .unwrap(),
-            v1::Message::ConfigFacts(old)
-        );
-    }
-    #[test]
-    fn disabled_mouse_facts_are_withheld_only_from_legacy_peers() {
-        let mut facts = Facts::new(
-            Boot {
-                device_id: oink_foundation::DeviceId([1; 32]),
-                nonce: [2; 16],
-            },
-            GroupId([3; 16]),
-            "source",
-            "test",
-            &OfferProfile::default(),
-        )
-        .unwrap();
-        facts
-            .edit(|raw| {
-                raw.insert(16, RawValue::Map([(2, 2u32.write()), (3, 0u32.write())].into()));
-                raw.insert(
-                    18,
-                    RawValue::Array(
-                        [1u32, 2]
-                            .into_iter()
-                            .map(|option| {
-                                RawValue::Map(
-                                    [
-                                        (1, option.write()),
-                                        (2, 1u64.write()),
-                                        (3, (if option == 1 { 2u32 } else { 0 }).write()),
-                                    ]
-                                    .into(),
-                                )
-                            })
-                            .collect(),
-                    ),
-                );
-                Ok(())
-            })
-            .unwrap();
-        let original = facts.value().clone();
-        assert_eq!(
-            for_mouse_capability(original.clone(), true).unwrap().raw(),
-            original.raw()
-        );
-        let legacy = for_mouse_capability(original.clone(), false).unwrap();
-        assert_eq!(legacy.resources().unwrap().unwrap().mouse_mode().unwrap(), None);
-        assert_eq!(
-            legacy.resources().unwrap().unwrap().keyboard_mode().unwrap(),
-            Some(dto::SharingMode::Shared)
-        );
-        let preferences = legacy.preferences().unwrap().unwrap();
-        assert_eq!(preferences.0.len(), 1);
-        assert_eq!(preferences.0[0].option().unwrap(), dto::LocalOption::KeyboardMode);
-        assert_eq!(legacy.fact_sequence().unwrap(), original.fact_sequence().unwrap());
-    }
-}
-
-/// The owner keeps its full settings. Each C0 publication gets an old-compatible
-/// copy unless this exact peer negotiated the None/Fn representation.
-pub(super) fn for_keymap_capability(facts: dto::DeviceFacts, supported: bool) -> v1::Result<dto::DeviceFacts> {
-    if supported {
-        return Ok(facts);
-    }
-    fn keyboard(value: &mut RawValue) {
-        let RawValue::Map(raw) = value else { return };
-        if let Some(RawValue::Array(table)) = raw.get_mut(&2) {
-            table.retain(|entry| {
-                !matches!(entry, RawValue::Map(m)
-                if m.get(&2) == Some(&RawValue::Uint(0))
-                    || m.get(&1) == Some(&RawValue::Uint(oink_foundation::input::KeyCode::APPLE_FN.0.into())))
-            });
-        }
-        // The old CapsTapHold validator rejects either empty output. Omit the
-        // entire split, rather than inventing a different tap/hold relationship.
-        if raw.get(&3).is_some_and(|v| {
-            matches!(v, RawValue::Map(c)
-            if c.get(&1) == Some(&RawValue::Uint(0)) || c.get(&2) == Some(&RawValue::Uint(0)))
-        }) {
-            raw.remove(&3);
-        }
-    }
-    let mut raw = facts.into_raw();
-    if let Some(RawValue::Array(preferences)) = raw.get_mut(&18) {
-        for preference in preferences {
-            let RawValue::Map(preference) = preference else {
-                continue;
-            };
-            if preference.get(&1) != Some(&dto::LocalOption::InputTransform.write()) {
-                continue;
-            }
-            let Some(RawValue::Map(transform)) = preference.get_mut(&3) else {
-                continue;
-            };
-            for key in [1, 2] {
-                if let Some(RawValue::Map(target)) = transform.get_mut(&key)
-                    && let Some(mapping) = target.get_mut(&2)
-                {
-                    keyboard(mapping);
-                }
-            }
-            if let Some(RawValue::Array(overrides)) = transform.get_mut(&3) {
-                for item in overrides {
-                    if let RawValue::Map(item) = item
-                        && let Some(mapping) = item.get_mut(&3)
-                    {
-                        keyboard(mapping);
-                    }
-                }
-            }
-        }
-    }
-    dto::DeviceFacts::from_raw(raw)
-}
-
-#[cfg(test)]
-mod keymap_compatibility_tests {
-    use super::*;
-    use oink_foundation::{DeviceId, input::KeyCode, input_transform::*};
-
-    // Freeze the pre-extension owner's acceptance contract. Decoding with the
-    // current DTO alone would miss the old CapsTapHold validator rejecting zero.
-    fn legacy_owner_accepts(facts: &dto::DeviceFacts) -> bool {
-        facts.preferences().unwrap().unwrap().0.iter().all(|p| {
-            if p.option().unwrap() != dto::LocalOption::InputTransform {
-                return true;
-            }
-            let transform =
-                crate::config::read_transform(dto::InputTransformValue::read(&p.value().unwrap()).unwrap()).unwrap();
-            let supported = candidate_keys();
-            [&transform.macos.keyboard, &transform.windows.keyboard]
-                .into_iter()
-                .chain(transform.overrides.iter().filter_map(|o| o.keyboard.as_ref()))
-                .all(|k| {
-                    k.table
-                        .iter()
-                        .all(|m| supported.contains(&m.from) && supported.contains(&m.to))
-                        && k.caps_tap_hold
-                            .is_none_or(|c| supported.contains(&c.tap) && supported.contains(&c.hold))
-                })
-        })
-    }
-    fn source_facts() -> dto::DeviceFacts {
-        let mut facts = Facts::new(
-            Boot {
-                device_id: DeviceId([1; 32]),
-                nonce: [2; 16],
-            },
-            GroupId([3; 16]),
-            "source",
-            "macos",
-            &OfferProfile::default(),
-        )
-        .unwrap();
-        let keyboard = KeyboardMapping {
-            saved_custom: None,
-            preset: KeyPreset::Custom,
-            table: vec![
-                KeyMapping {
-                    from: KeyCode::LEFT_CTRL,
-                    to: KeyCode::NONE,
-                },
-                KeyMapping {
-                    from: KeyCode::APPLE_FN,
-                    to: KeyCode::RIGHT_ALT,
-                },
-                KeyMapping {
-                    from: KeyCode::LEFT_GUI,
-                    to: KeyCode::RIGHT_CTRL,
-                },
-            ],
-            caps_tap_hold: Some(CapsTapHold {
-                tap: KeyCode::NONE,
-                hold: KeyCode::LEFT_SHIFT,
-            }),
-        };
-        let transform = InputTransform {
-            macos: TargetTransform {
-                reverse_wheel: true,
-                keyboard: keyboard.clone(),
-            },
-            windows: TargetTransform {
-                reverse_wheel: false,
-                keyboard: keyboard.clone(),
-            },
-            overrides: vec![TargetOverride {
-                target: DeviceId([4; 32]),
-                reverse_wheel: Some(true),
-                keyboard: Some(keyboard),
-            }],
-        };
-        let mut value = crate::config::write_transform(&transform);
-        if let RawValue::Map(raw) = &mut value {
-            raw.insert(900, RawValue::Text("retained".into()));
-        }
-        facts
-            .edit(|raw| {
-                raw.insert(
-                    18,
-                    RawValue::Array(vec![
-                        RawValue::Map([(1, 13u32.write()), (2, 77u64.write()), (3, value)].into()),
-                        RawValue::Map([(1, 16u32.write()), (2, 3u64.write()), (3, RawValue::from("source"))].into()),
-                    ]),
-                );
-                Ok(())
-            })
-            .unwrap();
-        facts.value().clone()
-    }
-    #[test]
-    fn keymap_legacy_peer_accepts_projected_publication_and_modern_peer_keeps_none() {
-        let original = source_facts();
-        assert!(!legacy_owner_accepts(&original));
-        assert_eq!(for_keymap_capability(original.clone(), true).unwrap(), original);
-        let legacy = for_keymap_capability(original.clone(), false).unwrap();
-        assert!(
-            legacy_owner_accepts(&legacy),
-            "a legacy owner must accept the complete ConfigFacts publication"
-        );
-        let frame = v1::frame::encode(&v1::Message::ConfigFacts(legacy.clone()), v1::limits::CONFIG_FRAME).unwrap();
-        // Optional external probe: feed these actual publications to the
-        // pre-feature codec/owner validator without adding a second product codec.
-        if let Ok(directory) = std::env::var("OINK_KEYMAP_COMPAT_FRAMES") {
-            let directory = std::path::Path::new(&directory);
-            std::fs::write(directory.join("legacy-facts.bin"), &frame).unwrap();
-            std::fs::write(
-                directory.join("modern-facts.bin"),
-                v1::frame::encode(&v1::Message::ConfigFacts(original.clone()), v1::limits::CONFIG_FRAME).unwrap(),
-            )
-            .unwrap();
-        }
-        let v1::Message::ConfigFacts(decoded) = v1::frame::OpaqueFrame::parse_exact(&frame, v1::limits::CONFIG_FRAME)
-            .unwrap()
-            .decode()
-            .unwrap()
-        else {
-            panic!("facts")
-        };
-        assert!(legacy_owner_accepts(&decoded));
-        assert_eq!(decoded.fact_sequence().unwrap(), original.fact_sequence().unwrap());
-        let preferences = decoded.preferences().unwrap().unwrap().0;
-        assert_eq!(preferences[0].revision().unwrap(), 77);
-        assert_eq!(preferences[1], original.preferences().unwrap().unwrap().0[1]);
-        assert_eq!(
-            preferences[0].value().unwrap().as_map().unwrap()[&900],
-            RawValue::from("retained")
-        );
-        let transform =
-            crate::config::read_transform(dto::InputTransformValue::read(&preferences[0].value().unwrap()).unwrap())
-                .unwrap();
-        for keyboard in [&transform.macos.keyboard, &transform.windows.keyboard]
-            .into_iter()
-            .chain(transform.overrides.iter().filter_map(|o| o.keyboard.as_ref()))
-        {
-            assert_eq!(
-                keyboard.table,
-                [KeyMapping {
-                    from: KeyCode::LEFT_GUI,
-                    to: KeyCode::RIGHT_CTRL
-                }]
-            );
-            assert_eq!(keyboard.caps_tap_hold, None);
-        }
-        assert!(transform.macos.reverse_wheel);
-        assert_eq!(transform.overrides[0].reverse_wheel, Some(true));
-        assert!(
-            !legacy_owner_accepts(&original),
-            "projection must not mutate the author's durable facts"
-        );
-    }
-    #[test]
-    fn keymap_projection_only_removes_caps_split_with_empty_outputs() {
-        for (tap, hold) in [
-            (KeyCode::NONE, KeyCode::NONE),
-            (KeyCode::NONE, KeyCode::LEFT_SHIFT),
-            (KeyCode::LEFT_SHIFT, KeyCode::NONE),
-            (KeyCode::LEFT_SHIFT, KeyCode::CAPS_LOCK),
-        ] {
-            let mut original = source_facts().into_raw();
-            let RawValue::Array(preferences) = original.get_mut(&18).unwrap() else {
-                panic!("preferences")
-            };
-            let RawValue::Map(preference) = &mut preferences[0] else {
-                panic!("preference")
-            };
-            let mut transform =
-                crate::config::read_transform(dto::InputTransformValue::read(&preference[&3]).unwrap()).unwrap();
-            let caps = CapsTapHold { tap, hold };
-            transform.macos.keyboard.caps_tap_hold = Some(caps);
-            transform.windows.keyboard.caps_tap_hold = Some(caps);
-            transform.overrides[0].keyboard.as_mut().unwrap().caps_tap_hold = Some(caps);
-            preference.insert(3, crate::config::write_transform(&transform));
-            let legacy = for_keymap_capability(dto::DeviceFacts::from_raw(original).unwrap(), false).unwrap();
-            assert!(legacy_owner_accepts(&legacy));
-            let value = legacy.preferences().unwrap().unwrap().0[0].value().unwrap();
-            let transform = crate::config::read_transform(dto::InputTransformValue::read(&value).unwrap()).unwrap();
-            let expected = (tap != KeyCode::NONE && hold != KeyCode::NONE).then_some(caps);
-            for k in [&transform.macos.keyboard, &transform.windows.keyboard]
-                .into_iter()
-                .chain(transform.overrides.iter().filter_map(|o| o.keyboard.as_ref()))
-            {
-                assert_eq!(k.caps_tap_hold, expected);
-            }
-        }
-    }
-    #[test]
-    fn keymap_capability_is_offered_without_becoming_required() {
-        let profile = crate::node::Node::offer_profile();
-        assert!(profile.capabilities.iter().any(|c| c == "oink.input.keymap-none/1"));
-        assert!(
-            !profile
-                .required_capabilities
-                .iter()
-                .any(|c| c == "oink.input.keymap-none/1")
-        );
-    }
-}
+/// DeviceFacts key of the global audio configuration.
+const AUDIO_CONFIG: u32 = 33;
 
 #[cfg(test)]
 mod observation_tests {
@@ -945,5 +394,17 @@ mod observation_tests {
                 "field {key} cannot take the telemetry shortcut"
             );
         }
+    }
+
+    #[test]
+    fn new_facts_include_required_v2_identity_fields() {
+        let boot = Boot {
+            device_id: oink_foundation::DeviceId([9; 32]),
+            nonce: [8; 16],
+        };
+        let facts = Facts::new(boot, GroupId([7; 16]), "owner", "macos", &OfferProfile::default()).unwrap();
+        assert_eq!(facts.value().device_kind().unwrap(), dto::DeviceKind::Desktop);
+        assert_eq!(facts.value().protocol_major().unwrap(), v2::MAJOR);
+        assert_eq!(facts.value().protocol_minor().unwrap(), v2::MINOR);
     }
 }

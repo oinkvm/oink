@@ -413,6 +413,7 @@ fn build_inner(mut spec: NativeSpec, clipboard: bool) -> Result<Target, Clipboar
         if matches!(rep.data, RepresentationData::File(_)) {
             continue;
         }
+        let foreign = foreign || rep.format.platform() != ClipPlatform::Windows;
         let ids = if foreign {
             if rep.standard == Some(StandardFormat::Url) {
                 let item = spec
@@ -843,6 +844,115 @@ pub(crate) mod tests {
                 assert_eq!(medium::serialize(&value, Medium::HGlobal).unwrap(), [0; 4]);
                 // SAFETY: this test owns the returned medium.
                 unsafe { ReleaseStgMedium(&mut value) };
+            }
+        });
+    }
+    /// A proxy PC publishing a phone's photos (user 2026-11-12): the clipboard
+    /// holds one bitmap, the first image's, as PNG, DIB and DIBV5; the file
+    /// formats for the whole selection follow it.
+    #[test]
+    fn phone_photos_publish_the_first_image_as_the_one_bitmap() {
+        use std::collections::HashMap;
+        struct Photos {
+            inventory: Inventory,
+            pngs: HashMap<RepresentationId, Vec<u8>>,
+        }
+        impl Provider for Photos {
+            fn inventory(&self) -> Inventory {
+                self.inventory.clone()
+            }
+            fn translator(&self) -> Arc<dyn Translator> {
+                struct Portable;
+                impl Translator for Portable {
+                    fn standard(&self, rep: &Representation, bytes: &[u8]) -> io::Result<Vec<crate::ClipData>> {
+                        content::decode_standard(rep, bytes)
+                    }
+                }
+                Arc::new(Portable)
+            }
+            fn open(&self, id: RepresentationId) -> io::Result<crate::FileReader> {
+                Ok(Box::new(io::Cursor::new(self.pngs[&id].clone())))
+            }
+        }
+        let png = |red: u8| {
+            let mut png = Vec::new();
+            {
+                let mut encoder = png::Encoder::new(&mut png, 1, 1);
+                encoder.set_color(png::ColorType::Rgba);
+                encoder.set_depth(png::BitDepth::Eight);
+                encoder
+                    .write_header()
+                    .unwrap()
+                    .write_image_data(&[red, 2, 3, 255])
+                    .unwrap();
+            }
+            png
+        };
+        super::super::tests::sta(move || {
+            let cf_png = super::super::super::formats().png as u16;
+            // A document first, then three photos: the first photo is the bitmap.
+            for (kinds, first) in [
+                (vec![true], RepresentationId(0)),
+                (vec![true, true, true], RepresentationId(0)),
+                (vec![false, true, true, true], RepresentationId(1)),
+            ] {
+                let inventory = crate::model::file_images::inventory(&kinds);
+                let pngs: HashMap<_, _> = inventory
+                    .items
+                    .iter()
+                    .flat_map(|item| &item.representations)
+                    .map(|rep| (rep.id, png(rep.id.0 as u8 * 40 + 10)))
+                    .collect();
+                let target = build(NativeSpec {
+                    inventory: inventory.clone(),
+                    contents: Arc::new(Photos {
+                        inventory,
+                        pngs: pngs.clone(),
+                    }),
+                    files: vec![],
+                    file_contents: None,
+                    sensitivity: crate::Sensitivity::Normal,
+                })
+                .unwrap();
+                // Each bitmap format once, bound to the first photo.
+                assert_eq!(
+                    target.formats().iter().map(|f| f.cfFormat).collect::<Vec<_>>(),
+                    [cf_png, 8, 17]
+                );
+                assert!(target.bindings.iter().all(|binding| binding.representation == first));
+                // File formats (CF_HDROP here) come after the bitmap.
+                let hdrop = FORMATETC {
+                    cfFormat: 15,
+                    ptd: std::ptr::null_mut(),
+                    dwAspect: DVASPECT_CONTENT.0,
+                    lindex: -1,
+                    tymed: TYMED_HGLOBAL.0 as u32,
+                };
+                assert_eq!(
+                    target
+                        .formats_with_files(&[hdrop])
+                        .iter()
+                        .map(|f| f.cfFormat)
+                        .collect::<Vec<_>>(),
+                    [cf_png, 8, 17, 15]
+                );
+                let formats = target.formats();
+                let mut value = target
+                    .get(&formats[0], || super::diagnostics::Publication::new().observe(None))
+                    .unwrap();
+                assert_eq!(medium::serialize(&value, Medium::HGlobal).unwrap(), pngs[&first]);
+                // SAFETY: get returned an owned medium; release exactly once.
+                unsafe { ReleaseStgMedium(&mut value) };
+                let mut value = target
+                    .get(&formats[1], || super::diagnostics::Publication::new().observe(None))
+                    .unwrap();
+                let dib = medium::serialize(&value, Medium::HGlobal).unwrap();
+                // SAFETY: get returned an owned medium; release exactly once.
+                unsafe { ReleaseStgMedium(&mut value) };
+                let decoded =
+                    super::super::super::image::decode_png(&super::super::super::image::dib_to_png(&dib).unwrap())
+                        .unwrap();
+                assert_eq!(decoded.data[0], first.0 as u8 * 40 + 10, "the first photo's pixels");
             }
         });
     }

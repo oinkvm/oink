@@ -172,7 +172,6 @@ fn input_transform_is_owned_locally_and_persists_without_a_layout_edit() {
 }
 
 mod audio;
-mod echo;
 
 /// Compare the exact retained layout register, including its owner version.
 fn assert_layout_files_equal(a: &Node, b: &Node) {
@@ -387,24 +386,23 @@ async fn pair_route_clipboard_layout_disconnect_scenario() {
             && bn.audio_status().unwrap().devices.iter().any(|d| d.device == an.id())
     })
     .await;
-    // Output discovery and owner claims arrive independently. Resolution stays
-    // unknown until the current claim record from every member is observed.
-    wait_for("audio owner claims exchanged", 5.0, || {
+    // Each audio owner executes the (still empty) group route setting.
+    wait_for("audio route setting executed", 5.0, || {
         [&an, &bn].iter().all(|node| {
             matches!(
                 node.audio_status().unwrap().resolution,
-                oink_audio::claims::Resolution::None { .. }
+                oink_audio::route::Resolution::None
             )
         })
     })
     .await;
     assert!(matches!(
         an.audio_status().unwrap().resolution,
-        oink_audio::claims::Resolution::None { .. }
+        oink_audio::route::Resolution::None
     ));
     assert!(matches!(
         bn.audio_status().unwrap().resolution,
-        oink_audio::claims::Resolution::None { .. }
+        oink_audio::route::Resolution::None
     ));
 
     // ---- 布局：两边独立自动排列，结果一致；B 在 A 的哪一边由设备 ID 决定。
@@ -512,12 +510,12 @@ async fn pair_route_clipboard_layout_disconnect_scenario() {
     // Applying the real audio domain must keep the held key and exact session.
     // Capture remains disabled: this verifies control application, not hardware.
     let before_audio = injected(&b.input).key_events;
-    let claim = audio::withdraw_exit(&an).await;
-    wait_for("audio claim withdrawal on B", 5.0, || {
+    let speaker = audio::withdraw_exit(&an).await;
+    wait_for("audio exit withdrawal on B", 5.0, || {
         bn.device_facts(an.id())
-            .and_then(|facts| facts.audio_exit_claim().ok())
-            .flatten()
-            == Some(claim.clone())
+            .and_then(|facts| facts.audio_config().ok().flatten())
+            .and_then(|config| config.speaker_exit().ok().flatten())
+            == Some(speaker.clone())
     })
     .await;
     sessions_unchanged("checkpoint 3");
@@ -567,7 +565,7 @@ async fn pair_route_clipboard_layout_disconnect_scenario() {
     a.clip.copy(many.clone(), Sensitivity::Normal);
     {
         use oink_clipboard::ClipboardBackend;
-        use oink_protocol::v1::{limits, schema::WireDto};
+        use oink_protocol::v2::{limits, schema::WireDto};
         let inventory = a.clip.capture(an.data_dir()).unwrap().content.unwrap().inventory();
         let wire = oink_clipboard::wire::inventory(&inventory).unwrap();
         assert!(wire.encode(limits::INVENTORY).unwrap().len() > limits::RELIABLE_FRAME);
@@ -1556,7 +1554,45 @@ async fn clipboard_source_settles_then_publishes_both_ui_events_scenario() {
     // Here the payload-specific events prove both real transports deliver after it.
 }
 
+/// 2026-11-12: an application wrote the clipboard twice ~180 ms apart and
+/// the first state was announced, then gone before anyone could read it.
+/// Writes inside the quiet period are announced once, as the last state; the
+/// intermediate state reaches no peer. (Timing edges: `oink_clipboard::sync`.)
+#[test]
+fn a_quick_double_write_is_announced_once_as_its_last_state() {
+    crate::test_watchdog::run(
+        module_path!(),
+        "a_quick_double_write_is_announced_once_as_its_last_state",
+        Some(4),
+        async {
+            use oink_clipboard::ClipboardBackend;
+            let text = |value: &str| vec![ClipData::Text(value.into())];
+            let a = start("burst-a", 0).await;
+            let b = start("burst-b", 0).await;
+            common::pair(&a.node, &b.node).await;
+            common::active(&[&a.node, &b.node]).await;
+            let announced = a.node.clipboard_activity().unwrap().len();
+            let b_count = b.clip.change_count();
+            a.clip.copy(text("intermediate"), Sensitivity::Normal);
+            // Well inside the 250 ms quiet period.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            a.clip.copy(text("final"), Sensitivity::Normal);
+            wait_for("final on B", 5.0, || b.clip.items() == text("final")).await;
+            tokio::time::sleep(Duration::from_millis(800)).await;
+            assert_eq!(
+                a.node.clipboard_activity().unwrap().len(),
+                announced + 1,
+                "the burst was announced more than once"
+            );
+            assert_eq!(b.clip.change_count(), b_count + 1, "B wrote the intermediate state");
+            a.node.shutdown().await;
+            b.node.shutdown().await;
+        },
+    );
+}
+
 mod cache;
+mod echo;
 
 #[test]
 fn remote_card_modes_apply_persist_and_publish_without_editing_requester() {
@@ -1652,7 +1688,7 @@ fn remote_card_modes_apply_persist_and_publish_without_editing_requester() {
             assert_eq!(b.node.input_status().unwrap().mouse_mode, InputMode::Shared);
             assert_eq!(b.node.input_status().unwrap().keyboard_mode, InputMode::Shared);
             api(&a.node, |node| {
-                use oink_protocol::v1::{RawValue, dto};
+                use oink_protocol::v2::{RawValue, dto};
                 let option = dto::LocalOption::InputTransform;
                 crate::node::lock(&node.inner.config)
                     .update_owner(|store| {
@@ -1672,7 +1708,7 @@ fn remote_card_modes_apply_persist_and_publish_without_editing_requester() {
             })
             .await;
             wait_for("remote transform extension publication", 5., || {
-                use oink_protocol::v1::dto;
+                use oink_protocol::v2::dto;
                 b.node
                     .device_facts(a.node.id())
                     .and_then(|facts| facts.preferences().ok().flatten())
@@ -1718,15 +1754,15 @@ fn remote_card_modes_apply_persist_and_publish_without_editing_requester() {
             assert_eq!(saved.settings.input_transform, expected_transform);
             let raw = saved
                 .owner()
-                .value(oink_protocol::v1::dto::LocalOption::InputTransform)
+                .value(oink_protocol::v2::dto::LocalOption::InputTransform)
                 .unwrap();
             assert_eq!(
                 raw.as_map().unwrap().get(&99),
-                Some(&oink_protocol::v1::RawValue::Text("future transform".into()))
+                Some(&oink_protocol::v2::RawValue::Text("future transform".into()))
             );
             assert_eq!(
                 raw.as_map().unwrap()[&2].as_map().unwrap().get(&99),
-                Some(&oink_protocol::v1::RawValue::Text("future target".into()))
+                Some(&oink_protocol::v2::RawValue::Text("future target".into()))
             );
             assert_eq!(a.node.settings().input_transform, expected_transform);
             assert_eq!(b.node.settings().input_transform, requester_transform);
@@ -1763,7 +1799,7 @@ fn remote_pause_and_emergency_clear_only_owner_disables_and_publish_release() {
         async {
             use crate::device_cards::{CardAction, DeviceControlReply, DeviceControlResult};
             use oink_foundation::input::InputMode;
-            use oink_protocol::v1::{dto::LocalOption, schema::WireValue};
+            use oink_protocol::v2::{dto::LocalOption, schema::WireValue};
             let a = start("disable-owner", 0).await;
             let b = start("pause-requester", 0).await;
             common::pair(&a.node, &b.node).await;
@@ -1858,7 +1894,7 @@ fn shared_microphone_hotkey_dispatches_to_source_and_no_source_notice_stays_loca
         Some(4),
         async {
             use crate::api::ApiEvent;
-            use oink_protocol::v1::{
+            use oink_protocol::v2::{
                 RawValue, dto,
                 schema::{WireDto, WireValue},
             };
@@ -1894,11 +1930,27 @@ fn shared_microphone_hotkey_dispatches_to_source_and_no_source_notice_stays_loca
                 let source = a.node.id();
                 let result = api(observer, move |node| {
                     let mut inputs = node.card_inputs();
-                    inputs.microphone_resolution = oink_audio::claims::Resolution::Exit {
-                        stamp: oink_audio::claims::Stamp {
-                            owner: source,
-                            counter: 1,
-                        },
+                    let version = oink_audio::route::Version {
+                        author: source,
+                        stamp: 1,
+                    };
+                    // Simulated: `source` is the microphone sender in this overview.
+                    inputs.audio.joined = true;
+                    inputs.audio.microphone = Some(oink_audio::route::Route {
+                        version,
+                        target: Some(source),
+                    });
+                    inputs.audio.devices.retain(|entry| entry.device != source);
+                    inputs.audio.devices.push(oink_audio::route::DeviceOverview {
+                        device: source,
+                        speaker: oink_audio::route::Mode::Local,
+                        microphone: oink_audio::route::Mode::Holder,
+                        forward: Some(false),
+                        receive: Some(false),
+                    });
+                    inputs.microphone_resolution = oink_audio::route::Resolution::Exit {
+                        version,
+                        target: source,
                         available: true,
                     };
                     let member = inputs

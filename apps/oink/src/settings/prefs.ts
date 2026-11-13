@@ -3,7 +3,15 @@ import { DEFAULT_SHORTCUTS } from './Shortcuts';
 import type { ShortcutId, ShortcutPref } from './Shortcuts';
 export type MacKey = 'control' | 'option' | 'command' | 'shift' | 'caps';
 export type WinKey = 'ctrl' | 'win' | 'alt' | 'shift' | 'caps';
-export type KeyPreset = 'mac' | 'win' | 'custom';
+/** Which system's feel a mapping gives; Custom is the user's own table. */
+export type KeyPreset = 'mac' | 'win' | 'android' | 'custom';
+/** The target system whose mapping row is edited (InputTransform row). */
+export type KeyTarget = 'macos' | 'windows' | 'android';
+export const defaultKeyTarget = (platform: Platform): KeyTarget => platform === 'mac' ? 'windows' : 'macos';
+export const localFeel = (platform: Platform): Exclude<KeyPreset, 'custom'> => platform === 'mac' ? 'mac' : 'win';
+export const targetFeel = (target: KeyTarget): Exclude<KeyPreset, 'custom'> => target === 'macos' ? 'mac' : target === 'windows' ? 'win' : 'android';
+/** Destination names: macOS key names for a Mac target, PC names otherwise. */
+export const targetKeys = (target: KeyTarget) => target === 'macos' ? ['control', 'option', 'command', 'shift', 'caps'] : ['ctrl', 'win', 'alt', 'shift', 'caps'];
 export interface KeyMap {
     keys: Record<string, string>;
     capsLong?: string;
@@ -20,7 +28,20 @@ export const KEY_NAMES: Record<Platform, Record<string, {
     },
     win: { ctrl: { name: 'Ctrl' }, win: { name: 'Win' }, alt: { name: 'Alt' }, shift: { name: 'Shift' }, caps: { name: 'Caps Lock' } },
 };
-export function presetMap(platform: Platform, preset: Exclude<KeyPreset, 'custom'>, capsIme: boolean): KeyMap {
+/** The table a feel produces for one source platform and target system. The
+ * Mac↔Windows rows keep their established tables; every other pair sends the
+ * physical keys as labelled. Mac→Android presets replace modifiers only:
+ * Mac feel swaps Command/Control; Android feel uses the Windows positions. */
+export function feelMap(platform: Platform, target: KeyTarget, feel: Exclude<KeyPreset, 'custom'>, capsIme: boolean): KeyMap {
+    if (feel !== 'android' && (platform === 'mac' ? target === 'windows' : target === 'macos')) return presetMap(platform, feel, capsIme);
+    if (platform === 'mac' && target === 'android' && feel === 'android') return presetMap(platform, 'win', false);
+    if (platform === 'mac' && target === 'android' && feel === 'mac') return { keys: { control: 'win', option: 'alt', command: 'ctrl', shift: 'shift', caps: 'caps' } };
+    const keys: Record<string, string> = platform === 'mac'
+        ? target === 'macos' ? { control: 'control', option: 'option', command: 'command' } : { control: 'ctrl', option: 'alt', command: 'win' }
+        : target === 'macos' ? { ctrl: 'control', win: 'command', alt: 'option' } : { ctrl: 'ctrl', win: 'win', alt: 'alt' };
+    return { keys: { ...keys, shift: 'shift', caps: 'caps' } };
+}
+export function presetMap(platform: Platform, preset: 'mac' | 'win', capsIme: boolean): KeyMap {
     if (platform === 'mac') {
         return preset === 'mac'
             ? { keys: { control: 'win', option: 'alt', command: 'ctrl', shift: 'shift', caps: capsIme ? 'shift' : 'caps' }, capsLong: capsIme ? 'caps' : undefined }
@@ -66,6 +87,7 @@ export interface Prefs {
     audioEncodingQuality: 'smooth' | 'quality' | 'lossless';
     audioDevice: string;
     keepLocalPlayback: boolean;
+    echoCancellation: boolean;
     shortcuts: Record<ShortcutId, ShortcutPref>;
     logLevel: LogLevel;
     logMaxMb: string;
@@ -106,6 +128,7 @@ export const DEFAULT_PREFS: Prefs = {
     audioEncodingQuality: 'quality',
     audioDevice: 'default',
     keepLocalPlayback: false,
+    echoCancellation: true,
     shortcuts: DEFAULT_SHORTCUTS,
     logLevel: 'info',
     logMaxMb: '1024',

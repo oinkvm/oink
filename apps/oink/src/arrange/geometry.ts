@@ -18,6 +18,8 @@ export interface Screen extends Rect {
     offline?: boolean;
     device?: string;
     groupSize?: number;
+    android?: boolean;
+    privileged?: boolean;
 }
 export type Corner = 'nw' | 'ne' | 'sw' | 'se';
 export const CORNERS: Corner[] = ['nw', 'ne', 'sw', 'se'];

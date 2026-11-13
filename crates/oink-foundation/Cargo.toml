@@ -18,8 +18,9 @@ thiserror.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 arc-swap = "1.7"
-# Clipboard deduplication digests (src/clipboard_dedupe.rs).
 blake3 = "1"
+# Pure RGBA -> bounded inline JPEG, shared by PC and mobile history producers.
+image = { version = "0.25", default-features = false, features = ["jpeg"] }
 # Rolling ordinary-log files shared by the agent and the Windows service (src/logging).
 fs2 = "0.4"
 crossbeam-channel = "0.5"

@@ -18,12 +18,15 @@ pub mod cache;
 mod cloud_files;
 pub mod content;
 pub mod dedupe;
+pub mod mobile;
 pub mod model;
 pub mod negotiation;
 pub mod paste_file;
 pub mod policy;
 pub mod received;
+pub mod retained;
 pub mod timing;
+pub mod tracked_file;
 
 pub mod provider_preparation;
 use std::sync::Arc;
@@ -119,6 +122,7 @@ pub type FileReader = Box<dyn std::io::Read + Send>;
 pub mod copy_diagnostics;
 pub mod dnd;
 pub mod formats;
+pub mod image_file;
 #[cfg(target_os = "macos")]
 mod macos;
 #[cfg(target_os = "macos")]
@@ -258,6 +262,15 @@ pub trait ClipboardBackend: Send + Sync {
     fn write_native_guarded(&self, _spec: NativeSpec, _guard: content::ReaderGuard) -> Result<u64, ClipboardError> {
         Err(ClipboardError::Unsupported)
     }
+    /// Publish a completed mobile share into the local system clipboard.
+    ///
+    /// Mobile shares may outlive their transfer staging directory. Platform
+    /// implementations must therefore adopt delayed text/image bytes before
+    /// returning, while retaining the caller's revision guard until the
+    /// native declaration boundary.
+    fn write_mobile_guarded(&self, spec: NativeSpec, guard: content::ReaderGuard) -> Result<u64, ClipboardError> {
+        self.write_native_guarded(spec, guard)
+    }
     /// `current` is a side-effect-free cancellation check for preparatory
     /// metadata work. `guard` is called only at the native declaration boundary.
     /// Existing backends retain their single guarded publication implementation.
@@ -349,14 +362,13 @@ pub trait FileContents: Send + Sync {
     fn cancel(&self) {}
 }
 
-/// macOS backend bound to a private named pasteboard instead of the general
-/// one (probes running beside an installed Oink, native tests).
+/// 创建本机平台的实现。
+/// macOS backend bound to a private named pasteboard instead of the general one.
 #[cfg(target_os = "macos")]
 pub fn named_pasteboard_backend(name: &str) -> Result<Box<dyn ClipboardBackend>, ClipboardError> {
     macos::named_backend(name)
 }
 
-/// 创建本机平台的实现。
 pub fn platform_backend() -> Result<Box<dyn ClipboardBackend>, ClipboardError> {
     #[cfg(target_os = "macos")]
     return macos::backend();
@@ -370,3 +382,6 @@ pub fn platform_backend() -> Result<Box<dyn ClipboardBackend>, ClipboardError> {
 #[cfg(all(test, debug_assertions, not(windows)))]
 #[path = "windows/image.rs"]
 mod windows_image_tests;
+
+/// PC shared history persistence and portable content cache.
+pub mod history;

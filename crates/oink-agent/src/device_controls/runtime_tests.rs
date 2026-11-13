@@ -107,15 +107,15 @@ fn legacy_screen_preferences_enabled_patch_edits_global_layout_only() {
                     option: option.number(),
                 },
             };
-            let patch = oink_protocol::v1::RawValue::Map(
+            let patch = oink_protocol::v2::RawValue::Map(
                 [(
                     1,
-                    oink_protocol::v1::RawValue::Map(
+                    oink_protocol::v2::RawValue::Map(
                         [(
                             1,
-                            oink_protocol::v1::RawValue::Array(vec![oink_protocol::v1::RawValue::Map(
+                            oink_protocol::v2::RawValue::Array(vec![oink_protocol::v2::RawValue::Map(
                                 [
-                                    (1, oink_protocol::v1::RawValue::Text("owner".into())),
+                                    (1, oink_protocol::v2::RawValue::Text("owner".into())),
                                     (3, false.write()),
                                 ]
                                 .into(),
@@ -325,7 +325,7 @@ fn process_shutdown_flushes_pending_forwarding_preferences_before_returning() {
             lock(&node.inner.config)
                 .edit_forwarding_deferred(
                     revision,
-                    oink_protocol::v1::RawValue::Map([(1, 67u16.write()), (2, false.write())].into_iter().collect()),
+                    oink_protocol::v2::RawValue::Map([(1, 67u16.write()), (2, false.write())].into_iter().collect()),
                 )
                 .unwrap();
             assert!(!lock(&node.inner.config).forwarding_persisted());
@@ -391,7 +391,7 @@ fn update_preparation_drains_admitted_preferences_after_closing_new_writes() {
             lock(&node.inner.config)
                 .edit_forwarding_deferred(
                     revision,
-                    oink_protocol::v1::RawValue::Map([(1, 73u16.write()), (2, false.write())].into_iter().collect()),
+                    oink_protocol::v2::RawValue::Map([(1, 73u16.write()), (2, false.write())].into_iter().collect()),
                 )
                 .unwrap();
             let preparing = node.clone();
@@ -419,7 +419,7 @@ fn update_preparation_drains_admitted_preferences_after_closing_new_writes() {
                 lock(&node.inner.config)
                     .edit_forwarding_deferred(
                         revision + 1,
-                        oink_protocol::v1::RawValue::Map([(1, 74u16.write())].into_iter().collect())
+                        oink_protocol::v2::RawValue::Map([(1, 74u16.write())].into_iter().collect())
                     )
                     .is_err()
             );
@@ -429,7 +429,7 @@ fn update_preparation_drains_admitted_preferences_after_closing_new_writes() {
             lock(&node.inner.config)
                 .edit_forwarding_deferred(
                     revision + 1,
-                    oink_protocol::v1::RawValue::Map([(1, 74u16.write())].into_iter().collect()),
+                    oink_protocol::v2::RawValue::Map([(1, 74u16.write())].into_iter().collect()),
                 )
                 .unwrap();
             let path = lock(&node.inner.config).settings_path();

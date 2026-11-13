@@ -118,6 +118,8 @@ pub(super) fn reason_code(reason: crate::model::Unavailable) -> u8 {
         NoProgress => 8,
         StorageFull => 9,
         InvalidData => 10,
+        Paused => 11,
+        SendDisabled => 12,
     }
 }
 
