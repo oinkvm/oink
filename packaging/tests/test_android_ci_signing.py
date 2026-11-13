@@ -39,4 +39,14 @@ class AndroidSigning(unittest.TestCase):
                     else:
                         with self.assertRaises(ValueError):signing.verify(Path('fixture.apk'),Path('apksigner'),out)
 
+    def test_sdk37_per_scheme_output_matches_the_same_pinned_leaf(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out=Path(tmp)/'proof.json'
+            for text in [f'V2 Signer: certificate SHA-256 digest: {signing.CERTIFICATE_SHA256}\n', f'V2 Signer: certificate SHA-256 digest: {signing.CERTIFICATE_SHA256}\nV3 Signer: certificate SHA-256 digest: {signing.CERTIFICATE_SHA256}\n']:
+                with patch.object(signing.subprocess,'run',return_value=subprocess.CompletedProcess([],0,text,'')):
+                    signing.verify(Path('fixture.apk'),Path('apksigner'),out)
+            mixed=f'V2 Signer: certificate SHA-256 digest: {signing.CERTIFICATE_SHA256}\nV3 Signer: certificate SHA-256 digest: {"a"*64}\n'
+            with patch.object(signing.subprocess,'run',return_value=subprocess.CompletedProcess([],0,mixed,'')):
+                with self.assertRaises(ValueError):signing.verify(Path('fixture.apk'),Path('apksigner'),out)
+
 if __name__=='__main__':unittest.main()

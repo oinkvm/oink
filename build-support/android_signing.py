@@ -35,8 +35,10 @@ def verify(apk, apksigner, output):
     result=subprocess.run([str(apksigner),'verify','--print-certs',str(apk)],capture_output=True,text=True)
     if result.returncode:
         raise ValueError('APK signature verification failed')
-    found=re.findall(r'Signer #\d+ certificate SHA-256 digest:\s*([0-9a-fA-F]{64})',result.stdout)
-    if len(found)!=1 or found[0].lower()!=CERTIFICATE_SHA256:
+    # SDK 37 reports per-scheme `V2 Signer:`, older releases use `Signer #1`.
+    # Multiple schemes may repeat one leaf certificate; any different signer fails.
+    found=re.findall(r'^(?:Signer #\d+ certificate|V\d+(?:\.\d+)? Signer: certificate) SHA-256 digest:\s*([0-9a-fA-F]{64})',result.stdout,re.MULTILINE)
+    if not found or {v.lower() for v in found}!={CERTIFICATE_SHA256}:
         raise ValueError('APK signer differs from the existing in-house certificate')
     output.write_text(json.dumps(dict(verified=True,certificate_sha256=CERTIFICATE_SHA256),indent=2)+'\n')
     print('APK signature verified against the existing in-house certificate')
