@@ -165,11 +165,16 @@ jobs:
           workspaces: |
             . -> target
             build-support/mobile/uniffi-bindgen -> target/uniffi-bindgen
-      - name: Select JDK and install the app's pinned Android SDK
+      - uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5
+        with:
+          distribution: temurin
+          java-version: '21'
+      - uses: android-actions/setup-android@9fc6c4e9069bf8d3d10b2204b1fb8f6ef7065407 # v3
+        with:
+          packages: platform-tools
+      - name: Install the app's pinned Android SDK
         shell: bash
         run: |
-          echo "JAVA_HOME=$JAVA_HOME_21_X64" >> "$GITHUB_ENV"
-          echo "$JAVA_HOME_21_X64/bin" >> "$GITHUB_PATH"
           sdkmanager 'platforms;android-36' 'build-tools;37.0.0' 'ndk;30.0.16248370'
           echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/30.0.16248370" >> "$GITHUB_ENV"
       - name: Install cargo-ndk
