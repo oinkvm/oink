@@ -78,3 +78,16 @@ test('bundled sponsor marks retain project provenance, terms and brand notices',
     assert.match(asset.trademarkNotice, /grants no trademark rights or endorsement/, path);
   }
 });
+
+test('public attribution inputs are product files, not excluded development generators', () => {
+  for (const asset of native.assets) {
+    for (const source of [asset, ...(asset.copies ?? [])]) {
+      assert.doesNotMatch(source.path, /^(?:scripts|docs|\.claude|tools)\//, source.path);
+      assert.ok(readFileSync(new URL(`../${source.path}`, import.meta.url)).length, source.path);
+    }
+  }
+  const lucide = native.assets.find(asset => asset.id === 'asset:lucide-icons@0.468.0');
+  assert.ok(lucide.copies.some(copy => /Lucide-.*\.pdf$/.test(copy.path)));
+  const robot = native.assets.find(asset => asset.id.startsWith('asset:android-robot-head'));
+  assert.ok(robot.copies.some(copy => /OSAndroid-head\.pdf$/.test(copy.path)));
+});

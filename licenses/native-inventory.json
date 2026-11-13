@@ -2114,8 +2114,393 @@
       "sha256": "d985419856253bcee25c948ca10ec144e1da872a2f3c45f838ae79a2a2872311",
       "copies": [
         {
-          "path": "scripts/mobile/generate-ios-ui-assets.mjs",
-          "sha256": "860274bd7e25e6409243815f8718f84b2b33d19bb8338d16c699156a8bddb076",
+          "path": "apps/mobile/ios/App/Assets.xcassets/UI/Lucide-alert-circle-2.imageset/Lucide-alert-circle-2.pdf",
+          "sha256": "abe2d5b21183074396583c142c9aa4d9c5aa08983f9589449a51686f0dc8141e",
+          "platforms": [
+            "ios-arm64"
+          ]
+        },
+        {
+          "path": "apps/mobile/ios/App/Assets.xcassets/UI/Lucide-arrow-down-2.imageset/Lucide-arrow-down-2.pdf",
+          "sha256": "fa7d92cb4061efa8272e609d659c034fcec71e636268ae924b26614e903ec239",
+          "platforms": [
+            "ios-arm64"
+          ]
+        },
+        {
+          "path": "apps/mobile/ios/App/Assets.xcassets/UI/Lucide-arrow-down-up-1_8.imageset/Lucide-arrow-down-up-1_8.pdf",
+          "sha256": "5b11b1f6c5a7ef6b85d539aaa5b9ae56a12c3fae51e9bc1e0175b357e13e76bb",
+          "platforms": [
+            "ios-arm64"
+          ]
+        },
+        {
+          "path": "apps/mobile/ios/App/Assets.xcassets/UI/Lucide-arrow-down-up-2_2.imageset/Lucide-arrow-down-up-2_2.pdf",
+          "sha256": "03e0b3184147b9116f5987b4cba4c96e31b37ca850310397ada9b9bea0aee24e",
+          "platforms": [
+            "ios-arm64"
+          ]
+        },
+        {
+          "path": "apps/mobile/ios/App/Assets.xcassets/UI/Lucide-arrow-left-2.imageset/Lucide-arrow-left-2.pdf",
+          "sha256": "e24b7ebd2b9420353e09287fb277c4edb62dcb0c23702e08cd0966dd6b0f6866",
+          "platforms": [
+            "ios-arm64"
+          ]
+        },
+        {
+          "path": "apps/mobile/ios/App/Assets.xcassets/UI/Lucide-arrow-right-2.imageset/Lucide-arrow-right-2.pdf",
+          "sha256": "ebcba470b58e3a362a84a6cd15de7f061f44c23d1141e0fec81cef0ea9df8a9c",
+          "platforms": [
+            "ios-arm64"
+          ]
+        },
+        {
+          "path": "apps/mobile/ios/App/Assets.xcassets/UI/Lucide-arrow-up-2.imageset/Lucide-arrow-up-2.pdf",
+          "sha256": "32eb167e140be771d7e9889835202b01af4589c4fc48a41f5d60905198371040",
+          "platforms": [
+            "ios-arm64"
+          ]
+        },
+        {
+          "path": "apps/mobile/ios/App/Assets.xcassets/UI/Lucide-camera-2.imageset/Lucide-camera-2.pdf",
+          "sha256": "1f85394bcc5180886d010b28387857f05fba3749381702389a373299fd1acd06",
+          "platforms": [
+            "ios-arm64"
+          ]
+        },
+        {
+          "path": "apps/mobile/ios/App/Assets.xcassets/UI/Lucide-check-2.imageset/Lucide-check-2.pdf",
+          "sha256": "f1bfa952a05cd4b677a2a44d9865e04a6509e5adae1e005456792a26e4139e8e",
+          "platforms": [
+            "ios-arm64"
+          ]
+        },
+        {
+          "path": "apps/mobile/ios/App/Assets.xcassets/UI/Lucide-check-2_4.imageset/Lucide-check-2_4.pdf",
+          "sha256": "266b158c106b9917cbb10bfbd8e331fb717d06e22916c790582eca60db2e44d3",
+          "platforms": [
+            "ios-arm64"
+          ]
+        },
+        {
+          "path": "apps/mobile/ios/App/Assets.xcassets/UI/Lucide-check-2_6.imageset/Lucide-check-2_6.pdf",
+          "sha256": "06ea6dc79f6d3b5e01d1be33641a3229efbf5e14386d5d8616a44418ea1f7c73",
+          "platforms": [
+            "ios-arm64"
+          ]
+        },
+        {
+          "path": "apps/mobile/ios/App/Assets.xcassets/UI/Lucide-check-3.imageset/Lucide-check-3.pdf",
+          "sha256": "292dbc41c31c7fc03dc0faa70a024d728e06a362650245608925087ca55e0f93",
+          "platforms": [
+            "ios-arm64"
+          ]
+        },
+        {
+          "path": "apps/mobile/ios/App/Assets.xcassets/UI/Lucide-chevron-down-2.imageset/Lucide-chevron-down-2.pdf",
+          "sha256": "715a859a5f90025c4f6991aad9e909b970831d2d94153f2a6c122a70a9ba033a",
+          "platforms": [
+            "ios-arm64"
+          ]
+        },
+        {
+          "path": "apps/mobile/ios/App/Assets.xcassets/UI/Lucide-chevron-down-2_2.imageset/Lucide-chevron-down-2_2.pdf",
+          "sha256": "3c15ec80405e2f06ad7dfb89419890b22c5b30c1c1c878968e94692c4af2ef6e",
+          "platforms": [
+            "ios-arm64"
+          ]
+        },
+        {
+          "path": "apps/mobile/ios/App/Assets.xcassets/UI/Lucide-chevron-left-2.imageset/Lucide-chevron-left-2.pdf",
+          "sha256": "8cae772764c4b6b1278acfdee68fd6d756de18c4265375cf17c3d81610434486",
+          "platforms": [
+            "ios-arm64"
+          ]
+        },
+        {
+          "path": "apps/mobile/ios/App/Assets.xcassets/UI/Lucide-chevron-right-2.imageset/Lucide-chevron-right-2.pdf",
+          "sha256": "62674a1c4ddc1f49ad0b02907767db7ff516801d5310cbbc0c251d00418984ab",
+          "platforms": [
+            "ios-arm64"
+          ]
+        },
+        {
+          "path": "apps/mobile/ios/App/Assets.xcassets/UI/Lucide-chevrons-down-up-2.imageset/Lucide-chevrons-down-up-2.pdf",
+          "sha256": "8fc3acfc89939a43e55883553e5136ee2f85c092a0afcc8e92c8c4a095099668",
+          "platforms": [
+            "ios-arm64"
+          ]
+        },
+        {
+          "path": "apps/mobile/ios/App/Assets.xcassets/UI/Lucide-chevrons-up-down-2.imageset/Lucide-chevrons-up-down-2.pdf",
+          "sha256": "5c5f2d9b2fc51e2e9d60f5de9618687815c0b9d3077fabc32e505032c17e651b",
+          "platforms": [
+            "ios-arm64"
+          ]
+        },
+        {
+          "path": "apps/mobile/ios/App/Assets.xcassets/UI/Lucide-clipboard-copy-2_2.imageset/Lucide-clipboard-copy-2_2.pdf",
+          "sha256": "56593179fbfc8fc77732253f68cde6d8cd6d7b95964de515d04e635f42c0683b",
+          "platforms": [
+            "ios-arm64"
+          ]
+        },
+        {
+          "path": "apps/mobile/ios/App/Assets.xcassets/UI/Lucide-clipboard-paste-2.imageset/Lucide-clipboard-paste-2.pdf",
+          "sha256": "4bdeb61b6966a7d98c2aada3323cba120eb8a22aa19e8b7b767475f27feb7aed",
+          "platforms": [
+            "ios-arm64"
+          ]
+        },
+        {
+          "path": "apps/mobile/ios/App/Assets.xcassets/UI/Lucide-copy-2.imageset/Lucide-copy-2.pdf",
+          "sha256": "0d3960962d16744bc255f885af1466ad22c808d8d3e5c28d3a0e23d012a5fe6d",
+          "platforms": [
+            "ios-arm64"
+          ]
+        },
+        {
+          "path": "apps/mobile/ios/App/Assets.xcassets/UI/Lucide-corner-down-left-2.imageset/Lucide-corner-down-left-2.pdf",
+          "sha256": "183862ba96907455e834894f8b736c3a4dcf5bb2ca21e8d25ff033624b3c0be0",
+          "platforms": [
+            "ios-arm64"
+          ]
+        },
+        {
+          "path": "apps/mobile/ios/App/Assets.xcassets/UI/Lucide-delete-2.imageset/Lucide-delete-2.pdf",
+          "sha256": "1c3b1d94fb4edc21daa26c5fa77849490659d6032c062c8b00aaad3134bd1b22",
+          "platforms": [
+            "ios-arm64"
+          ]
+        },
+        {
+          "path": "apps/mobile/ios/App/Assets.xcassets/UI/Lucide-download-2.imageset/Lucide-download-2.pdf",
+          "sha256": "e214bdc4508a2b337e6651e83dcff061f2ddf82629e69b69d4ee83ccb083a8e8",
+          "platforms": [
+            "ios-arm64"
+          ]
+        },
+        {
+          "path": "apps/mobile/ios/App/Assets.xcassets/UI/Lucide-external-link-2.imageset/Lucide-external-link-2.pdf",
+          "sha256": "75647ae590c4faad97ad1611e9a57ac5b7a5a5ad63ae4f9a235dc6a9b6fb7821",
+          "platforms": [
+            "ios-arm64"
+          ]
+        },
+        {
+          "path": "apps/mobile/ios/App/Assets.xcassets/UI/Lucide-fast-forward-fill-2.imageset/Lucide-fast-forward-fill-2.pdf",
+          "sha256": "2564f0dba211985ed6a5fb7560fb1d93a63ed57b07f09b1db96595f23d042835",
+          "platforms": [
+            "ios-arm64"
+          ]
+        },
+        {
+          "path": "apps/mobile/ios/App/Assets.xcassets/UI/Lucide-file-1_8.imageset/Lucide-file-1_8.pdf",
+          "sha256": "9d0c2af1cb051f8c308c7d6afaef2a5fa41575dc501b37b913704cfee30df144",
+          "platforms": [
+            "ios-arm64"
+          ]
+        },
+        {
+          "path": "apps/mobile/ios/App/Assets.xcassets/UI/Lucide-file-2.imageset/Lucide-file-2.pdf",
+          "sha256": "3d79678b65fdc01ab6b0df0529f7aaf1b6a06bfc39a6c04ec44069e808f6965d",
+          "platforms": [
+            "ios-arm64"
+          ]
+        },
+        {
+          "path": "apps/mobile/ios/App/Assets.xcassets/UI/Lucide-file-archive-1_8.imageset/Lucide-file-archive-1_8.pdf",
+          "sha256": "c1b1f93ff5238ccd2ad6accff5bc342a9ffff1eab5569fda046d0db469986f92",
+          "platforms": [
+            "ios-arm64"
+          ]
+        },
+        {
+          "path": "apps/mobile/ios/App/Assets.xcassets/UI/Lucide-file-spreadsheet-1_8.imageset/Lucide-file-spreadsheet-1_8.pdf",
+          "sha256": "61f2214d3944be68c350f7b55ffdcd49dc2de5f5137d0ad69bfda19c65a043ab",
+          "platforms": [
+            "ios-arm64"
+          ]
+        },
+        {
+          "path": "apps/mobile/ios/App/Assets.xcassets/UI/Lucide-file-text-1_8.imageset/Lucide-file-text-1_8.pdf",
+          "sha256": "a59b721e9f11f6e9d01d1f7ec058ae532a38a4b38e57f897ce08694ce7489e21",
+          "platforms": [
+            "ios-arm64"
+          ]
+        },
+        {
+          "path": "apps/mobile/ios/App/Assets.xcassets/UI/Lucide-folder-1_8.imageset/Lucide-folder-1_8.pdf",
+          "sha256": "460e443ec46d33681bd532b14bc53e84d76a99112fc60cf3143e8d5b55af356f",
+          "platforms": [
+            "ios-arm64"
+          ]
+        },
+        {
+          "path": "apps/mobile/ios/App/Assets.xcassets/UI/Lucide-folder-2.imageset/Lucide-folder-2.pdf",
+          "sha256": "d9a1d01a0b62a4c0a1553e52a33bf95448d73ab45e06a15ae1b9a1707aee12f2",
+          "platforms": [
+            "ios-arm64"
+          ]
+        },
+        {
+          "path": "apps/mobile/ios/App/Assets.xcassets/UI/Lucide-image-2.imageset/Lucide-image-2.pdf",
+          "sha256": "196f66031a17ff16d6e686c062324d83faf05fd075982cd6eec9735ab75b404b",
+          "platforms": [
+            "ios-arm64"
+          ]
+        },
+        {
+          "path": "apps/mobile/ios/App/Assets.xcassets/UI/Lucide-image-off-2.imageset/Lucide-image-off-2.pdf",
+          "sha256": "2ee003eb1f6b8656aa4a2efd9ce8bf1987c8207b4a451b6e15bdf2fd4915d06f",
+          "platforms": [
+            "ios-arm64"
+          ]
+        },
+        {
+          "path": "apps/mobile/ios/App/Assets.xcassets/UI/Lucide-info-2.imageset/Lucide-info-2.pdf",
+          "sha256": "1c82ea51f4320f2425409fd2a8c11285d65930a6ff12fd87ead0514d626aa2eb",
+          "platforms": [
+            "ios-arm64"
+          ]
+        },
+        {
+          "path": "apps/mobile/ios/App/Assets.xcassets/UI/Lucide-lock-keyhole-2.imageset/Lucide-lock-keyhole-2.pdf",
+          "sha256": "cfe601251bacc0b275b8d581c9c8b90b07f5f75be64c93c639ea2da646858bf5",
+          "platforms": [
+            "ios-arm64"
+          ]
+        },
+        {
+          "path": "apps/mobile/ios/App/Assets.xcassets/UI/Lucide-lock-keyhole-2_2.imageset/Lucide-lock-keyhole-2_2.pdf",
+          "sha256": "f7c1c2a97767a388f95486623656b0e18d1d9dd813198b3f66af50c3faa716d2",
+          "platforms": [
+            "ios-arm64"
+          ]
+        },
+        {
+          "path": "apps/mobile/ios/App/Assets.xcassets/UI/Lucide-monitor-1_8.imageset/Lucide-monitor-1_8.pdf",
+          "sha256": "133546db1417b5dd4ed28fea8838da3a755ffef7409cf0a76b4102170901b30d",
+          "platforms": [
+            "ios-arm64"
+          ]
+        },
+        {
+          "path": "apps/mobile/ios/App/Assets.xcassets/UI/Lucide-monitor-2_2.imageset/Lucide-monitor-2_2.pdf",
+          "sha256": "fb0b0510dd4cbd017183035afbd11a0d0b5a71c02a7937d1678374fa04fa6bf5",
+          "platforms": [
+            "ios-arm64"
+          ]
+        },
+        {
+          "path": "apps/mobile/ios/App/Assets.xcassets/UI/Lucide-monitor-smartphone-2.imageset/Lucide-monitor-smartphone-2.pdf",
+          "sha256": "a13dbf1f92d2a45c49942fdb9e4a8ea096983cc51f401a8017d81c1ae32bf3cd",
+          "platforms": [
+            "ios-arm64"
+          ]
+        },
+        {
+          "path": "apps/mobile/ios/App/Assets.xcassets/UI/Lucide-play-2.imageset/Lucide-play-2.pdf",
+          "sha256": "4f0b17db255dee47e89e3a78da89d14aaacf60862c607669a897955b909b9208",
+          "platforms": [
+            "ios-arm64"
+          ]
+        },
+        {
+          "path": "apps/mobile/ios/App/Assets.xcassets/UI/Lucide-plus-2.imageset/Lucide-plus-2.pdf",
+          "sha256": "716a36cbfea88936a07e0784f4ac4b0aa23555757b3619bffe71ca76812ecc19",
+          "platforms": [
+            "ios-arm64"
+          ]
+        },
+        {
+          "path": "apps/mobile/ios/App/Assets.xcassets/UI/Lucide-plus-2_2.imageset/Lucide-plus-2_2.pdf",
+          "sha256": "29918c6bc6ef4cdffec886eb192e2619b82a0f02f04b9e8090e2253378f028d3",
+          "platforms": [
+            "ios-arm64"
+          ]
+        },
+        {
+          "path": "apps/mobile/ios/App/Assets.xcassets/UI/Lucide-plus-2_4.imageset/Lucide-plus-2_4.pdf",
+          "sha256": "fb568990f517ec8464cfb3d91a77284f3ede94be44d7b359f96ee31697303f94",
+          "platforms": [
+            "ios-arm64"
+          ]
+        },
+        {
+          "path": "apps/mobile/ios/App/Assets.xcassets/UI/Lucide-radar-2.imageset/Lucide-radar-2.pdf",
+          "sha256": "daaff154184d92b1961e1ea324e124e585b716c39b92e372a6073855b983e64f",
+          "platforms": [
+            "ios-arm64"
+          ]
+        },
+        {
+          "path": "apps/mobile/ios/App/Assets.xcassets/UI/Lucide-refresh-cw-2.imageset/Lucide-refresh-cw-2.pdf",
+          "sha256": "4e4a2e69035a1bc3a637bfe83d1bcf9a301901818b1d87e7580edaf600b820d6",
+          "platforms": [
+            "ios-arm64"
+          ]
+        },
+        {
+          "path": "apps/mobile/ios/App/Assets.xcassets/UI/Lucide-rewind-fill-2.imageset/Lucide-rewind-fill-2.pdf",
+          "sha256": "1c8b7ec66d9ff131f707ccc2409ea0dfe287adab0e97426e893b92028d37c90a",
+          "platforms": [
+            "ios-arm64"
+          ]
+        },
+        {
+          "path": "apps/mobile/ios/App/Assets.xcassets/UI/Lucide-rotate-cw-2.imageset/Lucide-rotate-cw-2.pdf",
+          "sha256": "80c3b32ec2c1c67460f6bf781652aca61c994a967c0b37dfae237702d1ccf1ab",
+          "platforms": [
+            "ios-arm64"
+          ]
+        },
+        {
+          "path": "apps/mobile/ios/App/Assets.xcassets/UI/Lucide-settings-2.imageset/Lucide-settings-2.pdf",
+          "sha256": "f73ea5b9d0ff6b657273ec9055e1f9c328c42f1c6897bf59fb4bc5fccf9a925f",
+          "platforms": [
+            "ios-arm64"
+          ]
+        },
+        {
+          "path": "apps/mobile/ios/App/Assets.xcassets/UI/Lucide-shield-alert-2.imageset/Lucide-shield-alert-2.pdf",
+          "sha256": "46bba0b2dce944addf6ec156dcd39859e5d800259471a7d8d910d99a577811c6",
+          "platforms": [
+            "ios-arm64"
+          ]
+        },
+        {
+          "path": "apps/mobile/ios/App/Assets.xcassets/UI/Lucide-sliders-horizontal-2.imageset/Lucide-sliders-horizontal-2.pdf",
+          "sha256": "9e819770d30f5124b6fa9e6b469162689d7d3f7b922fdcc28862d10537721c55",
+          "platforms": [
+            "ios-arm64"
+          ]
+        },
+        {
+          "path": "apps/mobile/ios/App/Assets.xcassets/UI/Lucide-square-dot-2.imageset/Lucide-square-dot-2.pdf",
+          "sha256": "f65ed6052bf427e7d54694241039e18b3f49c9e51d60ab89d8624ea47c55c0cc",
+          "platforms": [
+            "ios-arm64"
+          ]
+        },
+        {
+          "path": "apps/mobile/ios/App/Assets.xcassets/UI/Lucide-wifi-off-2.imageset/Lucide-wifi-off-2.pdf",
+          "sha256": "110d36fd8a8cf50ad8bf932f1c9dba8a204132eb31bf03dd0f32e2cdbee69a08",
+          "platforms": [
+            "ios-arm64"
+          ]
+        },
+        {
+          "path": "apps/mobile/ios/App/Assets.xcassets/UI/Lucide-x-2_2.imageset/Lucide-x-2_2.pdf",
+          "sha256": "a2f6b747716d4cf8df652b6e8ee2f2a97c682da733fc6a95bf0faf39bab646fa",
+          "platforms": [
+            "ios-arm64"
+          ]
+        },
+        {
+          "path": "apps/mobile/ios/App/Assets.xcassets/UI/Lucide-x-2_6.imageset/Lucide-x-2_6.pdf",
+          "sha256": "3d2bf989fcdd5f00d7f5d20e5575c8537064f330e86956d3d9e25fd632fb660a",
           "platforms": [
             "ios-arm64"
           ]
@@ -2199,8 +2584,8 @@
           ]
         },
         {
-          "path": "scripts/mobile/generate-ios-ui-assets.mjs",
-          "sha256": "860274bd7e25e6409243815f8718f84b2b33d19bb8338d16c699156a8bddb076",
+          "path": "apps/mobile/ios/App/Assets.xcassets/UI/OSAndroid-head.imageset/OSAndroid-head.pdf",
+          "sha256": "613d3738960eacab5560a7e1c1bf634260037afb49ef31adaec9c65ea50e6f03",
           "platforms": [
             "ios-arm64"
           ]
