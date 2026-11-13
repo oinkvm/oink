@@ -24,6 +24,16 @@ final class DrawnPointer implements AutoCloseable {
         try {
             surface=Surface.class.getConstructor(controlType).newInstance(control);
             transaction=Class.forName("android.view.SurfaceControl$Transaction").getConstructor().newInstance();
+            // A buffer-only SurfaceControl still participates in input occlusion. On
+            // HyperOS 3 / Android 16, InputDispatcher drops mouse events underneath this
+            // very arrow as BLOCK_UNTRUSTED, despite its empty touch region and lack of
+            // an input channel. Mark our shell-owned layer (and its BLAST child) trusted
+            // before showing it. The API starts at Android 12, with untrusted-touch
+            // blocking. This preserves the visible arrow through clicks and drags and
+            // changes no other window's input policy. Android 15 previously accepted
+            // the unmarked layer on the test phone.
+            if(android.os.Build.VERSION.SDK_INT>=31)
+                change("setTrustedOverlay",new Class[]{boolean.class},true);
             Canvas canvas=surface.lockCanvas(null);
             try {
                 canvas.drawColor(Color.TRANSPARENT,PorterDuff.Mode.CLEAR);
@@ -42,9 +52,8 @@ final class DrawnPointer implements AutoCloseable {
     }
     void position(float x,float y) throws Exception {
         change("setPosition",new Class[]{float.class,float.class},x-hotSpotX,y-hotSpotY);
-        // No input window or touch region is registered. Android 15 delivers flags=0 with this
-        // layer visible through DOWN/MOVE/UP; no transparent-window or hide-on-press workaround
-        // is needed. API30–34 are untested. Hide only when input focus is released or on teardown.
+        // Keep the trusted layer visible through DOWN/MOVE/UP. Hide only when input
+        // focus is released or on teardown.
         change("show",new Class[]{});apply();
     }
     void hide() throws Exception { change("hide",new Class[]{});apply(); }

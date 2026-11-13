@@ -20,7 +20,6 @@ internal object LocalAdb {
         val host = requireNotNull(address.hostAddress).substringBefore('%')
         return if (address is java.net.Inet6Address && address.scopeId != 0) "$host%${address.scopeId}" else host
     }
-    fun publicKeyLine(credential: ByteArray) = uniffi.oink_mobile_ffi.adbPublicKey(credential)
     fun isLocal(address: InetAddress): Boolean = address.isLoopbackAddress || runCatching {
         NetworkInterface.getNetworkInterfaces()?.toList().orEmpty().any { address in it.inetAddresses.toList() }
     }.getOrDefault(false)

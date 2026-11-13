@@ -107,6 +107,12 @@ class DraftIntegrity(unittest.TestCase):
             self.assertTrue(request['draft']);self.assertTrue(request['prerelease'])
             self.assertEqual(request['tag_name'],'ci-0.4.0-beta.83')
             self.assertEqual(request['target_commitish'],COMMIT)
+            self.assertEqual(
+                request['body'],
+                'NOTICE: Early beta — expect bugs. Not compatible with earlier versions; '
+                'all devices in a group must upgrade together. Use with caution.\n\n'
+                'Supports mobile devices.',
+            )
             self.assertEqual(upload.call_count,1)
             with patch.object(beta.subprocess,'check_output',return_value=json.dumps([dict(tag_name='ci-0.4.0-beta.83',draft=False,target_commitish=COMMIT,id=42)])), patch.object(beta.subprocess,'run') as upload:
                 with self.assertRaises(ValueError):beta.publish(out,record)

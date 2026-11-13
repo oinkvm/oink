@@ -1688,11 +1688,6 @@ impl MobileSession {
     pub fn clipboard(&self) -> Arc<MobileClipboard> {
         self.clipboard.clone()
     }
-    pub fn recovery(&self) -> Arc<MobileRecovery> {
-        Arc::new(MobileRecovery {
-            network: self.network.clone(),
-        })
-    }
     pub async fn shutdown(self: Arc<Self>) -> Result<(), MobileError> {
         // The native waiter may be cancelled while the network drains.
         tokio::spawn(async move {
@@ -1786,21 +1781,6 @@ impl MobileSession {
     pub async fn unsubscribe(&self) {
         self.subscribed.send_replace(false);
         self.listener.lock().unwrap().take();
-    }
-    pub async fn bootstrap_identity_proof(
-        &self,
-        nonce: String,
-        serial: String,
-        digest: String,
-        enabled: bool,
-        revision: u64,
-    ) -> Option<String> {
-        let presence = self.presence.lock().unwrap();
-        if presence.stopped || presence.suspended {
-            return None;
-        }
-        self.network
-            .android_bootstrap_proof(&nonce, &serial, &digest, enabled, revision)
     }
     pub async fn nearby(&self) -> Result<NearbySnapshot, MobileError> {
         Ok(self.nearby_view())
@@ -2623,121 +2603,6 @@ impl From<MobileDirectoryEntry> for DirectoryEntry {
             version: value.version,
             child: None,
         }
-    }
-}
-
-#[derive(Debug, Clone, uniffi::Record)]
-pub struct RecoveryEndpoint {
-    pub address: String,
-    pub port: u16,
-    pub scope_id: u32,
-}
-#[derive(Clone, uniffi::Record)]
-pub struct RecoveryKey {
-    pub owner: String,
-    pub key_id: Vec<u8>,
-    pub origin: String,
-    pub revision: u64,
-    pub revoked: bool,
-    pub private_key: Vec<u8>,
-    pub public_key: Vec<u8>,
-}
-impl std::fmt::Debug for RecoveryKey {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("RecoveryKey").finish_non_exhaustive()
-    }
-}
-#[derive(Debug, Clone, uniffi::Record)]
-pub struct RecoveryCredentials {
-    pub group: Vec<u8>,
-    pub peer: String,
-    pub update_id: Vec<u8>,
-    pub epoch_counter: u64,
-    pub epoch_origin: String,
-    pub records: Vec<RecoveryKey>,
-}
-#[derive(Debug, Clone, uniffi::Record)]
-pub struct RecoveryRequest {
-    pub request: Vec<u8>,
-    pub helper_version: String,
-    pub helper_digest: Vec<u8>,
-    pub ttl_ms: u64,
-}
-#[derive(Debug, Clone, uniffi::Enum)]
-pub enum RecoveryEvent {
-    Credential { value: RecoveryCredentials },
-    Start { value: RecoveryRequest },
-    Result { phase: u8, reason: u8 },
-}
-#[derive(uniffi::Object)]
-pub struct MobileRecovery {
-    network: MobileNetwork,
-}
-impl std::fmt::Debug for MobileRecovery {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("MobileRecovery").finish_non_exhaustive()
-    }
-}
-#[uniffi::export]
-impl MobileRecovery {
-    pub fn group_id(&self) -> Vec<u8> {
-        self.network.group_id().0.to_vec()
-    }
-    pub fn local_device(&self) -> String {
-        self.network.device_id()
-    }
-    pub fn members(&self) -> Vec<String> {
-        self.network
-            .members()
-            .into_iter()
-            .map(|member| member.device.to_hex())
-            .collect()
-    }
-    /// PC-assisted privileged recovery (API 30-32 fallback, PC-initiated
-    /// start) has no protocol v2 message and no PC executor. Hosts must gate
-    /// every PC-assist call on this; local wireless-ADB recovery is separate.
-    pub fn pc_assist_supported(&self) -> bool {
-        false
-    }
-    /// No group PC can execute a recovery request in protocol v2.
-    pub fn candidates(&self) -> Vec<String> {
-        vec![]
-    }
-    /// No PC request is ever outstanding.
-    pub fn remaining_ms(&self, _request: Vec<u8>) -> u64 {
-        0
-    }
-    /// No PC sends recovery events in protocol v2; the stream is closed.
-    pub fn next(&self) -> Option<RecoveryEvent> {
-        None
-    }
-    pub fn credential_ack(
-        &self,
-        _batch: RecoveryCredentials,
-        _accepted: bool,
-        _epoch: u64,
-        _origin: String,
-    ) -> Result<(), MobileError> {
-        Err(pc_assist_unsupported())
-    }
-    /// Nothing is sent: no PC consumes recovery endpoints in protocol v2.
-    /// Kept non-failing only because the current Android host calls it on
-    /// its local-recovery path; hosts must stop calling it (pc_assist_supported).
-    pub fn publish_endpoints(&self, _generation: u64, _endpoints: Vec<RecoveryEndpoint>) {}
-    /// Nothing is sent; see `publish_endpoints`.
-    pub fn publish_credentials(&self, _value: RecoveryCredentials) {}
-    pub fn request_pc(&self, _peer: String, _request: RecoveryRequest) -> Result<(), MobileError> {
-        Err(pc_assist_unsupported())
-    }
-    pub fn progress(&self, _request: Vec<u8>, _phase: u8, _reason: u8) -> Result<(), MobileError> {
-        Err(pc_assist_unsupported())
-    }
-}
-
-fn pc_assist_unsupported() -> MobileError {
-    MobileError::Command {
-        code: UserFacingCode::Unsupported,
-        detail: "PC-assisted privileged recovery is not part of protocol v2".into(),
     }
 }
 

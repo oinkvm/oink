@@ -274,9 +274,6 @@ sealed interface EditResult {
 /** Suspend calls run off the UI thread. Publication checks are memory-only on Main.
  * stop must await sockets and tasks before returning. */
 interface CoreBridge {
-    /** Current in-process owner identity, unavailable while stopped/locked. */
-    fun bootstrapDeviceId(): String? = null
-    fun bootstrapIdentityProof(nonce: String, serial: String, digest: String, enabled: Boolean, revision: String): String? = null
     val events: Flow<CoreEvent>
     /** `systemName` is the system device name, the default this phone shows to the group. */
     suspend fun start(directory: File, systemName: String)

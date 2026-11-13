@@ -13,6 +13,11 @@ from provenance import digest, source_tree_sha256
 from versioning import beta_label, inhouse_version
 
 TARGETS = ('macos-arm64', 'macos-x64', 'windows-x64', 'android-arm64-v8a', 'android-x86_64')
+BETA_RELEASE_BODY = (
+    'NOTICE: Early beta — expect bugs. Not compatible with earlier versions; '
+    'all devices in a group must upgrade together. Use with caution.\n\n'
+    'Supports mobile devices.'
+)
 
 
 def plan(sequence, reserve=False, request_id=''):
@@ -133,7 +138,7 @@ def publish(output, record):
         release_id = old['id']
     else:
         body = dict(tag_name=tag, target_commitish=record['built_commit'], name='Oink '+record['version'],
-                    draft=True, prerelease=True, make_latest='false', body=(output/'draft-notes.md').read_text())
+                    draft=True, prerelease=True, make_latest='false', body=BETA_RELEASE_BODY)
         request = output / 'draft-request.json';request.write_text(json.dumps(body))
         made = json.loads(subprocess.check_output(['gh','api','--method','POST','repos/oinkvm/oink/releases','--input',str(request)],text=True))
         release_id = made['id']

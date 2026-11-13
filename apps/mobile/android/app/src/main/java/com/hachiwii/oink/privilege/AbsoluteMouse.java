@@ -28,8 +28,8 @@ final class AbsoluteMouse implements AutoCloseable {
     void update(float x,float y,int desired,float wheel,float horizontal) throws Exception {
         if(!Float.isFinite(x)||!Float.isFinite(y)||(desired&~7)!=0||!Float.isFinite(wheel)||!Float.isFinite(horizontal))throw new IllegalArgumentException("mouse report");
         this.x=x;this.y=y;
-        // This is a compositor-only layer, not an input window: keeping it visible does not
-        // mark mouse events OBSCURED. Hiding it here made every press/drag lose its cursor.
+        // DrawnPointer marks its compositor layer trusted for input occlusion.
+        // Keep it visible while pressing and dragging, at the injected coordinates.
         pointer.position(x,y);
         int old=buttons;
         if(old==0 && desired!=0){downTime=SystemClock.uptimeMillis();buttons=desired;event(MotionEvent.ACTION_DOWN,0,0,0);}

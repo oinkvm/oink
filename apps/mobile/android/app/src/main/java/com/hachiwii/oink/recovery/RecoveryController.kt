@@ -6,20 +6,12 @@ import com.hachiwii.oink.privilege.PrivilegeClient
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 
-/** These phases map to frozen BootstrapPhase/BootstrapReason in the Rust owner. */
+/** Local wireless-ADB recovery state, independent of the device group. */
 enum class RecoveryPhase { Pending, Connecting, Starting, Ready, Failed, Expired }
 enum class RecoveryReason { None, Unavailable, PermissionDenied, ConnectionFailed, StartFailed, Expired }
 data class RecoveryStatus(val phase: RecoveryPhase, val reason: RecoveryReason, val detail: String)
 
-data class LocalAdbEndpoint(val address: String, val port: Int, val scopeId: Int)
-data class AdbEndpointSnapshot(val generation: ULong, val endpoints: List<LocalAdbEndpoint>)
-
 object RecoveryController {
-    private val mutableEndpoints = MutableStateFlow(AdbEndpointSnapshot(0u, emptyList()))
-    internal val endpoints = mutableEndpoints.asStateFlow()
-    @Synchronized internal fun updateEndpoints(values: List<LocalAdbEndpoint>) {
-        mutableEndpoints.value = AdbEndpointSnapshot(mutableEndpoints.value.generation + 1u, values.take(16))
-    }
     @Volatile private var application: Context? = null
     private val consecutiveDeaths = java.util.concurrent.atomic.AtomicInteger()
     fun initialize(context: Context) { application = context.applicationContext }
@@ -27,6 +19,7 @@ object RecoveryController {
     private val mutableStatus = MutableStateFlow(RecoveryStatus(RecoveryPhase.Pending, RecoveryReason.None, "idle"))
     val status = mutableStatus.asStateFlow()
     internal fun report(phase: RecoveryPhase, reason: RecoveryReason = RecoveryReason.None, detail: String) {
+        android.util.Log.i("OinkRecovery", "phase=$phase reason=$reason detail=$detail")
         mutableStatus.value = RecoveryStatus(phase, reason, detail)
     }
     private val mutablePointerProblem = MutableStateFlow<String?>(null)
@@ -41,12 +34,6 @@ object RecoveryController {
     @Synchronized fun setEnabled(context: Context, enabled: Boolean) {
         RecoveryStore(context).enabled = enabled
         applyEnabled(context, enabled)
-    }
-    /** Provider applies a previously signed PC disable only if the user intent is still identical. */
-    @Synchronized fun compareAndDisable(context: Context, expectedRevision: String): Boolean {
-        if (!RecoveryStore(context).compareAndDisable(expectedRevision)) return false
-        applyEnabled(context, false)
-        return true
     }
     private fun applyEnabled(context: Context, enabled: Boolean) {
         consecutiveDeaths.set(0)
@@ -63,16 +50,12 @@ object RecoveryController {
             report(RecoveryPhase.Pending, detail = "disabled")
         }
     }
-    internal val credentialChanges = kotlinx.coroutines.flow.MutableSharedFlow<Unit>(extraBufferCapacity = 1)
     fun resetCredentials(context: Context) {
         setEnabled(context, false)
-        RecoveryStore(context).reset()
-        credentialChanges.tryEmit(Unit)
     }
     suspend fun pair(context: Context, host: String, port: Int, code: String): Boolean =
         kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
             val pem = RecoveryStore(context).pairingCredential()
-            credentialChanges.tryEmit(Unit)
             try { LocalAdb.pair(java.net.InetAddress.getByName(host), port, code, pem) }
             finally { pem.fill(0) }
             // 「配对并开启」 (or the code sent from the pairing notification) is the user's intent to turn
@@ -80,10 +63,6 @@ object RecoveryController {
             setEnabled(context, true)
             true
         }
-    fun forgetGroup(context: Context) {
-        setEnabled(context, false)
-        RecoveryStore(context).clear()
-    }
     /** Explicit foreground App start supports API30–32 without changing system settings. */
     fun start(context: Context, automatic: Boolean = false) {
         if (!enabled(context)) return
@@ -118,7 +97,7 @@ object RecoveryController {
         } else {
             val retry = consecutiveDeaths.incrementAndGet() <= 3
             report(RecoveryPhase.Failed, RecoveryReason.StartFailed, if (retry) "helper_lost" else "helper_crash_limit")
-            // Permit at most three automatic restarts per process; PC fallback shares this limit.
+            // Permit at most three automatic helper restarts per App process.
             if (retry) application?.let { context ->
                 android.os.Handler(android.os.Looper.getMainLooper()).post { start(context, automatic = true) }
             }

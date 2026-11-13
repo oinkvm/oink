@@ -1300,22 +1300,6 @@ impl MobileNetwork {
         self.state.profile.capabilities.clone()
     }
 
-    /// Sign the Android helper bootstrap challenge with the running mobile
-    /// identity. The domain separates this proof from roster and C0 signatures.
-    pub fn android_bootstrap_proof(
-        &self,
-        nonce: &str,
-        serial: &str,
-        digest: &str,
-        enabled: bool,
-        revision: u64,
-    ) -> Option<String> {
-        if self.advertisement().os != "android" {
-            return None;
-        }
-        bootstrap_identity_proof(&self.state.identity, nonce, serial, digest, enabled, revision)
-    }
-
     pub fn device_id(&self) -> String {
         hex(self.state.identity.id())
     }
@@ -1630,29 +1614,6 @@ impl MobileNetwork {
         // Waiters re-check their session state (stopped) on this change.
         self.state.connectivity.changed();
     }
-}
-
-fn bootstrap_identity_proof(
-    identity: &oink_network::identity::Identity,
-    nonce: &str,
-    serial: &str,
-    digest: &str,
-    enabled: bool,
-    revision: u64,
-) -> Option<String> {
-    let hash = |value: &str| value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit());
-    if !hash(nonce) || !hash(digest) || serial.is_empty() || serial.len() > 256 {
-        return None;
-    }
-    let hex = |bytes: &[u8]| bytes.iter().map(|byte| format!("{byte:02x}")).collect::<String>();
-    let payload = format!(
-        "oink-bootstrap-identity-v1\n{}\n{}\n{}\n{}\n{enabled}\n{revision}\n",
-        nonce.to_ascii_lowercase(),
-        identity.id().to_hex(),
-        hex(serial.as_bytes()),
-        digest.to_ascii_lowercase(),
-    );
-    Some(hex(&identity.sign(payload.as_bytes())))
 }
 
 fn advert_for(state: &NetworkState, group: &State) -> Advert {
@@ -2401,34 +2362,6 @@ mod tests {
         let shared = base.with_roster(&roster).unwrap();
         let bytes = shared.wire().encode(v2::limits::CONFIG_STATE).unwrap();
         (bytes.clone(), bytes)
-    }
-
-    #[test]
-    fn android_bootstrap_proof_matches_the_helper_challenge_format() {
-        let identity = oink_network::identity::Identity::from_seed([47; 32]);
-        let nonce = "ab".repeat(32);
-        let digest = "cd".repeat(32);
-        let proof = bootstrap_identity_proof(&identity, &nonce.to_uppercase(), "id", &digest, true, 9).unwrap();
-        assert_eq!(proof.len(), 128);
-        let mut signature = [0; 64];
-        for (index, byte) in signature.iter_mut().enumerate() {
-            *byte = u8::from_str_radix(&proof[index * 2..index * 2 + 2], 16).unwrap();
-        }
-        let payload = format!(
-            "oink-bootstrap-identity-v1\n{nonce}\n{}\n6964\n{digest}\ntrue\n9\n",
-            identity.id().to_hex()
-        );
-        assert!(oink_network::identity::verify(
-            &identity.id(),
-            payload.as_bytes(),
-            &signature
-        ));
-        assert!(!oink_network::identity::verify(
-            &identity.id(),
-            payload.replace("true", "false").as_bytes(),
-            &signature
-        ));
-        assert!(bootstrap_identity_proof(&identity, "invalid", "id", &digest, true, 9).is_none());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

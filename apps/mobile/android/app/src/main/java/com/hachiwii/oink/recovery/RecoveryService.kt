@@ -35,7 +35,6 @@ class RecoveryService : Service() {
     private val resolving = ArrayDeque<NsdServiceInfo>()
     private val candidates = ArrayDeque<NsdServiceInfo>()
     private val withdrawn = mutableSetOf<String>()
-    private val endpointHints = mutableMapOf<String, LocalAdbEndpoint>()
     private var resolveBusy = false
     private var watchingNetwork = false
     private val networkCallback = object : ConnectivityManager.NetworkCallback() {
@@ -73,7 +72,7 @@ class RecoveryService : Service() {
             stopSelf(); return START_NOT_STICKY
         }
         if (!hasCredential) {
-            RecoveryController.report(RecoveryPhase.Failed, RecoveryReason.Unavailable, "group_key_required")
+            RecoveryController.report(RecoveryPhase.Failed, RecoveryReason.Unavailable, "local_key_required")
             stopSelf(); return START_NOT_STICKY
         }
         if (watchingNetwork) { restartDiscovery(); return START_NOT_STICKY }
@@ -115,8 +114,6 @@ class RecoveryService : Service() {
         resolving.clear()
         candidates.clear()
         withdrawn.clear()
-        endpointHints.clear()
-        RecoveryController.updateEndpoints(emptyList())
     }
     private fun restartDiscovery() {
         if (!RecoveryStore(this).enabled) { stopSelf(); return }
@@ -161,8 +158,6 @@ class RecoveryService : Service() {
                 scope.launch {
                     if (epoch == generation) {
                         withdrawn.add(info.serviceName)
-                        endpointHints.remove(info.serviceName)
-                        RecoveryController.updateEndpoints(endpointHints.values.toList())
                         resolving.removeAll { it.serviceName == info.serviceName }
                         candidates.removeAll { it.serviceName == info.serviceName }
                     }
@@ -184,10 +179,6 @@ class RecoveryService : Service() {
                     resolveBusy = false
                     val host = info.host
                     if (epoch == generation && info.serviceName !in withdrawn && host != null && LocalAdb.isLocal(host)) {
-                        endpointHints[info.serviceName] = LocalAdbEndpoint(
-                            requireNotNull(host.hostAddress).substringBefore('%'), info.port,
-                            (host as? java.net.Inet6Address)?.scopeId ?: 0)
-                        RecoveryController.updateEndpoints(endpointHints.values.toList())
                         candidates.add(info)
                         attemptNext()
                     }

@@ -121,8 +121,6 @@ data class AppState(
 }
 
 class OinkRepository(private val context: Context) {
-    fun bootstrapDeviceId(): String? = core?.bootstrapDeviceId()
-    fun bootstrapIdentityProof(nonce: String, serial: String, digest: String, enabled: Boolean, revision: String): String? = core?.bootstrapIdentityProof(nonce, serial, digest, enabled, revision)
     private val settings = LocalSettings(context)
     val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val mutableState = MutableStateFlow(AppState(name = SystemDeviceName.read(context),
@@ -216,7 +214,6 @@ class OinkRepository(private val context: Context) {
             val active = core
             if (active != null) active.leaveGroup() else {
                 readOffline(true)
-                com.hachiwii.oink.recovery.RecoveryController.forgetGroup(context)
             }
         } }.fold(onSuccess = { null }, onFailure = { it.oinkMessage ?: "无法离开设备组" })
     }.await()

@@ -16,11 +16,6 @@ import uniffi.oink_mobile_ffi.*
 
 /** One adapter per LAN owner. Callbacks enqueue work and never block Rust workers. */
 class RustCoreBridge(private val context: android.content.Context) : CoreBridge {
-    override fun bootstrapDeviceId(): String? = session?.deviceId()
-    override fun bootstrapIdentityProof(nonce: String, serial: String, digest: String, enabled: Boolean, revision: String): String? = runBlocking(Dispatchers.IO) {
-        withTimeoutOrNull(5000) { session?.bootstrapIdentityProof(nonce, serial, digest, enabled, revision.toULong()) }
-    }
-    private var recoveryOwner: com.hachiwii.oink.recovery.RecoveryOwner? = null
     var audioOwner: com.hachiwii.oink.audio.MobileAudioOwner? = null
         private set
     val mediaSession get() = audioOwner?.media
@@ -137,7 +132,7 @@ class RustCoreBridge(private val context: android.content.Context) : CoreBridge 
         audioOwner = com.hachiwii.oink.audio.MobileAudioOwner(context, owner.media()) {
             scheduleCapabilityRefresh()
         }.also { it.start() }
-        recoveryOwner = com.hachiwii.oink.recovery.RecoveryOwner(context, owner.recovery())
+        com.hachiwii.oink.recovery.RecoveryController.start(context)
         clipboard = owner.clipboard()
         withContext(Dispatchers.Main.immediate) {
             // Observe revisions only. Ordinary mode never reads system clipboard contents.
@@ -205,8 +200,6 @@ class RustCoreBridge(private val context: android.content.Context) : CoreBridge 
             diagnosticsCollector = null
             diagnosticsTried = false
         }
-        recoveryOwner?.close()
-        recoveryOwner = null
         privilegeOwner?.close()
         privilegeOwner = null
         privilegedClipboard = null
@@ -232,7 +225,6 @@ class RustCoreBridge(private val context: android.content.Context) : CoreBridge 
         output.send(CoreEvent.Advertise(Advertisement(a.instance, a.serviceType, a.port.toInt(), a.txt)))
     }
     private suspend fun refresh() {
-        recoveryOwner?.retryFallback()
         snapshot = snapshot.copy(nearby = owner.nearby().rows.map { it.toDevice() })
         updateBlocked(owner.blockedDevices())
         updateCards(owner.deviceCards())
@@ -249,7 +241,6 @@ class RustCoreBridge(private val context: android.content.Context) : CoreBridge 
         if (cardsStream != cards.stream) signalsRevision = 0uL
         cardsStream = cards.stream
         cardsRevision = cards.revision
-        recoveryOwner?.retryFallback()
         val onlineBefore = snapshot.devices.filter { it.online && !it.isSelf }.mapTo(mutableSetOf()) { it.id }
         val devices = cards.cards.map { it.toDevice() }
         val onlineAfter = devices.filter { it.online && !it.isSelf }.mapTo(mutableSetOf()) { it.id }
@@ -508,16 +499,7 @@ class RustCoreBridge(private val context: android.content.Context) : CoreBridge 
         controlReply(owner.setRemoteFocus(request(), value.owner, value.versionToken, locked, target))
     }
     override suspend fun control(actionToken: String) { controlReply(owner.invokeDeviceCardAction(request(), actionToken)) }
-    override suspend fun leaveGroup() {
-        recoveryOwner?.close()
-        recoveryOwner = null
-        try {
-            owner.leaveGroup()
-            com.hachiwii.oink.recovery.RecoveryController.forgetGroup(context)
-        } finally {
-            recoveryOwner = com.hachiwii.oink.recovery.RecoveryOwner(context, owner.recovery())
-        }
-    }
+    override suspend fun leaveGroup() { owner.leaveGroup() }
     override suspend fun refreshNearby() { accepted(owner.refreshNearby(request())) }
     override suspend fun queryAddress(address: String, port: Int?) {
         releaseAddress()
