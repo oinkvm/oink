@@ -163,6 +163,7 @@ codes!(PauseReason {
     RemoteUser,
     Emergency,
     InputBacklog,
+    RemoteDesktop,
     Unknown
 });
 codes!(DeliveryState {

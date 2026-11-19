@@ -13,21 +13,29 @@
 //! 调度中心与切换 Space，这里只参考它的机制，代码独立编写）：
 //! - Dock 轻扫：类型 30（`kCGSEventDockControl`），HID 类型 23（`kIOHIDEventTypeDockSwipe`），
 //!   轻扫种类（123、165：1 左右、2 上下、3 捏合）、阶段（132、134：`IOHIDEventPhaseBits`）、累计进度（124，
-//!   135 是它的 float32 位）、结束速度（129、130）。每个 Dock 控制事件后面跟一个类型 29 的手势事件。
+//!   135 是它的 float32 位）、结束速度（129、130）。macOS 26 及以前在 Dock 控制事件后跟一个类型 29 的手势事件。
 //!   本机实测：合成竖直进度 −1.0 打开调度中心。Pinch 的方向还受字段 136（invertedFromDevice）控制：
 //!   136=1 时负进度显示桌面；136=0 时负进度打开 Apps。线上统一为正 = 张开、负 = 捏合，
-//!   截获按 136 归一化，重放固定使用 136=1 并转换进度与结束速度。
+//!   截获按 136 归一化。macOS 27 的 Dock 控制重放需要附带 IOHIDEvent，见 `create_hid_dock_swipe`。
 //! - 捏合、旋转、智能缩放：类型 29（`kCGSEventGesture`），HID 类型 8（缩放，113 = 放大量）、5（旋转，
 //!   114 = 角度）、22（智能缩放）。
 //!
 //! 合成的事件都带本项目的注入标记（`kCGEventSourceUserData` = `MAGIC`），截获回调据此跳过。
 
+use std::ffi::c_void;
+use std::sync::OnceLock;
+
+use objc2::rc::{Allocated, Retained, autoreleasepool};
+use objc2::runtime::{AnyClass, AnyObject};
+use objc2::{msg_send, sel};
 use objc2_core_foundation::CFRetained;
 use objc2_core_graphics::{CGEvent, CGEventField, CGEventFlags, CGEventTapLocation, CGEventType};
+use objc2_foundation::NSProcessInfo;
 use oink_foundation::input::{Gesture, GesturePhase, SwipeAxis};
 
 use super::inject::MAGIC;
 use super::keymap::{AuxKey, NX_SUBTYPE_AUX_CONTROL_BUTTONS};
+use super::system::find_symbol;
 
 /// CGEvent 类型：系统定义事件。
 pub(crate) const TYPE_SYSDEFINED: u32 = 14;
@@ -60,8 +68,25 @@ mod field {
 mod hid_type {
     pub const ROTATION: i64 = 5;
     pub const ZOOM: i64 = 8;
+    pub const VELOCITY: u32 = 9;
     pub const ZOOM_TOGGLE: i64 = 22;
     pub const DOCK_SWIPE: i64 = 23;
+}
+
+mod hid_field {
+    // IOHIDEvent fields use the event type as their high word.
+    pub const MOTION: u32 = 0x17_0001;
+    pub const PROGRESS: u32 = 0x17_0002;
+    pub const FLAVOR: u32 = 0x17_0005;
+    pub const VELOCITY_X: u32 = 0x09_0000;
+    pub const VELOCITY_Y: u32 = 0x09_0001;
+}
+
+const HID_PHASE_SHIFT: u32 = 24;
+const DOCK_PRIMARY_FLAVOR: i64 = 3;
+
+unsafe extern "C" {
+    fn mach_absolute_time() -> u64;
 }
 
 /// `IOHIDEventPhaseBits`。
@@ -153,6 +178,14 @@ fn phase_to_bits(p: GesturePhase) -> i64 {
     }
 }
 
+fn swipe_motion(axis: SwipeAxis) -> i64 {
+    match axis {
+        SwipeAxis::Horizontal => 1,
+        SwipeAxis::Vertical => 2,
+        SwipeAxis::Pinch => 3,
+    }
+}
+
 /// 从手势类事件的字段翻译出手势（纯函数：`int` / `dbl` 读字段）。不是能转发的手势时为 `None`
 /// （例如只携带触点的手势事件、Dock 控制事件后面的伴随事件、`MayBegin`）。
 pub(crate) fn parse_gesture(ty: u32, int: impl Fn(u32) -> i64, dbl: impl Fn(u32) -> f64) -> Option<Gesture> {
@@ -219,11 +252,7 @@ pub(crate) fn synth_gesture(g: &Gesture) -> Vec<Synth> {
             progress,
             velocity,
         } => {
-            let motion = match axis {
-                SwipeAxis::Horizontal => 1,
-                SwipeAxis::Vertical => 2,
-                SwipeAxis::Pinch => 3,
-            };
+            let motion = swipe_motion(axis);
             // Dock interprets pinch progress using field 136. Always synthesize the natural
             // direction form; invert both progress and exit velocity from the wire convention.
             let (progress, velocity) = if axis == SwipeAxis::Pinch {
@@ -288,8 +317,117 @@ pub(crate) fn synth_gesture(g: &Gesture) -> Vec<Synth> {
     }
 }
 
+type AttachHidEvent = unsafe extern "C" fn(&CGEvent, *const c_void);
+
+fn dock_swipe_hid_api() -> Option<(&'static AnyClass, AttachHidEvent)> {
+    static API: OnceLock<Option<(&'static AnyClass, AttachHidEvent)>> = OnceLock::new();
+    *API.get_or_init(|| {
+        let class = AnyClass::get(c"HIDEvent")?;
+        for selector in [
+            sel!(initWithType:timestamp:senderID:),
+            sel!(setOptions:),
+            sel!(setIntegerValue:forField:),
+            sel!(setDoubleValue:forField:),
+            sel!(appendEvent:),
+        ] {
+            class.instance_method(selector)?;
+        }
+        let attach = find_symbol(c"SLEventSetIOHIDEvent");
+        if attach.is_null() {
+            return None;
+        }
+        // SAFETY: SkyLight exports SLEventSetIOHIDEvent(CGEventRef, IOHIDEventRef).
+        Some((class, unsafe {
+            std::mem::transmute::<*mut c_void, AttachHidEvent>(attach)
+        }))
+    })
+}
+
+fn new_hid_event(class: &AnyClass, kind: u32, timestamp: u64) -> Option<Retained<AnyObject>> {
+    // SAFETY: HIDEvent's initializer is checked in dock_swipe_hid_api. It takes a
+    // u32 IOHIDEventType, a u64 Mach timestamp and a u64 sender ID (0 for synthetic).
+    unsafe {
+        let allocated: Allocated<AnyObject> = msg_send![class, alloc];
+        msg_send![allocated, initWithType: kind, timestamp: timestamp, senderID: 0_u64]
+    }
+}
+
+/// WindowManager on macOS 27.2.1 drops a type-30 CGEvent if its attached IOHIDEvent is null.
+/// Use a single type-30 wrapper with a DockSwipe payload. The old type-29 companion carries
+/// no gesture of its own. Posting delayed terminal frames can terminate a subsequent swipe.
+/// The payload has been read back on macOS 26.6.2 and 27.2.1.
+fn create_hid_dock_swipe(
+    axis: SwipeAxis,
+    phase: GesturePhase,
+    progress: f64,
+    velocity: f64,
+) -> Option<CFRetained<CGEvent>> {
+    let (class, attach) = dock_swipe_hid_api()?;
+    // The HID path applies the direction reversal for which legacy CGEvent used
+    // field 136. With the 0.3.6 wire convention this negates vertical progress
+    // and velocity. Pinch already has the normalized wire sign.
+    let direction = if axis == SwipeAxis::Vertical { -1.0 } else { 1.0 };
+    let ev = CGEvent::new(None)?;
+    CGEvent::set_type(Some(&ev), CGEventType(TYPE_DOCK_CONTROL));
+    autoreleasepool(|_| {
+        // SAFETY: mach_absolute_time is callable from the injection worker.
+        let timestamp = unsafe { mach_absolute_time() };
+        let hid = new_hid_event(class, hid_type::DOCK_SWIPE as u32, timestamp)?;
+        // SAFETY: these HIDEvent selectors and their argument widths match the
+        // IOKit ABI. The wrapper retains the attached HIDEvent and its child.
+        unsafe {
+            let options = (phase_to_bits(phase) as u32) << HID_PHASE_SHIFT;
+            let _: () = msg_send![&hid, setOptions: options];
+            let _: () = msg_send![&hid, setIntegerValue: swipe_motion(axis), forField: hid_field::MOTION];
+            let _: () = msg_send![&hid, setIntegerValue: DOCK_PRIMARY_FLAVOR, forField: hid_field::FLAVOR];
+            let _: () = msg_send![&hid, setDoubleValue: progress * direction, forField: hid_field::PROGRESS];
+            if phase.is_end() {
+                let child = new_hid_event(class, hid_type::VELOCITY, timestamp)?;
+                let velocity = velocity * direction;
+                let _: () = msg_send![&child, setDoubleValue: velocity, forField: hid_field::VELOCITY_X];
+                let _: () = msg_send![&child, setDoubleValue: velocity, forField: hid_field::VELOCITY_Y];
+                let _: () = msg_send![&hid, appendEvent: &*child];
+            }
+            attach(&ev, Retained::as_ptr(&hid).cast());
+        }
+        CGEvent::set_integer_value_field(Some(&ev), CGEventField::EventSourceUserData, MAGIC);
+        Some(ev)
+    })
+}
+
+fn post_gesture_frame(ev: &CGEvent, g: &Gesture, frame: usize) {
+    tracing::debug!(
+        ?g,
+        frame,
+        event_type = CGEvent::r#type(Some(ev)).0,
+        timestamp_ns = CGEvent::timestamp(Some(ev)),
+        "gesture injection: posting native frame (delivery unconfirmed)"
+    );
+    CGEvent::post(CGEventTapLocation::SessionEventTap, Some(ev));
+}
+
+fn uses_hid_dock_swipe() -> bool {
+    static HID_DOCK_SWIPE: OnceLock<bool> = OnceLock::new();
+    *HID_DOCK_SWIPE.get_or_init(|| NSProcessInfo::processInfo().operatingSystemVersion().majorVersion >= 27)
+}
+
 /// 投递合成的手势事件（位置取当前光标，应用内手势发给光标下的窗口）。
 pub(crate) fn post_gesture(g: &Gesture) -> bool {
+    if let Gesture::DockSwipe {
+        axis,
+        phase,
+        progress,
+        velocity,
+    } = *g
+        && uses_hid_dock_swipe()
+    {
+        let Some(ev) = create_hid_dock_swipe(axis, phase, progress, velocity) else {
+            tracing::warn!(?g, "gesture injection: could not construct DockSwipe HID event");
+            return false;
+        };
+        post_gesture_frame(&ev, g, 0);
+        return true;
+    }
     for (frame, s) in synth_gesture(g).into_iter().enumerate() {
         let Some(ev): Option<CFRetained<CGEvent>> = CGEvent::new(None) else {
             tracing::warn!(
@@ -308,14 +446,7 @@ pub(crate) fn post_gesture(g: &Gesture) -> bool {
             }
         }
         CGEvent::set_integer_value_field(Some(&ev), CGEventField::EventSourceUserData, MAGIC);
-        tracing::debug!(
-            ?g,
-            frame,
-            event_type = s.ty,
-            timestamp_ns = CGEvent::timestamp(Some(&ev)),
-            "gesture injection: posting native frame (delivery unconfirmed)"
-        );
-        CGEvent::post(CGEventTapLocation::SessionEventTap, Some(&ev));
+        post_gesture_frame(&ev, g, frame);
     }
     true
 }
@@ -323,7 +454,73 @@ pub(crate) fn post_gesture(g: &Gesture) -> bool {
 #[cfg(all(test, debug_assertions))]
 mod tests {
     use super::*;
+    use objc2_core_foundation::{CFArray, CFType};
     use std::collections::HashMap;
+    use std::ptr::NonNull;
+
+    #[link(name = "IOKit", kind = "framework")]
+    unsafe extern "C" {
+        fn IOHIDEventGetType(event: &CFType) -> u32;
+        fn IOHIDEventGetPhase(event: &CFType) -> u16;
+        fn IOHIDEventGetIntegerValue(event: &CFType, field: u32) -> isize;
+        fn IOHIDEventGetDoubleValue(event: &CFType, field: u32) -> f64;
+        fn IOHIDEventGetChildren(event: &CFType) -> *const CFArray<CFType>;
+    }
+
+    #[test]
+    fn dock_swipe_hid_payload_survives_cg_serialization() {
+        type CopyHidEvent = unsafe extern "C" fn(&CGEvent) -> *mut CFType;
+        let copy = find_symbol(c"CGEventCopyIOHIDEvent");
+        if !uses_hid_dock_swipe() && (copy.is_null() || dock_swipe_hid_api().is_none()) {
+            return;
+        }
+        assert!(!copy.is_null());
+        // SAFETY: CoreGraphics exports CGEventCopyIOHIDEvent(CGEventRef) -> IOHIDEventRef.
+        let copy = unsafe { std::mem::transmute::<*mut c_void, CopyHidEvent>(copy) };
+
+        for (axis, motion, sign) in [
+            (SwipeAxis::Horizontal, 1, 1.0),
+            (SwipeAxis::Vertical, 2, -1.0),
+            (SwipeAxis::Pinch, 3, 1.0),
+        ] {
+            for (phase, bits) in [
+                (GesturePhase::Began, 1),
+                (GesturePhase::Changed, 2),
+                (GesturePhase::Ended, 4),
+                (GesturePhase::Cancelled, 8),
+            ] {
+                let event = create_hid_dock_swipe(axis, phase, 0.5, -2.25).unwrap();
+                assert_eq!(
+                    CGEvent::integer_value_field(Some(&event), CGEventField::EventSourceUserData),
+                    MAGIC
+                );
+                let data = CGEvent::new_data(None, Some(&event)).unwrap();
+                let restored = CGEvent::from_data(None, Some(&data)).unwrap();
+                for event in [&*event, &*restored] {
+                    assert_eq!(CGEvent::r#type(Some(event)).0, TYPE_DOCK_CONTROL);
+                    // SAFETY: Copy returns an owned IOHIDEvent (a CF object). All child
+                    // pointers are borrowed from it and used before it is released.
+                    unsafe {
+                        let hid = CFRetained::from_raw(NonNull::new(copy(event)).unwrap());
+                        assert_eq!(IOHIDEventGetType(&hid), 23);
+                        assert_eq!(IOHIDEventGetPhase(&hid), bits);
+                        assert_eq!(IOHIDEventGetIntegerValue(&hid, hid_field::MOTION), motion);
+                        assert_eq!(IOHIDEventGetIntegerValue(&hid, hid_field::FLAVOR), 3);
+                        assert_eq!(IOHIDEventGetDoubleValue(&hid, hid_field::PROGRESS), 0.5 * sign);
+                        let children = IOHIDEventGetChildren(&hid).as_ref();
+                        let count = children.map_or(0, CFArray::len);
+                        assert_eq!(count, usize::from(phase.is_end()));
+                        if phase.is_end() {
+                            let child = children.unwrap().get(0).unwrap();
+                            assert_eq!(IOHIDEventGetType(&child), 9);
+                            assert_eq!(IOHIDEventGetDoubleValue(&child, hid_field::VELOCITY_X), -2.25 * sign);
+                            assert_eq!(IOHIDEventGetDoubleValue(&child, hid_field::VELOCITY_Y), -2.25 * sign);
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     // Runs on libtest's worker, with no AppKit main loop and no event posting.
     #[test]

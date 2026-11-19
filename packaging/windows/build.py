@@ -275,9 +275,9 @@ def main():
                 raise RuntimeError('Unexpected external CRT dependency in ' + b[role])
             (a.output / (b[role] + '-dependencies.txt')).write_text(imports)
     run('cl.exe', '/nologo', '/LD', '/Z7', '/experimental:deterministic', f'/pathmap:{ROOT}=oink', f'/pathmap:{a.output}=oink/generated', '/EHsc', '/std:c++17', '/W4', '/WX', '/MT',
-        '/DUNICODE', '/D_UNICODE', f'/I{a.output}', ROOT / 'packaging/windows/InstallerCA.cpp',
-        f'/Fo{a.output}/InstallerCA.obj', '/link', '/DEBUG:FULL', f'/PDB:{symbols}/InstallerCA.pdb', '/PDBALTPATH:%_PDB%', f'/OUT:{a.output}/InstallerCA.dll', f'/IMPLIB:{a.output}/InstallerCA.lib',
-        'msi.lib', 'advapi32.lib', 'shell32.lib', 'ole32.lib', 'bcrypt.lib', 'user32.lib', 'userenv.lib')
+        '/DUNICODE', '/D_UNICODE', f'/I{a.output}', f'/I{ROOT}/crates/oink-credential-provider', ROOT / 'packaging/windows/InstallerCA.cpp',
+        ROOT / 'crates/oink-winsvc/native/unlock.cpp', f'/Fo{a.output}/', '/link', '/DEBUG:FULL', f'/PDB:{symbols}/InstallerCA.pdb', '/PDBALTPATH:%_PDB%', f'/OUT:{a.output}/InstallerCA.dll', f'/IMPLIB:{a.output}/InstallerCA.lib',
+        'crypt32.lib', 'wtsapi32.lib', 'oleaut32.lib', 'msi.lib', 'advapi32.lib', 'shell32.lib', 'ole32.lib', 'bcrypt.lib', 'user32.lib', 'userenv.lib')
     ca_identity = image_identity(a.output / 'InstallerCA.dll')
     if pdb_identity(symbols / 'InstallerCA.pdb') != {key: ca_identity[key] for key in ('debug_id', 'debug_age')}:
         raise RuntimeError('Installer custom action PDB identity mismatch')
@@ -286,7 +286,7 @@ def main():
     (symbols / 'manifest.json').write_text(json.dumps({'source_tree_sha256': a.source_tree_sha256,
                                                      'images': symbol_records}, indent=2) + '\n')
     if a.run_native_tests:
-        for test in ('AuthorizationTests', 'QuiescenceTests', 'MaintenanceCleanupTests', 'CloudFilesCleanupTests', 'FinishInstallTests', 'GracefulStopTests', 'RelaunchTests', 'UserDataCleanupTests', 'EmbeddedPowerShellTests', 'MicrophoneRestartTests'):
+        for test in ('RecoveryTests', 'AuthorizationTests', 'QuiescenceTests', 'MaintenanceCleanupTests', 'CloudFilesCleanupTests', 'FinishInstallTests', 'GracefulStopTests', 'RelaunchTests', 'UserDataCleanupTests', 'EmbeddedPowerShellTests', 'MicrophoneRestartTests'):
             run('cl.exe', '/nologo', '/EHsc', '/std:c++17', '/W4', '/WX', '/MT', ROOT / f'packaging/windows/{test}.cpp',
                 f'/Fo{a.output}/{test}.obj', f'/Fe{a.output}/{test}.exe', 'advapi32.lib', 'user32.lib')
             run(a.output / f'{test}.exe')

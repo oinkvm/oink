@@ -6,6 +6,11 @@ import type { Message } from '../catalog';
  * uses each message.
  */
 export const en = {
+  'Oink 的更新存储权限不安全，请运行最新安装包修复。': "Oink's update storage has unsafe permissions. Run the latest installer to repair it.",
+  'Oink 正在完成更新，请稍候再打开。若长时间未完成，请运行最新安装包修复。': 'Oink is finishing an update. Please open it again shortly. If it remains unfinished, run the latest installer to repair it.',
+  '功能受限': 'Limited functionality',
+  '处于远程桌面，键鼠注入不可用，退出远程后恢复': 'Remote desktop is active. Keyboard and mouse injection is unavailable; functionality resumes after leaving remote desktop.',
+  '{0}，已暂停': '{0}, paused',
   "鼠标中键": "Middle mouse button",
   "鼠标侧键 1": "Mouse side button 1",
   "鼠标侧键 2": "Mouse side button 2",

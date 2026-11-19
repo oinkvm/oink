@@ -124,14 +124,14 @@ it.each(['disconnected', 'connecting', 'address_stale'] as const)(
     },
 );
 
-it('hides every paused computer screen and restores exact stored geometry after resume', () => {
+it('keeps every paused computer screen and its exact stored geometry editable', () => {
     const value = layout([
         screen('a', {x:0,y:0,w:1000,h:600}),
         screen('b', {x:1000,y:-200,w:800,h:500}),
     ]);
     const shown = renderLayout(value, {}, [placement]);
     const devices = [{id:'computer',screenSharing:true,screen:'shared' as const,paused:true}];
-    expect(visibleScreens(shown,value,devices)).toEqual([]);
+    expect(visibleScreens(shown,value,devices)).toEqual(shown);
     expect(value.geometry.screens.every(s=>!s.hidden && !s.device_disabled)).toBe(true);
     const resumed = visibleScreens(shown,value,[{...devices[0],paused:false}]);
     expect(resumed).toEqual(shown);

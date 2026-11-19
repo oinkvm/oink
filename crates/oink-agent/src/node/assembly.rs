@@ -40,6 +40,9 @@ impl Node {
                 .initialize_visibility(&self.inner.data_dir)
                 .context("initialize display visibility storage")?;
         }
+        lock(&self.inner.controls)
+            .pause
+            .set_remote_desktop(self.remote_desktop());
         let initial_displays = self.current_displays().context("read initial displays")?;
         {
             let _gate = self.owner_gate();
@@ -111,15 +114,24 @@ impl Node {
             .group
             .set(group.clone())
             .map_err(|_| anyhow::anyhow!("configuration already started"))?;
+        #[cfg(windows)]
+        if self.inner.native_services && self.profile() == Profile::User {
+            group
+                .require_console_displays()
+                .context("guard console display publication")?;
+        }
         // Initial inputs are published before the input owner takes its first turn.
         // The module retains startup state and broadcasts later changes itself.
         self.publish_local_options();
+        self.publish_owner_preferences()
+            .map_err(|e| anyhow::anyhow!("initial pause: {e:?}"))?;
         self.publish_local_permissions();
         #[cfg(windows)]
         let initial_displays = {
             let node = self.clone();
             tokio::task::spawn_blocking(move || {
                 if components.companions
+                    && !node.remote_desktop()
                     && let Err(error) = node.apply_windows_startup_layout()
                 {
                     tracing::warn!(%error,"Windows startup display layout apply failed");
@@ -130,10 +142,17 @@ impl Node {
             .context("join Windows startup display layout")??
         };
         let initial_group = group.clone();
-        tokio::task::spawn_blocking(move || initial_group.initialize_displays(initial_displays))
-            .await
-            .context("join display initialization")?
-            .context("initialize group displays")?;
+        let suppress_displays = self.remote_desktop();
+        tokio::task::spawn_blocking(move || {
+            if suppress_displays {
+                Ok(())
+            } else {
+                initial_group.initialize_displays(initial_displays)
+            }
+        })
+        .await
+        .context("join display initialization")?
+        .context("initialize group displays")?;
         // Preserve the initial list before exposing the started Node to callers,
         // including a crash before a later profile handoff callback.
         let node = self.clone();
@@ -143,7 +162,9 @@ impl Node {
             // its first native token between the UI query and commit, spuriously
             // rejecting the edit as stale. Failed/unsupported reads still leave
             // rigid editing available; the observer retains its normal retries.
-            let _ = node.observe_native_arrangement("startup");
+            if !node.remote_desktop() {
+                let _ = node.observe_native_arrangement("startup");
+            }
             node.refresh_layout_profiles();
         })
         .await;

@@ -13,6 +13,65 @@ use crate::boot::BootInfo;
 pub(crate) const ERROR_REPORTER: &str = r#"window.addEventListener('keydown',e=>{if(e.key==='Escape'&&new URLSearchParams(location.search).get('view')==='panel'){e.preventDefault();window.__TAURI_INTERNALS__?.invoke('shell_close')}});window.addEventListener('error',e=>window.__TAURI_INTERNALS__?.invoke('frontend_error',{message:String(e.error||e.message)}));window.addEventListener('unhandledrejection',e=>window.__TAURI_INTERNALS__?.invoke('frontend_error',{message:String(e.reason)}));"#;
 
 #[tauri::command]
+async fn startup_status(state: State<'_, Backend>) -> Result<String, ()> {
+    Ok(state.startup.status_after(None).await)
+}
+#[tauri::command]
+fn startup_retry(_state: State<'_, Backend>) {
+    #[cfg(windows)]
+    _state.startup.retry(false);
+}
+#[tauri::command]
+fn startup_details() -> String {
+    #[cfg(windows)]
+    {
+        format!(
+            "{}\nUser logs: {}\nService logs: {}",
+            oink_winsvc::backend::startup_details().unwrap_or_else(|e| e.to_string()),
+            oink_foundation::paths::log_dir().display(),
+            oink_winsvc::backend::service_log_dir()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|e| e.to_string())
+        )
+    }
+    #[cfg(not(windows))]
+    String::new()
+}
+#[tauri::command]
+async fn startup_open_logs() -> Result<(), crate::commands::ShellError> {
+    let user = crate::commands::open_folder(oink_foundation::paths::log_dir()).await;
+    #[cfg(windows)]
+    {
+        let path =
+            oink_winsvc::backend::service_log_dir().map_err(|_| crate::commands::ShellError::OpenFolderFailed)?;
+        if path.is_dir() {
+            crate::commands::open_folder(path).await?;
+        }
+    }
+    user
+}
+#[tauri::command]
+fn startup_open_services() -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStringExt;
+        let mut buffer = [0u16; 32768];
+        // SAFETY: caller-owned writable UTF-16 buffer, length checked below.
+        let length =
+            unsafe { windows::Win32::System::SystemInformation::GetSystemDirectoryW(Some(&mut buffer)) } as usize;
+        if length == 0 || length >= buffer.len() {
+            return Err("Windows system directory unavailable".into());
+        }
+        let dir = std::path::PathBuf::from(std::ffi::OsString::from_wide(&buffer[..length]));
+        std::process::Command::new(dir.join("mmc.exe"))
+            .arg(dir.join("services.msc"))
+            .spawn()
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
 fn frontend_error(message: String) {
     tracing::warn!(%message, "界面脚本错误");
 }
@@ -274,6 +333,10 @@ pub fn run() {
             tracing::error!(%error);
             return;
         }
+        #[cfg(target_os = "macos")]
+        if !oink_agent::backend::startup_macos::connect_ui(&data_dir) {
+            return;
+        }
         match oink_agent::instance::acquire_ui(&data_dir) {
             Ok(lock) => {
                 ui_lock = Some(lock);
@@ -292,17 +355,6 @@ pub fn run() {
                 } else {
                     tracing::error!(%error, "UI single-instance lock failed");
                 }
-                return;
-            }
-        }
-        #[cfg(not(windows))]
-        {
-            if let Err(error) = crate::service::check_backend_ownership(&data_dir) {
-                tracing::error!(%error, "backend process ownership unavailable");
-                return;
-            }
-            if let Err(error) = remote.hello() {
-                tracing::error!(%error, "backend unavailable");
                 return;
             }
         }
@@ -334,7 +386,7 @@ pub fn run() {
             _ui_lock: ui_lock,
         })
         .invoke_handler(tauri::generate_handler![
-            boot_info,
+            boot_info, startup_status, startup_retry, startup_details, startup_open_logs, startup_open_services,
             open_diagnostics_folder,
             frontend_error,
             frontend_notice,
@@ -345,6 +397,7 @@ pub fn run() {
             crate::shell::shell_ready,
             crate::shell::shell_close,
             crate::shell::shell_titlebar_center,
+            crate::shell::shell_start_title_drag,
             crate::shell::shell_resize_panel,
             crate::shell::shell_show_panel,
             crate::commands::read_attribution,
@@ -413,6 +466,19 @@ pub fn run() {
                 option_env!("OINK_RELEASE_BUILD").and_then(|s|s.parse().ok()).unwrap_or(0)));
             #[cfg(windows)]
             {
+                // One watch follows the process lifetime. A closed WebView must
+                // not leave a pending native IPC invocation for each reopening.
+                let observer = handle.clone();
+                tauri::async_runtime::spawn(async move {
+                    use tauri::Emitter;
+                    let mut previous = None;
+                    loop {
+                        let next = observer.state::<Backend>().startup.status_after(previous).await;
+                        let _ = observer.emit_to("main", "startup-changed", &next);
+                        if next == "ready" {break;}
+                        previous = Some(next);
+                    }
+                });
                 crate::foreground_windows::install(&handle);
                 setup_tray(&handle)?;
             }
@@ -426,23 +492,35 @@ pub fn run() {
                 let connected = handle.clone();
                 std::thread::spawn(move || {
                     #[cfg(windows)]
-                    {
-                        let result = std::env::current_exe().map_err(|e| e.to_string())
-                            .and_then(|exe| crate::service::start_once(&remote, &exe));
-                        match result {
-                            Ok(()) => {
-                                connected.state::<Backend>().startup.finish(Ok(()));
-                                crate::native_controls::initialize(&connected);
+                    let mut presented = false;
+                    #[cfg(windows)]
+                    loop {
+                        let revision = connected.state::<Backend>().startup.session_revision();
+                        let result = crate::service::start_once(&remote, |detail| {
+                            connected.state::<Backend>().startup.waiting(detail);
+                            if show_at_start && !presented {
+                                presented = true;
+                                show_main(&connected);
                             }
+                        });
+                        match result {
+                            Ok(()) => break,
                             Err(error) => {
                                 tracing::error!(%error, "backend startup failed");
-                                connected.state::<Backend>().startup.finish(Err(error));
+                                let state = connected.state::<Backend>();
+                                state.startup.finish(Err(error.clone()));
                                 if remote.build_mismatch() {
                                     connected.exit(0);
                                     return;
                                 }
-                                show_main(&connected);
-                                return;
+                                if !presented { presented = true; show_main(&connected); }
+                                // A WTS notification may race the broker's rejection. Consume
+                                // that activation once, even if it arrived before finish().
+                                if error.starts_with("startup_session:") && state.startup.session_revision() != revision
+                                    && oink_winsvc::session::current_launch_allowed() {
+                                    state.startup.retry(true);
+                                }
+                                tauri::async_runtime::block_on(state.startup.wait_for_retry(error));
                             }
                         }
                     }
@@ -463,10 +541,17 @@ pub fn run() {
                     crate::service::follow(
                         &remote,
                         |_| {
-                            // Seed the native icon before the first window becomes visible.
+                            // The status panel may already be visible. Release its
+                            // initial reads only after the event stream is attached.
+                            #[cfg(windows)]
+                            {
+                                connected.state::<Backend>().startup.finish(Ok(()));
+                                crate::native_controls::initialize(&connected);
+                            }
                             seed();
                             // Subscribe before the WebView starts its initial API reads,
                             // so changes during that load are already queued as events.
+                            #[cfg(windows)] let show_at_start = show_at_start && !presented;
                             if show_at_start {
                                 show_main(&connected);
                             }

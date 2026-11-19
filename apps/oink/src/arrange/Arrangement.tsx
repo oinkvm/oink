@@ -674,19 +674,18 @@ export function Arrangement({ screens, platform = 'mac', geometryScreens = scree
             const resW = fmt(s.labelWidth ?? r.w);
             const resH = fmt(s.labelHeight ?? r.h);
             const label = tr('{0}，{1} × {2}，位置 {3}, {4}', s.name, resW, resH, fmt(s.x), fmt(s.y));
-            return (<div key={s.id} className="scr" style={style} role="button" tabIndex={0} aria-pressed={selected} aria-label={s.offline ? tr('{0}，离线', label) : label} aria-describedby={hintId} data-selected={selected && (!multi || alone) ? '' : undefined} data-active={isActive ? active!.mode : undefined} data-corner={isActive ? active!.corner : undefined} data-overlap={isActive && active!.overlap ? '' : undefined} data-ctx={contextFor?.(s)} onContextMenu={() => { if (contextFor?.(s))
+            return (<div key={s.id} className="scr" style={style} role="button" tabIndex={0} aria-pressed={selected} aria-label={s.paused ? tr('{0}，已暂停', label) : s.offline ? tr('{0}，离线', label) : label} aria-describedby={hintId} data-selected={selected && (!multi || alone) ? '' : undefined} data-active={isActive ? active!.mode : undefined} data-corner={isActive ? active!.corner : undefined} data-overlap={isActive && active!.overlap ? '' : undefined} data-ctx={contextFor?.(s)} onContextMenu={() => { if (contextFor?.(s))
                 onSelect(s.id); }} onFocus={() => { if (!pointerFocus.current) onSelect(s.id); }} onDoubleClick={() => onSelect(s.id, 'device')} onKeyDown={(e) => onScreenKeyDown(e, s)} onPointerDown={(e) => begin(e, s, 'move')} onPointerMove={move} onPointerUp={(e) => end(e)} onPointerCancel={(e) => end(e, true)} onLostPointerCapture={(e) => end(e)}>
             {/* Write radii on the painted node: the WebKit fallback rereads its
                 geometry on style mutations, including animated contact corners. */}
-            <div className="scr__body" data-offline={s.offline ? '' : undefined} style={{
+            <div className="scr__body" data-offline={s.offline || s.paused ? '' : undefined} style={{
                 '--r-nw': `${rc.nw}px`, '--r-ne': `${rc.ne}px`,
                 '--r-sw': `${rc.sw}px`, '--r-se': `${rc.se}px`,
-                backgroundImage: s.image && !s.offline ? `url(${s.image})` : undefined,
+                backgroundImage: s.image && !s.offline && !s.paused ? `url(${s.image})` : undefined,
             } as CSSProperties}>
               <span className="scr__content">
-              {s.offline && <Icon className="scr__offline">
-                <g dangerouslySetInnerHTML={{ __html: ICONS.monitor }}/>
-                <path d="M3 3 17 17"/>
+              {(s.offline || s.paused) && <Icon className="scr__offline">
+                {s.paused ? <path d="M7 5v10M13 5v10"/> : <><g dangerouslySetInnerHTML={{ __html: ICONS.monitor }}/><path d="M3 3 17 17"/></>}
               </Icon>}
               <span className="scr__label">
                 <span className="scr__name">{s.name}</span>

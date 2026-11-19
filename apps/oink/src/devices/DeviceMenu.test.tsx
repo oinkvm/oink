@@ -165,3 +165,15 @@ it('offers single-screen hide for an online rigid computer', async () => {
   expect(handlers.onHideScreen).toHaveBeenCalledWith('remote:1');
   expect(handlers.onScreensHidden).not.toHaveBeenCalled();
 });
+
+it.each(['self', 'online'] as const)('disables unavailable resume for a paused %s device while keeping screen edits available', async group => {
+  setLanguage('en');
+  const onPause = vi.fn();
+  menu({ target: 'device:remote', devices: [{ ...remote, group, paused: true, pauseReason: 'remote_desktop', canPause: false }], onPause,
+    screens: [{ id: 'remote:1', device: 'remote', name: 'Display', hidden: false }] });
+  const resume = await screen.findByRole('menuitem', { name: 'Resume sharing' });
+  expect(resume.getAttribute('aria-disabled')).toBe('true');
+  fireEvent.click(resume);
+  expect(onPause).not.toHaveBeenCalled();
+  expect((await screen.findByRole('menuitem', { name: 'Hide all screens' })).getAttribute('aria-disabled')).not.toBe('true');
+});

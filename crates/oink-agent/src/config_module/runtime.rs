@@ -267,6 +267,8 @@ pub(super) struct Owner {
     last_state: Instant,
     displays: Vec<DisplayInfo>,
     displays_observed: bool,
+    #[cfg(windows)]
+    pub(super) require_console_displays: bool,
     display_layout_dependency: Option<(GroupId, dto::ConfigVersion)>,
     detached: detached::DetachedScreens,
     discovery: Option<Arc<Discovery>>,
@@ -555,6 +557,8 @@ impl Owner {
             last_state: Instant::now(),
             displays: vec![],
             displays_observed: false,
+            #[cfg(windows)]
+            require_console_displays: false,
             display_layout_dependency: None,
             detached,
             discovery: None,

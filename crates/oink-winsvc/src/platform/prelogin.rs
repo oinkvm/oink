@@ -59,7 +59,7 @@ fn program_data() -> io::Result<PathBuf> {
         Ok(path)
     }
 }
-fn product_dir() -> io::Result<PathBuf> {
+pub(super) fn product_dir() -> io::Result<PathBuf> {
     Ok(program_data()?.join("Oink"))
 }
 /// `%ProgramData%\Oink\Prelogin`.
@@ -398,6 +398,9 @@ impl Store for Protected {
 /// Service side: one authenticated request from the console session's user.
 /// `process` is the kernel-authenticated, PID-pinned client process.
 pub(super) fn handle(request: &BackendLaunch, id: u32, process: &Handle) -> io::Result<BackendLaunch> {
+    if !super::session::console(id) {
+        return Err(denied());
+    }
     let sid = security::sid_string(&security::user_sid(id)?)?;
     let elevated = super::update::elevated(process);
     let reply = store_access().handle(

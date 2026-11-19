@@ -35,8 +35,9 @@ inline const wchar_t* failure(int code) {
     switch (code) {
     case 1: case 3: return L"Oink Setup could not read the installation directory. Run this installer from a local file and try again.";
     case 2: return L"Oink Setup could not verify this package or its installation path. Use the original Oink installer and try again.";
-    case 4: case 5: return L"Oink's installation has unsafe permissions or redirected files. Repair the protected installation before continuing.";
-    case 6: return L"An Oink installation or update is already in progress, or the package could not be verified. Let it finish, then run Setup again.";
+    case 4: return L"Oink's installation root or a parent has unsafe permissions or redirected files. See the installer log for the rejected path.";
+    case 5: return L"Oink's maintenance storage could not be safely restored. A redirected file, hard link or inaccessible path was found. See the installer log.";
+    case 6: return L"An Oink update transaction is still running. Let it finish, then run Setup again. If it remains unfinished, restart Windows and run the latest Oink installer.";
     case 8: return L"Oink is running. Quit Oink in every signed-in user session, then run Setup again. Setup could not complete the normal shutdown; no process was force-closed.";
     case 9: case 10: return L"Oink Setup could not verify the OinkInput Windows service. Check the service configuration and try again.";
     case 11: case 12: return L"Oink Setup could not finish its protected maintenance transaction. Close other installers and try again.";

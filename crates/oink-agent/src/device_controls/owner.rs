@@ -538,6 +538,9 @@ impl Node {
         self.owner_authority(requester, group, &Message::ConfigPauseDevice(request.clone()))?;
         let remote = requester.device.0 != self.id();
         let paused = field(request.paused())?;
+        if !paused && self.remote_desktop() {
+            return Err(Failure::StateConflict);
+        }
         self.consume_local_emergency();
         let observed = self.input_status().map_err(|_| Failure::ApplyFailed)?;
         let mut candidate = lock(&self.inner.controls).pause.clone();

@@ -58,7 +58,7 @@ export interface PauseStatus {
   author: DeviceKey | null;
   author_name: string | null;
   emergency: boolean;
-  reason: "none" | "local_user" | "remote_user" | "emergency" | "input_backlog" | "unknown";
+  reason: "none" | "local_user" | "remote_user" | "emergency" | "input_backlog" | "remote_desktop" | "unknown";
   capture_detached: boolean;
   settling: boolean;
 }

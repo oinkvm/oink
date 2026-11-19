@@ -80,7 +80,7 @@ inline std::string sha256(const std::wstring& path) {
     return result.str();
 }
 
-inline bool read_record(const std::wstring& path, admission::Object& object) {
+inline bool read_record(const std::wstring& path, admission::Object& object, bool journal_literals = false) {
     if (!protected_path(path)) return false;
     HANDLE file = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
     if (file == INVALID_HANDLE_VALUE) return false;
@@ -89,7 +89,7 @@ inline bool read_record(const std::wstring& path, admission::Object& object) {
     DWORD count = 0;
     if (ok) ok = ReadFile(file, text.data(), static_cast<DWORD>(text.size()), &count, nullptr) && count == text.size();
     CloseHandle(file);
-    return ok && admission::parse(text, object);
+    return ok && admission::parse(text, object, journal_literals);
 }
 
 inline bool ensure_directory(const std::wstring& path, const wchar_t* acl) {
@@ -112,7 +112,7 @@ inline bool absent(const std::wstring& path) {
 // are needed to defend against trusted administrators or SYSTEM.
 inline bool admit(const std::string& code, const std::string& hash, const std::string& remove, const std::string& remove_hash, bool system_caller) {
     if (!ensure_directory(root(), L"O:BAG:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;GRGX;;;BU)") ||
-        !ensure_directory(directory(), L"O:BAG:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)")) return false;
+        !ensure_directory(directory(), L"O:BAG:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;;GRGX;;;BU)")) return false;
     HANDLE lock = CreateFileW(lock_path().c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr,
         OPEN_ALWAYS, FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
     if (lock == INVALID_HANDLE_VALUE) {

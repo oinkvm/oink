@@ -1,7 +1,7 @@
 import { useSyncExternalStore } from 'react';
 import { toast } from 'oink-ui';
 import { api, call, onAgentEvent, shell } from './client';
-import { ApiFailure, toFailure } from './transport';
+import { ApiFailure, toFailure, inTauri, transport } from './transport';
 import { problemText, tr } from '../i18n';
 import type * as T from './types';
 import type { DeviceCardsView, DeviceControlCompleted, DeviceControlReply } from './cards';
@@ -68,6 +68,8 @@ export function newerProfiles(current: LayoutProfilesState | null, incoming: Lay
 }
 
 export function backendFailureDetail(detail: string): string {
+  if (detail.includes('oink_update_storage_unsafe')) return tr('Oink 的更新存储权限不安全，请运行最新安装包修复。');
+  if (detail.includes('oink_update_in_progress')) return tr('Oink 正在完成更新，请稍候再打开。若长时间未完成，请运行最新安装包修复。');
   const exited = /^backend_exited:(\d+)$/.exec(detail);
   return exited ? tr('后台启动后退出（退出码 {0}）', `${exited[1]} / 0x${Number(exited[1]).toString(16).toUpperCase().padStart(8,'0')}`) : detail;
 }
@@ -238,6 +240,30 @@ async function warmMicrophonePlugin(generation:number):Promise<void> {
   if(generation===warmupGeneration&&agent.get().microphonePlugin?.refreshing) {
     microphoneWarmup=setTimeout(()=>{void warmMicrophonePlugin(generation).catch(requestFailure);},750);
   }
+}
+/** The main shell can show the launch diagnosis before any backend-dependent
+ * query runs. A watch on native state also covers errors before WebView creation. */
+export async function waitForStartup(show: (detail: string) => void): Promise<void> {
+  if (!inTauri) return;
+  const {listen} = await import('@tauri-apps/api/event');
+  let connected!: () => void;
+  const ready = new Promise<void>(resolve => { connected = resolve; });
+  const present = (state: string) => {
+    if (state === 'ready') connected();
+    else if (state !== 'starting') show(state);
+  };
+  let received = false;
+  const stop = await listen<string>('startup-changed', event => {
+    received = true;
+    present(event.payload);
+  });
+  try {
+    // Listen first. A notification during the snapshot read is newer than or
+    // equivalent to the snapshot. Backend readiness is terminal for this UI.
+    const state = await transport.shell<string>('startup_status');
+    if (!received || state === 'ready') present(state);
+    await ready;
+  } finally { stop(); }
 }
 export function start(view = 'main'): Promise<void> {
   if (starting) return starting;

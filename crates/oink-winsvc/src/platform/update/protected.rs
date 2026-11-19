@@ -47,6 +47,27 @@ fn acl(handle: HANDLE) -> io::Result<()> {
             return Err(io::Error::from_raw_os_error(code as i32));
         }
         let result = acl_policy(owner, dacl);
+        if result.is_err() {
+            let mut path = [0u16; 32768];
+            let length = GetFinalPathNameByHandleW(handle, path.as_mut_ptr(), path.len() as u32, 0) as usize;
+            let mut sddl = ptr::null_mut();
+            if ConvertSecurityDescriptorToStringSecurityDescriptorW(
+                descriptor,
+                1,
+                OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+                &mut sddl,
+                ptr::null_mut(),
+            ) != 0
+            {
+                let mut size = 0;
+                while *sddl.add(size) != 0 {
+                    size += 1;
+                }
+                tracing::error!(path = %String::from_utf16_lossy(&path[..length.min(path.len())]),
+                    owner_dacl = %String::from_utf16_lossy(std::slice::from_raw_parts(sddl, size)), "unsafe maintenance ACL/owner");
+                LocalFree(sddl.cast());
+            }
+        }
         LocalFree(descriptor);
         result
     }
@@ -121,9 +142,16 @@ pub(in crate::platform) fn open_one(path: &Path, directory: bool) -> io::Result<
     Ok(file)
 }
 fn open_raw(path: &Path, directory: bool) -> io::Result<File> {
+    open_shared(path, directory, false)
+}
+fn open_shared(path: &Path, directory: bool, share_delete: bool) -> io::Result<File> {
     std::fs::OpenOptions::new()
         .access_mode(FILE_READ_DATA | FILE_READ_ATTRIBUTES | READ_CONTROL)
-        .share_mode(FILE_SHARE_READ | if directory { FILE_SHARE_WRITE } else { 0 })
+        .share_mode(
+            FILE_SHARE_READ
+                | if directory { FILE_SHARE_WRITE } else { 0 }
+                | if share_delete { FILE_SHARE_DELETE } else { 0 },
+        )
         .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | if directory { FILE_FLAG_BACKUP_SEMANTICS } else { 0 })
         .open(path)
 }
@@ -135,13 +163,13 @@ pub(in crate::platform) fn open(path: &Path) -> io::Result<File> {
 /// Retains the protected maintenance directory and file until msiexec exits. FILE_SHARE_READ
 /// permits installation reads while denying content writes, deletion and rename.
 pub(super) struct PinnedFile {
-    pub file: File,
+    _file: File,
     _parents: Vec<File>,
 }
 pub(super) fn pin(path: &Path) -> io::Result<PinnedFile> {
     let parents = pin_parents(path, true)?;
     Ok(PinnedFile {
-        file: open_one(path, false)?,
+        _file: open_one(path, false)?,
         _parents: parents,
     })
 }
@@ -191,8 +219,13 @@ pub(super) fn entries(path: &Path) -> io::Result<Vec<PathBuf>> {
         .collect()
 }
 pub(super) fn read(path: &Path, max: u64) -> Result<Vec<u8>, Error> {
-    let mut pinned = pin(path).map_err(|_| Error::Storage)?;
-    bytes(&mut pinned.file, max)
+    let _parents = pin_parents(path, true).map_err(|_| Error::Storage)?;
+    // A record is an immutable snapshot published by rename. Windows otherwise
+    // lets an observer veto the old worker's terminal delete (Win10 22H2).
+    // MSI/package pins still deny delete; only short record reads share it.
+    let mut file = open_shared(path, false, true).map_err(|_| Error::Storage)?;
+    inspect(&file, false).map_err(|_| Error::Storage)?;
+    bytes(&mut file, max)
 }
 pub(super) fn hash(path: &Path) -> Result<String, Error> {
     let mut file = open(path).map_err(|_| Error::Storage)?;
@@ -238,6 +271,9 @@ pub(super) fn write(path: &Path, bytes: &[u8]) -> Result<(), Error> {
     if ok == 0 {
         return Err(Error::Storage);
     }
+    if path.file_name().is_some_and(|name| name == "pending.json") {
+        super::invalidate_observation();
+    }
     Ok(())
 }
 pub(super) fn lock() -> Result<Handle, Error> {
@@ -246,9 +282,8 @@ pub(super) fn lock() -> Result<Handle, Error> {
     let _parent = open_one(&directory, true).map_err(|_| Error::Storage)?;
     let path = directory.join("maintenance.lock");
     let descriptor = security::system_security().map_err(|_| Error::Storage)?;
-    let mut attrs = descriptor.attrs();
-    attrs.bInheritHandle = 1;
-    // SAFETY: fixed protected lock, exclusive sharing, inherited only into the old verified worker.
+    let attrs = descriptor.attrs();
+    // SAFETY: fixed protected lock, exclusive sharing, non-inheritable.
     let handle = Handle::new(unsafe {
         CreateFileW(
             wide(path.to_str().ok_or(Error::Storage)?).as_ptr(),
@@ -539,6 +574,15 @@ mod tests {
         }
     }
     #[test]
+    fn record_snapshot_does_not_veto_terminal_delete() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("pending.json");
+        std::fs::write(&path, b"committed snapshot").unwrap();
+        let mut reader = open_shared(&path, false, true).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(bytes(&mut reader, 64).unwrap(), b"committed snapshot");
+    }
+    #[test]
     fn staging_handle_denies_writes_rename_and_delete_but_allows_installer_reads() {
         let directory = std::env::temp_dir().join(format!("oink-pin-unit-{}", std::process::id()));
         std::fs::create_dir(&directory).unwrap();
@@ -547,7 +591,7 @@ mod tests {
         // Same open flags as production, bypassing only its installation-root
         // and privileged-owner policy for this isolated ordinary-user fixture.
         let pinned = PinnedFile {
-            file: open_raw(&path, false).unwrap(),
+            _file: open_raw(&path, false).unwrap(),
             _parents: vec![open_raw(&directory, true).unwrap()],
         };
         assert!(std::fs::read(&path).is_ok());

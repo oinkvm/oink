@@ -870,7 +870,8 @@ extern "C" DWORD oink_unlock_unregister_under(HKEY hive, const wchar_t *vault,
 // session of the msiexec client (session 1 for an uninstall started from the
 // desktop; session 0 only for one started from a service or ssh). Requiring
 // session 0 failed every desktop uninstall (issue #46). The caller has
-// already verified the protected installed image.
+// authenticated either the service image or this code embedded in the MSI
+// custom-action DLL. Restoring an ACL alone does not authenticate old bytes.
 extern "C" DWORD oink_unlock_unregister(DWORD *step, wchar_t *object,
                                         DWORD capacity) {
   const UnregisterFailure out{step, object, capacity};

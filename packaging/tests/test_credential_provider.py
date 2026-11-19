@@ -26,13 +26,14 @@ class CredentialProviderTests(unittest.TestCase):
         self.assertIn('Source="$(var.Payload)/OinkCredentialProvider.dll"', source)
         self.assertIn('Source="$(var.Payload)/OinkPasteMenu.dll"', source)
         ca = (ROOT / 'packaging/windows/InstallerCA.cpp').read_text()
-        self.assertIn('L"--unregister-credential-provider"', ca)
+        self.assertIn('oink_unlock_unregister(&step', ca)
+        self.assertIn("ROOT / 'crates/oink-winsvc/native/unlock.cpp'", (ROOT / 'packaging/windows/build.py').read_text())
         self.assertIn('"--unregister-credential-provider" => auto_unlock::unregister()',
                       (ROOT / 'crates/oink-winsvc/src/platform/mod.rs').read_text())
 
     def test_unregister_is_a_logging_dll_action(self):
         # Issue #46: an EXE custom action hid the failing step behind "error
-        # code 1". The DLL action copies the service image's stderr to the log.
+        # code 1". The trusted DLL logs the shared native cleanup's failing object.
         source = (ROOT / 'packaging/windows/Package.wxs').read_text()
         action = re.search(r'<CustomAction Id="UnregisterCredentialProvider"[^>]*/>', source).group(0)
         for attribute in ('BinaryRef="InstallerCA"', 'DllEntry="UnregisterCredentialProvider"', 'Execute="deferred"',
@@ -45,8 +46,9 @@ class CredentialProviderTests(unittest.TestCase):
         ca = (ROOT / 'packaging/windows/InstallerCA.cpp').read_text()
         entry = ca[ca.index('UINT __stdcall UnregisterCredentialProvider'):]
         entry = entry[:entry.index('\n}\n')]
-        self.assertIn('STARTF_USESTDHANDLES', ca)
-        self.assertIn('hStdError = write', ca)
+        self.assertNotIn('run_captured(executable', entry)
+        self.assertIn('native cleanup step=', entry)
+        self.assertIn('Windows error=', entry)
         self.assertIn('INSTALLMESSAGE_INFO', entry)
         self.assertIn('INSTALLMESSAGE_ERROR', entry)
         self.assertIn('return ERROR_INSTALL_FAILURE;', entry)

@@ -13,10 +13,10 @@ bool effective_system(CallerToken thread, ProcessToken process) {
     // non-SYSTEM impersonation token must never borrow the process identity.
     return thread == CallerToken::absent ? process() : thread == CallerToken::system;
 }
-struct Value { std::string text; bool number = false; };
+struct Value { std::string text; bool number = false; bool literal = false; };
 using Object = std::map<std::string, Value>;
 
-inline bool parse(const std::string& input, Object& result) {
+inline bool parse(const std::string& input, Object& result, bool journal_literals = false) {
     result.clear();
     if (input.size() > 8192) return false;
     size_t at = 0;
@@ -41,6 +41,9 @@ inline bool parse(const std::string& input, Object& result) {
         space(); if (at == input.size() || input[at++] != ':') return false; space();
         if (at < input.size() && input[at] == '"') {
             if (!quoted(value.text)) return false;
+        } else if (journal_literals && (input.compare(at, 4, "true") == 0 || input.compare(at, 5, "false") == 0 || input.compare(at, 4, "null") == 0)) {
+            const auto count = input[at] == 'f' ? 5u : 4u;
+            value.text = input.substr(at, count); value.literal = true; at += count;
         } else {
             value.number = true;
             while (at < input.size() && input[at] >= '0' && input[at] <= '9') value.text.push_back(input[at++]);

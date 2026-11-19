@@ -168,7 +168,7 @@ export interface ExitVolumeCard {
 export interface LocalPauseCard {
   action: CardAction; // toggle the current owner pause; no Resume all
   paused: boolean;
-  reason: "none" | "local_user" | "remote_user" | "emergency" | "input_backlog" | "unknown";
+  reason: "none" | "local_user" | "remote_user" | "emergency" | "input_backlog" | "remote_desktop" | "unknown";
   revision: DecimalU64;
   canResume: boolean; // exact live owner Boot/pause revision available, self or remote
 }

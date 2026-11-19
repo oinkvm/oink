@@ -1492,3 +1492,44 @@ async fn replacing_prepared_query_after_member_removal_refreshes_pairing_context
     );
     stop(&nodes).await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn remote_desktop_freezes_console_displays_and_first_install_has_no_displays() {
+    let nodes = start(fresh(2)).await;
+    for (i, node) in nodes.iter().enumerate() {
+        if i == 0 {
+            node.group.initialize_displays(vec![display("console")]).unwrap();
+        }
+        if i == 1 {
+            assert!(node.group.local_displays().displays.is_empty());
+        }
+        let before = node.group.applied().layout.clone();
+        node.group
+            .call(|owner| {
+                let mut pause = crate::device_controls::pause::PauseOwner::default();
+                pause.set_remote_desktop(true);
+                owner.local.owner(Vec::new(), pause.state(), None).unwrap();
+                Ok(())
+            })
+            .unwrap();
+        node.group.initialize_displays(vec![display("virtual")]).unwrap();
+        assert_eq!(node.group.applied().layout, before);
+        assert!(!node.group.local_displays().displays.iter().any(|d| d.key == "virtual"));
+        node.group
+            .call(|owner| {
+                owner
+                    .local
+                    .owner(
+                        Vec::new(),
+                        crate::device_controls::pause::PauseOwner::default().state(),
+                        None,
+                    )
+                    .unwrap();
+                Ok(())
+            })
+            .unwrap();
+        node.group.initialize_displays(vec![display("console")]).unwrap();
+        assert!(node.group.local_displays().displays.iter().any(|d| d.key == "console"));
+    }
+    stop(&nodes).await;
+}

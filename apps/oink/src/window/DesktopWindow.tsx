@@ -1,5 +1,6 @@
 import { tr } from '../i18n';
 import { inTauri } from '../api/transport';
+import { shell } from '../api/client';
 import { forwardRef, useEffect, useRef, useState } from 'react';
 import type { CSSProperties, ReactNode, TransitionEvent } from 'react';
 import { Button, Icon, Tooltip, mergeRefs, presets, speed } from 'oink-ui';
@@ -197,7 +198,14 @@ interface BarProps {
 function MacTitlebar({ state, onMinimize, onToggleMaximize, onClose, extra, center, end, coverBar }: BarProps) {
     const bar = useRef<HTMLDivElement>(null);
     const offset = useTrafficLightAlignment(bar);
-    return (<div ref={bar} className="win__titlebar" style={{'--native-controls-offset': `${offset}px`} as CSSProperties} data-tauri-drag-region onDoubleClick={(e) => { if (e.target === e.currentTarget)
+    return (<div ref={bar} className="win__titlebar" style={{'--native-controls-offset': `${offset}px`} as CSSProperties} data-tauri-drag-region
+      onMouseDown={e => {
+        if (!inTauri || e.target !== e.currentTarget || e.button !== 0 || e.detail !== 1) return;
+        e.preventDefault();
+        e.stopPropagation();
+        void shell.startTitleDrag();
+      }}
+      onDoubleClick={(e) => { if (e.target === e.currentTarget)
         onToggleMaximize(); }}>
       <div className="mac-lights" style={inTauri ? {visibility:'hidden',pointerEvents:'none'} : undefined}>
         <button type="button" className="mac-light" data-kind="close" aria-label={tr('关闭')} onClick={onClose}>

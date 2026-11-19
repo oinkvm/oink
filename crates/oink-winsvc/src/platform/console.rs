@@ -245,8 +245,11 @@ pub(super) fn register(process: &Handle, id: u32, sid: &[u8]) -> io::Result<()> 
         source,
         process: Handle::new(retained)?,
     });
-    // The launch path verified this was the active console, never an RDP source.
-    registry.owner.0 = Some(id);
+    // Registration pins a child identity, not console authority. RDP starts may
+    // acquire authority only after WTS observes this same session on the console.
+    if super::session::console(id) {
+        registry.owner.0 = Some(id);
+    }
     super::broker::changed();
     Ok(())
 }
@@ -281,18 +284,23 @@ pub(super) fn select(id: u32, account: &Account, prelogin: Option<Source>) -> Op
         .children
         .iter()
         .find(|c| {
-            registry.owner.0 == Some(c.source.identity.session)
+            super::session::console(c.source.identity.session)
+                && registry.owner.0 == Some(c.source.identity.session)
                 && crate::console_policy::allows(c.source.identity.session, id, account, &c.source.owner_sid)
         })
         .map(|c| c.source.clone())
 }
 
-/// A source cannot survive logout/reuse of its original session as an authority.
+/// A user source cannot survive RDP/detachment or logout/reuse as an authority.
+/// SYSTEM prelogin retains its separate explicit route to the login desktop.
 pub(super) fn source_current(source: &Source) -> bool {
     match (&source.user_sid, source.logon) {
-        (Some(sid), Some(logon_id)) => user_token(source.identity.session).is_ok_and(|t| {
-            security::sid_bytes(t.0).is_ok_and(|actual| actual == *sid) && logon(t.0).ok() == Some(logon_id)
-        }),
+        (Some(sid), Some(logon_id)) => {
+            super::session::console(source.identity.session)
+                && user_token(source.identity.session).is_ok_and(|t| {
+                    security::sid_bytes(t.0).is_ok_and(|actual| actual == *sid) && logon(t.0).ok() == Some(logon_id)
+                })
+        }
         (None, None) => true,
         _ => false,
     }

@@ -73,7 +73,7 @@ struct LaunchState {
 static EXIT: AtomicU8 = AtomicU8::new(0);
 static SHOW_REQUESTED: AtomicBool = AtomicBool::new(false);
 
-fn request_window() {
+pub(super) fn request_window() {
     let mtm = MainThreadMarker::new().expect("launch request on AppKit thread");
     let app = NSApplication::sharedApplication(mtm);
     // The bundle entry and WebView helper are separate applications. macOS 14+
@@ -162,7 +162,19 @@ define_class!(
                         let remote = crate::remote::RemoteApi::new(oink_foundation::paths::data_dir());
                         if let Err(error) = remote.show_window() { tracing::error!(%error); EXIT.store(1, Ordering::Release); }
                     }
-                    Err(error) => { tracing::error!(%error, "backend startup failed"); EXIT.store(1, Ordering::Release); }
+                    Err(error) => {
+                        tracing::error!(%error, "backend startup failed");
+                        EXIT.store(1, Ordering::Release);
+                        if show {
+                            on_main(move || {
+                                if super::startup_macos::diagnose(&error) {
+                                    retry_backend();
+                                }
+                                stop_loop();
+                            });
+                            return;
+                        }
+                    }
                 }
                 on_main(stop_loop);
             }));
@@ -318,18 +330,42 @@ pub(super) fn run(launch: Launch, smoke: bool) -> u8 {
     } else {
         oink_network::NetworkConfig::default()
     };
-    let lock = match super::claim_instance(&net.data_dir) {
-        Ok(Some(lock)) => lock,
-        Ok(None) => return 0,
-        Err(error) => {
-            eprintln!("后台单实例锁失败：{error}");
-            return 1;
+    // Parallel helper launches can both observe an empty home. Only the
+    // winner starts a host; the initiating UI handles the owner's hello.
+    let claim = if launch == Launch::Login {
+        match crate::instance::acquire(&net.data_dir) {
+            Ok(lock) => Ok(Some(lock)),
+            Err(error) if error.is::<crate::instance::AlreadyRunning>() && !smoke => Ok(None),
+            Err(error) => Err(error),
+        }
+    } else {
+        super::claim_instance(&net.data_dir)
+    };
+    let lock = {
+        match claim {
+            Ok(Some(lock)) => lock,
+            Ok(None) => return 0,
+            Err(error) if launch != Launch::Login && !smoke && super::startup_macos::diagnose(&error) => {
+                retry_backend();
+                return 1;
+            }
+            Err(error) => {
+                tracing::error!(%error, "could not acquire backend ownership");
+                return 1;
+            }
         }
     };
     if smoke {
         crate::logs::init_service();
     }
     run_application(launch, smoke, (net, lock))
+}
+
+fn retry_backend() {
+    // Start a fresh process image after host teardown. AppKit's application
+    // delegate only receives applicationDidFinishLaunching once per process.
+    let error = super::startup_macos::restart_process();
+    tracing::error!(%error, "could not restart backend");
 }
 
 fn run_application(

@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
-import { cleanup, render, screen, waitFor } from '@testing-library/react';
+import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { OinkProvider } from 'oink-ui';
 import { shell } from '../api/client';
 import { DesktopWindow } from './DesktopWindow';
@@ -29,6 +29,19 @@ describe('native macOS titlebar',()=>{
     expect(lights.nextElementSibling).toBe(toggle);
     expect(lights.parentElement?.className).toBe('win__titlebar');
     expect(lights.parentElement?.hasAttribute('data-tauri-drag-region')).toBe(true);
+  });
+  it('starts a native move only on a direct primary single press',()=>{
+    vi.spyOn(shell,'titlebarCenter').mockResolvedValue(null);
+    const start=vi.spyOn(shell,'startTitleDrag').mockResolvedValue();
+    const noop=()=>{};
+    const {container}=render(<OinkProvider><DesktopWindow platform="mac" state={{maximized:false,minimized:false,closed:false}} active title="Oink" onMinimize={noop} onToggleMaximize={noop} onClose={noop} onActivate={noop} navOpen onToggleNav={noop} nav={()=>null}>Canvas</DesktopWindow></OinkProvider>);
+    const bar=container.querySelector('.win__titlebar')!;
+    fireEvent.mouseDown(screen.getByRole('button',{expanded:true}),{button:0,detail:1});
+    fireEvent.mouseDown(bar,{button:2,detail:1});
+    fireEvent.mouseDown(bar,{button:0,detail:2});
+    expect(start).not.toHaveBeenCalled();
+    expect(fireEvent.mouseDown(bar,{button:0,detail:1})).toBe(false);
+    expect(start).toHaveBeenCalledTimes(1);
   });
 });
 

@@ -42,6 +42,7 @@ pub(super) fn attach(node: &Node) {
     std::thread::spawn(move || {
         let mut registered = false;
         let mut health_mode = initial.is_some();
+        let mut health_reported = None;
         let mut prepared = initial.take();
         let mut delay = Duration::from_millis(500);
         loop {
@@ -50,11 +51,7 @@ pub(super) fn attach(node: &Node) {
                 break;
             };
             let node = Node { inner };
-            delay = if prepared.is_some() || lock(&node.inner.update).status.phase == Phase::Quiescing {
-                Duration::from_millis(50)
-            } else {
-                Duration::from_millis(500)
-            };
+            delay = polling_delay(health_mode, prepared.is_some(), lock(&node.inner.update).status.phase);
             if !registered {
                 if status().is_err() {
                     continue;
@@ -129,13 +126,20 @@ pub(super) fn attach(node: &Node) {
                             Err(_) => continue,
                         }
                     }
-                    if let Ok(status) = node.input_status() {
-                        let _ = oink_winsvc::update::request(Request::Health {
-                            transaction,
+                    if health_report_due(health_reported.as_ref(), &transaction, std::time::Instant::now())
+                        && let Ok(status) = node.input_status()
+                    {
+                        let ready = oink_update::trust::health_ready(status.helper_priority.is_some())
+                            && status.focus_info.is_some();
+                        let reply = oink_winsvc::update::request(Request::Health {
+                            transaction: transaction.clone(),
                             build,
                             input_ready: oink_update::trust::health_ready(status.helper_priority.is_some()),
                             routing_ready: status.focus_info.is_some(),
                         });
+                        if ready && matches!(reply, Ok(Reply::Registered)) {
+                            health_reported = Some((transaction, std::time::Instant::now()));
+                        }
                     }
                 }
                 Ok(Reply::Status { status }) => {
@@ -143,6 +147,7 @@ pub(super) fn attach(node: &Node) {
                     if health_mode {
                         prepared = None;
                         health_mode = false;
+                        health_reported = None;
                     }
                     let changed = lock(&node.inner.update).status != status;
                     if changed {
@@ -197,5 +202,57 @@ pub(crate) fn startup_gate() -> Result<(), Error> {
         Ok(Reply::Status { .. }) => Ok(()),
         Err(Error::NotConfigured) if env!("OINK_RELEASE_BUILD") == "0" => Ok(()),
         _ => Err(Error::Transaction),
+    }
+}
+
+// Released workers require every session proof to be at most three seconds
+// old. Refresh once a second until commit, so one slow session cannot expire
+// another session's successful proof. The old 50 ms preparation poll generated
+// a record-write/wake feedback loop; this is a bounded health heartbeat only.
+fn health_report_due(last: Option<&(String, std::time::Instant)>, transaction: &str, now: std::time::Instant) -> bool {
+    last.is_none_or(|(tx, at)| tx != transaction || now.saturating_duration_since(*at) >= Duration::from_secs(1))
+}
+// Health proofs are acknowledged state, not a 50 ms preparation fence. Keeping
+// the preparation cadence after a successful proof caused a record-write/wake
+// feedback loop in the new service during an old worker's commit (Win10 22H2).
+fn polling_delay(health_mode: bool, prepared: bool, phase: Phase) -> Duration {
+    if !health_mode && (prepared || phase == Phase::Quiescing) {
+        Duration::from_millis(50)
+    } else {
+        Duration::from_millis(500)
+    }
+}
+#[cfg(test)]
+mod health_poll_tests {
+    use super::*;
+    #[test]
+    fn a_delayed_second_session_does_not_expire_the_first_sessions_proof() {
+        let now = std::time::Instant::now();
+        let proof = ("transaction".into(), now);
+        assert!(health_report_due(None, "transaction", now));
+        assert!(!health_report_due(
+            Some(&proof),
+            "transaction",
+            now + Duration::from_millis(999)
+        ));
+        assert!(health_report_due(
+            Some(&proof),
+            "transaction",
+            now + Duration::from_secs(1)
+        ));
+        assert!(health_report_due(
+            Some(&proof),
+            "transaction",
+            now + Duration::from_secs(10)
+        ));
+        assert!(health_report_due(Some(&proof), "another", now));
+    }
+    #[test]
+    fn candidate_health_does_not_reenter_the_fast_preparation_poll() {
+        for phase in [Phase::Installing, Phase::Quiescing, Phase::Committed] {
+            assert_eq!(polling_delay(true, true, phase), Duration::from_millis(500));
+        }
+        assert_eq!(polling_delay(false, true, Phase::Quiescing), Duration::from_millis(50));
+        assert_eq!(polling_delay(false, false, Phase::Idle), Duration::from_millis(500));
     }
 }

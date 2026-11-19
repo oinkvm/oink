@@ -62,6 +62,10 @@ pub fn publish() -> windows::core::Result<()> {
             Some(instance.into()),
             None,
         )?;
+        use windows::Win32::System::RemoteDesktop::{NOTIFY_FOR_THIS_SESSION, WTSRegisterSessionNotification};
+        if let Err(error) = WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION) {
+            tracing::warn!(%error, "WTS startup notifications unavailable");
+        }
         OWNER.with(|owner| *owner.borrow_mut() = Some((hwnd, None)));
     }
     Ok(())
@@ -134,6 +138,14 @@ pub fn configure(app: &AppHandle, hotkeys: &[Hotkey]) {
 }
 
 unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    if message == windows::Win32::UI::WindowsAndMessaging::WM_WTSSESSION_CHANGE {
+        use tauri::Manager;
+        if let Some(app) = OWNER.with(|owner| owner.borrow().as_ref().and_then(|(_, app)| app.clone()))
+            && oink_winsvc::session::current_launch_allowed()
+        {
+            app.state::<crate::app::Backend>().startup.session_activated();
+        }
+    }
     if message == OPEN || (message == WM_HOTKEY && wp.0 == HOTKEY as usize) {
         let app = OWNER.with(|owner| owner.borrow().as_ref().and_then(|(_, app)| app.clone()));
         if let Some(app) = app {

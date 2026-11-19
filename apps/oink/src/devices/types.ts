@@ -53,7 +53,7 @@ export interface Device {
     gameActive?: boolean | null;
     gameDetected?: boolean;
     paused?: boolean;
-    pauseReason?: "none" | "local_user" | "remote_user" | "emergency" | "input_backlog" | "unknown";
+    pauseReason?: "none" | "local_user" | "remote_user" | "emergency" | "input_backlog" | "remote_desktop" | "unknown";
     unknown?: boolean;
     canPause?: boolean;
     canDisableMouse?: boolean;

@@ -21,10 +21,11 @@ struct Version {
     platform: u32,
     service_pack: [u16; 128],
 }
-pub(super) fn observe() -> Result<Summary, &'static str> {
-    if cfg!(not(target_pointer_width = "64")) {
-        return Err("unsupported pointer width");
-    }
+pub(super) fn version_string() -> Result<String, &'static str> {
+    let v = version()?;
+    Ok(format!("{}.{}.{}", v.major, v.minor, v.build))
+}
+fn version() -> Result<Version, &'static str> {
     let mut version = Version {
         size: std::mem::size_of::<Version>() as u32,
         major: 0,
@@ -37,6 +38,13 @@ pub(super) fn observe() -> Result<Summary, &'static str> {
     if unsafe { RtlGetVersion(&mut version) } < 0 {
         return Err("version unavailable");
     }
+    Ok(version)
+}
+pub(super) fn observe() -> Result<Summary, &'static str> {
+    if cfg!(not(target_pointer_width = "64")) {
+        return Err("unsupported pointer width");
+    }
+    let version = version()?;
     let layout = Layout::windows(version.major, version.build).ok_or("unsupported Windows version")?;
     let mut size = 16384usize;
     loop {

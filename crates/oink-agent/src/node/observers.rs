@@ -18,6 +18,9 @@ impl Node {
     }
 
     pub(super) fn current_displays(&self) -> anyhow::Result<Vec<DisplayInfo>> {
+        if self.remote_desktop() {
+            return Ok(Vec::new());
+        }
         match &self.inner.display_backend {
             Some(backend) => Ok(backend.displays()?),
             None => Ok(self.inner.initial_displays.clone()),
@@ -25,6 +28,9 @@ impl Node {
     }
 
     pub(crate) fn current_active_displays(&self) -> anyhow::Result<Vec<DisplayInfo>> {
+        if self.remote_desktop() {
+            return Ok(Vec::new());
+        }
         match &self.inner.display_backend {
             Some(backend) => Ok(backend.active_displays()?),
             None => Ok(self.inner.initial_displays.clone()),
@@ -132,6 +138,14 @@ impl Node {
                         node.inner.windows_access.publish(observed);
                         node.emit(ApiEvent::Permissions(crate::agent_api::permission_items(&node)));
                     }
+                    let remote_desktop = node.remote_desktop();
+                    match node.apply_remote_desktop(remote_desktop) {
+                        Ok(true) => {
+                            dirty.store(true, Ordering::Release);
+                        }
+                        Ok(false) => {}
+                        Err(error) => tracing::warn!(?error, "session pause transition pending"),
+                    }
                     let backend = node.input_backend();
                     let observation_started = Instant::now();
                     let session_observation = backend.session_lock_observation();
@@ -156,7 +170,7 @@ impl Node {
                     let refresh_displays = dirty.swap(false, Ordering::AcqRel)
                         || display_retry_at.is_some_and(|at| now >= at)
                         || (!display_notifications && now >= display_fallback_at);
-                    if refresh_displays || native_retry_at.is_some_and(|at| now >= at) {
+                    if !remote_desktop && (refresh_displays || native_retry_at.is_some_and(|at| now >= at)) {
                         // Reconfiguration callbacks also cover mode identity changes
                         // whose visible bounds stay equal. Never read native state
                         // on the idle profile clock; retry only failed observations.
@@ -174,7 +188,7 @@ impl Node {
                             }
                         }
                     }
-                    if refresh_displays {
+                    if refresh_displays && !remote_desktop {
                         display_fallback_at = Instant::now() + Duration::from_secs(30);
                         let _arrangement = lock(&node.inner.profiles.native.observation_gate);
                         #[cfg(windows)]

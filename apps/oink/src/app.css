@@ -783,3 +783,20 @@ body:has(.oink-app:is([data-view="main"], [data-view="panel"])) { background: tr
 
 .shortcut-mouse { width: 18px; height: 20px; display: block; }
 .shortcut-mouse__active { fill: var(--ok-accent); stroke: var(--ok-accent); }
+
+.win__limited { color: var(--ok-warning, #b7791f); }
+.win__limited path { stroke: currentColor; }
+
+.win__title-center[data-shown] .win__limited { pointer-events: auto; }
+
+.boot-wrap { position: absolute; inset: 0; display: grid; place-items: center; overflow: auto; padding: 24px; }
+.boot-content { width: 100%; max-width: 480px; text-align: center; }
+.boot.ok-empty { --_m: 64px; padding: 8px 0; }
+.boot .ok-empty__desc { max-width: 29em; }
+.boot .ok-empty__actions { display: flex; justify-content: center; gap: 8px; }
+.boot__tools { display: flex; flex-wrap: wrap; justify-content: center; margin-top: 10px; }
+.boot__details { padding: 12px; background: var(--ok-surface); border-radius: 12px; white-space: pre-wrap; overflow-wrap: anywhere; text-align: left; font: 12px/1.6 var(--ok-font-mono); }
+.boot .ok-empty__media { background: var(--ok-warning-soft); color: var(--ok-warning-text); }
+.boot:is([data-tone="missing"],[data-tone="exited"]) .ok-empty__media { background: var(--ok-danger-soft); color: var(--ok-danger-text); }
+.boot:is([data-tone="rdp"],[data-tone="session"]) .ok-empty__media { background: var(--ok-info-soft); color: var(--ok-info-text); }
+.boot[data-tone="waiting"] .ok-empty__media { background: var(--ok-accent-soft); color: var(--ok-accent); }

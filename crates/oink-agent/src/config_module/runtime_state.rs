@@ -702,6 +702,26 @@ impl Owner {
         self.commit(candidate)
     }
     pub(crate) fn displays_changed(&mut self, displays: Vec<DisplayInfo>) -> ApiResult<()> {
+        // The session can move after enumeration but before this actor turn.
+        // Recheck at publication so that a queued RDP enumeration cannot replace
+        // console geometry before the ordinary observer publishes its pause.
+        #[cfg(windows)]
+        if self.require_console_displays && oink_winsvc::session::remote_desktop() {
+            return Ok(());
+        }
+        // A runtime session cause freezes the last console catalog, including
+        // edits that re-enumerate after a native transaction. Never publish RDP
+        // virtual geometry or clear a retained console layout with an empty list.
+        if self
+            .local
+            .value()
+            .pause()
+            .ok()
+            .flatten()
+            .is_some_and(|pause| pause.reason() == Ok(dto::PauseReason::RemoteDesktop))
+        {
+            return Ok(());
+        }
         self.displays_observed = true;
         self.displays = displays.clone();
         self.observe_display_facts()?;

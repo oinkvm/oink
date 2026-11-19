@@ -31,6 +31,7 @@ import { CompactIcon } from './arrange/CompactIcon';
 import { nextSelection, type SelectMode } from './arrange/selection';
 import { ScreenPreview } from './arrange/screenPreview';
 import { CreateProfileDialog, ProfileList, ProfileTools } from './arrange/LayoutProfiles';
+import { StartupPanel } from './window/StartupPanel';
 import { DesktopWindow } from './window/DesktopWindow';
 import { ResizeEdges } from './window/ResizeEdges';
 import { FileProviderDialog, useFileProviderExplainer } from './permissions/FileProviderDialog';
@@ -118,6 +119,7 @@ export function App() {
     // next toggle from the newest intent, never a captured render's old value.
     const currentDevices=()=>presentControls(agent.get().cards,controls.targets(),agent.get().permissions);
     const self = devices.find(d => d.group === 'self');
+    const remotePaused = platform === 'win' && self?.pauseReason === 'remote_desktop';
     const [navOpen, setNavOpen] = useState(true);
     const [maximized,setMaximized] = useState(false);
     const [windowActive,setWindowActive] = useState(true);
@@ -137,7 +139,7 @@ export function App() {
     const [onboardKey, setOnboardKey] = useState(0);
     const onboardingBusy = useRef(false);
     const onboardTimer = useRef(0);
-    const onboarding = view === 'main' && (onboard === null ? !!state.overview && !state.overview.onboarding_done : onboard !== 'off');
+    const onboarding = !remotePaused && view === 'main' && (onboard === null ? !!state.overview && !state.overview.onboarding_done : onboard !== 'off');
     useEffect(() => {
         if (view === 'main' && state.overview && onboard === null) setOnboard(state.overview.onboarding_done ? 'off' : 'on');
     }, [view, state.overview, onboard]);
@@ -696,23 +698,23 @@ export function App() {
                     : <SideContextMenu {...menu}>
       <DesktopWindow ref={mergeRefs(setWinEl)} platform={platform} covered={packageDrag || onboarding && onboard !== 'leaving'} coverBar={packageDrag ? <span className="package-drop-title">Oink</span> : onboarding && <OnboardingLanguage value={prefs.prefs.language} leaving={onboard === 'leaving'} onChange={v => prefs.set('language', v)}/>}
         cover={packageDrag ? <PackageDropArea platform={platform}/> : onboarding && <Onboarding key={onboardKey} platform={platform} pairing={pairing} perms={permissions} onGrant={grant} onOpenSettings={openPermissionSettings} preferences={prefs} container={winEl} leaving={onboard === 'leaving'} version={state.boot?.version ?? version} connected={devices.some(d => d.group === 'online')} onSkip={finishOnboarding} onFinish={finishOnboarding}/>}
-        state={{ maximized, minimized: false, closed: false }} active={windowActive} title={tr('显示器排列')} onMinimize={() => { void windowAction('minimize'); }} onToggleMaximize={() => { void windowAction('toggleMaximize'); }} onClose={() => { void windowAction('close'); }} onActivate={() => { }} navOpen={navOpen} onSideBlank={clearSelection} onToggleNav={() => { if (navOpen) clearSelection(); setNavOpen(!navOpen); if (navMode !== 'devices')
+        state={{ maximized, minimized: false, closed: false }} active={windowActive} title={tr('显示器排列')} onMinimize={() => { void windowAction('minimize'); }} onToggleMaximize={() => { void windowAction('toggleMaximize'); }} onClose={() => { void windowAction('close'); }} onActivate={() => { }} navOpen={!remotePaused && navOpen} onSideBlank={clearSelection} onToggleNav={() => { if (remotePaused) return; if (navOpen) clearSelection(); setNavOpen(!navOpen); if (navMode !== 'devices')
                         setNavMode('devices'); }} pages={{ add: navMode === 'add', settings: navMode === 'settings' }} onSideAction={action => { if (action === 'quit') {
                         if (prefs.prefs.confirmQuit)
                             setQuitAsk(true);
                         else
                             void shell.quit().catch(fail);
                     }
-                    else {
+                    else if (!remotePaused) {
                         setNavOpen(true);
                         setNavMode(navMode === action ? 'devices' : action);
-                    } }} version={state.boot?.version ?? version} sideExtra={navMode === 'add' ? <SelfInfo container={winEl}/> : null} titleEnd={<><UpgradeButton/><PromoArea sponsor={!prefs.presentation.hide_sponsor} container={winEl}/></>} titleCenter={self?.paused ? <span className="win__paused"><PauseGlyph/>{tr('共享已暂停')}</span> : null} navBack={platform === 'win' && navMode !== 'devices' ? { title: navMode === 'add' ? tr('添加设备') : tr('设置'), label: tr('返回设备列表'), onBack: () => setNavMode('devices') } : null} nav={collapsed => <>
+                    } }} version={state.boot?.version ?? version} sideExtra={navMode === 'add' ? <SelfInfo container={winEl}/> : null} titleEnd={<><UpgradeButton/><PromoArea sponsor={!prefs.presentation.hide_sponsor} container={winEl}/></>} titleCenter={self?.paused ? <span className="win__paused"><PauseGlyph/>{tr('共享已暂停')}</span> : null} navBack={!remotePaused && platform === 'win' && navMode !== 'devices' ? { title: navMode === 'add' ? tr('添加设备') : tr('设置'), label: tr('返回设备列表'), onBack: () => setNavMode('devices') } : null} nav={collapsed => remotePaused ? null : <>
           <div className="nav-stack">
             {platform === 'win' && <RequestsGroup pairing={pairing} collapsed={collapsed} onExpand={() => setNavOpen(true)} hidden={navMode === 'settings'}/>}
             <div className="nav-view" key={navMode} data-view={navMode} data-anim={navSwitched ? '' : undefined}>{platform === 'mac' && <><AddHead open={navMode !== 'devices'} title={navMode === 'add' ? tr('添加设备') : tr('设置')} onBack={() => setNavMode('devices')}/><RequestsGroup pairing={pairing} collapsed={collapsed} onExpand={() => setNavOpen(true)} hidden={navMode === 'settings'}/></>}{navMode === 'add' ? <AddPanel pairing={pairing}/> : navMode === 'settings' ? <SettingsNav platform={platform} query={query} onQuery={setQuery} active={section} onJump={id => setJump({ section: id, n: Date.now() })}/> : <DeviceList onGrantPermission={grantDevicePermission} onGrantAccessibility={() => { void accessibilityGrant.grant('accessibility'); }} devices={devices} selectedId={selectedDevice} onSelect={id => { setNavOpen(true); selectDevice(id); }} onToggle={toggle} onPause={menu.onPause} onSpeaker={menu.onSpeaker} onMicrophone={microphone} hiddenScreens={hiddenScreens} collapsed={collapsed} now={Date.now()} onReorder={(id, placement) => api.moveDeviceOrder(id, placement)}/>}</div>
           </div>
         </>}>
-        <div className="disp" data-hidden={navMode === 'settings' ? '' : undefined} aria-hidden={navMode === 'settings' || undefined} inert={navMode === 'settings'}>
+        {remotePaused ? <div className="disp"><div className="disp__canvas"><StartupPanel raw="rdp"/></div></div> : <div className="disp" data-hidden={navMode === 'settings' ? '' : undefined} aria-hidden={navMode === 'settings' || undefined} inert={navMode === 'settings'}>
           <VisuallyHidden id={hint}>{tr('方向键移动位置；Command 或 Ctrl 加方向键缩放；Shift 微调按键、拖动或缩放时按住可关闭吸附；Esc 取消选中')}</VisuallyHidden>
           <div className="disp__canvas" ref={canvas} aria-busy={savingLayout}>
             <div className="canvas-tools" role="toolbar" aria-label={tr('排列操作')}>
@@ -728,7 +730,8 @@ export function App() {
             <Arrangement platform={platform} screens={visible} geometryScreens={screens} onProjection={previewScreens} onScreensChange={(next, change) => { void saveScreens(next, change.label, change.merge); }} selectedId={selected} onSelect={selectScreen} settings={{ showHotZones: false, snapping: true, compact: compactLayout, padding: navOpen ? 24 : 48, step: 10 }} keyScope={canvas} hintId={hint} selectedGroup={!screenOnly && selectedDevice ? new Set(screens.filter(s => s.device === selectedDevice).map(s => s.id)) : selection.length > 1 ? new Set(selection) : undefined} contextFor={s => `screen:${s.id}`} screenEditable={s => !!s.device && editable.has(s.device) && independent(s)} screenPreview={screenPreview} onScreenMove={move => { void moveScreen(move); }}/>
           </div>
         </div>
-        {settingsMounted && <SettingsPage open={navMode === 'settings'} platform={platform} api={prefs} capsIme={state.input?.mac_caps_switches_input_source ?? null} query={query} jump={jump} onActive={setSection} version={state.boot?.version ?? version} upgrade={{ available: false, next: '' }} perms={permissions} onGrant={grant} onOpenPermissionSettings={openPermissionSettings} onLog={() => { }} onAbout={menu.onAbout} onBlocklist={() => setBlockedOpen(true)} layoutProfiles={<ProfileList state={profiles} platform={platform} hotkeys={profileHotkeys} onHotkey={setProfileHotkey} onRename={renameProfile} onDelete={deleteProfile}/>} onOnboarding={replayOnboarding}/>}
+        }
+        {!remotePaused && settingsMounted && <SettingsPage open={navMode === 'settings'} platform={platform} api={prefs} capsIme={state.input?.mac_caps_switches_input_source ?? null} query={query} jump={jump} onActive={setSection} version={state.boot?.version ?? version} upgrade={{ available: false, next: '' }} perms={permissions} onGrant={grant} onOpenPermissionSettings={openPermissionSettings} onLog={() => { }} onAbout={menu.onAbout} onBlocklist={() => setBlockedOpen(true)} layoutProfiles={<ProfileList state={profiles} platform={platform} hotkeys={profileHotkeys} onHotkey={setProfileHotkey} onRename={renameProfile} onDelete={deleteProfile}/>} onOnboarding={replayOnboarding}/>}
       </DesktopWindow>
     </SideContextMenu>;
     // oink-ui ships built-in component strings (default aria labels, key names)

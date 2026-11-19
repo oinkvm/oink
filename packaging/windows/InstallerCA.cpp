@@ -44,19 +44,35 @@ static bool trusted(PSID sid) {
     return false;
 }
 
-static bool protected_handle(HANDLE file) {
+static MSIHANDLE diagnostic_install = 0;
+static void diagnostic(MSIHANDLE install, const std::wstring& text) {
+    MSIHANDLE record = MsiCreateRecord(1);
+    MsiRecordSetStringW(record, 0, L"[1]");
+    MsiRecordSetStringW(record, 1, text.c_str());
+    MsiProcessMessage(install, INSTALLMESSAGE_INFO, record);
+    MsiCloseHandle(record);
+}
+
+static bool protected_handle(HANDLE file, bool volume_root = false) {
     BY_HANDLE_FILE_INFORMATION info{};
     bool ok = GetFileInformationByHandle(file, &info) && !(info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)
         && ((info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || info.nNumberOfLinks == 1);
+    std::wstring rejected = (info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) ? L"reparse point" :
+        info.nNumberOfLinks > 1 ? L"multiple file links" : L"unreadable file metadata";
     PSECURITY_DESCRIPTOR sd = nullptr;
     PSID owner = nullptr;
     PACL acl = nullptr;
-    if (ok) ok = GetSecurityInfo(file, SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
-        &owner, nullptr, &acl, nullptr, &sd) == ERROR_SUCCESS && owner && trusted(owner) && acl;
+    if (ok) {
+        const DWORD security = GetSecurityInfo(file, SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+            &owner, nullptr, &acl, nullptr, &sd);
+        ok = security == ERROR_SUCCESS && owner && trusted(owner) && acl;
+        rejected = security != ERROR_SUCCESS ? L"GetSecurityInfo error=" + std::to_wstring(security) :
+            !owner || !trusted(owner) ? L"non-privileged or missing owner SID" : L"missing DACL";
+    }
     if (ok) {
         for (DWORD index = 0; index < acl->AceCount; ++index) {
             void* raw = nullptr;
-            if (!GetAce(acl, index, &raw)) { ok = false; break; }
+            if (!GetAce(acl, index, &raw)) { rejected = L"unreadable ACE index=" + std::to_wstring(index); ok = false; break; }
             auto ace = static_cast<ACCESS_ALLOWED_ACE*>(raw);
             if (ace->Header.AceFlags & INHERIT_ONLY_ACE) continue;
             PSID sid = nullptr;
@@ -71,10 +87,27 @@ static bool protected_handle(HANDLE file) {
             }
             // Deny/audit ACEs do not grant writes and are not an admission veto.
             if (!sid) continue;
-            constexpr DWORD writes = FILE_WRITE_DATA | FILE_APPEND_DATA | FILE_WRITE_EA |
+            const DWORD writes = (volume_root ? 0 : FILE_APPEND_DATA) | FILE_WRITE_DATA | FILE_WRITE_EA |
                 FILE_WRITE_ATTRIBUTES | FILE_DELETE_CHILD | DELETE | WRITE_DAC | WRITE_OWNER | GENERIC_WRITE | GENERIC_ALL;
-            if ((ace->Mask & writes) && !trusted(sid)) { ok = false; break; }
+            if ((ace->Mask & writes) && !trusted(sid)) {
+                LPWSTR text = nullptr; ConvertSidToStringSidW(sid, &text);
+                rejected = L"untrusted write ACE index=" + std::to_wstring(index) + L", mask=" +
+                    std::to_wstring(ace->Mask) + L", SID=" + (text ? text : L"unreadable");
+                if (text) LocalFree(text);
+                ok = false; break;
+            }
         }
+    }
+    if (!ok && diagnostic_install) {
+        wchar_t path[32768]{};
+        GetFinalPathNameByHandleW(file, path, static_cast<DWORD>(std::size(path)), FILE_NAME_NORMALIZED);
+        LPWSTR text = nullptr;
+        if (sd) ConvertSecurityDescriptorToStringSecurityDescriptorW(sd, SDDL_REVISION_1,
+            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION, &text, nullptr);
+        diagnostic(diagnostic_install, std::wstring(L"Protected check failed: path=") + path +
+            L", check=" + rejected + L", attributes=" + std::to_wstring(info.dwFileAttributes) + L", links=" + std::to_wstring(info.nNumberOfLinks) +
+            L", owner/DACL=" + (text ? text : L"unreadable") + L", error=" + std::to_wstring(GetLastError()));
+        if (text) LocalFree(text);
     }
     if (sd) LocalFree(sd);
     return ok;
@@ -88,7 +121,10 @@ static bool protected_path(const std::wstring& path) {
         DWORD error = GetLastError();
         return error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND;
     }
-    bool ok = protected_handle(file);
+    // Windows' default volume-root ACL permits creating new directories. That
+    // right cannot replace the existing, pinned Program Files directory; delete
+    // child, owner/DACL changes and all other writes still fail closed.
+    bool ok = protected_handle(file, path.size() == 3 && path[1] == L':' && path[2] == L'\\');
     CloseHandle(file);
     return ok;
 }
@@ -97,6 +133,7 @@ static bool protected_path(const std::wstring& path) {
 #include "Quiescence.h"
 #include "MaintenanceCleanup.h"
 #include "UserDataCleanup.h"
+#include "Recovery.h"
 
 static std::wstring property(MSIHANDLE install, const wchar_t* name) {
     wchar_t value[32768]; DWORD size = static_cast<DWORD>(std::size(value));
@@ -192,8 +229,9 @@ static bool bind_package(MSIHANDLE install) {
     const bool system_caller = admission::effective_system(thread, [] {
         return maintenance::system_process(GetCurrentProcess());
     });
-    const auto data = source + L"|" + maintenance::wide(hash + "|" + remove + "|" + remove_hash) + (system_caller ? L"|1" : L"|0");
-    return MsiSetPropertyW(install, L"CheckProtectedState", data.c_str()) == ERROR_SUCCESS;
+    const auto data = source + L"|" + maintenance::wide(hash + "|" + remove + "|" + remove_hash) + (system_caller ? L"|1" : L"|0") + (property(install, L"REMOVE") == L"ALL" ? L"|1" : L"|0");
+    return MsiSetPropertyW(install, L"CheckProtectedState", data.c_str()) == ERROR_SUCCESS &&
+        MsiSetPropertyW(install, L"CheckMaintenanceLock", data.c_str()) == ERROR_SUCCESS;
 }
 
 extern "C" __declspec(dllexport) UINT __stdcall CheckInstallPath(MSIHANDLE install) {
@@ -453,20 +491,37 @@ extern "C" __declspec(dllexport) UINT __stdcall RelaunchUserSessions(MSIHANDLE i
     return ERROR_SUCCESS;
 }
 
-extern "C" __declspec(dllexport) UINT __stdcall CheckProtectedState(MSIHANDLE install) {
-    const auto directory = root();
-    if (directory.empty()) return fail(install, 3);
-    if (!protected_path(maintenance::directory())) return fail(install, 5);
+static bool checked_action_data(MSIHANDLE install, std::vector<std::wstring>& parts) {
     const auto data = property(install, L"CustomActionData");
-    std::vector<std::wstring> parts; size_t offset = 0;
+    size_t offset = 0;
     for (;;) {
         auto next = data.find(L'|', offset);
         parts.push_back(data.substr(offset, next == std::wstring::npos ? next : next - offset));
         if (next == std::wstring::npos) break;
         offset = next + 1;
     }
-    if (parts.size() != 5 || (parts[4] != L"0" && parts[4] != L"1") || maintenance::sha256(parts[0]) != maintenance::narrow(parts[1]) ||
-        !maintenance::admit(admission::guid(maintenance::narrow(ID_PRODUCT_CODE)), maintenance::narrow(parts[1]),
+    return !(parts.size() != 6 || (parts[4] != L"0" && parts[4] != L"1") ||
+        (parts[5] != L"0" && parts[5] != L"1") || maintenance::sha256(parts[0]) != maintenance::narrow(parts[1]));
+}
+
+extern "C" __declspec(dllexport) UINT __stdcall CheckMaintenanceLock(MSIHANDLE install) {
+    diagnostic_install = install;
+    std::vector<std::wstring> parts;
+    if (!checked_action_data(install, parts)) return fail(install, 2);
+    return recovery::live_guard(install, admission::guid(maintenance::narrow(ID_PRODUCT_CODE)), maintenance::narrow(parts[1]),
+        maintenance::narrow(parts[2]), maintenance::narrow(parts[3]), parts[4] == L"1") ? ERROR_SUCCESS : fail(install, recovery::failure_code);
+}
+
+extern "C" __declspec(dllexport) UINT __stdcall CheckProtectedState(MSIHANDLE install) {
+    const auto directory = root();
+    if (directory.empty()) return fail(install, 3);
+    diagnostic_install = install;
+    std::vector<std::wstring> parts;
+    if (!checked_action_data(install, parts)) return fail(install, 2);
+    if (!recovery::prepare(install, parts[5] == L"1")) return fail(install, recovery::failure_code);
+    if (!protected_path(directory)) return fail(install, 4);
+    if (!protected_path(maintenance::directory())) return fail(install, 5);
+    if (!maintenance::admit(admission::guid(maintenance::narrow(ID_PRODUCT_CODE)), maintenance::narrow(parts[1]),
                             maintenance::narrow(parts[2]), maintenance::narrow(parts[3]), parts[4] == L"1")) return fail(install, 6);
     SC_HANDLE scm = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT);
     if (!scm) return fail(install, 9);
@@ -487,9 +542,9 @@ extern "C" __declspec(dllexport) UINT __stdcall CheckProtectedState(MSIHANDLE in
 }
 
 // Deferred SYSTEM action on standalone uninstall (issue #46). The protected
-// service image owns the removal of the auto unlock vault and the credential
-// provider registration; this action runs it and copies its exit code and
-// stderr into the MSI log, which an EXE custom action never does (0.3.5 logged
+// shared native implementation owns removal of the auto unlock vault and the
+// credential provider registration; its failing step/object/code is copied to
+// the MSI log, which an EXE custom action never does (0.3.5 logged
 // only "returned actual error code 1"). A non-zero exit stays fatal: the
 // uninstall must not leave the provider or the stored password behind.
 static void log_text(MSIHANDLE install, INSTALLMESSAGE kind, const std::wstring& text) {
@@ -503,82 +558,20 @@ static void log_text(MSIHANDLE install, INSTALLMESSAGE kind, const std::wstring&
     MsiCloseHandle(record);
 }
 
-static std::wstring widen_output(const std::string& bytes) {
-    // Rust writes UTF-8 to a redirected stderr.
-    std::wstring text;
-    if (!bytes.empty()) {
-        const int size = MultiByteToWideChar(CP_UTF8, 0, bytes.data(), static_cast<int>(bytes.size()), nullptr, 0);
-        text.resize(size > 0 ? static_cast<size_t>(size) : 0);
-        if (size > 0) MultiByteToWideChar(CP_UTF8, 0, bytes.data(), static_cast<int>(bytes.size()), text.data(), size);
-    }
-    while (!text.empty() && (text.back() == L'\n' || text.back() == L'\r' || text.back() == L' ')) text.pop_back();
-    for (auto& c : text) if (c == L'\r' || c == L'\n') c = L' ';
-    return text;
-}
-
-// Returns false with a reason when the process could not be run at all.
-static bool run_captured(const std::wstring& executable, const std::wstring& arguments, const std::wstring& directory,
-                         DWORD& exit_code, std::string& output, std::wstring& reason) {
-    SECURITY_ATTRIBUTES inherit{sizeof(inherit), nullptr, TRUE};
-    HANDLE read = nullptr, write = nullptr;
-    if (!CreatePipe(&read, &write, &inherit, 0)) { reason = L"CreatePipe error " + std::to_wstring(GetLastError()); return false; }
-    SetHandleInformation(read, HANDLE_FLAG_INHERIT, 0);
-    // Inherit only the pipe's write end, as stdout and stderr.
-    SIZE_T size = 0;
-    InitializeProcThreadAttributeList(nullptr, 1, 0, &size);
-    std::vector<BYTE> list(size);
-    auto attributes = reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(list.data());
-    const bool initialized = InitializeProcThreadAttributeList(attributes, 1, 0, &size) != FALSE;
-    bool ok = initialized &&
-        UpdateProcThreadAttribute(attributes, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, &write, sizeof(write), nullptr, nullptr);
-    STARTUPINFOEXW startup{};
-    startup.StartupInfo.cb = sizeof(startup);
-    startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
-    startup.StartupInfo.hStdOutput = write;
-    startup.StartupInfo.hStdError = write;
-    startup.lpAttributeList = attributes;
-    PROCESS_INFORMATION child{};
-    std::wstring command = L"\"" + executable + L"\" " + arguments;
-    if (ok) ok = CreateProcessW(executable.c_str(), command.data(), nullptr, nullptr, TRUE,
-                                CREATE_NO_WINDOW | EXTENDED_STARTUPINFO_PRESENT, nullptr, directory.c_str(),
-                                &startup.StartupInfo, &child) != FALSE;
-    if (!ok) reason = L"CreateProcess error " + std::to_wstring(GetLastError());
-    if (initialized) DeleteProcThreadAttributeList(attributes);
-    CloseHandle(write);
-    if (ok) {
-        char buffer[4096];
-        DWORD n = 0;
-        while (ReadFile(read, buffer, sizeof(buffer), &n, nullptr) && n) output.append(buffer, n);
-        WaitForSingleObject(child.hProcess, INFINITE);
-        ok = GetExitCodeProcess(child.hProcess, &exit_code) != FALSE;
-        if (!ok) reason = L"GetExitCodeProcess error " + std::to_wstring(GetLastError());
-        CloseHandle(child.hThread);
-        CloseHandle(child.hProcess);
-    }
-    CloseHandle(read);
-    return ok;
-}
+extern "C" DWORD oink_unlock_unregister(DWORD* step, wchar_t* object, DWORD capacity);
 
 extern "C" __declspec(dllexport) UINT __stdcall UnregisterCredentialProvider(MSIHANDLE install) {
-    const auto directory = root();
-    const auto executable = directory + L"\\" ID_SERVICE_EXE;
-    DWORD code = 0;
-    std::string output;
-    std::wstring reason;
-    bool ran = false;
-    if (directory.empty()) reason = L"Program Files folder unavailable";
-    else if (!protected_path(executable)) reason = executable + L" is not a protected installed image";
-    else ran = run_captured(executable, L"--unregister-credential-provider", directory, code, output, reason);
-    const auto text = widen_output(output);
-    if (ran) {
-        log_text(install, INSTALLMESSAGE_INFO, L"UnregisterCredentialProvider: " ID_SERVICE_EXE L" exited with " +
-            std::to_wstring(code) + (text.empty() ? std::wstring() : L": " + text));
-        if (code == 0) return ERROR_SUCCESS;
-    } else {
-        log_text(install, INSTALLMESSAGE_INFO, L"UnregisterCredentialProvider: could not run " ID_SERVICE_EXE L": " + reason);
-    }
-    log_text(install, INSTALLMESSAGE_ERROR, L"Oink could not remove its sign-in component (auto unlock). " +
-        (ran ? (text.empty() ? L"Exit code " + std::to_wstring(code) : text) : reason));
+    // ACL repair cannot authenticate bytes that were previously user-writable.
+    // Use the existing native implementation linked into this MSI's trusted CA,
+    // never launch the formerly unprotected installed service as SYSTEM.
+    DWORD step = 0;
+    wchar_t object[32768]{};
+    const DWORD code = oink_unlock_unregister(&step, object, static_cast<DWORD>(std::size(object)));
+    const auto details = L"UnregisterCredentialProvider: native cleanup step=" + std::to_wstring(step) +
+        L", object=" + object + L", Windows error=" + std::to_wstring(code);
+    log_text(install, INSTALLMESSAGE_INFO, details);
+    if (code == ERROR_SUCCESS) return ERROR_SUCCESS;
+    log_text(install, INSTALLMESSAGE_ERROR, L"Oink could not remove its sign-in component (auto unlock). " + details);
     return ERROR_INSTALL_FAILURE;
 }
 

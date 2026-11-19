@@ -161,7 +161,7 @@
                  Full-uninstall commit removes it after MSI completes; active
                  worker transactions retain their exclusive lock and state. -->
             <CreateFolder>
-              <PermissionEx Sddl="O:BAG:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)" />
+              <PermissionEx Sddl="O:BAG:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;;GRGX;;;BU)" />
             </CreateFolder>
           </Component>
         </Directory>
@@ -182,6 +182,7 @@
     </StandardDirectory>
     <Binary Id="InstallerCA" SourceFile="$(var.CustomAction)" />
     <CustomAction Id="CheckInstallPath" BinaryRef="InstallerCA" DllEntry="CheckInstallPath" Execute="immediate" Return="check" />
+    <CustomAction Id="CheckMaintenanceLock" BinaryRef="InstallerCA" DllEntry="CheckMaintenanceLock" Execute="deferred" Impersonate="no" Return="check" />
     <CustomAction Id="CheckProtectedState" BinaryRef="InstallerCA" DllEntry="CheckProtectedState" Execute="deferred" Impersonate="no" Return="check" />
     <CustomAction Id="CheckQuiescence" BinaryRef="InstallerCA" DllEntry="CheckQuiescence" Execute="deferred" Impersonate="no" Return="check" />
     <CustomAction Id="CleanupMicrophone" BinaryRef="InstallerCA" DllEntry="CleanupMicrophone" Execute="commit" Impersonate="no" Return="ignore" />
@@ -244,8 +245,9 @@
            otherwise the old preflight sees the new service's interactive helper. -->
       <StartServices Sequence="6502" />
       <Custom Action="CheckInstallPath" Before="InstallInitialize" />
-      <Custom Action="CheckProtectedState" After="InstallInitialize" />
-      <Custom Action="CheckQuiescence" After="StopServices" />
+      <Custom Action="CheckMaintenanceLock" After="InstallInitialize" />
+      <Custom Action="CheckProtectedState" After="StopServices" />
+      <Custom Action="CheckQuiescence" After="CheckProtectedState" />
       <!-- Commit-only: never destroy user data if MSI rolls back. Cloud Files
            unregister happens inside this action before deleting any data tree. -->
       <Custom Action="CleanupMicrophone" Before="CleanupUserData" Condition="REMOVE~=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />

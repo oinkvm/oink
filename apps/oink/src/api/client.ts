@@ -123,6 +123,7 @@ export const shell = {
   close: () => transport.shell<void>('shell_close'),
   ready: () => transport.shell<void>('shell_ready', { generation: (window as Window & { __OINK_WINDOW_GENERATION__?: number }).__OINK_WINDOW_GENERATION__ ?? 0 }),
   titlebarCenter: () => transport.shell<number | null>('shell_titlebar_center'),
+  startTitleDrag: () => transport.shell<void>('shell_start_title_drag'),
   quit: () => transport.shell<void>('shell_quit'),
   resizePanel: (width: number, height: number) => transport.shell<void>('shell_resize_panel', { width, height }),
   showPanel: () => transport.shell<void>('shell_show_panel'),

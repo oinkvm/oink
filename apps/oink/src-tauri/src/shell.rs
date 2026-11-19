@@ -299,6 +299,18 @@ pub fn shell_ready(app: AppHandle, window: tauri::WebviewWindow, generation: u32
     });
 }
 
+#[tauri::command]
+pub fn shell_start_title_drag(window: tauri::WebviewWindow) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    if window.label() == View::Main.label() {
+        let app = window.app_handle().clone();
+        return on_ui(&app, move || crate::main_window_macos::start_title_drag(&window))
+            .map_err(|error| error.to_string());
+    }
+    let _ = window;
+    Ok(())
+}
+
 fn create_normal(app: &AppHandle, view: View) -> tauri::Result<()> {
     debug_assert!(view.normal());
     #[cfg(target_os = "macos")]
@@ -327,7 +339,6 @@ fn create_normal(app: &AppHandle, view: View) -> tauri::Result<()> {
             .focused(false);
         let builder = if view == View::Main {
             builder
-                .min_inner_size(820.0 + gutter * 2.0, 560.0 + gutter * 2.0)
                 .visible(false)
                 // Tauri/Wry clears both the native backing and WebView backing
                 // (including WKWebView drawsBackground/underPageBackgroundColor).
@@ -341,6 +352,20 @@ fn create_normal(app: &AppHandle, view: View) -> tauri::Result<()> {
                 .resizable(false)
                 .maximizable(false)
                 .minimizable(view != View::About)
+        };
+        #[cfg(target_os = "macos")]
+        let builder = if view == View::Main {
+            // Native tiling uses these minimums. The visible-edge tracker
+            // preserves the larger limit for an ordinary manual resize.
+            builder.min_inner_size(640.0, 480.0)
+        } else {
+            builder
+        };
+        #[cfg(windows)]
+        let builder = if view == View::Main {
+            builder.min_inner_size(820.0 + gutter * 2.0, 560.0 + gutter * 2.0)
+        } else {
+            builder
         };
         #[cfg(target_os = "macos")]
         let builder = builder

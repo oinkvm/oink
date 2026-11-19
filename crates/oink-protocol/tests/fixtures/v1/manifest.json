@@ -60804,6 +60804,14 @@
     },
     {
       "expected": {
+        "uint": "6"
+      },
+      "file": "enum-PauseReason-6.hex",
+      "kind": "enum",
+      "schema": "PauseReason"
+    },
+    {
+      "expected": {
         "uint": "2147483646"
       },
       "file": "enum-PauseReason-2147483646.hex",
@@ -81697,5 +81705,5 @@
     "reliable_frame": 16384
   },
   "revision": "2026-10-15-ui-freeze",
-  "schema_sha256": "f05e7c8d34d6503957ad15e759dcc0103483d87065b46020762aab77e84d3ba3"
+  "schema_sha256": "0faed4990c3284491febce65a1038e43b2405f371fc2f56fcd2785c9a22d815d"
 }

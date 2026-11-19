@@ -22,6 +22,8 @@ use std::sync::Mutex;
 mod macos;
 #[cfg(target_os = "macos")]
 pub(crate) mod smoke;
+#[cfg(target_os = "macos")]
+pub mod startup_macos;
 static NODE: Mutex<Option<Node>> = Mutex::new(None);
 
 pub(crate) fn attach(node: &Node) {
@@ -50,7 +52,13 @@ pub(crate) fn attach(node: &Node) {
             if opens_window(event)
                 && let Err(error) = deliver_ui(event.clone())
             {
-                tracing::error!(%error, "could not open UI");
+                macos::on_main(move || {
+                    if startup_macos::diagnose(&error) {
+                        macos::request_window();
+                    } else {
+                        quit();
+                    }
+                });
             }
         }),
         crate::api::LiveViews::default(),
@@ -98,10 +106,14 @@ fn opens_window(event: &ApiEvent) -> bool {
 /// process to show its UI, through the same IPC used by all other clients.
 #[cfg(any(target_os = "macos", all(test, debug_assertions)))]
 fn claim_instance(data_dir: &std::path::Path) -> anyhow::Result<Option<crate::instance::InstanceLock>> {
+    #[cfg(not(target_os = "macos"))]
     use crate::api::AgentApi;
     match crate::instance::acquire(data_dir) {
         Ok(lock) => Ok(Some(lock)),
-        Err(error) if error.downcast_ref::<crate::instance::AlreadyRunning>().is_some() => {
+        Err(error) if error.is::<crate::instance::AlreadyRunning>() => {
+            #[cfg(target_os = "macos")]
+            startup_macos::existing_owner(data_dir)?;
+            #[cfg(not(target_os = "macos"))]
             crate::remote::RemoteApi::new(data_dir).show_window()?;
             Ok(None)
         }
@@ -216,7 +228,7 @@ pub fn show_ui() -> std::io::Result<()> {
 }
 
 #[cfg(target_os = "macos")]
-fn deliver_ui(event: ApiEvent) -> std::io::Result<()> {
+fn deliver_ui(event: ApiEvent) -> anyhow::Result<()> {
     let mut ui = UI.lock().unwrap();
     let running = crate::instance::is_ui_running(&oink_foundation::paths::data_dir())
         .ok_or_else(|| std::io::Error::other("UI process ownership unavailable"))?;
@@ -243,7 +255,7 @@ fn deliver_ui(event: ApiEvent) -> std::io::Result<()> {
             // reopen to the same helper and leaves both process lifetimes intact.
             let status = ui_launch_command(&helper, &oink_foundation::paths::data_dir(), true, false).status()?;
             if !status.success() {
-                return Err(std::io::Error::other("UI LaunchServices activation failed"));
+                anyhow::bail!("UI LaunchServices activation failed: {status}");
             }
         }
         return Ok(());
@@ -253,10 +265,16 @@ fn deliver_ui(event: ApiEvent) -> std::io::Result<()> {
     }
     ui.ready = false;
     tracing::info!(foreground = opens_window(&event), "launching UI helper");
-    let status =
-        ui_launch_command(&helper, &oink_foundation::paths::data_dir(), opens_window(&event), true).status()?;
-    if !status.success() {
-        return Err(std::io::Error::other("UI LaunchServices request failed"));
+    let output = ui_launch_command(&helper, &oink_foundation::paths::data_dir(), opens_window(&event), true)
+        .stderr(std::process::Stdio::piped())
+        .output()?;
+    if !output.status.success() {
+        return Err(startup_macos::HelperLaunchError(format!(
+            "{}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))
+        .into());
     }
     // No watchdog or resident `open -W` process: a failed startup can be retried
     // by the next user click after this bounded in-flight interval.

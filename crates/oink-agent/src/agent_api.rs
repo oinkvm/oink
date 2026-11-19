@@ -554,7 +554,7 @@ fn alerts(node: &Node) -> Vec<Alert> {
     // failures. They are not display enumeration outcomes, and peer failures
     // belong to that device's resource card, never to a local display toast.
     if let Ok(status) = node.input_status()
-        && let Some(alert) = display_failure_alert(node.id(), &status, now)
+        && let Some(alert) = display_failure_alert(node.id(), &status, pause.reason, now)
     {
         out.push(alert);
     }
@@ -572,7 +572,17 @@ fn alerts(node: &Node) -> Vec<Alert> {
     out
 }
 
-fn display_failure_alert(device: DeviceId, status: &crate::threads::input::InputStatus, now: i64) -> Option<Alert> {
+fn display_failure_alert(
+    device: DeviceId,
+    status: &crate::threads::input::InputStatus,
+    pause_reason: crate::device_cards::PauseReason,
+    now: i64,
+) -> Option<Alert> {
+    // RDP deliberately withholds native displays. An empty input catalog is
+    // expected there, rather than a failed attempt to enumerate the console.
+    if pause_reason == crate::device_cards::PauseReason::RemoteDesktop {
+        return None;
+    }
     let fault = status.display_enumeration_fault;
     if !matches!(
         fault,
@@ -2114,6 +2124,7 @@ mod permission_tests {
                         display_enumeration_fault: source,
                         ..Default::default()
                     },
+                    crate::device_cards::PauseReason::None,
                     0,
                 )
                 .is_none()
@@ -2126,6 +2137,7 @@ mod permission_tests {
                     display_enumeration_fault: Some(failure),
                     ..Default::default()
                 },
+                crate::device_cards::PauseReason::None,
                 10,
             )
             .unwrap();
@@ -2150,7 +2162,18 @@ mod permission_tests {
             },
             ..Default::default()
         };
-        assert!(display_failure_alert(DeviceId([1; 32]), &status, 0).is_none());
+        assert!(display_failure_alert(DeviceId([1; 32]), &status, crate::device_cards::PauseReason::None, 0).is_none());
+    }
+
+    #[test]
+    fn remote_desktop_does_not_warn_about_deliberately_withheld_displays() {
+        use crate::device_cards::PauseReason;
+        let status = crate::threads::input::InputStatus {
+            display_enumeration_fault: Some(dto::ResourceFaultCode::DeviceUnavailable),
+            ..Default::default()
+        };
+        assert!(display_failure_alert(DeviceId([1; 32]), &status, PauseReason::RemoteDesktop, 0).is_none());
+        assert!(display_failure_alert(DeviceId([1; 32]), &status, PauseReason::LocalUser, 0).is_some());
     }
 
     #[test]

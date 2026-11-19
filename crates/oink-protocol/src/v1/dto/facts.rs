@@ -183,7 +183,7 @@ wire_map!(EmergencyPauseAck, validate_emergency_ack, {
     4 => pause_revision: u64 = required;
     5 => cleanup_pending: bool = required;
 });
-open_enum!(PauseReason { None=0,LocalUser=1,Emergency=3,RemoteUser=4,InputBacklog=5 });
+open_enum!(PauseReason { None=0,LocalUser=1,Emergency=3,RemoteUser=4,InputBacklog=5,RemoteDesktop=6 });
 open_enum!(EmergencyOutcome { EnteredPause=0,AlreadyPaused=1,AlreadySeen=2 });
 open_enum!(AddressFamily { Ipv4=0,Ipv6=1 });
 open_enum!(RunIntent { Starting=0,Running=1,Stopping=2 });

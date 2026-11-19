@@ -35,5 +35,16 @@ class WindowsAdmission(unittest.TestCase):
         preflight = ca[ca.index('UINT __stdcall CheckProtectedState('):ca.index('UINT __stdcall CleanupMaintenance(')]
         self.assertNotIn('clients_quiescent', preflight)
         package = (ROOT / 'packaging/windows/Package.wxs').read_text()
-        self.assertIn('Action="CheckQuiescence" After="StopServices"', package)
+        self.assertIn('Action="CheckQuiescence" After="CheckProtectedState"', package)
         self.assertNotIn('MaintenanceGuard', package)
+
+    def test_recovery_is_before_old_product_removal_and_never_inherits_user_read(self):
+        package = (ROOT / 'packaging/windows/Package.wxs').read_text()
+        self.assertIn('Schedule="afterInstallExecute"', package)
+        self.assertIn('Action="CheckProtectedState" After="StopServices"', package)
+        self.assertIn('Action="CheckMaintenanceLock" After="InstallInitialize"', package)
+        self.assertIn('Sddl="O:BAG:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;;GRGX;;;BU)"', package)
+        recovery = (ROOT / 'packaging/windows/Recovery.h').read_text() + (ROOT / 'packaging/windows/RecoveryTree.h').read_text()
+        self.assertIn('FILE_FLAG_OPEN_REPARSE_POINT', recovery)
+        self.assertIn('info.nNumberOfLinks == 1', recovery)
+        self.assertIn('Recovery refused unsafe parent', recovery)

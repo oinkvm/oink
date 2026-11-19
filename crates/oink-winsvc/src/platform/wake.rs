@@ -134,6 +134,11 @@ impl Process {
         // SAFETY: retained creation object, including after exit.
         unsafe { WaitForSingleObject(self._wait._object.0, 0) == WAIT_OBJECT_0 }
     }
+    pub(super) fn exit_code(&self) -> Option<u32> {
+        let mut code = 0;
+        // SAFETY: retained process creation object; report only a completed exit.
+        (self.exited() && unsafe { GetExitCodeProcess(self._wait._object.0, &mut code) } != 0).then_some(code)
+    }
     pub(super) fn matches(&self, identity: (u32, u64)) -> bool {
         self.identity == identity
     }
@@ -265,7 +270,7 @@ impl Directory {
             FindFirstChangeNotificationW(
                 wide(path.to_str().ok_or_else(denied)?).as_ptr(),
                 1,
-                FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_DIR_NAME,
+                FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_DIR_NAME | FILE_NOTIFY_CHANGE_SECURITY,
             )
         };
         if handle == INVALID_HANDLE_VALUE {

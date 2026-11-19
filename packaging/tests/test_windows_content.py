@@ -69,7 +69,7 @@ class MsiContent(unittest.TestCase):
                           Name='Oink - Bulk transfer (TCP)', Description='Oink - Bulk transfer (TCP)')
         acl = {'MsiLockPermissionsEx': [
             ['root-acl', 'INSTALLFOLDER', 'CreateFolder', 'O:BAG:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;GRGX;;;BU)', ''],
-            ['maintenance-acl', 'MAINTENANCEFOLDER', 'CreateFolder', 'O:BAG:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)', '']],
+            ['maintenance-acl', 'MAINTENANCEFOLDER', 'CreateFolder', 'O:BAG:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;;GRGX;;;BU)', '']],
             'CreateFolder': [['INSTALLFOLDER', 'InstallRoot'], ['MAINTENANCEFOLDER', 'MaintenanceRoot']]}
         arp_key = r'Software\Microsoft\Windows\CurrentVersion\Uninstall\[ProductCode]'
         upgrade = '{' + IDENTITY['windows']['upgrade_code'] + '}'
@@ -84,7 +84,7 @@ class MsiContent(unittest.TestCase):
                 ('InstallInitialize', 1500), ('RemoveRegistryValues', 2600), ('RegisterProduct', 6100),
                 ('WriteRegistryValues', 6101), ('InstallExecute', 6500),
                 ('RemoveExistingProducts', 6501), ('InstallFinalize', 6600), ('StartServices', 6502),
-                ('CheckProtectedState', 1502), ('StopServices', 1900), ('CheckQuiescence', 1901),
+                ('CheckMaintenanceLock', 1502), ('CheckProtectedState', 1901), ('StopServices', 1900), ('CheckQuiescence', 1902),
                 ('CostFinalize', 1000), ('InstallValidate', 1400), ('SetARPINSTALLLOCATION', 1001), ('DeleteServices', 2000), ('RemoveFiles', 3500)]],
             'Upgrade': [[upgrade, '', MSI_VERSION, '', '1', '', 'WIX_UPGRADE_DETECTED'],
                         [upgrade, MSI_VERSION, '', '', '2', '', 'WIX_DOWNGRADE_DETECTED']],
@@ -414,9 +414,11 @@ class MsiContent(unittest.TestCase):
             C.verify_msi(manifest, extracted, IDENTITY, tables)
             for action, field, value in [
                     ('StartServices', 2, '5900'), # Old MSI must see the broker stopped.
+                    ('CheckMaintenanceLock', 1, 'NOT Installed'),
+                    ('CheckMaintenanceLock', 2, '1901'),
                     ('CheckProtectedState', 1, 'NOT Installed'),
                     ('CheckQuiescence', 1, 'NOT REMOVE'),
-                    ('CheckProtectedState', 2, '1902'),
+                    ('CheckProtectedState', 2, '1502'),
                     ('CheckQuiescence', 2, '1899')]:
                 with self.subTest(action=action, value=value):
                     changed = copy.deepcopy(tables)

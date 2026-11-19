@@ -451,3 +451,77 @@ fn update_preparation_drains_admitted_preferences_after_closing_new_writes() {
         },
     );
 }
+
+#[test]
+fn remote_desktop_refuses_local_and_remote_resume_at_the_owner() {
+    crate::test_watchdog::run(
+        module_path!(),
+        "remote_desktop_refuses_local_and_remote_resume_at_the_owner",
+        Some(6),
+        async {
+            let dir = tempfile::tempdir().unwrap();
+            let node = start_with_clip(
+                &oink_test_support::network_config(dir.path().join("owner"), "owner", 0),
+                &Displays::new("owner"),
+                None,
+            )
+            .await;
+            let peer = start_with_clip(
+                &oink_test_support::network_config(dir.path().join("peer"), "peer", 0),
+                &Displays::new("peer"),
+                None,
+            )
+            .await;
+            crate::snapshot_tests::pair(&node, &peer).await;
+            crate::snapshot_tests::active(&node, &peer).await;
+            let remote_requester = Requester {
+                device: peer.id().into(),
+                nonce: peer.inner.boot.nonce,
+            };
+            node.hold_platform_sensor_clock().await;
+            let owner = node.clone();
+            tokio::task::spawn_blocking(move || {
+                assert_eq!(owner.apply_remote_desktop(true), Ok(true));
+                assert!(owner.pause_status().paused);
+                for remote in [false, true] {
+                    let binding = TokenBinding {
+                        owner: OwnerVersion {
+                            group: owner.link_config().unwrap().applied().group.into(),
+                            device: owner.id().into(),
+                            boot_nonce: owner.inner.boot.nonce,
+                            revision: lock(&owner.inner.controls).pause.revision(),
+                        },
+                        operation: TokenOperation::Pause { paused: false },
+                    };
+                    let Message::ConfigPauseDevice(request) =
+                        requests::action_request(&binding, &fresh_request_id()).unwrap()
+                    else {
+                        panic!("pause request")
+                    };
+                    let requester = if remote {
+                        remote_requester
+                    } else {
+                        Requester {
+                            device: owner.id().into(),
+                            nonce: owner.inner.boot.nonce,
+                        }
+                    };
+                    // Admission is tested elsewhere; the common owner application
+                    // must reject both an IPC command and a previously issued peer token.
+                    let result = owner.apply_pause_request(requester, binding.owner.group.0, request);
+                    assert!(
+                        matches!(result, Err(dto::ControlFailure::StateConflict)),
+                        "remote={remote}: {result:?}"
+                    );
+                }
+                assert_eq!(owner.apply_remote_desktop(false), Ok(true));
+                assert!(!owner.pause_status().paused);
+            })
+            .await
+            .unwrap();
+            node.resume_platform_sensor_clock();
+            peer.shutdown().await;
+            node.shutdown().await;
+        },
+    );
+}

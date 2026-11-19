@@ -350,8 +350,12 @@ pub(super) fn dispatch(state: &Arc<Mutex<State>>, id: u32, process: &Handle, req
     let wake = !matches!(&request, Request::Poll { .. } | Request::Query)
         || (matches!(&request, Request::Poll { .. }) && state.transaction.is_some() && !state.shutdown);
     if pending() {
-        let (phase, error) =
-            journal_status("pending.json").unwrap_or((Phase::RepairRequired, Some(Error::RepairRequired)));
+        let (phase, error) = super::journal()
+            .and_then(|journal| {
+                let journal = journal.ok_or(Error::Transaction)?;
+                Ok((transaction_phase(&journal), journal.failure))
+            })
+            .unwrap_or((Phase::RepairRequired, Some(Error::RepairRequired)));
         state.status.phase = phase;
         state.status.error = error;
     }
@@ -400,16 +404,11 @@ pub(super) fn dispatch(state: &Arc<Mutex<State>>, id: u32, process: &Handle, req
             }
             Request::Query => {}
             Request::Startup => {
-                if pending() {
+                if pending() && !super::completed() {
                     if !super::input_allowed() {
                         return Err(Error::Busy);
                     }
-                    let journal = oink_update::transaction::Journal::parse(&protected::read(
-                        &protected::maintenance()
-                            .map_err(|_| Error::Storage)?
-                            .join("pending.json"),
-                        65536,
-                    )?)?;
+                    let journal = super::journal()?.ok_or(Error::Transaction)?;
                     return Ok(Reply::HealthCheck {
                         transaction: journal.transaction,
                         build: state.status.current_build,
@@ -469,12 +468,7 @@ pub(super) fn dispatch(state: &Arc<Mutex<State>>, id: u32, process: &Handle, req
                     });
                 }
                 if pending() {
-                    let journal = oink_update::transaction::Journal::parse(&protected::read(
-                        &protected::maintenance()
-                            .map_err(|_| Error::Storage)?
-                            .join("pending.json"),
-                        65536,
-                    )?)?;
+                    let journal = super::journal()?.ok_or(Error::Transaction)?;
                     if matches!(journal.stage, oink_update::transaction::Stage::Recovering) {
                         return if state.registrations[&id].quiesced.as_ref() == Some(&journal.transaction) {
                             Ok(Reply::Shutdown {
@@ -486,7 +480,7 @@ pub(super) fn dispatch(state: &Arc<Mutex<State>>, id: u32, process: &Handle, req
                             })
                         };
                     }
-                    if super::input_allowed() {
+                    if super::input_allowed() && !super::completed() {
                         return Ok(Reply::HealthCheck {
                             transaction: journal.transaction,
                             build: state.status.current_build,
@@ -527,12 +521,7 @@ pub(super) fn dispatch(state: &Arc<Mutex<State>>, id: u32, process: &Handle, req
                     return Err(Error::Policy);
                 }
                 let directory = transaction_dir(&transaction)?;
-                let journal = oink_update::transaction::Journal::parse(&protected::read(
-                    &protected::maintenance()
-                        .map_err(|_| Error::Storage)?
-                        .join("pending.json"),
-                    65536,
-                )?)?;
+                let journal = super::journal()?.ok_or(Error::Transaction)?;
                 if journal.transaction != transaction {
                     return Err(Error::Policy);
                 }
@@ -686,6 +675,12 @@ pub(super) fn serve() {
     if let Err(error) = protected::system() {
         tracing::error!(%error, "update service disabled: not running as SYSTEM");
         return;
+    }
+    for directory in [protected::root(), protected::maintenance()] {
+        if let Err(error) = directory.and_then(|path| protected::open_one(&path, true)) {
+            tracing::error!(%error, "update storage is unsafe; run the latest Oink installer to restore permissions");
+            return;
+        }
     }
     let mut initial = match State::new() {
         Ok(state) => state,
@@ -915,7 +910,7 @@ fn engine(state: Arc<Mutex<State>>, wake: Arc<super::super::wake::Event>) {
     let mut housekeeping: Option<Cleanup> = None;
     let mut cleanup_retry = None;
     let mut worker_process: Option<super::super::wake::Process> = None;
-    let mut recovery_retry = None;
+    let mut recovery_attempted = false;
     let mut cleanup_needed = true;
     let mut observed_input = None;
     while !super::super::broker::STOP.load(Ordering::Acquire) {
@@ -930,12 +925,17 @@ fn engine(state: Arc<Mutex<State>>, wake: Arc<super::super::wake::Event>) {
             super::super::broker::changed();
         }
         if is_pending && worker_process.as_ref().is_some_and(|process| process.exited()) {
+            tracing::warn!(
+                exit_code = worker_process.as_ref().and_then(|process| process.exit_code()),
+                "update worker exited with pending state; attempting terminal cleanup"
+            );
             worker_process = None;
-            // A worker that exits with pending state is unfinished recovery, not
-            // an idle poll. Preserve the former one-second recovery cadence.
-            recovery_retry = Some(Instant::now() + Duration::from_secs(1));
+            // Retry terminal cleanup once, but never respawn a failed recovery
+            // worker on its own exit notification.
         }
-        if is_pending && recovery_retry.is_none_or(|at| Instant::now() >= at) {
+        let completed = is_pending && worker::finish_committed().unwrap_or(false);
+        if is_pending && !completed && !recovery_attempted {
+            recovery_attempted = true;
             let watched = (|| {
                 let process =
                     worker::resume_pending().map_err(|_| std::io::Error::other("update worker unavailable"))?;
@@ -945,10 +945,12 @@ fn engine(state: Arc<Mutex<State>>, wake: Arc<super::super::wake::Event>) {
                 }
                 Ok::<_, std::io::Error>(())
             })();
-            recovery_retry = watched.is_err().then(|| Instant::now() + Duration::from_secs(1));
+            if let Err(error) = watched {
+                tracing::warn!(%error, "update recovery could not start; manual repair may be required");
+            }
         } else if !is_pending {
             worker_process = None;
-            recovery_retry = None;
+            recovery_attempted = false;
         }
         if was_pending && !is_pending {
             let mut state = state.lock().unwrap();
@@ -1161,7 +1163,7 @@ fn engine(state: Arc<Mutex<State>>, wake: Arc<super::super::wake::Event>) {
                 && !pending()
                 && selected.as_ref().is_none_or(|candidate| candidate.prepared.is_none())
         });
-        let deadline = deadline.into_iter().chain(retry).chain(recovery_retry).min();
+        let deadline = deadline.into_iter().chain(retry).min();
         match super::super::wake::wait(&[events.stop.raw(), wake.raw(), files.raw()], deadline) {
             Ok(super::super::wake::Woke::Signal(0)) => break,
             Ok(super::super::wake::Woke::Signal(2)) => {
@@ -1304,10 +1306,9 @@ fn transaction_matches(state: &State, tx: &str) -> bool {
     if state.transaction.as_deref() == Some(tx) {
         return true;
     }
-    protected::maintenance()
+    super::journal()
         .ok()
-        .and_then(|dir| protected::read(&dir.join("pending.json"), 65536).ok())
-        .and_then(|bytes| oink_update::transaction::Journal::parse(&bytes).ok())
+        .flatten()
         .is_some_and(|journal| journal.transaction == tx)
 }
 

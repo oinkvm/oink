@@ -6,7 +6,7 @@ mod platform;
 pub mod power;
 pub mod wire;
 #[cfg(windows)]
-pub use platform::{backend, client, prelogin, run, update};
+pub use platform::{backend, client, prelogin, run, session, update};
 #[cfg(any(windows, test))]
 mod backend_launch;
 #[cfg(any(windows, test))]
@@ -26,6 +26,8 @@ mod token_policy;
 mod console_policy;
 #[cfg(any(windows, test))]
 mod prelogin_route;
+#[cfg(any(windows, test))]
+mod session_policy;
 #[cfg(any(windows, test))]
 mod supervision;
 

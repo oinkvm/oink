@@ -110,6 +110,7 @@ impl Node {
                 Some(dto::PauseReason::RemoteUser) => crate::device_cards::PauseReason::RemoteUser,
                 Some(dto::PauseReason::Emergency) => crate::device_cards::PauseReason::Emergency,
                 Some(dto::PauseReason::InputBacklog) => crate::device_cards::PauseReason::InputBacklog,
+                Some(dto::PauseReason::RemoteDesktop) => crate::device_cards::PauseReason::RemoteDesktop,
                 _ => crate::device_cards::PauseReason::Unknown,
             },
             capture_detached,

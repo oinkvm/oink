@@ -16,6 +16,7 @@ export interface Screen extends Rect {
     minimumWidth?: number;
     image?: string;
     offline?: boolean;
+    paused?: boolean;
     device?: string;
     groupSize?: number;
 }

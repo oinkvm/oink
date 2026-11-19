@@ -1,5 +1,6 @@
 //! SYSTEM-only launch broker. The backend remains the interactive user, on Default.
 pub use super::backend_stop::{StopWatch, watch as watch_service_stop};
+pub use super::service_peer::{StartupWatch, watch_startup};
 use super::*;
 use crate::backend_launch::{BackendLaunch, MAX_FRAME};
 use std::{path::Path, sync::atomic::Ordering, time::Duration};
@@ -53,14 +54,18 @@ pub fn start(data_dir: &Path) -> io::Result<u32> {
 /// The broker duplicates the original creation handle into this UI. Opening a
 /// PID here would race early exit/PID reuse and UIAccess integrity restrictions.
 pub fn start_tracked(data_dir: &Path) -> io::Result<StartedProcess> {
+    start_observed(data_dir, |_| {})
+}
+/// Reports confirmed service readiness waits, before sending any launch request.
+pub fn start_observed(data_dir: &Path, waiting: impl FnMut(String)) -> io::Result<StartedProcess> {
     let exe = std::env::current_exe()?;
-    request(data_dir, exe.parent().ok_or_else(denied)?, false)
+    request(data_dir, exe.parent().ok_or_else(denied)?, false, waiting)
 }
 pub fn reopen(data_dir: &Path) -> io::Result<u32> {
-    request(data_dir, &std::env::current_dir()?, true).map(|process| process.id())
+    request(data_dir, &std::env::current_dir()?, true, |_| {}).map(|process| process.id())
 }
 pub fn start_in(data_dir: &Path, directory: &Path) -> io::Result<u32> {
-    request(data_dir, directory, false).map(|process| process.id())
+    request(data_dir, directory, false, |_| {}).map(|process| process.id())
 }
 /// Owns only SYNCHRONIZE and PROCESS_QUERY_LIMITED_INFORMATION, never input,
 /// mutation, token or duplication rights to the UIAccess process.
@@ -88,7 +93,12 @@ impl StartedProcess {
         }
     }
 }
-fn request(data_dir: &Path, directory: &Path, reopen: bool) -> io::Result<StartedProcess> {
+fn request(
+    data_dir: &Path,
+    directory: &Path,
+    reopen: bool,
+    mut waiting: impl FnMut(String),
+) -> io::Result<StartedProcess> {
     if !security::client_installation()? {
         return Err(denied());
     }
@@ -114,7 +124,7 @@ fn request(data_dir: &Path, directory: &Path, reopen: bool) -> io::Result<Starte
         BackendLaunch::Start { environment, directory }
     };
     let reply = crate::launch_recipe::wait_for_prelogin_exit(
-        || exchange(message.clone()),
+        || exchange_observed(message.clone(), &mut waiting),
         |process_handle| {
             // SAFETY: only a verified service reply supplies this synchronize-only handle.
             let previous = Handle::new(process_handle as usize as HANDLE)?;
@@ -142,13 +152,17 @@ fn request(data_dir: &Path, directory: &Path, reopen: bool) -> io::Result<Starte
 /// One request/reply on this session's launch pipe, after verifying the
 /// installed OinkInput service as its server. Never replayed.
 pub(super) fn exchange(message: BackendLaunch) -> io::Result<BackendLaunch> {
+    exchange_observed(message, &mut |_| {})
+}
+fn exchange_observed(message: BackendLaunch, waiting: &mut impl FnMut(String)) -> io::Result<BackendLaunch> {
     if !security::client_installation()? {
         return Err(denied());
     }
     let id = session()?;
     // At logon the interactive token can appear before SCM has exposed the launch
-    // pipe. Bound only this startup/pipe-busy wait; never replay a sent launch request.
+    // pipe. Only Start follows SCM readiness. Other exchanges retain their bounded wait.
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let startup = matches!(message, BackendLaunch::Start { .. });
     let pipe = loop {
         // SAFETY: fixed local name; identification only, no inherited handles.
         let result = Handle::new(unsafe {
@@ -164,6 +178,16 @@ pub(super) fn exchange(message: BackendLaunch) -> io::Result<BackendLaunch> {
         });
         match result {
             Ok(pipe) => break pipe,
+            Err(error) if startup && matches!(error.raw_os_error(), Some(2 | 231)) => {
+                let (reason, detail) = startup_observation(id);
+                if reason != "waiting" {
+                    return Err(io::Error::other(format!(
+                        "startup_{reason}: {detail}; CreateFileW: {error}"
+                    )));
+                }
+                waiting(format!("waiting: {detail}; CreateFileW: {error}"));
+                std::thread::sleep(Duration::from_millis(250));
+            }
             Err(error) if matches!(error.raw_os_error(), Some(2 | 231)) && std::time::Instant::now() < deadline => {
                 std::thread::sleep(Duration::from_millis(50));
             }
@@ -206,34 +230,42 @@ fn receive(pipe: &Handle) -> io::Result<BackendLaunch> {
 
 pub(super) fn serve() {
     let Some(events) = broker::events() else { return };
-    // A persistent failure retries every 250 ms; log each distinct error once.
-    let mut reported: Option<String> = None;
+    // Each active session owns its own authenticated endpoint. The SCM session
+    // event wakes enumeration; per-session bounded waits revalidate eligibility
+    // without competing for the auto-reset launch wake event.
+    let mut workers = std::collections::BTreeMap::<u32, std::thread::JoinHandle<()>>::new();
     while !broker::STOP.load(Ordering::Acquire) {
-        // SAFETY: read-only active console session query.
-        let id = unsafe { WTSGetActiveConsoleSessionId() };
-        let retry = if id != 0 && id != u32::MAX && security::user_sid(id).is_ok() {
-            match serve_session(id) {
-                Ok(()) => {
-                    reported = None;
-                    continue;
-                }
-                Err(error) => {
-                    let text = error.to_string();
-                    if reported.as_deref() != Some(text.as_str()) {
-                        tracing::warn!(session = id, error = %text, "UIAccess launch broker failed");
-                        reported = Some(text);
+        workers.retain(|_, worker| !worker.is_finished());
+        for id in super::session::active()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|id| security::user_sid(*id).is_ok())
+        {
+            workers.entry(id).or_insert_with(|| {
+                std::thread::spawn(move || {
+                    while !broker::STOP.load(Ordering::Acquire) && super::session::launch_allowed(id) {
+                        if let Err(error) = serve_session(id) {
+                            tracing::warn!(session = id, %error, "UIAccess launch broker failed");
+                            let _ = super::wake::wait(
+                                &[broker::events().unwrap().stop.raw()],
+                                Some(std::time::Instant::now() + Duration::from_millis(250)),
+                            );
+                        }
                     }
-                    // Preserve bind-failure recovery, but never wake periodically
-                    // while a session simply has no interactive user.
-                    Some(std::time::Instant::now() + Duration::from_millis(250))
-                }
-            }
-        } else {
-            None
-        };
-        if super::wake::wait(&[events.stop.raw(), events.launch.raw()], retry).is_err() {
+                })
+            });
+        }
+        if super::wake::wait(
+            &[events.stop.raw(), events.launch.raw()],
+            Some(std::time::Instant::now() + Duration::from_secs(1)),
+        )
+        .is_err()
+        {
             break;
         }
+    }
+    for worker in workers.into_values() {
+        let _ = worker.join();
     }
 }
 fn serve_session(id: u32) -> io::Result<()> {
@@ -259,11 +291,12 @@ fn serve_session(id: u32) -> io::Result<()> {
         op.connect()?;
         loop {
             // SAFETY: event owned by op, non-mutating session query.
-            let ready = super::wake::wait(&[op.event(), events.stop.raw(), events.launch.raw()], None)?;
-            // SAFETY: read-only active console session query.
-            let active = unsafe { WTSGetActiveConsoleSessionId() };
+            let ready = super::wake::wait(
+                &[op.event(), events.stop.raw()],
+                Some(std::time::Instant::now() + Duration::from_secs(1)),
+            )?;
             if broker::STOP.load(Ordering::Acquire)
-                || active != id
+                || !super::session::launch_allowed(id)
                 || security::user_sid(id).ok().as_ref() != Some(&user)
             {
                 return Ok(());
@@ -279,11 +312,15 @@ fn serve_session(id: u32) -> io::Result<()> {
             let _client = security::launch_peer(pipe.0, id).map_err(|e| context("authenticate launch client", e))?;
             // A session may have switched while authentication was running.
             // SAFETY: no mutation; launch must still belong to the active interactive user.
-            if unsafe { WTSGetActiveConsoleSessionId() } != id {
-                return Err(denied());
+            if !super::session::launch_allowed(id) {
+                return Ok(BackendLaunch::Failed {
+                    error: format!("startup_session: session={id}"),
+                });
             }
-            if super::update::pending() {
-                return Err(denied());
+            if let Some(reason) = super::update::launch_error() {
+                // Return the journal rejection unchanged so the UI can distinguish
+                // an unfinished transaction from a failed identity check.
+                return Ok(BackendLaunch::Failed { error: reason.into() });
             }
             let client_token = token(_client.0)?;
             if !security::interactive_token(client_token.0)? {
@@ -296,6 +333,9 @@ fn serve_session(id: u32) -> io::Result<()> {
                     | BackendLaunch::PreloginRelease
                     | BackendLaunch::PreloginSnapshot { .. }
             ) {
+                if !super::session::console(id) {
+                    return Err(denied());
+                }
                 return super::prelogin::handle(&request, id, &_client);
             }
             let user = security::sid_bytes(client_token.0)?;
@@ -308,7 +348,7 @@ fn serve_session(id: u32) -> io::Result<()> {
                         process_handle: handle,
                     })
                 };
-                if target == crate::launch_recipe::Target::Backend {
+                if target == crate::launch_recipe::Target::Backend && super::session::console(id) {
                     return super::prelogin::handoff(&_client, create);
                 }
                 create()
@@ -498,7 +538,7 @@ fn spawn_at(
             || {
                 // A console transition during creation invalidates this launch.
                 // SAFETY: read-only query and owned suspended primary thread.
-                if unsafe { WTSGetActiveConsoleSessionId() } != id {
+                if !super::session::launch_allowed(id) {
                     return Err(denied());
                 }
                 // SAFETY: owned primary thread of our still-suspended child.
@@ -666,5 +706,140 @@ mod tests {
         child.stdin.take().unwrap().write_all(&[1]).unwrap();
         child.wait().unwrap();
         assert!(tracked.exit_code().unwrap().is_some());
+    }
+}
+
+fn classify(
+    state: u32,
+    start: u32,
+    exit: u32,
+    session: &'static str,
+    boot_in_progress: bool,
+    dependency_pending: bool,
+) -> &'static str {
+    use windows_sys::Win32::System::Services::*;
+    match (state, start, exit) {
+        (SERVICE_START_PENDING, _, _) => "waiting",
+        // SCM reports ERROR_SERVICE_NEVER_STARTED before the first start since boot.
+        (SERVICE_STOPPED, SERVICE_AUTO_START, ERROR_SERVICE_NEVER_STARTED)
+            if boot_in_progress || dependency_pending =>
+        {
+            "waiting"
+        }
+        (SERVICE_RUNNING, _, _) if matches!(session, "eligible" | "transition") => "waiting",
+        (SERVICE_RUNNING, _, _) => session,
+        (_, SERVICE_DISABLED, _) => "disabled",
+        (SERVICE_STOPPED | SERVICE_STOP_PENDING, _, _) => "stopped",
+        _ => "unavailable",
+    }
+}
+/// A never-started automatic service can also be left behind by an interrupted
+/// installation. 1077 alone would keep waiting forever in that case. SCM's
+/// global AutoStartComplete event is unsignalled during the boot start pass.
+/// Dependency observations supplement this boot-wide SCM signal.
+fn scm_boot_in_progress() -> bool {
+    // SAFETY: read the existing SCM event without acquiring or modifying it.
+    unsafe {
+        Handle::new(OpenEventW(
+            SYNCHRONIZE,
+            0,
+            wide(r"Global\SC_AutoStartComplete").as_ptr(),
+        ))
+        .is_ok_and(|event| WaitForSingleObject(event.0, 0) == WAIT_TIMEOUT)
+    }
+}
+fn startup_observation(id: u32) -> (&'static str, String) {
+    let (session, session_detail) = super::session::startup_session(id);
+    let (code, scm) = match super::service_peer::startup_status() {
+        Ok((state, start, exit, dependency_pending)) => (
+            classify(
+                state,
+                start,
+                exit,
+                session,
+                state == windows_sys::Win32::System::Services::SERVICE_STOPPED
+                    && start == windows_sys::Win32::System::Services::SERVICE_AUTO_START
+                    && exit == ERROR_SERVICE_NEVER_STARTED
+                    && scm_boot_in_progress(),
+                dependency_pending,
+            ),
+            format!("state={state} start_type={start} exit={exit} dependency_start_pending={dependency_pending}"),
+        ),
+        Err(e) => (
+            if matches!(e.raw_os_error(), Some(1060 | 1072)) {
+                "missing"
+            } else {
+                "unavailable"
+            },
+            format!("SCM: {e}"),
+        ),
+    };
+    (code, format!("OinkInput {scm}; {session_detail}"))
+}
+pub fn startup_reason() -> io::Result<&'static str> {
+    Ok(startup_observation(session()?).0)
+}
+pub fn service_log_dir() -> io::Result<std::path::PathBuf> {
+    Ok(super::prelogin::product_dir()?.join("Logs"))
+}
+pub fn startup_details() -> io::Result<String> {
+    Ok(format!(
+        "Windows {}\n{}",
+        super::power::version_string().unwrap_or_else(str::to_owned),
+        startup_observation(session()?).1
+    ))
+}
+
+#[cfg(test)]
+mod startup_tests {
+    use super::*;
+    use windows_sys::Win32::System::Services::*;
+    #[test]
+    #[ignore = "device: read-only diagnostics against installed OinkInput"]
+    fn installed_startup_observation() {
+        // Exercise both database and service subscriptions under the interactive
+        // token, including the extra read right needed for configuration events.
+        let _database_watch = watch_startup(true, || {}).unwrap();
+        let _service_watch = watch_startup(false, || {}).unwrap();
+        let (state, start, exit, _) = super::super::service_peer::startup_status().unwrap();
+        println!(
+            "SCM state={state}, start={start}, exit={exit}\n{}",
+            startup_details().unwrap()
+        );
+    }
+    #[test]
+    fn pending_dependency_outlives_boot_signal_only_for_never_started_auto_service() {
+        for (start, exit, expected) in [
+            (SERVICE_AUTO_START, ERROR_SERVICE_NEVER_STARTED, "waiting"),
+            (SERVICE_AUTO_START, 1067, "stopped"),
+            (SERVICE_DEMAND_START, ERROR_SERVICE_NEVER_STARTED, "stopped"),
+            (SERVICE_DISABLED, ERROR_SERVICE_NEVER_STARTED, "disabled"),
+        ] {
+            assert_eq!(
+                classify(SERVICE_STOPPED, start, exit, "eligible", false, true),
+                expected
+            );
+        }
+    }
+    #[test]
+    fn classifies_pre_send_pipe_absence() {
+        assert_eq!(
+            classify(SERVICE_STOPPED, SERVICE_AUTO_START, 1077, "eligible", false, false),
+            "stopped"
+        );
+        for (state, start, exit, eligible, expected) in [
+            (SERVICE_START_PENDING, SERVICE_AUTO_START, 0, "session", "waiting"),
+            (SERVICE_RUNNING, SERVICE_AUTO_START, 0, "eligible", "waiting"),
+            (SERVICE_RUNNING, SERVICE_DISABLED, 0, "eligible", "waiting"),
+            (SERVICE_RUNNING, SERVICE_AUTO_START, 0, "session", "session"),
+            (SERVICE_RUNNING, SERVICE_AUTO_START, 0, "transition", "waiting"),
+            (SERVICE_RUNNING, SERVICE_AUTO_START, 0, "unavailable", "unavailable"),
+            (SERVICE_STOPPED, SERVICE_AUTO_START, 1077, "eligible", "waiting"),
+            (SERVICE_STOPPED, SERVICE_AUTO_START, 1067, "eligible", "stopped"),
+            (SERVICE_STOPPED, SERVICE_DEMAND_START, 0, "eligible", "stopped"),
+            (SERVICE_STOPPED, SERVICE_DISABLED, 1077, "eligible", "disabled"),
+        ] {
+            assert_eq!(classify(state, start, exit, eligible, true, false), expected);
+        }
     }
 }

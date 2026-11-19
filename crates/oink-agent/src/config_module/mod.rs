@@ -376,6 +376,13 @@ impl ConfigModule {
             Ok(result)
         })
     }
+    #[cfg(windows)]
+    pub(crate) fn require_console_displays(&self) -> ApiResult<()> {
+        self.call(|owner| {
+            owner.require_console_displays = true;
+            Ok(())
+        })
+    }
     pub(crate) fn initialize_displays(&self, displays: Vec<DisplayInfo>) -> ApiResult<()> {
         self.call(move |owner| owner.displays_changed(displays))
     }

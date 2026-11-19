@@ -160,6 +160,11 @@ impl ServiceInfo {
     }
 }
 
+#[cfg(target_os = "macos")]
+#[derive(Debug, thiserror::Error)]
+#[error("local IPC build mismatch: {0:?}")]
+pub(crate) struct OtherBuild(pub BuildIdentity);
+
 /// 运行中的 IPC 服务。
 #[derive(Debug)]
 pub struct Server {
@@ -537,6 +542,10 @@ impl Client {
             }
         })?;
         let v: serde_json::Value = serde_json::from_str(&out)?;
+        #[cfg(target_os = "macos")]
+        if v["closing"] == CLOSING_BUILD_MISMATCH {
+            return Err(OtherBuild(serde_json::from_value(v["backend"].clone())?).into());
+        }
         if let Some(e) = v.get("err") {
             let e: ApiError = serde_json::from_value(e.clone())?;
             return Err(anyhow::anyhow!("{e}"));

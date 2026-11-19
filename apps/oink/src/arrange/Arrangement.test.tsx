@@ -611,3 +611,16 @@ describe('auto-compaction follows manual edits only', () => {
     expect(next[1].x).toBeCloseTo(1120);
   });
 });
+
+it('renders a paused online screen using offline styling, a pause icon and no wallpaper', () => {
+  setLanguage('en');
+  const device = { id: 'self', name: 'Local', group: 'online' as const, paused: true };
+  const screens = presentScreens([{ id: 'a', device: 'self', name: 'Local', x: 0, y: 0, w: 100, h: 60, wallpaper: 0, image: 'data:image/png;base64,test' }], [device]);
+  const { container } = render(<Arrangement screens={screens} onScreensChange={vi.fn()} selectedId="a" onSelect={vi.fn()} settings={settings}/>);
+  expect(container.querySelector('.scr')?.getAttribute('aria-label')).toContain('paused');
+  const body = container.querySelector('.scr__body') as HTMLElement;
+  expect(body.hasAttribute('data-offline')).toBe(true);
+  expect(body.style.backgroundImage).toBe('');
+  expect(body.querySelector('.scr__offline path')?.getAttribute('d')).toBe('M7 5v10M13 5v10');
+  expect(screens[0].offline).toBe(false);
+});

@@ -550,13 +550,8 @@ fn platform_sync_target() -> bool {
 
 #[cfg(windows)]
 fn platform_console_session() -> bool {
-    use windows::Win32::System::{
-        RemoteDesktop::{ProcessIdToSessionId, WTSGetActiveConsoleSessionId},
-        Threading::GetCurrentProcessId,
-    };
-    let mut own = 0;
-    // SAFETY: read-only session queries with a valid output slot.
-    unsafe { ProcessIdToSessionId(GetCurrentProcessId(), &mut own).is_ok() && WTSGetActiveConsoleSessionId() == own }
+    // Match the launch/input boundary, including protocol and disconnected state.
+    !oink_winsvc::session::remote_desktop()
 }
 #[cfg(not(windows))]
 fn platform_console_session() -> bool {

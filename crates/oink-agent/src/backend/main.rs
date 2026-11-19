@@ -14,8 +14,18 @@ fn run() -> std::process::ExitCode {
     }
     let launch = if std::env::args().any(|arg| arg == oink_agent::backend::REOPEN_FLAG) {
         oink_agent::backend::Launch::Reopen
+    } else if cfg!(target_os = "macos") && std::env::args().any(|arg| arg == "--ui-start-backend") {
+        oink_agent::backend::Launch::Login
     } else {
         oink_agent::backend::Launch::User
     };
-    std::process::ExitCode::from(oink_agent::backend::run(launch))
+    let code = oink_agent::backend::run(launch);
+    #[cfg(target_os = "macos")]
+    if launch == oink_agent::backend::Launch::Login
+        && let Some(path) = std::env::args_os().skip_while(|arg| arg != "--ui-start-backend").nth(1)
+        && let Ok(socket) = std::os::unix::net::UnixDatagram::unbound()
+    {
+        let _ = socket.send_to(&[code], path);
+    }
+    std::process::ExitCode::from(code)
 }

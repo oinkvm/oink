@@ -13,6 +13,7 @@ mod prelogin_peer;
 mod security;
 mod server;
 mod service_peer;
+pub mod session;
 pub mod update;
 mod wake;
 use std::{io, ptr};

@@ -287,7 +287,11 @@ fn connect() -> io::Result<Connection> {
     // this name grants nothing: the helper requires the registered source.
     // SAFETY: read-only physical console query.
     let active = unsafe { windows_sys::Win32::System::RemoteDesktop::WTSGetActiveConsoleSessionId() };
-    let routed = PRELOGIN_ROUTE.load(Ordering::Acquire) || active != own;
+    let prelogin = PRELOGIN_ROUTE.load(Ordering::Acquire);
+    if !prelogin && !super::session::console(own) {
+        return Err(denied());
+    }
+    let routed = prelogin;
     let id = if routed { active } else { own };
     if id == 0 || id == u32::MAX {
         return Err(denied());

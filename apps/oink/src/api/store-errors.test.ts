@@ -126,3 +126,15 @@ it.each([
   expect(notices()).toEqual([]);
   expect(notify).not.toHaveBeenCalled();
 });
+
+it('explains the update admission gate independently of identity verification', () => {
+  expect(backendFailureDetail('UIAccess backend launch failed: oink_update_in_progress')).not.toContain('oink_update_in_progress');
+  expect(backendFailureDetail('UIAccess backend launch failed: oink_update_in_progress')).toContain('Oink');
+});
+
+it('explains untrusted maintenance storage as installer repair rather than a running update', () => {
+  const detail = backendFailureDetail('UIAccess backend launch failed: oink_update_storage_unsafe');
+  expect(detail).not.toContain('oink_update_storage_unsafe');
+  expect(detail).toContain('Oink');
+  expect(detail).not.toBe(backendFailureDetail('oink_update_in_progress'));
+});

@@ -166,7 +166,7 @@ impl Node {
     /// register; it never edits owner visibility preferences.
     pub(crate) fn apply_global_layout_visibility(&self, layout: &oink_display::layout::Layout) -> Result<()> {
         let settings = self.settings();
-        if !settings.sync_system_arrangement {
+        if self.remote_desktop() || !settings.sync_system_arrangement {
             return Ok(());
         }
         let backend = self
@@ -208,6 +208,12 @@ impl Node {
     /// Read-only enumeration. Called from the blocking display worker, never the
     /// ConfigModule actor (publishing Facts synchronously calls that actor).
     pub(crate) fn refresh_native_arrangement(&self) -> Result<NativeState> {
+        if self.remote_desktop() {
+            return Err(fail(
+                ErrorCode::Unsupported,
+                "Native arrangement unavailable in remote desktop",
+            ));
+        }
         let _observation = lock(&self.inner.profiles.native.observation_gate);
         #[cfg(windows)]
         let _ = self.follow_windows_reconnections()?;
@@ -375,6 +381,12 @@ impl Node {
         reply
     }
     fn apply_owner_arrangement(&self, peer: DeviceKey, request: &d::LayoutArrangementRequest) -> Result<()> {
+        if self.remote_desktop() {
+            return Err(fail(
+                ErrorCode::Unsupported,
+                "Native arrangement unavailable in remote desktop",
+            ));
+        }
         // Same lock order as the platform observer: enumeration first, then
         // owner preferences. A pre-transaction callback must not publish stale
         // geometry after the transaction's final observation.
@@ -564,7 +576,7 @@ impl Node {
         if !settings.sync_system_arrangement || !settings.disable_hidden_displays {
             backend.release_disabled_displays().map_err(unavailable)?;
         }
-        if !settings.sync_system_arrangement {
+        if self.remote_desktop() || !settings.sync_system_arrangement {
             return Ok(());
         }
         let config = self.link_config().map_err(unavailable)?;
