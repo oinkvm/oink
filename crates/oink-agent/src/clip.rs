@@ -15,7 +15,7 @@ use std::{
     path::PathBuf,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -65,7 +65,7 @@ struct Publication {
     result: Result<u64, oink_clipboard::ClipboardError>,
 }
 enum Input {
-    Reconfigure,
+    Reconfigure(u64),
     LocalChange(u64),
     Captured(
         u64,
@@ -118,6 +118,11 @@ struct Shared {
     receive_policy: oink_clipboard::policy::SharingPolicy,
     enabled: AtomicBool,
     paused: AtomicBool,
+    // Serialize a policy change with publication of its generation. The
+    // actor must skip superseded notifications: applying the same resumed
+    // state twice cancels native writes started by the first notification.
+    changes: Mutex<()>,
+    generation: AtomicU64,
     activity: Mutex<VecDeque<ClipActivity>>,
     transfer: Mutex<Option<FileTransferStatus>>,
     dnd_files: Mutex<Option<Arc<crate::dnd::DndFiles>>>,
@@ -137,6 +142,7 @@ impl ClipHandle {
         *self.shared.settings.lock().unwrap()
     }
     pub fn set_settings(&self, settings: ClipboardSettings) {
+        let _change = self.shared.changes.lock().unwrap();
         let mut current = self.shared.settings.lock().unwrap();
         if *current == settings {
             return;
@@ -147,6 +153,9 @@ impl ClipHandle {
             dedupe: settings.dedupe,
             ..*current
         } == settings;
+        if !dedupe_only {
+            self.shared.generation.fetch_add(1, Ordering::AcqRel);
+        }
         *current = settings;
         drop(current);
         if !dedupe_only {
@@ -155,12 +164,18 @@ impl ClipHandle {
     }
     /// The caller durably commits owner option3 before applying it here.
     pub fn set_enabled(&self, enabled: bool) {
-        if self.shared.enabled.swap(enabled, Ordering::AcqRel) != enabled {
+        let _change = self.shared.changes.lock().unwrap();
+        if self.shared.enabled.load(Ordering::Acquire) != enabled {
+            self.shared.generation.fetch_add(1, Ordering::AcqRel);
+            self.shared.enabled.store(enabled, Ordering::Release);
             self.reconfigure();
         }
     }
     pub fn set_paused(&self, paused: bool) {
-        if self.shared.paused.swap(paused, Ordering::AcqRel) != paused {
+        let _change = self.shared.changes.lock().unwrap();
+        if self.shared.paused.load(Ordering::Acquire) != paused {
+            self.shared.generation.fetch_add(1, Ordering::AcqRel);
+            self.shared.paused.store(paused, Ordering::Release);
             self.reconfigure();
         }
     }
@@ -184,7 +199,9 @@ impl ClipHandle {
         }
         self.shared.links.cancel_all();
         self.shared.links.pause_changed(!active);
-        let _ = self.tx.send(Input::Reconfigure);
+        let _ = self
+            .tx
+            .send(Input::Reconfigure(self.shared.generation.load(Ordering::Acquire)));
     }
     pub fn fetch_files(&self) {
         let _ = self.tx.send(Input::FetchFiles);

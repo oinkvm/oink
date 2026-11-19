@@ -66,6 +66,8 @@ pub(crate) fn start_link_runtime(
         receive_policy: oink_clipboard::policy::SharingPolicy::new(enabled && !paused && settings.receive),
         enabled: AtomicBool::new(enabled),
         paused: AtomicBool::new(paused),
+        changes: Mutex::default(),
+        generation: AtomicU64::new(0),
         activity: Mutex::default(),
         transfer: Mutex::default(),
         dnd_files: Mutex::default(),
@@ -232,7 +234,9 @@ impl Task {
                     },
                     Some(Input::Applied{id,ticket,publication})=>self.applied(id,ticket,publication),
                     Some(Input::LocalChange(count))=>if self.active(){self.observe(count);},
-                    Some(Input::Reconfigure)=>self.reconfigure(),
+                    Some(Input::Reconfigure(generation))=>if generation == self.shared.generation.load(Ordering::Acquire) {
+                        self.reconfigure();
+                    },
                     Some(Input::FetchFiles)=>self.fetch(),
                     Some(Input::CancelFiles)=>{self.cancel_native_write();self.fetch_requested=None;self.cancelled=self.current_id();if let Some(mut status)=handle.transfer(){status.phase=FileTransferPhase::Cancelled;self.set_transfer(Some(status));}},
                     #[cfg(target_os = "macos")]
