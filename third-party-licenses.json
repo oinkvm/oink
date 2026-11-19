@@ -9557,14 +9557,14 @@
       ]
     },
     {
-      "id": "cargo:quinn-proto@0.11.18",
+      "id": "cargo:quinn-proto@0.11.19",
       "name": "quinn-proto",
-      "version": "0.11.18",
+      "version": "0.11.19",
       "ecosystem": "cargo",
       "repository": "https://github.com/quinn-rs/quinn",
       "source": {
-        "url": "https://crates.io/api/v1/crates/quinn-proto/0.11.18/download",
-        "integrity": "sha256:a9746dbde176634f4f2f1faf2404e30a31b2bc1e9cafb5329c95d8177a18c9fc"
+        "url": "https://crates.io/api/v1/crates/quinn-proto/0.11.19/download",
+        "integrity": "sha256:0e750cca55fe4f0439a15d0bb529da9651e79993e8e72c61a899a36d462befbe"
       },
       "licenseExpression": "MIT OR Apache-2.0",
       "selectedLicense": "MIT",
@@ -9593,14 +9593,14 @@
       ]
     },
     {
-      "id": "cargo:quinn-udp@0.5.15",
+      "id": "cargo:quinn-udp@0.5.16",
       "name": "quinn-udp",
-      "version": "0.5.15",
+      "version": "0.5.16",
       "ecosystem": "cargo",
       "repository": "https://github.com/quinn-rs/quinn",
       "source": {
-        "url": "https://crates.io/api/v1/crates/quinn-udp/0.5.15/download",
-        "integrity": "sha256:35a133f956daabe89a61a685c2649f13d82d5aa4bd5d12d1277e1072a21c0694"
+        "url": "https://crates.io/api/v1/crates/quinn-udp/0.5.16/download",
+        "integrity": "sha256:af66907df18639dcf4db56ca65490cabc4b27a97dbadd96f2926cca73298f016"
       },
       "licenseExpression": "MIT OR Apache-2.0",
       "selectedLicense": "MIT",

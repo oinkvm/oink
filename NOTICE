@@ -1331,12 +1331,12 @@ quick-xml 0.42.0 (MIT)
 Copyright (c) 2016 Johann Tuffe
 Full terms: licenses/texts/f0cf9b1c62bbe3bd3a69f5f79c7158f513f612b4940a0a812d1db39d605318bc.txt
 
-quinn-proto 0.11.18 (MIT)
+quinn-proto 0.11.19 (MIT)
 Copyright (c) 2018 The quinn Developers
 Full terms: licenses/texts/4b2d0aca6789fa39e03d6738e869ea0988cceba210ca34ebb59c15c463e93a04.txt
 Full terms: licenses/texts/c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4.txt
 
-quinn-udp 0.5.15 (MIT)
+quinn-udp 0.5.16 (MIT)
 Copyright (c) 2018 The quinn Developers
 Full terms: licenses/texts/4b2d0aca6789fa39e03d6738e869ea0988cceba210ca34ebb59c15c463e93a04.txt
 Full terms: licenses/texts/c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4.txt
